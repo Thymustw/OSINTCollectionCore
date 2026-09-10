@@ -45,7 +45,7 @@ core-security = { path = "crates/core-security" }
 dotenvy = "0.15.7"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 opensearch = { version = "2.4.0", default-features = false, features = ["rustls-tls"] }
-rand = { version = "0.8.5", features = ["std"] }
+rand = { version = "0.10.2", features = ["std"] }
 # 不用 cmake-build：librdkafka 的 #cmakedefine01 WITH_OAUTHBEARER_OIDC
 # 在關閉時仍寫成 `#define WITH_OAUTHBEARER_OIDC 0`，C 端 `#ifdef` 仍為真，
 # 因而 #include <curl/curl.h>。系統沒有 libcurl-dev。

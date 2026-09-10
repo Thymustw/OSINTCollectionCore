@@ -573,7 +573,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "jsonwebtoken",
- "rand 0.8.8",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "thiserror",
