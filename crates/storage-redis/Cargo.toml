@@ -1,0 +1,17 @@
+[package]
+name = "storage-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Redis KeyValueStore adapter"
+
+[dependencies]
+async-trait = { workspace = true }
+redis = { workspace = true }
+storage-core = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }
