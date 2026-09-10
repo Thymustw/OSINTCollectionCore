@@ -81,36 +81,46 @@ jobs:
       - run: cargo nextest run --workspace --lib
 
   integration-test:
-    name: Integration tests
+    name: Integration tests (full stack via docker-compose)
     runs-on: ubuntu-latest
     needs: [unit-test]
-    services:
-      postgres:
-        image: postgres:17-bookworm
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7.4-bookworm
-        ports: ["6379:6379"]
+    # Runs the same docker/docker-compose.yml used locally, on its canonical
+    # ports (9200/9000/9001/...) — CI runners don't have the local-dev-machine
+    # OpenCTI port conflict that docker-compose.dev.yml works around, so the
+    # override file is deliberately NOT used here.
+    #
+    # NOTE: this job has not yet been validated by an actual push (see the
+    # conversation/commit history) — the docker-compose file's own healthchecks
+    # and `--wait` are expected to work on GitHub's ubuntu-latest runners, but
+    # that is an expectation, not something already observed passing in CI.
+    env:
+      DATABASE_URL: postgres://osint:osint_dev@localhost:5432/osint_core
+      SQLITE_URL: "sqlite:./var/osint-local.sqlite?mode=rwc"
+      OPENSEARCH_URL: http://localhost:9200
+      S3_ENDPOINT: http://localhost:9000
+      S3_BUCKET: raw-evidence
+      MINIO_ROOT_USER: osint
+      MINIO_ROOT_PASSWORD: osint_dev_minio
+      REDIS_URL: redis://localhost:6379/0
+      REDPANDA_BROKERS: localhost:9092
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run --workspace --test '*'
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-          REDIS_URL: redis://localhost:6379
-      # OpenSearch/Redpanda/MinIO conformance tests need their own docker-compose
-      # based job once storage-opensearch/storage-s3 land (V0.1 Phase 2) — GitHub
-      # Actions `services:` containers don't cover Redpanda's multi-port setup
-      # well, so add that job alongside those crates rather than guessing now.
+      - uses: taiki-e/install-action@sqlx-cli
+      - name: Start infrastructure
+        run: docker compose -f docker/docker-compose.yml up -d --wait --wait-timeout 180
+      - run: mkdir -p var
+      - run: sqlx migrate run --source migrations/postgres --database-url "$DATABASE_URL"
+      - run: sqlx migrate run --source migrations/sqlite --database-url "$SQLITE_URL"
+      - run: cargo nextest run --workspace --all-targets
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose -f docker/docker-compose.yml logs
+      - name: Stop infrastructure
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v
 
   build:
     name: Build (release)
