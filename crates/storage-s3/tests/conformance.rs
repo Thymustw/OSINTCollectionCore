@@ -7,8 +7,9 @@ use storage_s3::S3ObjectStore;
 async fn s3_object_conformance() {
     load_workspace_dotenv();
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
-    let parsed = verify_not_opencti_s3(&endpoint).expect("拒絕 9000 / OpenCTI");
-    assert_eq!(parsed.port(), Some(19000), "必須是 osint-core 的 19000");
+    // 埠號本身不代表身分——只在本機開 OSINT_STRICT_PORT_ISOLATION 時才會擋 9000。
+    // MinIO 沒有等同 OpenSearch 的身分驗證 API，這是目前唯一的防線，只在已知衝突的機器生效。
+    let _parsed = verify_not_opencti_s3(&endpoint).expect("URL 格式或本機嚴格模式檢查失敗");
 
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
     let access = required_env("MINIO_ROOT_USER").expect("MINIO_ROOT_USER");

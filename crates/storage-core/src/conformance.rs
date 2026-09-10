@@ -56,44 +56,51 @@ pub fn required_env(name: &str) -> Result<String, StorageError> {
     })
 }
 
-/// 確認 URL 的埠號是本專案 OpenSearch（19200），不是 OpenCTI Elasticsearch（9200）。
+/// 只有本機開發機（同時跑 OpenCTI，9200/9000 canonical 埠被占走）才需要開嚴格埠號檢查。
+/// 設 `OSINT_STRICT_PORT_ISOLATION=1`（已寫在本機 `.env`，不進版本庫）才會擋 9200/9000；
+/// CI 或其他沒有這個埠衝突的機器不要設這個變數，9200/9000 在那裡通常就是我們自己的服務。
+///
+/// 這條規則原本寫死「9200/9000 一律拒絕」，在 GitHub Actions 的第一次 CI run 上就直接把
+/// 我們自己乾淨的 OpenSearch/MinIO（canonical 埠,沒有 OpenCTI 衝突）誤判成 OpenCTI 擋下來——
+/// 埠號在不同環境代表不同東西,不能寫死。真正該信任的是連線後的身分驗證
+/// （見 [`assert_opensearch_identity`]),埠號檢查只在已知有衝突的這台機器上當額外防線。
+fn strict_port_isolation_enabled() -> bool {
+    env::var("OSINT_STRICT_PORT_ISOLATION")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 驗證 URL 格式正確；只有在本機開了 `OSINT_STRICT_PORT_ISOLATION` 時才額外擋 9200
+/// （本機的 OpenCTI Elasticsearch）。實際的服務身分一律以 [`assert_opensearch_identity`] 為準。
 pub fn verify_not_opencti_search(url: &str) -> Result<Url, StorageError> {
     let parsed = Url::parse(url).map_err(|err| StorageError::Configuration {
         message: format!("OPENSEARCH_URL `{url}` 不是合法 URL：{err}"),
     })?;
-    match parsed.port_or_known_default() {
-        Some(19200) => Ok(parsed),
-        Some(9200) => Err(StorageError::Configuration {
+    if strict_port_isolation_enabled() && parsed.port_or_known_default() == Some(9200) {
+        return Err(StorageError::Configuration {
             message: format!(
                 "OPENSEARCH_URL `{url}` 指向埠 9200。本機 9200 是 OpenCTI Elasticsearch，不是 osint-core-opensearch-1。請改成 http://127.0.0.1:19200"
             ),
-        }),
-        other => Err(StorageError::Configuration {
-            message: format!(
-                "OPENSEARCH_URL `{url}` 的埠是 {other:?}，本機 osint-core OpenSearch 應為 19200。拒絕連線以免寫到錯誤叢集"
-            ),
-        }),
+        });
     }
+    Ok(parsed)
 }
 
-/// 確認 endpoint 埠號是本專案 MinIO（19000），不是 OpenCTI MinIO（9000）。
+/// 驗證 URL 格式正確；只有在本機開了 `OSINT_STRICT_PORT_ISOLATION` 時才額外擋 9000
+/// （本機的 OpenCTI MinIO）。MinIO 目前沒有等同 [`assert_opensearch_identity`] 的身分驗證，
+/// 所以這台已知衝突的機器上，埠號檢查仍是唯一防線，其餘環境不受影響。
 pub fn verify_not_opencti_s3(endpoint: &str) -> Result<Url, StorageError> {
     let parsed = Url::parse(endpoint).map_err(|err| StorageError::Configuration {
         message: format!("S3_ENDPOINT `{endpoint}` 不是合法 URL：{err}"),
     })?;
-    match parsed.port_or_known_default() {
-        Some(19000) => Ok(parsed),
-        Some(9000) => Err(StorageError::Configuration {
+    if strict_port_isolation_enabled() && parsed.port_or_known_default() == Some(9000) {
+        return Err(StorageError::Configuration {
             message: format!(
                 "S3_ENDPOINT `{endpoint}` 指向埠 9000。本機 9000 是 OpenCTI MinIO，不是 osint-core-minio-1。請改成 http://127.0.0.1:19000"
             ),
-        }),
-        other => Err(StorageError::Configuration {
-            message: format!(
-                "S3_ENDPOINT `{endpoint}` 的埠是 {other:?}，本機 osint-core MinIO 應為 19000。拒絕連線以免寫到錯誤 bucket"
-            ),
-        }),
+        });
     }
+    Ok(parsed)
 }
 
 /// 檢查 GET `/` 回應確實是 OpenSearch，且不是 Elasticsearch。
@@ -706,11 +713,35 @@ pub fn assert_sqlite_path_safe(path: &Path) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `OSINT_STRICT_PORT_ISOLATION` 是行程環境變數；測試必須序列化，否則會互相覆蓋。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_strict_isolation<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { env::set_var("OSINT_STRICT_PORT_ISOLATION", "1") };
+        let result = f();
+        unsafe { env::remove_var("OSINT_STRICT_PORT_ISOLATION") };
+        result
+    }
 
     #[test]
-    fn rejects_opensearch_canonical_port() {
-        let err = verify_not_opencti_search("http://127.0.0.1:9200").unwrap_err();
-        assert!(format!("{err}").contains("19200"));
+    fn rejects_opensearch_canonical_port_when_strict() {
+        with_strict_isolation(|| {
+            let err = verify_not_opencti_search("http://127.0.0.1:9200").unwrap_err();
+            assert!(format!("{err}").contains("19200"));
+        });
+    }
+
+    #[test]
+    fn accepts_opensearch_canonical_port_by_default() {
+        // 沒開 OSINT_STRICT_PORT_ISOLATION 時（CI、其他沒有 OpenCTI 衝突的機器），
+        // 9200 就是普通的 OpenSearch 埠，不該被拒絕——真正的身分驗證交給
+        // assert_opensearch_identity，這裡只驗證 URL 格式。
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { env::remove_var("OSINT_STRICT_PORT_ISOLATION") };
+        verify_not_opencti_search("http://127.0.0.1:9200").unwrap();
     }
 
     #[test]
@@ -719,9 +750,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_minio_canonical_port() {
-        let err = verify_not_opencti_s3("http://127.0.0.1:9000").unwrap_err();
-        assert!(format!("{err}").contains("19000"));
+    fn rejects_minio_canonical_port_when_strict() {
+        with_strict_isolation(|| {
+            let err = verify_not_opencti_s3("http://127.0.0.1:9000").unwrap_err();
+            assert!(format!("{err}").contains("19000"));
+        });
+    }
+
+    #[test]
+    fn accepts_minio_canonical_port_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { env::remove_var("OSINT_STRICT_PORT_ISOLATION") };
+        verify_not_opencti_s3("http://127.0.0.1:9000").unwrap();
     }
 
     #[test]
