@@ -1,0 +1,70 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+
+# Python / AI runtime
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Frontend (TypeScript / React / Vite)
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+credentials.json
+
+# Local AI model artifacts
+*.gguf
+*.safetensors
+/models/
+/model-cache/
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local artifacts
+.claude/settings.local.json
+.claude/worktrees/
+.claude/shell-snapshots/
+.claude/*.local.*
+CLAUDE.local.md
+.mcp.local.json
+
+# --- Defense in depth: these must NEVER end up in this repo. ---
+# The export script (scripts/export-public.sh in the private repo) only ever
+# copies an explicit allow-list, so nothing below should ever be produced by
+# it — these entries exist so a future mistake in that script still can't be
+# committed here without a forced `git add -f`. See ../OSINTCollectionCore's
+# docs/adr/ADR-003-two-repo-public-export-model.md for why.
+docs/architecture/
+docs/specs/
+docs/governance/
+docs/security/
+docs/operations/
+docs/developer/
+docs/adr/
+docs/claude/
+.claude/CLAUDE.md

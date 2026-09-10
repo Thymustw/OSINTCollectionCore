@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Gate order: lint -> secret scan -> SCA -> IaC scan -> unit -> integration -> build.
+#
+# No continue-on-error anywhere: a green run must mean the gate actually
+# passed. This file is intentionally NOT pushed to the remote until the
+# Cargo workspace exists — pushing it against an empty workspace would force a
+# choice between "red from commit one" and "continue-on-error everywhere," and
+# the latter turns the gate into decoration once real code lands.
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sca:
+    name: Dependency audit (cargo-audit + cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo audit
+      - run: cargo deny check
+
+  iac-scan:
+    name: Docker/IaC scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trivy config scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: docker/
+          exit-code: "1"
+
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --lib
+
+  integration-test:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: [unit-test]
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.4-bookworm
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --test '*'
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          REDIS_URL: redis://localhost:6379
+      # OpenSearch/Redpanda/MinIO conformance tests need their own docker-compose
+      # based job once storage-opensearch/storage-s3 land (V0.1 Phase 2) — GitHub
+      # Actions `services:` containers don't cover Redpanda's multi-port setup
+      # well, so add that job alongside those crates rather than guessing now.
+
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    needs: [unit-test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release
