@@ -32,3 +32,45 @@ async fn s3_object_conformance() {
         .await
         .expect("object round-trip");
 }
+
+/// `object_store` 沒有 CreateBucket；這條是專門驗證 adapter 自己簽 SigV4 打 PUT /{bucket}。
+#[tokio::test]
+async fn ensure_bucket_creates_when_missing() {
+    load_workspace_dotenv();
+    let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
+    let _parsed = verify_not_opencti_s3(&endpoint).expect("URL 格式或本機嚴格模式檢查失敗");
+    let access = required_env("MINIO_ROOT_USER").expect("MINIO_ROOT_USER");
+    let secret = required_env("MINIO_ROOT_PASSWORD").expect("MINIO_ROOT_PASSWORD");
+
+    let bucket = format!("osint-ensure-{}", uuid::Uuid::now_v7().simple());
+    let store = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("S3 client");
+
+    let before = storage_core::HealthProvider::health(&store)
+        .await
+        .expect("health before");
+    assert!(
+        !before.healthy,
+        "測試前 bucket `{bucket}` 不該已存在：{}",
+        before.message
+    );
+
+    store.ensure_bucket().await.expect("ensure missing bucket");
+    store
+        .ensure_bucket()
+        .await
+        .expect("ensure_bucket 對已存在的 bucket 必須是冪等");
+
+    let after = storage_core::HealthProvider::health(&store)
+        .await
+        .expect("health after");
+    assert!(
+        after.healthy,
+        "ensure_bucket 之後 health 應為 true：{}",
+        after.message
+    );
+
+    store
+        .delete_empty_bucket()
+        .await
+        .expect("清掉測試用空 bucket");
+}

@@ -12,10 +12,7 @@ yanked = "deny"
 # （finding/severity/component/exploitability/compensating control/owner/expiry）。
 # 這裡多一條 ID、那邊沒有對應紀錄，就是流程違規，不是合法例外。
 ignore = [
-    "RUSTSEC-2026-0194", # quick-xml，經 rust-s3 帶入，見 VULNERABILITY_TRIAGE.md
-    "RUSTSEC-2026-0195", # quick-xml，同上
     "RUSTSEC-2023-0071", # rsa (Marvin Attack)，經 jsonwebtoken 帶入，見 VULNERABILITY_TRIAGE.md
-    "RUSTSEC-2026-0009", # time stack exhaustion，經 rust-s3 帶入，見 VULNERABILITY_TRIAGE.md
 ]
 
 [licenses]

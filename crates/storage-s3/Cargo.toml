@@ -5,11 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "MinIO/S3 ObjectStore adapter（rust-s3 + rustls）"
+description = "MinIO/S3 ObjectStore adapter（object_store aws + reqwest/rustls）"
 
 [dependencies]
 async-trait = { workspace = true }
-rust-s3 = { workspace = true }
+http = "1"
+object_store = { workspace = true }
 serde_json = { workspace = true }
 storage-core = { workspace = true }
 
