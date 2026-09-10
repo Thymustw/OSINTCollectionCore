@@ -63,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: trivy config scan
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: docker/
@@ -108,7 +108,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - uses: taiki-e/install-action@sqlx-cli
+      # taiki-e/install-action has no sqlx-cli tag (confirmed: not in its
+      # tags list) — that shorthand only works for tools it actually
+      # publishes prebuilt binaries for. Build from source instead, pinned
+      # to the exact features used locally (postgres+sqlite+rustls, no
+      # native-tls/openssl).
+      - run: cargo install sqlx-cli --version =0.9.0 --locked --no-default-features --features postgres,sqlite,rustls
       - name: Start infrastructure
         run: docker compose -f docker/docker-compose.yml up -d --wait --wait-timeout 180
       - run: mkdir -p var
