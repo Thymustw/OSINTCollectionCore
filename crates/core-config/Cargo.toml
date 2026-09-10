@@ -3,7 +3,7 @@ name = "core-config"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 publish.workspace = true
 description = "TOML 設定載入、環境變數覆寫，以及 SecretRef 密鑰參照型別"
 

@@ -3,7 +3,7 @@ name = "storage-postgres"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 publish.workspace = true
 description = "PostgreSQL CanonicalStore + RelationalStore adapter"
 

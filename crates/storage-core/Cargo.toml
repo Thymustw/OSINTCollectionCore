@@ -3,7 +3,7 @@ name = "storage-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 publish.workspace = true
 description = "Capability-based storage ports、錯誤模型與 conformance 測試"
 

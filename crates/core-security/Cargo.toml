@@ -3,7 +3,7 @@ name = "core-security"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 publish.workspace = true
 description = "JWT、API token hash、RBAC、AuditLog trait、SSRF IP 分類"
 

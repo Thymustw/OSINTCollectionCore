@@ -3,7 +3,7 @@ name = "core-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file.workspace = true
 publish.workspace = true
 description = "V0.1 canonical domain types（serde）。欄位對齊 docs/specs/SPEC_V0.1.md"
 

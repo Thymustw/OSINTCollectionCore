@@ -1,0 +1,11 @@
+# cargo-audit 設定。跟 deny.toml 的 [advisories] ignore 清單保持一致——
+# 每一條都要在 docs/security/VULNERABILITY_TRIAGE.md 有對應紀錄，且有到期日。
+# 到期後要嘛真的修掉、要嘛重新走一次 triage 流程更新到期日，不要放著不管。
+
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0194", # quick-xml，經 rust-s3 帶入，7.5 HIGH，見 VULNERABILITY_TRIAGE.md，30 天到期
+    "RUSTSEC-2026-0195", # quick-xml，同上
+    "RUSTSEC-2023-0071", # rsa (Marvin Attack)，經 jsonwebtoken 帶入，5.9 MEDIUM，90 天到期
+    "RUSTSEC-2026-0009", # time stack exhaustion，經 rust-s3 帶入，6.8 MEDIUM，90 天到期
+]

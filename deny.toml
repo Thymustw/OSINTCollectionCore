@@ -1,0 +1,52 @@
+# cargo-deny 設定。V0.1 DevSecOps baseline 的一部分（docs/governance/DEVSECOPS.md §25）。
+# 只管相依套件的授權/漏洞，不管我們自己 workspace 的授權——我們自己的授權在根目錄 LICENSE，
+# 不是標準 SPDX（source-available, all rights reserved），所以要排除 workspace 成員本身。
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# 每一條都要在 docs/security/VULNERABILITY_TRIAGE.md 有對應紀錄
+# （finding/severity/component/exploitability/compensating control/owner/expiry）。
+# 這裡多一條 ID、那邊沒有對應紀錄，就是流程違規，不是合法例外。
+ignore = [
+    "RUSTSEC-2026-0194", # quick-xml，經 rust-s3 帶入，見 VULNERABILITY_TRIAGE.md
+    "RUSTSEC-2026-0195", # quick-xml，同上
+    "RUSTSEC-2023-0071", # rsa (Marvin Attack)，經 jsonwebtoken 帶入，見 VULNERABILITY_TRIAGE.md
+    "RUSTSEC-2026-0009", # time stack exhaustion，經 rust-s3 帶入，見 VULNERABILITY_TRIAGE.md
+]
+
+[licenses]
+version = 2
+# 常見寬鬆 OSS 授權，涵蓋目前相依樹裡看到的套件（tokio/axum/serde 等多為 MIT/Apache-2.0，
+# webpki-roots/webpki-root-certs 是 CDLA-Permissive-2.0，屬憑證資料集常見授權）。
+# 之後新增相依若被擋下來，先確認授權條款是否可接受，不要直接把它加進 allow 就跳過。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+    "BSL-1.0",
+]
+# 我們自己的 13 個 crate 用自訂 LICENSE（license-file），不是 SPDX 識別碼，
+# 不應該被上面的 allow list 擋下來——workspace 成員一律排除授權檢查。
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+# "deny" 會把 monorepo 內部的 path/workspace 相依（例如 core-api 依賴
+# core-config = { workspace = true }）誤判成「沒有版本限制的外部相依」而擋下來。
+# 這些是我們自己的 crate，不是從外部登錄檔抓的不明版本，改成 warn 只留紀錄。
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
