@@ -26,7 +26,7 @@ jobs:
     name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,7 +38,7 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
@@ -49,7 +49,7 @@ jobs:
     name: Dependency audit (cargo-audit + cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-audit
@@ -61,7 +61,7 @@ jobs:
     name: Docker/IaC scan (trivy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: trivy config scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -104,7 +104,7 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       REDPANDA_BROKERS: localhost:9092
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -132,7 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [unit-test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
