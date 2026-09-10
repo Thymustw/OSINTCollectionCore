@@ -97,4 +97,6 @@ See [`SECURITY.md`](SECURITY.md) for the vulnerability disclosure policy.
 
 ## License
 
-Not yet finalized.
+Source-available, all rights reserved — see [`LICENSE`](LICENSE). This is a
+deliberate, temporary policy; no open-source license is granted at this time,
+but that may change in the future.
