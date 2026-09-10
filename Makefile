@@ -3,7 +3,7 @@
 # 目標先寫成直接呼叫，工具未安裝時應失敗而不是假裝通過。
 
 .PHONY: help check build test lint fmt audit secret-scan docker-scan \
-	compose-up compose-down compose-ps migrate-postgres migrate-sqlite
+	compose-up compose-down compose-ps migrate-postgres migrate-sqlite run-api
 
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 CARGO ?= cargo
@@ -27,6 +27,7 @@ help:
 	@echo "  make audit             cargo audit（需已安裝 cargo-audit）"
 	@echo "  make secret-scan       gitleaks detect（需已安裝 gitleaks）"
 	@echo "  make docker-scan       trivy fs docker/（需已安裝 trivy）"
+	@echo "  make run-api           啟動 osint-api（需 JWT_SECRET 與 compose）"
 
 check:
 	$(CARGO) check --workspace --all-targets
@@ -68,3 +69,6 @@ migrate-postgres:
 migrate-sqlite:
 	mkdir -p var
 	$(SQLX) migrate run --source migrations/sqlite --database-url "$(SQLITE_URL)"
+
+run-api:
+	$(CARGO) run -p core-api --bin osint-api

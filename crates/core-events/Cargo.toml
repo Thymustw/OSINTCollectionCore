@@ -1,0 +1,22 @@
+[package]
+name = "core-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Event envelope v1 與 Redpanda producer/consumer"
+
+[dependencies]
+chrono = { workspace = true }
+core-model = { workspace = true }
+rdkafka = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+dotenvy = { workspace = true }
+storage-core = { workspace = true }

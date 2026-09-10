@@ -89,6 +89,9 @@ pub trait RelationalStore: HealthProvider {
     async fn put_job(&self, job: &Job) -> Result<(), StorageError>;
     async fn get_job(&self, id: JobId) -> Result<Option<Job>, StorageError>;
     async fn delete_job(&self, id: JobId) -> Result<bool, StorageError>;
+    /// 依 UUID v7 由新到舊列出。`after` 為上一頁最後一筆 id（嚴格小於）。
+    /// `limit` 由呼叫端夾在 1..=100。
+    async fn list_jobs(&self, after: Option<JobId>, limit: u32) -> Result<Vec<Job>, StorageError>;
 
     async fn put_duplicate_group(&self, group: &DuplicateGroup) -> Result<(), StorageError>;
     async fn get_duplicate_group(

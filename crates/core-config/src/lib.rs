@@ -19,6 +19,10 @@ pub struct AppConfig {
     pub app: AppSection,
     pub storage: StorageSection,
     pub broker: BrokerSection,
+    #[serde(default)]
+    pub http: HttpSection,
+    #[serde(default)]
+    pub auth: AuthSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +80,42 @@ pub struct BrokerSection {
     pub brokers: String,
 }
 
+/// HTTP 綁定位址與全域 rate limit。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpSection {
+    pub bind: String,
+    pub rate_limit_per_second: u32,
+    pub request_body_limit_bytes: u32,
+}
+
+impl Default for HttpSection {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18080".into(),
+            rate_limit_per_second: 20,
+            request_body_limit_bytes: 1_048_576,
+        }
+    }
+}
+
+/// JWT／API token 設定。secret 只存 SecretRef。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSection {
+    pub jwt_secret_ref: SecretRef,
+    pub jwt_issuer: String,
+    pub jwt_ttl_secs: u64,
+}
+
+impl Default for AuthSection {
+    fn default() -> Self {
+        Self {
+            jwt_secret_ref: SecretRef::parse("env:JWT_SECRET").expect("literal SecretRef"),
+            jwt_issuer: "osint-core".into(),
+            jwt_ttl_secs: 3600,
+        }
+    }
+}
+
 /// 設定載入失敗。訊息會指出缺哪個檔／哪個鍵，以及建議怎麼修。
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -90,7 +130,9 @@ pub enum ConfigError {
 impl AppConfig {
     /// 依預設搜尋路徑載入。
     pub fn load() -> Result<Self, ConfigError> {
-        let extra = std::env::var_os("OSINT_CONFIG_FILE").map(PathBuf::from);
+        let extra = std::env::var_os("OSINT_CONFIG_FILE")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         Self::load_from(None, extra.as_deref())
     }
 
@@ -107,7 +149,7 @@ impl AppConfig {
         };
         builder = builder.add_source(config::File::from(default_path).required(true));
 
-        if let Some(path) = extra_file {
+        if let Some(path) = extra_file.filter(|p| !p.as_os_str().is_empty()) {
             builder = builder.add_source(config::File::from(path.to_path_buf()).required(true));
         }
 
@@ -172,6 +214,9 @@ mod tests {
         assert_eq!(cfg.storage.canonical.pool_max, 10);
         assert_eq!(cfg.storage.object.bucket, "raw-evidence");
         assert_eq!(cfg.broker.brokers, "127.0.0.1:9092");
+        assert_eq!(cfg.http.bind, "127.0.0.1:18080");
+        assert_eq!(cfg.auth.jwt_secret_ref.as_str(), "env:JWT_SECRET");
+        assert_eq!(cfg.auth.jwt_issuer, "osint-core");
     }
 
     #[test]
@@ -200,5 +245,13 @@ mod tests {
         let cfg = AppConfig::load_from(Some(&workspace_default()), Some(&path)).unwrap();
         assert_eq!(cfg.app.environment, "from-file");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_extra_file_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let cfg = AppConfig::load_from(Some(&workspace_default()), Some(Path::new(""))).unwrap();
+        assert_eq!(cfg.app.environment, "dev");
     }
 }

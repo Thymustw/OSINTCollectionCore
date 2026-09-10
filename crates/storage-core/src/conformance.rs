@@ -390,6 +390,12 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
     };
     store.put_job(&job).await?;
     assert_eq_debug("job", &job, &store.get_job(job.id).await?.expect("job"));
+    let listed = store.list_jobs(None, 10).await?;
+    if !listed.iter().any(|item| item.id == job.id) {
+        return Err(StorageError::NotFound {
+            message: "剛寫入的 job 沒有出現在 list_jobs 結果".into(),
+        });
+    }
 
     let dup = DuplicateGroup {
         id: Uuid::now_v7(),

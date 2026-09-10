@@ -32,3 +32,14 @@ url_secret_ref = "env:REDIS_URL"
 
 [broker]
 brokers = "127.0.0.1:9092"
+
+[http]
+# 本工作站 8080 是 OpenCTI。osint-api 預設 18080，避免搶埠。
+bind = "127.0.0.1:18080"
+rate_limit_per_second = 20
+request_body_limit_bytes = 1048576
+
+[auth]
+jwt_secret_ref = "env:JWT_SECRET"
+jwt_issuer = "osint-core"
+jwt_ttl_secs = 3600

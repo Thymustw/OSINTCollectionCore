@@ -3,6 +3,11 @@ resolver = "3"
 members = [
     "crates/core-model",
     "crates/core-config",
+    "crates/core-observability",
+    "crates/core-security",
+    "crates/core-events",
+    "crates/core-jobs",
+    "crates/core-api",
     "crates/storage-core",
     "crates/storage-postgres",
     "crates/storage-sqlite",
@@ -19,13 +24,36 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+argon2 = "0.6.0"
 async-trait = "0.1.92"
+axum = { version = "0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+    "tracing",
+] }
+base64 = "0.22.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 config = "0.15.25"
 core-config = { path = "crates/core-config" }
+core-events = { path = "crates/core-events" }
+core-jobs = { path = "crates/core-jobs" }
 core-model = { path = "crates/core-model" }
+core-observability = { path = "crates/core-observability" }
+core-security = { path = "crates/core-security" }
 dotenvy = "0.15.7"
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 opensearch = { version = "2.4.0", default-features = false, features = ["rustls-tls"] }
+rand = { version = "0.8.5", features = ["std"] }
+# 不用 cmake-build：librdkafka 的 #cmakedefine01 WITH_OAUTHBEARER_OIDC
+# 在關閉時仍寫成 `#define WITH_OAUTHBEARER_OIDC 0`，C 端 `#ifdef` 仍為真，
+# 因而 #include <curl/curl.h>。系統沒有 libcurl-dev。
+# 改走 mklove ./configure --disable-curl --disable-ssl（本機 Redpanda 明文 9092）。
+rdkafka = { version = "0.39.0", default-features = false, features = [
+    "tokio",
+    "libz",
+] }
 # 1.3+ 的 rust-version 是 1.88；workspace 鎖 1.85。必須用 `=` 精確釘版，
 # 否則 caret `1.2.2` 仍會解析到 1.7.0（MSRV 1.88）。
 redis = { version = "=1.2.2", default-features = false, features = ["tokio-comp"] }
@@ -43,6 +71,16 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 ] }
 storage-core = { path = "crates/storage-core" }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal"] }
+tower = { version = "0.5.3", features = ["limit", "util"] }
+tower-http = { version = "0.6.11", features = [
+    "trace",
+    "timeout",
+    "limit",
+    "cors",
+    "catch-panic",
+] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v7", "serde"] }

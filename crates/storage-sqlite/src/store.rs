@@ -761,6 +761,25 @@ impl RelationalStore for SqliteEmbeddedStore {
         self.delete_id("DELETE FROM jobs WHERE id = ?", id).await
     }
 
+    async fn list_jobs(&self, after: Option<JobId>, limit: u32) -> Result<Vec<Job>, StorageError> {
+        let limit = i64::from(limit.clamp(1, 100));
+        let after_text = after.map(|id| id.to_string());
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM jobs
+            WHERE (?1 IS NULL OR id < ?1)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(after_text)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::job).collect()
+    }
+
     async fn put_duplicate_group(&self, group: &DuplicateGroup) -> Result<(), StorageError> {
         sqlx::query(
             r#"
