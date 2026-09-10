@@ -17,3 +17,5 @@ SQLite
 This keeps the App portable without coupling it to Core PostgreSQL internals.
 
 Detailed App-specific instructions should be added when the first SQLite-based App is implemented.
+
+V0.1 bootstrap 已提供 `migrations/sqlite/` 與 `make migrate-sqlite`。預設檔案路徑是 `./var/osint-local.sqlite`。

@@ -1,0 +1,34 @@
+# OSINT Intelligence Core — 預設設定（無密文）
+# 環境變數覆寫：OSINT__<區段>__<鍵>，例如 OSINT__APP__ENVIRONMENT=dev
+# 密鑰一律用 SecretRef（env: / file: / store:），不要把連線密碼寫進這個檔。
+
+[app]
+environment = "dev"
+
+[storage.canonical]
+adapter = "postgres"
+dsn_secret_ref = "env:DATABASE_URL"
+pool_max = 10
+
+[storage.sqlite_local]
+adapter = "sqlite"
+path = "./var/osint-local.sqlite"
+roles = ["embedded", "relational"]
+
+[storage.search]
+adapter = "opensearch"
+url = "http://127.0.0.1:9200"
+
+[storage.object]
+adapter = "s3"
+endpoint = "http://127.0.0.1:9000"
+bucket = "raw-evidence"
+access_key_ref = "env:MINIO_ROOT_USER"
+secret_key_ref = "env:MINIO_ROOT_PASSWORD"
+
+[storage.cache]
+adapter = "redis"
+url_secret_ref = "env:REDIS_URL"
+
+[broker]
+brokers = "127.0.0.1:9092"

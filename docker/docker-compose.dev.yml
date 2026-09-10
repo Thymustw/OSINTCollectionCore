@@ -1,0 +1,34 @@
+# 開發覆寫：對齊本機約 31GB RAM / 8 核心，並避開已被其他堆疊佔用的主機埠。
+#
+# 實測（2026-09-10）：主機 9200 已被 OpenCTI Elasticsearch 佔用、
+# 9000 已被 OpenCTI MinIO 佔用。canonical 埠仍寫在 docker-compose.yml；
+# 這個 override 把 OpenSearch / MinIO 改掛 19200 / 19000 / 19001。
+# Postgres 5432、Redis 6379、Redpanda 9092/8081/8082/9644 主機端目前空閒，維持原埠。
+
+services:
+  postgres:
+    mem_limit: 1g
+    cpus: "1.0"
+
+  opensearch:
+    mem_limit: 1g
+    cpus: "1.0"
+    environment:
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    ports: !override
+      - "19200:9200"
+
+  redpanda:
+    mem_limit: 512m
+    cpus: "1.0"
+
+  redis:
+    mem_limit: 256m
+    cpus: "0.50"
+
+  minio:
+    mem_limit: 512m
+    cpus: "0.50"
+    ports: !override
+      - "19000:9000"
+      - "19001:9001"

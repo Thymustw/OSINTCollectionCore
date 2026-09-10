@@ -1,0 +1,10 @@
+# 共用工作站：不要預設吃滿 8 核。需要加速再 overlay。
+[build]
+jobs = 4
+
+[term]
+color = "auto"
+quiet = false
+
+[net]
+git-fetch-with-cli = true
