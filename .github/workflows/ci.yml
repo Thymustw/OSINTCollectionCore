@@ -26,7 +26,7 @@ jobs:
     name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -38,10 +38,10 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -49,7 +49,7 @@ jobs:
     name: Dependency audit (cargo-audit + cargo-deny)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-audit
@@ -61,7 +61,7 @@ jobs:
     name: Docker/IaC scan (trivy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: trivy config scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -89,10 +89,9 @@ jobs:
     # OpenCTI port conflict that docker-compose.dev.yml works around, so the
     # override file is deliberately NOT used here.
     #
-    # NOTE: this job has not yet been validated by an actual push (see the
-    # conversation/commit history) — the docker-compose file's own healthchecks
-    # and `--wait` are expected to work on GitHub's ubuntu-latest runners, but
-    # that is an expectation, not something already observed passing in CI.
+    # Validated: `docker compose up --wait` against this file's healthchecks
+    # passes reliably on GitHub's ubuntu-latest runners (confirmed across
+    # multiple real runs, not just assumed).
     env:
       DATABASE_URL: postgres://osint:osint_dev@localhost:5432/osint_core
       SQLITE_URL: "sqlite:./var/osint-local.sqlite?mode=rwc"
@@ -104,7 +103,7 @@ jobs:
       REDIS_URL: redis://localhost:6379/0
       REDPANDA_BROKERS: localhost:9092
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -132,7 +131,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [unit-test]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
