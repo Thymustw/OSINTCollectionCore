@@ -1,42 +1,39 @@
 [package]
-name = "normalizer"
+name = "deduplicator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "raw.collected → RSS／Atom／Static Web／JSON 匯入／CSV 匯入的 Document 正規化（冪等）"
+description = "object.normalized → SPEC §15 五階段去重 → DuplicateGroup（冪等，不刪證據）"
 
 [[bin]]
-name = "osint-normalizer"
+name = "osint-deduplicator"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
-connector-rss = { path = "../connector-rss" }
-connector-static-web = { path = "../connector-static-web" }
 core-config = { workspace = true }
 core-events = { workspace = true }
 core-model = { workspace = true }
 core-observability = { workspace = true }
-dotenvy = { workspace = true }
-import-format = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
+# SimHash 的 token 雜湊。自己實作 SimHash（見 src/simhash.rs 的說明），
+# 只借用 SHA256 當分布均勻的 64-bit 雜湊來源。
+sha2 = { workspace = true }
 storage-core = { workspace = true }
 storage-postgres = { path = "../storage-postgres" }
-storage-s3 = { path = "../storage-s3" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
 collector = { path = "../collector" }
-connector-sdk = { workspace = true }
 core-jobs = { workspace = true }
-core-security = { workspace = true }
-tower = { workspace = true, features = ["util"] }
-url = { workspace = true }
+normalizer = { path = "../normalizer" }
+storage-s3 = { path = "../storage-s3" }

@@ -6,8 +6,8 @@ use core_model::{
 use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
-use storage_core::StorageError;
 use storage_core::codec::{decode_enum, decode_json, decode_string_vec};
+use storage_core::{SimhashCandidate, StorageError};
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
@@ -41,6 +41,11 @@ fn opt_uuid(row: &SqliteRow, col: &str) -> Result<Option<Uuid>, StorageError> {
         Some(s) => Ok(Some(parse_uuid(&s, col)?)),
         None => Ok(None),
     }
+}
+
+/// 只取一欄 UUID 的查詢（dedup 候選 id 清單）用。
+pub fn uuid_column(row: &SqliteRow, col: &str) -> Result<Uuid, StorageError> {
+    uuid_from(row, col)
 }
 
 fn parse_uuid(raw: &str, col: &str) -> Result<Uuid, StorageError> {
@@ -233,6 +238,16 @@ pub fn document(row: &SqliteRow) -> Result<Document, StorageError> {
         confidence: get_f64(row, "confidence")?,
         labels: decode_string_vec(&get_str(row, "labels")?, "labels")?,
         attributes: json(row, "attributes")?,
+        external_key: get_opt_str(row, "external_key")?,
+        simhash: get_opt_i64(row, "simhash")?,
+        duplicate_of: opt_uuid(row, "duplicate_of")?,
+    })
+}
+
+pub fn simhash_candidate(row: &SqliteRow) -> Result<SimhashCandidate, StorageError> {
+    Ok(SimhashCandidate {
+        id: uuid_from(row, "id")?,
+        simhash: get_i64(row, "simhash")?,
     })
 }
 

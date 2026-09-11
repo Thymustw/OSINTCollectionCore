@@ -5,8 +5,8 @@ use core_model::{
 use serde_json::Value;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
-use storage_core::StorageError;
 use storage_core::codec::decode_enum;
+use storage_core::{SimhashCandidate, StorageError};
 
 use crate::error::map_sqlx;
 
@@ -162,6 +162,16 @@ pub fn document(row: &PgRow) -> Result<Document, StorageError> {
         confidence: get(row, "confidence")?,
         labels,
         attributes: get(row, "attributes")?,
+        external_key: get(row, "external_key")?,
+        simhash: get(row, "simhash")?,
+        duplicate_of: get(row, "duplicate_of")?,
+    })
+}
+
+pub fn simhash_candidate(row: &PgRow) -> Result<SimhashCandidate, StorageError> {
+    Ok(SimhashCandidate {
+        id: get(row, "id")?,
+        simhash: get(row, "simhash")?,
     })
 }
 

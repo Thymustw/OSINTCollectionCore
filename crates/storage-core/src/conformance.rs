@@ -405,6 +405,11 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         confidence: 0.9,
         labels: vec!["cve".into()],
         attributes: json!({"cve": "CVE-2026-0001"}),
+        // dedup 欄位在這裡刻意留空：模擬「normalizer 剛寫完、deduplicator 還沒處理」
+        // 的狀態，下面會另外寫一份有值的來驗證 round-trip。
+        external_key: None,
+        simhash: None,
+        duplicate_of: None,
     };
     store.put_document(&document).await?;
     let mut updated = document.clone();
@@ -424,6 +429,8 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
     store
         .link_collection_object(collection.id, document.id)
         .await?;
+
+    assert_dedup_queries(store, &updated).await?;
 
     let entity = Entity {
         id: Uuid::now_v7(),
@@ -610,6 +617,145 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         });
     }
 
+    Ok(())
+}
+
+/// SPEC §15／§16 的查詢能力：Stage 1～4 的候選查詢 + duplicate group 的兩個反查。
+///
+/// 每次呼叫用新的 UUID 當鍵（`external_key`／`canonical_url`／content hash 都含 UUID），
+/// 因為 e2e 共用同一個 Postgres，寫死字串會被其他測試的殘留資料干擾。
+async fn assert_dedup_queries<S: RelationalStore>(
+    store: &S,
+    base: &Document,
+) -> Result<(), StorageError> {
+    let run = Uuid::now_v7();
+    let key = format!("conformance-platform|{run}");
+    let url = format!("https://example.invalid/conformance/{run}");
+    // 假裝成 SHA256（64 個十六進位字元）：真實資料長這樣，欄位長度限制才測得到。
+    let hash = format!("{}{}", run.simple(), run.simple());
+
+    // canonical 先寫（id 較小），duplicate 後寫。查詢契約是「依 id 升序」，
+    // 所以 canonical 必須是候選清單的第一筆。
+    let mut canonical = base.clone();
+    canonical.id = Uuid::now_v7();
+    canonical.external_key = Some(key.clone());
+    canonical.canonical_url = Some(url.clone());
+    canonical.normalized_content_hash = Some(hash.clone());
+    // 0x0F0F... 與下面 duplicate 的 fingerprint 只差 1 個 bit。
+    canonical.simhash = Some(0x0F0F_0F0F_0F0F_0F0F);
+    canonical.duplicate_of = None;
+    store.put_document(&canonical).await?;
+
+    let mut duplicate = base.clone();
+    duplicate.id = Uuid::now_v7();
+    duplicate.external_key = Some(key.clone());
+    duplicate.canonical_url = Some(url.clone());
+    duplicate.normalized_content_hash = Some(hash.clone());
+    duplicate.simhash = Some(0x0F0F_0F0F_0F0F_0F0E);
+    duplicate.duplicate_of = Some(canonical.id);
+    store.put_document(&duplicate).await?;
+
+    // 三個 dedup 欄位必須能原樣讀回來——特別是 simhash：它是 u64 的位元重解讀，
+    // backend 若把它當數值轉換（例如走浮點）會靜默改值。
+    let got = store
+        .get_document(duplicate.id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "剛寫入的 duplicate document 讀不到".into(),
+        })?;
+    assert_eq_debug("document_dedup_fields", &duplicate, &got);
+
+    let by_key = store
+        .find_document_ids_by_external_key(&key, duplicate.id, 10)
+        .await?;
+    assert_only(&by_key, canonical.id, "find_document_ids_by_external_key")?;
+    let by_url = store
+        .find_document_ids_by_canonical_url(&url, duplicate.id, 10)
+        .await?;
+    assert_only(&by_url, canonical.id, "find_document_ids_by_canonical_url")?;
+    let by_hash = store
+        .find_document_ids_by_content_hash(&hash, duplicate.id, 10)
+        .await?;
+    assert_only(&by_hash, canonical.id, "find_document_ids_by_content_hash")?;
+
+    // `before` 是嚴格小於：用 canonical 自己當 before 時，比它新的 duplicate 不該出現
+    // （否則 duplicate_of 會形成環），它自己當然也不該出現。
+    let earlier_than_canonical = store
+        .find_document_ids_by_external_key(&key, canonical.id, 10)
+        .await?;
+    if earlier_than_canonical.contains(&canonical.id)
+        || earlier_than_canonical.contains(&duplicate.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "find_document_ids_by_external_key 的 before 必須是嚴格小於，實際回 {earlier_than_canonical:?}"
+            ),
+        });
+    }
+
+    // Stage 4：距離 1 的候選要找得到；距離上限 0 時同一筆不該出現。
+    let near = store
+        .find_simhash_candidates(duplicate.simhash.expect("simhash"), 3, duplicate.id, 500)
+        .await?;
+    if !near.iter().any(|c| c.id == canonical.id) {
+        return Err(StorageError::NotFound {
+            message: format!(
+                "find_simhash_candidates(max_distance=3) 應找到距離 1 的 canonical {}，實際回 {} 筆",
+                canonical.id,
+                near.len()
+            ),
+        });
+    }
+    let exact = store
+        .find_simhash_candidates(duplicate.simhash.expect("simhash"), 0, duplicate.id, 500)
+        .await?;
+    if exact.iter().any(|c| c.id == canonical.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_simhash_candidates(max_distance=0) 不該回距離 1 的候選".into(),
+        });
+    }
+
+    let group = DuplicateGroup {
+        id: Uuid::now_v7(),
+        canonical_object_id: canonical.id,
+        member_object_id: Some(duplicate.id),
+        member_raw_evidence_id: None,
+        method: "content_sha256".into(),
+        similarity: 1.0,
+        first_seen: fixture_ts(),
+    };
+    store.put_duplicate_group(&group).await?;
+    let by_member = store
+        .get_duplicate_group_by_member(duplicate.id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "get_duplicate_group_by_member 讀不到剛寫入的 group".into(),
+        })?;
+    assert_eq_debug("duplicate_group_by_member", &group, &by_member);
+    let by_canonical = store
+        .list_duplicate_groups_by_canonical(canonical.id, 10)
+        .await?;
+    if by_canonical.len() != 1 || by_canonical[0] != group {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_duplicate_groups_by_canonical 應回 1 筆相符 group，實際 {} 筆",
+                by_canonical.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn assert_only(ids: &[Uuid], expected: Uuid, label: &str) -> Result<(), StorageError> {
+    if ids != [expected] {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("{label} 應只回 [{expected}]，實際 {ids:?}"),
+        });
+    }
     Ok(())
 }
 

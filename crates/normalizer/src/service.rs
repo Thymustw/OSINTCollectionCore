@@ -8,7 +8,6 @@ use core_model::{Document, DocumentType, Provenance, RawEvidence};
 use core_observability::MetricsRegistry;
 use import_format::{ImportKind, ImportSpec};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use storage_core::{ObjectStore, RelationalStore};
 use storage_postgres::PostgresCanonicalStore;
 use storage_s3::S3ObjectStore;
@@ -199,11 +198,10 @@ impl Normalizer {
                 .url
                 .clone()
                 .or_else(|| Some(evidence.source_url.clone()));
-            let hash_src = format!(
-                "{}|{}|{}",
-                title.as_deref().unwrap_or(""),
-                summary.as_deref().unwrap_or(""),
-                body_text.as_deref().unwrap_or("")
+            let content_hash = core_model::content_hash(
+                title.as_deref(),
+                summary.as_deref(),
+                body_text.as_deref(),
             );
             let object_type = if class == ContentClass::Html {
                 DocumentType::WebPage
@@ -225,7 +223,7 @@ impl Normalizer {
                 collected_at: evidence.retrieved_at,
                 source_url: source_url.clone(),
                 canonical_url: source_url,
-                normalized_content_hash: Some(sha256_hex(hash_src.as_bytes())),
+                normalized_content_hash: Some(content_hash),
                 confidence: 0.8,
                 labels: Vec::new(),
                 attributes: json!({
@@ -233,6 +231,11 @@ impl Normalizer {
                     "external_id": item.external_id,
                     "feed_type": item.attributes.get("feed_type"),
                 }),
+                // dedup 欄位由 deduplicator 填。normalizer 不做去重判斷，
+                // 也不要在這裡猜一個值——空值就是「還沒判斷過」的唯一表示法。
+                external_key: None,
+                simhash: None,
+                duplicate_of: None,
             };
             documents.push(doc);
         }
@@ -348,10 +351,6 @@ impl Normalizer {
     }
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
 /// 從 `RawEvidence.metadata["import"]` 取出上傳當下寫下的 `ImportSpec`。
 ///
 /// 解不出來就當作沒有——寧可回報「不支援」也不要自己猜一組對映，
@@ -409,11 +408,10 @@ fn build_import_documents(
                 .url
                 .clone()
                 .or_else(|| Some(evidence.source_url.clone()));
-            let hash_src = format!(
-                "{}|{}|{}",
-                record.title.as_deref().unwrap_or(""),
-                record.summary.as_deref().unwrap_or(""),
-                record.body.as_deref().unwrap_or("")
+            let content_hash = core_model::content_hash(
+                record.title.as_deref(),
+                record.summary.as_deref(),
+                record.body.as_deref(),
             );
             Document {
                 id: Uuid::now_v7(),
@@ -430,7 +428,7 @@ fn build_import_documents(
                 collected_at: evidence.retrieved_at,
                 source_url: source_url.clone(),
                 canonical_url: source_url,
-                normalized_content_hash: Some(sha256_hex(hash_src.as_bytes())),
+                normalized_content_hash: Some(content_hash),
                 confidence: 0.8,
                 labels: Vec::new(),
                 attributes: json!({
@@ -445,6 +443,10 @@ fn build_import_documents(
                         .then_some(record.published_at_raw)
                         .flatten(),
                 }),
+                // 同上：dedup 欄位由 deduplicator 填。
+                external_key: None,
+                simhash: None,
+                duplicate_of: None,
             }
         })
         .collect();

@@ -55,6 +55,17 @@ per_domain_inflight = 1
 bind = "127.0.0.1:18082"
 consumer_group = "osint-normalizer"
 
+[deduplicator]
+bind = "127.0.0.1:18083"
+consumer_group = "osint-deduplicator"
+# SPEC §15 五階段的上限。三個都是硬上限，沒有「不限」：
+# Stage 4（SimHash）沒有可走索引的等值條件，少了上限就是每份 Document 全表掃一次。
+candidate_limit = 20
+simhash_scan_limit = 500
+# Hamming 距離門檻（64 bit 中最多差幾個 bit 才算近似重複）。
+# 3 是 SimHash 論文與多數實務的慣用值；理由見 crates/deduplicator/src/simhash.rs。
+simhash_max_distance = 3
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

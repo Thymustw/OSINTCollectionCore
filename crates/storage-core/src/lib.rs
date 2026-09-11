@@ -15,5 +15,5 @@ pub use error::StorageError;
 pub use health::{HealthProvider, StorageHealth};
 pub use traits::{
     BulkIndexResult, CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore, RelationalStore,
-    SearchDocument, SearchHit, SearchHits, SearchQuery, SearchStore,
+    SearchDocument, SearchHit, SearchHits, SearchQuery, SearchStore, SimhashCandidate,
 };

@@ -21,6 +21,7 @@ members = [
     "crates/import-format",
     "crates/collector",
     "crates/normalizer",
+    "crates/deduplicator",
     "crates/osint-cli",
 ]
 

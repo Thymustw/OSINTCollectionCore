@@ -5,6 +5,7 @@
 
 pub mod collection;
 pub mod connector;
+pub mod content;
 pub mod document;
 pub mod duplicate;
 pub mod entity;
@@ -21,6 +22,7 @@ pub mod source;
 
 pub use collection::Collection;
 pub use connector::Connector;
+pub use content::{content_hash, normalize_content};
 pub use document::Document;
 pub use duplicate::DuplicateGroup;
 pub use entity::Entity;
@@ -149,6 +151,9 @@ mod tests {
             confidence: 0.9,
             labels: vec!["cve".into()],
             attributes: json!({"cve": "CVE-2026-0001"}),
+            external_key: Some("nvd|CVE-2026-0001".into()),
+            simhash: Some(-1),
+            duplicate_of: Some(id()),
         };
         let v = serde_json::to_value(&doc).unwrap();
         assert_eq!(v["object_type"], "advisory");

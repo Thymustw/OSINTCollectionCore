@@ -18,8 +18,8 @@ use sqlx::sqlite::{
 use storage_core::codec::encode_enum;
 use storage_core::conformance::assert_sqlite_path_safe;
 use storage_core::{
-    CapabilityDescriptor, EmbeddedStore, HealthProvider, RelationalStore, StorageAdapter,
-    StorageError, StorageHealth,
+    CapabilityDescriptor, EmbeddedStore, HealthProvider, RelationalStore, SimhashCandidate,
+    StorageAdapter, StorageError, StorageHealth,
 };
 use uuid::Uuid;
 
@@ -60,6 +60,19 @@ fn bool_int(value: bool) -> i64 {
 /// list cursor 分頁的每頁上限。呼叫端傳 0 或超大值都夾回 1..=100，避免無界查詢。
 fn clamp_limit(limit: u32) -> i64 {
     i64::from(limit.clamp(1, 100))
+}
+
+/// Dedup Stage 4 的掃描上限。語意同 storage-postgres 的同名函式。
+fn clamp_scan_limit(limit: u32) -> i64 {
+    i64::from(limit.clamp(1, 5_000))
+}
+
+/// 兩個 64-bit fingerprint 的 Hamming 距離。
+///
+/// SQLite 端獨立實作一份（不依賴 deduplicator crate）：storage adapter 不該反向依賴
+/// 服務層。演算法就是 XOR 後數 1 的個數，兩份不會分岔。
+fn hamming_distance(a: i64, b: i64) -> u32 {
+    ((a as u64) ^ (b as u64)).count_ones()
 }
 
 fn ports_text(ports: Option<&[u16]>) -> Result<Option<String>, StorageError> {
@@ -148,6 +161,26 @@ impl SqliteEmbeddedStore {
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Stage 1／2／3 的候選查詢共用：一個字串鍵 + 「只看 id 比 before 小的」+ 上限。
+    async fn dedup_candidate_ids(
+        &self,
+        sql: &'static str,
+        key: &str,
+        before: Uuid,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, StorageError> {
+        let rows = sqlx::query(sql)
+            .bind(key)
+            .bind(uuid_text(before))
+            .bind(clamp_limit(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| mapping::uuid_column(row, "id"))
+            .collect()
     }
 
     async fn link(&self, sql: &'static str, left: Uuid, right: Uuid) -> Result<(), StorageError> {
@@ -611,8 +644,9 @@ impl RelationalStore for SqliteEmbeddedStore {
             INSERT INTO documents (
                 id, object_type, schema_version, title, body, summary, language, author,
                 published_at, modified_at, observed_at, collected_at, source_url, canonical_url,
-                normalized_content_hash, confidence, labels, attributes
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                normalized_content_hash, confidence, labels, attributes,
+                external_key, simhash, duplicate_of
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (id) DO UPDATE SET
                 object_type = excluded.object_type,
                 schema_version = excluded.schema_version,
@@ -630,7 +664,10 @@ impl RelationalStore for SqliteEmbeddedStore {
                 normalized_content_hash = excluded.normalized_content_hash,
                 confidence = excluded.confidence,
                 labels = excluded.labels,
-                attributes = excluded.attributes
+                attributes = excluded.attributes,
+                external_key = excluded.external_key,
+                simhash = excluded.simhash,
+                duplicate_of = excluded.duplicate_of
             "#,
         )
         .bind(uuid_text(document.id))
@@ -651,6 +688,9 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(document.confidence)
         .bind(labels)
         .bind(json_text(&document.attributes))
+        .bind(&document.external_key)
+        .bind(document.simhash)
+        .bind(opt_uuid_text(document.duplicate_of))
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -1006,6 +1046,104 @@ impl RelationalStore for SqliteEmbeddedStore {
         rows.iter().map(mapping::job).collect()
     }
 
+    async fn find_document_ids_by_external_key(
+        &self,
+        external_key: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError> {
+        self.dedup_candidate_ids(
+            r#"
+            SELECT id FROM documents
+            WHERE external_key = ?1 AND id < ?2
+            ORDER BY id ASC
+            LIMIT ?3
+            "#,
+            external_key,
+            before,
+            limit,
+        )
+        .await
+    }
+
+    async fn find_document_ids_by_canonical_url(
+        &self,
+        canonical_url: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError> {
+        self.dedup_candidate_ids(
+            r#"
+            SELECT id FROM documents
+            WHERE canonical_url = ?1 AND id < ?2
+            ORDER BY id ASC
+            LIMIT ?3
+            "#,
+            canonical_url,
+            before,
+            limit,
+        )
+        .await
+    }
+
+    async fn find_document_ids_by_content_hash(
+        &self,
+        content_hash: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError> {
+        self.dedup_candidate_ids(
+            r#"
+            SELECT id FROM documents
+            WHERE normalized_content_hash = ?1 AND id < ?2
+            ORDER BY id ASC
+            LIMIT ?3
+            "#,
+            content_hash,
+            before,
+            limit,
+        )
+        .await
+    }
+
+    async fn find_simhash_candidates(
+        &self,
+        fingerprint: i64,
+        max_distance: u32,
+        before: DocumentId,
+        scan_limit: u32,
+    ) -> Result<Vec<SimhashCandidate>, StorageError> {
+        // SQLite 沒有 popcount，也沒有整數 XOR 運算子（`#` 是 Postgres 專有，SQLite 連
+        // `^` 都沒有），所以距離無法在 SQL 裡算。改成：用跟 Postgres 完全相同的
+        // 「最近 scan_limit 筆」界線把掃描範圍夾住，取回 (id, simhash) 兩欄後在程式端
+        // 算 Hamming 距離。對外行為與 Postgres 一致，代價是多搬 scan_limit 筆
+        // 16 bytes 的資料——SQLite 是 embedded 角色，不是高併發 canonical，可以接受。
+        let rows = sqlx::query(
+            r#"
+            SELECT id, simhash FROM documents
+            WHERE simhash IS NOT NULL AND id < ?1
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(uuid_text(before))
+        .bind(clamp_scan_limit(scan_limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut hits = Vec::new();
+        for row in &rows {
+            let candidate = mapping::simhash_candidate(row)?;
+            if hamming_distance(candidate.simhash, fingerprint) <= max_distance {
+                hits.push(candidate);
+            }
+        }
+        // 契約是依 id 升序（最舊在前）；上面為了夾住掃描範圍必須用 DESC。
+        hits.sort_by_key(|c| c.id);
+        Ok(hits)
+    }
+
     async fn put_duplicate_group(&self, group: &DuplicateGroup) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -1045,6 +1183,39 @@ impl RelationalStore for SqliteEmbeddedStore {
             mapping::duplicate_group,
         )
         .await
+    }
+
+    async fn get_duplicate_group_by_member(
+        &self,
+        member_object_id: ObjectId,
+    ) -> Result<Option<DuplicateGroup>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM duplicate_groups WHERE member_object_id = ?",
+            member_object_id,
+            mapping::duplicate_group,
+        )
+        .await
+    }
+
+    async fn list_duplicate_groups_by_canonical(
+        &self,
+        canonical_object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<DuplicateGroup>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM duplicate_groups
+            WHERE canonical_object_id = ?1
+            ORDER BY first_seen ASC, id ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(uuid_text(canonical_object_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::duplicate_group).collect()
     }
 
     async fn put_entity_extraction(

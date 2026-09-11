@@ -9,7 +9,11 @@ description = "V0.1 canonical domain types（serde）。欄位對齊 docs/specs/
 
 [dependencies]
 chrono = { workspace = true }
+# content hash（SPEC §15 Stage 3）的定義放在 core-model，讓 normalizer 與 deduplicator
+# 共用同一份實作。見 src/content.rs 的說明。
+hex = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 

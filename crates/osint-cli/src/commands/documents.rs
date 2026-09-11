@@ -1,6 +1,6 @@
 //! `osint-cli documents ...`
 
-use core_model::{Provenance, RawEvidence};
+use core_model::{DuplicateGroup, Provenance, RawEvidence};
 use serde::Serialize;
 use storage_core::RelationalStore;
 use storage_core::codec::encode_enum;
@@ -35,24 +35,50 @@ async fn list(ctx: &Context, args: ListArgs) -> Result<(), CliError> {
             opt(doc.language.as_deref()),
             ts(Some(doc.observed_at)),
             format!("{:.2}", doc.confidence),
+            // 三態：重複／canonical／尚未去重。「-」不等於「不是重複」。
+            match (
+                doc.duplicate_of,
+                doc.external_key.is_some() || doc.simhash.is_some(),
+            ) {
+                (Some(_), _) => "重複".into(),
+                (None, true) => "canonical".to_string(),
+                (None, false) => "未去重".into(),
+            },
             truncate(&doc.labels.join(","), 20),
         ]);
     }
     print_table(
-        &["ID", "類型", "標題", "語言", "觀察時間", "信心", "標籤"],
+        &[
+            "ID",
+            "類型",
+            "標題",
+            "語言",
+            "觀察時間",
+            "信心",
+            "去重",
+            "標籤",
+        ],
         rows,
         "：還沒有任何 Document。RawEvidence 要先經 osint-normalizer 正規化才會產生 Document。",
     );
     Ok(())
 }
 
-/// `documents show --json` 的輸出。把「Document ← provenance ← RawEvidence」串成一份。
+/// `documents show --json` 的輸出。把「Document ← provenance ← RawEvidence」串成一份，
+/// 再加上去重關係（SPEC §16）：這份是誰的重複，或誰是這份的重複。
 #[derive(Debug, Serialize)]
 struct DocumentDetail {
     document: core_model::Document,
     provenance: Vec<Provenance>,
     raw_evidence: Vec<RawEvidence>,
+    /// 這份被判成重複時，它所屬的 duplicate group。
+    duplicate_of: Option<DuplicateGroup>,
+    /// 這份是 canonical 時，指向它的 duplicate group（最多 `DUPLICATE_PAGE` 筆）。
+    duplicates: Vec<DuplicateGroup>,
 }
+
+/// `documents show` 最多列幾個 duplicate。CLI 是唯讀查詢工具，不做無界查詢。
+const DUPLICATE_PAGE: u32 = 100;
 
 async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
     let store = ctx.store().await?;
@@ -80,11 +106,26 @@ async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
         }
     }
 
+    // 去重關係走 duplicate_groups 表而不是只看 documents.duplicate_of：
+    // group 才帶得出 method 與 similarity（「憑哪個 stage、多相似」），
+    // 那是判斷「這個去重結論可不可信」的依據。
+    let duplicate_of = store.get_duplicate_group_by_member(document.id).await?;
+    let duplicates = if duplicate_of.is_some() {
+        // 已經是別人的重複就不會同時是 canonical，省一次查詢。
+        Vec::new()
+    } else {
+        store
+            .list_duplicate_groups_by_canonical(document.id, DUPLICATE_PAGE)
+            .await?
+    };
+
     if ctx.format == Format::Json {
         return print_json(&DocumentDetail {
             document,
             provenance,
             raw_evidence,
+            duplicate_of,
+            duplicates,
         });
     }
 
@@ -108,9 +149,19 @@ async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
         ),
         ("confidence", format!("{:.4}", document.confidence)),
         ("labels", document.labels.join(", ")),
+        ("external_key", opt(document.external_key.as_deref())),
+        (
+            "simhash",
+            document
+                .simhash
+                .map_or_else(|| "-".into(), |v| format!("{:016x}", v as u64)),
+        ),
         ("attributes", serde_json::to_string(&document.attributes)?),
         ("body", truncate(&opt(document.body.as_deref()), 2000)),
     ]);
+
+    println!();
+    print_duplicate_section(duplicate_of.as_ref(), &duplicates);
 
     println!();
     println!("provenance 鏈（由舊到新）：");
@@ -155,4 +206,68 @@ async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
         );
     }
     Ok(())
+}
+
+/// 去重關係（SPEC §16）。三種狀態要能分辨：
+/// 是重複、是 canonical 且有人指向它、尚未被 deduplicator 處理或確定獨一無二。
+fn print_duplicate_section(duplicate_of: Option<&DuplicateGroup>, duplicates: &[DuplicateGroup]) {
+    if let Some(group) = duplicate_of {
+        println!("去重關係：這份是**重複**，canonical 是另一份");
+        print_table(
+            &["canonical Document", "命中階段", "相似度", "首次發現"],
+            vec![vec![
+                group.canonical_object_id.to_string(),
+                group.method.clone(),
+                format!("{:.4}", group.similarity),
+                ts(Some(group.first_seen)),
+            ]],
+            "",
+        );
+        return;
+    }
+
+    if duplicates.is_empty() {
+        // 刻意不說「沒有重複」：`duplicate_of` 為空也可能只是 deduplicator 還沒跑到。
+        // 兩者的差別看 provenance 有沒有 action=deduplicated 那一列。
+        println!(
+            "去重關係：目前沒有其他 Document 指向這一份。\
+             （若 provenance 沒有 deduplicated 那一列，代表 osint-deduplicator 還沒處理過它）"
+        );
+        return;
+    }
+
+    println!(
+        "去重關係：這份是 canonical，有 {} 份重複指向它",
+        duplicates.len()
+    );
+    let rows = duplicates
+        .iter()
+        .map(|group| {
+            vec![
+                group
+                    .member_object_id
+                    .map_or_else(|| "-".into(), |v| v.to_string()),
+                group.method.clone(),
+                format!("{:.4}", group.similarity),
+                group
+                    .member_raw_evidence_id
+                    .map_or_else(|| "-".into(), |v| v.to_string()),
+                ts(Some(group.first_seen)),
+            ]
+        })
+        .collect();
+    print_table(
+        &[
+            "重複的 Document",
+            "命中階段",
+            "相似度",
+            "該份的 RawEvidence",
+            "首次發現",
+        ],
+        rows,
+        "",
+    );
+    if duplicates.len() as u32 == DUPLICATE_PAGE {
+        println!("（只列出前 {DUPLICATE_PAGE} 筆，可能還有更多）");
+    }
 }

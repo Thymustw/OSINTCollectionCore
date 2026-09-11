@@ -28,6 +28,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub normalizer: NormalizerSection,
     #[serde(default)]
+    pub deduplicator: DeduplicatorSection,
+    #[serde(default)]
     pub import: ImportSection,
 }
 
@@ -154,6 +156,35 @@ impl Default for NormalizerSection {
         Self {
             bind: "127.0.0.1:18082".into(),
             consumer_group: "osint-normalizer".into(),
+        }
+    }
+}
+
+/// deduplicator consumer 與 SPEC §15 五階段的上限設定。
+///
+/// 三個上限都必須有值，沒有「不限」這個選項：Stage 4 沒有可走索引的等值條件，
+/// 少了上限就是「每來一份 Document 全表掃一次」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeduplicatorSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// Stage 1～3 每個鍵最多取回幾筆候選。
+    pub candidate_limit: u32,
+    /// Stage 4 每次最多掃描幾筆有 fingerprint 的 Document。
+    pub simhash_scan_limit: u32,
+    /// Stage 4 的 Hamming 距離門檻（0..=64）。門檻選擇的理由見
+    /// `crates/deduplicator/src/simhash.rs`。
+    pub simhash_max_distance: u32,
+}
+
+impl Default for DeduplicatorSection {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18083".into(),
+            consumer_group: "osint-deduplicator".into(),
+            candidate_limit: 20,
+            simhash_scan_limit: 500,
+            simhash_max_distance: 3,
         }
     }
 }
@@ -298,6 +329,11 @@ mod tests {
         assert_eq!(cfg.collector.per_domain_inflight, 1);
         assert_eq!(cfg.normalizer.bind, "127.0.0.1:18082");
         assert_eq!(cfg.normalizer.consumer_group, "osint-normalizer");
+        assert_eq!(cfg.deduplicator.bind, "127.0.0.1:18083");
+        assert_eq!(cfg.deduplicator.consumer_group, "osint-deduplicator");
+        assert_eq!(cfg.deduplicator.candidate_limit, 20);
+        assert_eq!(cfg.deduplicator.simhash_scan_limit, 500);
+        assert_eq!(cfg.deduplicator.simhash_max_distance, 3);
         assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.import.max_records, 10_000);
         assert_eq!(cfg.import.max_record_bytes, 262_144);

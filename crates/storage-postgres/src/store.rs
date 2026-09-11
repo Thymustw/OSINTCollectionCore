@@ -13,8 +13,8 @@ use sqlx::PgPool;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
-    CanonicalStore, CapabilityDescriptor, HealthProvider, RelationalStore, StorageAdapter,
-    StorageError, StorageHealth,
+    CanonicalStore, CapabilityDescriptor, HealthProvider, RelationalStore, SimhashCandidate,
+    StorageAdapter, StorageError, StorageHealth,
 };
 
 use crate::error::map_sqlx;
@@ -23,6 +23,12 @@ use crate::mapping;
 /// list cursor 分頁的每頁上限。呼叫端傳 0 或超大值都夾回 1..=100，避免無界查詢。
 fn clamp_limit(limit: u32) -> i64 {
     i64::from(limit.clamp(1, 100))
+}
+
+/// Dedup Stage 4 的掃描上限。比 `clamp_limit` 寬（SimHash 沒有等值索引可走，
+/// 掃描範圍太小會漏掉候選），但仍然是硬上限，不接受「不限」。
+fn clamp_scan_limit(limit: u32) -> i64 {
+    i64::from(limit.clamp(1, 5_000))
 }
 
 fn ports_json(ports: Option<&[u16]>) -> Result<Option<Value>, StorageError> {
@@ -100,6 +106,24 @@ impl PostgresCanonicalStore {
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Stage 1／2／3 的候選查詢共用：一個字串鍵 + 「只看 id 比 before 小的」+ 上限。
+    async fn dedup_candidate_ids(
+        &self,
+        sql: &'static str,
+        key: &str,
+        before: uuid::Uuid,
+        limit: u32,
+    ) -> Result<Vec<uuid::Uuid>, StorageError> {
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(sql)
+            .bind(key)
+            .bind(before)
+            .bind(clamp_limit(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     async fn link(
@@ -583,8 +607,9 @@ impl RelationalStore for PostgresCanonicalStore {
             INSERT INTO documents (
                 id, object_type, schema_version, title, body, summary, language, author,
                 published_at, modified_at, observed_at, collected_at, source_url, canonical_url,
-                normalized_content_hash, confidence, labels, attributes
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                normalized_content_hash, confidence, labels, attributes,
+                external_key, simhash, duplicate_of
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
             ON CONFLICT (id) DO UPDATE SET
                 object_type = EXCLUDED.object_type,
                 schema_version = EXCLUDED.schema_version,
@@ -602,7 +627,10 @@ impl RelationalStore for PostgresCanonicalStore {
                 normalized_content_hash = EXCLUDED.normalized_content_hash,
                 confidence = EXCLUDED.confidence,
                 labels = EXCLUDED.labels,
-                attributes = EXCLUDED.attributes
+                attributes = EXCLUDED.attributes,
+                external_key = EXCLUDED.external_key,
+                simhash = EXCLUDED.simhash,
+                duplicate_of = EXCLUDED.duplicate_of
             "#,
         )
         .bind(document.id)
@@ -623,6 +651,9 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(document.confidence)
         .bind(labels)
         .bind(&document.attributes)
+        .bind(&document.external_key)
+        .bind(document.simhash)
+        .bind(document.duplicate_of)
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -977,6 +1008,100 @@ impl RelationalStore for PostgresCanonicalStore {
         rows.iter().map(mapping::job).collect()
     }
 
+    async fn find_document_ids_by_external_key(
+        &self,
+        external_key: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError> {
+        self.dedup_candidate_ids(
+            r#"
+            SELECT id FROM documents
+            WHERE external_key = $1 AND id < $2
+            ORDER BY id ASC
+            LIMIT $3
+            "#,
+            external_key,
+            before,
+            limit,
+        )
+        .await
+    }
+
+    async fn find_document_ids_by_canonical_url(
+        &self,
+        canonical_url: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError> {
+        self.dedup_candidate_ids(
+            r#"
+            SELECT id FROM documents
+            WHERE canonical_url = $1 AND id < $2
+            ORDER BY id ASC
+            LIMIT $3
+            "#,
+            canonical_url,
+            before,
+            limit,
+        )
+        .await
+    }
+
+    async fn find_document_ids_by_content_hash(
+        &self,
+        content_hash: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError> {
+        self.dedup_candidate_ids(
+            r#"
+            SELECT id FROM documents
+            WHERE normalized_content_hash = $1 AND id < $2
+            ORDER BY id ASC
+            LIMIT $3
+            "#,
+            content_hash,
+            before,
+            limit,
+        )
+        .await
+    }
+
+    async fn find_simhash_candidates(
+        &self,
+        fingerprint: i64,
+        max_distance: u32,
+        before: DocumentId,
+        scan_limit: u32,
+    ) -> Result<Vec<SimhashCandidate>, StorageError> {
+        // 內層子查詢先把掃描範圍夾成「最近 scan_limit 筆有 fingerprint 的 Document」
+        // （走 idx_documents_simhash_recent），外層才算 Hamming 距離。
+        // `#` 是 PostgreSQL 的位元 XOR；bit_count 只吃 bit／bytea，所以要先 ::bit(64)。
+        // 距離計算留在 DB 端，不把整個掃描範圍搬回程式。
+        let rows = sqlx::query(
+            r#"
+            SELECT c.id, c.simhash
+            FROM (
+                SELECT id, simhash FROM documents
+                WHERE simhash IS NOT NULL AND id < $1
+                ORDER BY id DESC
+                LIMIT $4
+            ) AS c
+            WHERE bit_count((c.simhash # $2)::bit(64)) <= $3
+            ORDER BY c.id ASC
+            "#,
+        )
+        .bind(before)
+        .bind(fingerprint)
+        .bind(i64::from(max_distance))
+        .bind(clamp_scan_limit(scan_limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::simhash_candidate).collect()
+    }
+
     async fn put_duplicate_group(&self, group: &DuplicateGroup) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -1016,6 +1141,39 @@ impl RelationalStore for PostgresCanonicalStore {
             mapping::duplicate_group,
         )
         .await
+    }
+
+    async fn get_duplicate_group_by_member(
+        &self,
+        member_object_id: ObjectId,
+    ) -> Result<Option<DuplicateGroup>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM duplicate_groups WHERE member_object_id = $1",
+            member_object_id,
+            mapping::duplicate_group,
+        )
+        .await
+    }
+
+    async fn list_duplicate_groups_by_canonical(
+        &self,
+        canonical_object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<DuplicateGroup>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM duplicate_groups
+            WHERE canonical_object_id = $1
+            ORDER BY first_seen ASC, id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(canonical_object_id)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::duplicate_group).collect()
     }
 
     async fn put_entity_extraction(

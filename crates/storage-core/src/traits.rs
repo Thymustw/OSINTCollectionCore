@@ -159,11 +159,81 @@ pub trait RelationalStore: HealthProvider {
     /// `limit` 由呼叫端夾在 1..=100。
     async fn list_jobs(&self, after: Option<JobId>, limit: u32) -> Result<Vec<Job>, StorageError>;
 
+    /// Dedup Stage 1 候選：`documents.external_key` 完全相同、且 `id` **嚴格小於 `before`**
+    /// 的 Document，依 `id` 升序（最舊在前）。`limit` 由 adapter 夾在 1..=100，不可無界。
+    ///
+    /// 兩個約束都是刻意的：
+    /// * **升序**與其他 `list_*`（降序）相反——dedup 要的是「誰先存在」，
+    ///   UUID v7 最小的那筆就是 canonical 候選。
+    /// * **只看比自己早的**不只是「排除自己」。若允許比對到更新的 Document，
+    ///   事件亂序時可能出現 A 指向 B、B 指向 A 的 `duplicate_of` 環，
+    ///   之後任何一次 canonical 解析都會無限繞下去。限制成單向（永遠指向更小的 id）
+    ///   讓環在結構上不可能存在。代價是亂序抵達時可能漏判一組重複——
+    ///   漏判可以事後重跑補回來，環不行。
+    async fn find_document_ids_by_external_key(
+        &self,
+        external_key: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError>;
+    /// Dedup Stage 2 候選：`documents.canonical_url` 完全相同者。語意同
+    /// [`RelationalStore::find_document_ids_by_external_key`]。
+    ///
+    /// ⚠️ 比對的是**已正規化**的 URL。呼叫端要自己先正規化再查，
+    /// 直接丟原始 `source_url` 進來只會比到剛好沒有追蹤參數的那些。
+    async fn find_document_ids_by_canonical_url(
+        &self,
+        canonical_url: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError>;
+    /// Dedup Stage 3 候選：`documents.normalized_content_hash` 完全相同者。語意同
+    /// [`RelationalStore::find_document_ids_by_external_key`]。
+    async fn find_document_ids_by_content_hash(
+        &self,
+        content_hash: &str,
+        before: DocumentId,
+        limit: u32,
+    ) -> Result<Vec<DocumentId>, StorageError>;
+    /// Dedup Stage 4 候選：SimHash fingerprint 與 `fingerprint` 的 Hamming 距離
+    /// `<= max_distance` 的 Document。
+    ///
+    /// **契約（兩個 backend 必須一致）**：只掃描「`id` 嚴格小於 `before`、最近
+    /// `scan_limit` 筆有 fingerprint 的 Document」，在這個範圍內回傳全部命中者，
+    /// 依 `id` 升序（最舊在前）。`before` 的單向約束理由同
+    /// [`RelationalStore::find_document_ids_by_external_key`]。
+    /// 這是刻意的有界查詢——SimHash 沒有可走索引的等值條件，不設上限就等於每來一份
+    /// Document 就全表掃一次。代價是**比 `scan_limit` 更舊的近似文件會漏掉**，
+    /// 已知限制寫在 `docs/developer/deduplicator.md`。
+    ///
+    /// PostgreSQL 在 DB 端用 `bit_count((simhash # $1)::bit(64))` 過濾；
+    /// SQLite 沒有 popcount 也沒有整數 XOR 運算子，改成取回掃描範圍後在程式端算距離。
+    /// 兩者對外行為相同。
+    async fn find_simhash_candidates(
+        &self,
+        fingerprint: i64,
+        max_distance: u32,
+        before: DocumentId,
+        scan_limit: u32,
+    ) -> Result<Vec<SimhashCandidate>, StorageError>;
+
     async fn put_duplicate_group(&self, group: &DuplicateGroup) -> Result<(), StorageError>;
     async fn get_duplicate_group(
         &self,
         id: DuplicateGroupId,
     ) -> Result<Option<DuplicateGroup>, StorageError>;
+    /// 查「這份 Document 屬於哪個 duplicate group」。member 最多屬於一個 group
+    /// （由 `idx_duplicate_groups_member_object` 保證）。
+    async fn get_duplicate_group_by_member(
+        &self,
+        member_object_id: ObjectId,
+    ) -> Result<Option<DuplicateGroup>, StorageError>;
+    /// 查「這份 canonical 底下有哪些 duplicate」，依 `first_seen` 升序。`limit` 夾在 1..=100。
+    async fn list_duplicate_groups_by_canonical(
+        &self,
+        canonical_object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<DuplicateGroup>, StorageError>;
 
     async fn put_entity_extraction(
         &self,
@@ -173,6 +243,16 @@ pub trait RelationalStore: HealthProvider {
         &self,
         id: EntityExtractionId,
     ) -> Result<Option<EntityExtraction>, StorageError>;
+}
+
+/// Dedup Stage 4 的候選列。
+///
+/// 刻意**不回傳整份 `Document`**：候選查詢一次可能掃幾百筆，把 `body` 一起拉回來
+/// 是白花的 I/O。呼叫端挑中 canonical 之後再 `get_document` 一次就好。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimhashCandidate {
+    pub id: DocumentId,
+    pub simhash: i64,
 }
 
 /// 生產環境 Core canonical store。V0.1 由 PostgreSQL adapter 實作。

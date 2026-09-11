@@ -733,8 +733,10 @@ name = "core-model"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "uuid",
 ]
 
@@ -1031,6 +1033,32 @@ dependencies = [
  "darling_core 0.21.3",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "deduplicator"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "collector",
+ "core-config",
+ "core-events",
+ "core-jobs",
+ "core-model",
+ "core-observability",
+ "normalizer",
+ "serde_json",
+ "sha2 0.10.9",
+ "storage-core",
+ "storage-postgres",
+ "storage-s3",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2269,11 +2297,9 @@ dependencies = [
  "core-observability",
  "core-security",
  "dotenvy",
- "hex",
  "import-format",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "storage-core",
  "storage-postgres",
  "storage-s3",

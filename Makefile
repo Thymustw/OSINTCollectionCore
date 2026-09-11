@@ -4,7 +4,7 @@
 
 .PHONY: help check build test lint fmt audit secret-scan docker-scan \
 	compose-up compose-down compose-ps migrate-postgres migrate-sqlite \
-	run-api run-collector run-normalizer run-cli
+	run-api run-collector run-normalizer run-deduplicator run-cli
 
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 CARGO ?= cargo
@@ -31,6 +31,7 @@ help:
 	@echo "  make run-api           啟動 osint-api（需 JWT_SECRET 與 compose）"
 	@echo "  make run-collector     啟動 osint-collector（需 compose 與 .env）"
 	@echo "  make run-normalizer    啟動 osint-normalizer（需 compose 與 .env）"
+	@echo "  make run-deduplicator  啟動 osint-deduplicator（需 compose 與 .env）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
 
 check:
@@ -82,6 +83,11 @@ run-collector:
 
 run-normalizer:
 	$(CARGO) run -p normalizer --bin osint-normalizer
+
+# SPEC §15 五階段去重。訂閱 object.normalized，寫 DuplicateGroup。
+# 設計與已知限制見 docs/developer/deduplicator.md。
+run-deduplicator:
+	$(CARGO) run -p deduplicator --bin osint-deduplicator
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。
