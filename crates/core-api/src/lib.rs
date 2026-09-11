@@ -2,6 +2,7 @@
 
 mod error;
 mod extractors;
+mod import;
 mod jobs;
 mod middleware;
 mod pagination;
@@ -11,11 +12,12 @@ mod routes;
 mod state;
 
 pub use error::{ApiError, ErrorBody};
+pub use import::{AUDIT_ACTION as IMPORT_AUDIT_ACTION, ImportRequest};
 pub use pagination::{CursorPage, Pagination};
 pub use rate_limit::RateLimiter;
 pub use ready::{PostgresReady, ReadyCheck, ReadyProbe};
 pub use routes::router;
-pub use state::{AppState, AuthState};
+pub use state::{AppState, AuthState, ImportState};
 
 /// 不接下游的 readiness（測試／Postgres 掛掉時仍讓行程活著）。
 #[must_use]
@@ -30,20 +32,32 @@ use std::sync::Arc;
 
 /// 測試與本機不接 DB 時的最小 app（記憶體 token store）。
 pub fn test_app(jwt: JwtService) -> Router {
+    test_app_parts(jwt).0
+}
+
+/// 同 `test_app`，另外回傳稽核紀錄，讓測試可以驗證「真的有寫」。
+pub fn test_app_parts(jwt: JwtService) -> (Router, MemoryAuditLog) {
+    let audit = MemoryAuditLog::new();
     let state = AppState {
         metrics: MetricsRegistry::new(),
         auth: AuthState {
             jwt: Arc::new(jwt),
             tokens: Arc::new(MemoryApiTokenStore::new()),
         },
-        audit: Arc::new(MemoryAuditLog::new()),
+        audit: Arc::new(audit.clone()),
         jobs: None,
+        import: None,
         ready: ready::ReadyProbe::always_ready(),
         rate_limit_per_second: 100,
         request_body_limit_bytes: 1_048_576,
+        // 測試用小上限：不需要為了驗證 413 真的傳 10 MiB 進來。
+        import_config: core_config::ImportSection {
+            max_upload_bytes: 4_096,
+            ..core_config::ImportSection::default()
+        },
         rate_limiter: rate_limit::RateLimiter::new(100),
     };
-    router(state)
+    (router(state), audit)
 }
 
 /// 從 secret bytes 建測試 JWT。

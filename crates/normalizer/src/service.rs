@@ -1,11 +1,12 @@
 //! 把一筆 RawEvidence 正規化成 Document。冪等：同一 raw_evidence_id 不重複寫。
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use connector_rss::parse_feed;
 use connector_static_web::parse_html;
 use core_events::{EventProducer, EventTopic};
 use core_model::{Document, DocumentType, Provenance, RawEvidence};
 use core_observability::MetricsRegistry;
+use import_format::{ImportKind, ImportSpec};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use storage_core::{ObjectStore, RelationalStore};
@@ -112,6 +113,29 @@ impl Normalizer {
                 path: evidence.storage_path.clone(),
             })?;
 
+        let now = Utc::now();
+
+        // push 路徑（POST /api/v1/import）會把 ImportSpec 寫進 metadata。有 spec 才知道
+        // 哪個鍵是 title、哪個是 body——同樣是 JSON，REST API 抓回來的那份沒有這個資訊，
+        // 所以沒有 spec 的 JSON 仍然是 SkippedUnsupported，不是這裡少做了什麼。
+        if let Some(spec) = import_spec(&evidence) {
+            if spec.kind == ImportKind::Manual {
+                tracing::info!(
+                    raw_evidence_id = %evidence.id,
+                    content_type = ?evidence.content_type,
+                    "manual 上傳不拆 Document，跳過正規化"
+                );
+                return Ok(NormalizeOutcome::SkippedUnsupported {
+                    content_type: evidence.content_type.clone(),
+                });
+            }
+            let documents = match build_import_documents(&evidence, &body, &spec, now) {
+                Ok(documents) => documents,
+                Err(outcome) => return Ok(outcome),
+            };
+            return self.persist_documents(&evidence, documents, now).await;
+        }
+
         let class = match class {
             ContentClass::Unsupported if body_looks_like_feed(&body) => ContentClass::RssOrAtom,
             ContentClass::Unsupported if body_looks_like_html(&body) => ContentClass::Html,
@@ -119,7 +143,7 @@ impl Normalizer {
         };
 
         match class {
-            ContentClass::Json | ContentClass::Unsupported => {
+            ContentClass::Json | ContentClass::Csv | ContentClass::Unsupported => {
                 tracing::info!(
                     raw_evidence_id = %evidence.id,
                     content_type = ?evidence.content_type,
@@ -159,10 +183,9 @@ impl Normalizer {
                     });
                 }
             },
-            ContentClass::Json | ContentClass::Unsupported => unreachable!(),
+            ContentClass::Json | ContentClass::Csv | ContentClass::Unsupported => unreachable!(),
         };
 
-        let now = Utc::now();
         let mut documents = Vec::new();
         for item in items {
             let title = item.title.clone();
@@ -214,6 +237,20 @@ impl Normalizer {
             documents.push(doc);
         }
 
+        self.persist_documents(&evidence, documents, now).await
+    }
+
+    /// 寫 Document／provenance、佔 normalized claim、發 `object.normalized`。
+    ///
+    /// feed／HTML 與 JSON／CSV 匯入共用同一段：冪等保證只能有一份實作，
+    /// 兩份遲早會分岔。
+    async fn persist_documents(
+        &self,
+        evidence: &RawEvidence,
+        documents: Vec<Document>,
+        now: DateTime<Utc>,
+    ) -> Result<NormalizeOutcome, NormalizerError> {
+        let raw_evidence_id = evidence.id;
         // write-then-claim（刻意的選擇，不是 claim-first）：先寫 Document，最後才佔
         // unique index（action=normalized）。storage-core 目前沒有跨表交易能力，兩個寫入
         // 順序都無法完全原子化，兩種失效模式代價不對等，故意選代價較小的一邊：
@@ -242,7 +279,7 @@ impl Normalizer {
             self.store.put_provenance(&prov).await?;
         }
 
-        match self.claim_normalized(&evidence, &documents, now).await {
+        match self.claim_normalized(evidence, &documents, now).await {
             Ok(()) => {}
             Err(NormalizerError::Storage(storage_core::StorageError::Conflict { .. })) => {
                 let again = self
@@ -313,6 +350,105 @@ impl Normalizer {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// 從 `RawEvidence.metadata["import"]` 取出上傳當下寫下的 `ImportSpec`。
+///
+/// 解不出來就當作沒有——寧可回報「不支援」也不要自己猜一組對映，
+/// 猜錯會產生看起來正常、內容其實錯位的 Document。
+fn import_spec(evidence: &RawEvidence) -> Option<ImportSpec> {
+    let raw = evidence.metadata.get("import")?;
+    match serde_json::from_value::<ImportSpec>(raw.clone()) {
+        Ok(spec) => Some(spec),
+        Err(err) => {
+            tracing::warn!(
+                raw_evidence_id = %evidence.id,
+                error = %err,
+                "metadata.import 不是合法的 ImportSpec，當作非匯入證據處理"
+            );
+            None
+        }
+    }
+}
+
+/// JSON／CSV 匯入 → Document。解析失敗回 `SkippedUnparseable`，不讓 consumer 掛掉。
+///
+/// 這裡的上限用的是 spec 裡存的那份（上傳當下的設定），不是目前的 config：
+/// 已經被接受的證據不該因為之後有人調小上限就永遠正規化不了。
+fn build_import_documents(
+    evidence: &RawEvidence,
+    body: &[u8],
+    spec: &ImportSpec,
+    now: DateTime<Utc>,
+) -> Result<Vec<Document>, NormalizeOutcome> {
+    let outcome = match import_format::parse(body, spec) {
+        Some(Ok(outcome)) => outcome,
+        Some(Err(err)) => {
+            tracing::warn!(
+                raw_evidence_id = %evidence.id,
+                kind = spec.kind.as_str(),
+                error = %err,
+                "匯入內容無法解析，記錄後繼續消費下一則"
+            );
+            return Err(NormalizeOutcome::SkippedUnparseable {
+                message: err.to_string(),
+            });
+        }
+        None => {
+            return Err(NormalizeOutcome::SkippedUnsupported {
+                content_type: evidence.content_type.clone(),
+            });
+        }
+    };
+
+    let documents = outcome
+        .records
+        .into_iter()
+        .map(|record| {
+            let source_url = record
+                .url
+                .clone()
+                .or_else(|| Some(evidence.source_url.clone()));
+            let hash_src = format!(
+                "{}|{}|{}",
+                record.title.as_deref().unwrap_or(""),
+                record.summary.as_deref().unwrap_or(""),
+                record.body.as_deref().unwrap_or("")
+            );
+            Document {
+                id: Uuid::now_v7(),
+                object_type: spec.object_type,
+                schema_version: SCHEMA_VERSION.into(),
+                title: record.title,
+                body: record.body,
+                summary: record.summary,
+                language: record.language,
+                author: record.author,
+                published_at: record.published_at,
+                modified_at: None,
+                observed_at: now,
+                collected_at: evidence.retrieved_at,
+                source_url: source_url.clone(),
+                canonical_url: source_url,
+                normalized_content_hash: Some(sha256_hex(hash_src.as_bytes())),
+                confidence: 0.8,
+                labels: Vec::new(),
+                attributes: json!({
+                    "raw_evidence_id": evidence.id,
+                    "external_id": record.external_id,
+                    "import_kind": spec.kind.as_str(),
+                    "record_index": record.index,
+                    // 解析不出時間時保留原字串，之後要補格式才有依據。
+                    "published_at_raw": record
+                        .published_at
+                        .is_none()
+                        .then_some(record.published_at_raw)
+                        .flatten(),
+                }),
+            }
+        })
+        .collect();
+    Ok(documents)
 }
 
 fn document_ids_from(prov: &Provenance) -> Vec<Uuid> {

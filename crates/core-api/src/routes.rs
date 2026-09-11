@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::routing::{get, post};
@@ -17,6 +17,7 @@ use core_observability::HealthStatus;
 use core_security::Principal;
 
 use crate::error::ApiError;
+use crate::import;
 use crate::jobs;
 use crate::middleware as auth_mw;
 use crate::rate_limit;
@@ -46,9 +47,32 @@ pub fn router(state: AppState) -> Router {
         ));
 
     let body_limit = state.request_body_limit_bytes as usize;
+    let upload_limit = usize::try_from(state.import_config.max_upload_bytes).unwrap_or(usize::MAX);
+    // multipart 的 boundary／header 比檔案本身多一些。外層後盾放寬這點餘裕，
+    // 讓 handler 的串流檢查先觸發——那樣回的訊息會指出「是 max_upload_bytes 擋的」，
+    // 而不是只有一句籠統的太大。
+    let upload_envelope = upload_limit.saturating_add(64 * 1024);
+
+    // 檔案上傳自己一層較寬的上限，不去放寬其他路由的 body limit。
+    let import_routes = Router::new()
+        .route("/api/v1/import", post(import::import_upload))
+        .route_layer(middleware::from_fn(auth_mw::require_write))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_mw::authenticate,
+        ))
+        // 這裡刻意用 axum 的 DefaultBodyLimit 當硬性後盾，而不是 tower-http 的
+        // RequestBodyLimitLayer：後者的錯誤是 BoxError，multer 認不出它是「超過長度」，
+        // 會變成 IncompleteStream → 400「multipart 格式錯誤」，把使用者指向錯的方向。
+        // DefaultBodyLimit 的 LengthLimitError 是 axum 自己的型別，
+        // MultipartError::status() 認得，我們才能回正確的 413。
+        .layer(DefaultBodyLimit::max(upload_envelope));
 
     public
         .merge(protected)
+        .layer(RequestBodyLimitLayer::new(body_limit))
+        .layer(DefaultBodyLimit::max(body_limit))
+        .merge(import_routes)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit::rate_limit,
@@ -57,7 +81,6 @@ pub fn router(state: AppState) -> Router {
             ServiceBuilder::new()
                 .layer(CatchPanicLayer::new())
                 .layer(TraceLayer::new_for_http())
-                .layer(RequestBodyLimitLayer::new(body_limit))
                 // Timeout 必須包 Route（Body: Default），不能包 RequestBodyLimit：
                 // tower_http::limit::ResponseBody 沒有 Default，逾時無法組 408。
                 .layer(TimeoutLayer::with_status_code(

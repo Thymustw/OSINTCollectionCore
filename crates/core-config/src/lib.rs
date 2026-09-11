@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub collector: CollectorSection,
     #[serde(default)]
     pub normalizer: NormalizerSection,
+    #[serde(default)]
+    pub import: ImportSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +158,40 @@ impl Default for NormalizerSection {
     }
 }
 
+/// `POST /api/v1/import` 的上傳與解析上限。每一項都必須有值，沒有「不限」這個選項。
+///
+/// `max_upload_bytes` 與 `[http].request_body_limit_bytes` 是兩條獨立的界線：
+/// 一般 API 的 JSON body 維持 1 MiB 即可，檔案上傳需要大得多，
+/// 所以 import 路由自己掛一層較寬的上限，不去放寬其他路由。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSection {
+    /// 單次上傳的檔案 bytes 上限。超過回 413。
+    pub max_upload_bytes: u64,
+    /// 單次匯入最多幾筆紀錄。
+    pub max_records: u32,
+    /// 單筆紀錄（NDJSON 一行／JSON 陣列一元素／CSV 一列）bytes 上限。
+    pub max_record_bytes: u32,
+    /// 單一對映欄位 bytes 上限。
+    pub max_field_bytes: u32,
+    /// JSON 巢狀深度上限。
+    pub max_depth: u32,
+    /// CSV 欄位數上限。
+    pub max_columns: u32,
+}
+
+impl Default for ImportSection {
+    fn default() -> Self {
+        Self {
+            max_upload_bytes: 10 * 1024 * 1024,
+            max_records: 10_000,
+            max_record_bytes: 262_144,
+            max_field_bytes: 65_536,
+            max_depth: 32,
+            max_columns: 512,
+        }
+    }
+}
+
 /// 設定載入失敗。訊息會指出缺哪個檔／哪個鍵，以及建議怎麼修。
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -262,6 +298,12 @@ mod tests {
         assert_eq!(cfg.collector.per_domain_inflight, 1);
         assert_eq!(cfg.normalizer.bind, "127.0.0.1:18082");
         assert_eq!(cfg.normalizer.consumer_group, "osint-normalizer");
+        assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);
+        assert_eq!(cfg.import.max_records, 10_000);
+        assert_eq!(cfg.import.max_record_bytes, 262_144);
+        assert_eq!(cfg.import.max_field_bytes, 65_536);
+        assert_eq!(cfg.import.max_depth, 32);
+        assert_eq!(cfg.import.max_columns, 512);
     }
 
     #[test]

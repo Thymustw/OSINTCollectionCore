@@ -54,3 +54,13 @@ per_domain_inflight = 1
 [normalizer]
 bind = "127.0.0.1:18082"
 consumer_group = "osint-normalizer"
+
+[import]
+# POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
+# 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。
+max_upload_bytes = 10485760
+max_records = 10000
+max_record_bytes = 262144
+max_field_bytes = 65536
+max_depth = 32
+max_columns = 512

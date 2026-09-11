@@ -4,7 +4,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
-use core_api::{AppState, AuthState, ErrorBody, PostgresReady, ReadyProbe, router};
+use connector_sdk::StoreEvidenceSink;
+use core_api::{AppState, AuthState, ErrorBody, ImportState, PostgresReady, ReadyProbe, router};
 use core_config::AppConfig;
 use core_events::EventProducer;
 use core_jobs::JobService;
@@ -50,17 +51,33 @@ async fn run() -> Result<(), String> {
         }
     };
 
-    let (jobs, ready) = match connect_postgres(&cfg).await {
+    let (jobs, import, ready) = match connect_postgres(&cfg).await {
         Ok(store) => {
             let ready = ReadyProbe::new(vec![Arc::new(PostgresReady {
                 store: store.clone(),
             })]);
+            // 匯入另外需要物件儲存。MinIO 沒接上時只有 /api/v1/import 回 503，
+            // 其他路由照常——沒有理由讓查詢功能陪著一起掛掉。
+            let import = match connect_objects(&cfg).await {
+                Ok(objects) => Some(Arc::new(ImportState {
+                    store: store.clone(),
+                    sink: Arc::new(StoreEvidenceSink::new(store.clone(), objects)),
+                    producer: producer.clone(),
+                })),
+                Err(err) => {
+                    tracing::warn!(error = %err, "MinIO 未連上；POST /api/v1/import 會回 503");
+                    None
+                }
+            };
             let service = JobService::new(store, producer);
-            (Some(Arc::new(service)), ready)
+            (Some(Arc::new(service)), import, ready)
         }
         Err(err) => {
-            tracing::warn!(error = %err, "Postgres 未連上；/jobs 會回 503，/health 仍可用");
-            (None, ReadyProbe::always_ready())
+            tracing::warn!(
+                error = %err,
+                "Postgres 未連上；/jobs 與 /api/v1/import 會回 503，/health 仍可用"
+            );
+            (None, None, ReadyProbe::always_ready())
         }
     };
 
@@ -72,9 +89,11 @@ async fn run() -> Result<(), String> {
         },
         audit: Arc::new(MemoryAuditLog::new()),
         jobs,
+        import,
         ready,
         rate_limit_per_second: cfg.http.rate_limit_per_second,
         request_body_limit_bytes: cfg.http.request_body_limit_bytes,
+        import_config: cfg.import.clone(),
         rate_limiter: core_api::RateLimiter::new(cfg.http.rate_limit_per_second),
     };
 
@@ -108,13 +127,38 @@ async fn connect_postgres(cfg: &AppConfig) -> Result<PostgresCanonicalStore, Str
     Ok(store)
 }
 
+async fn connect_objects(cfg: &AppConfig) -> Result<storage_s3::S3ObjectStore, String> {
+    let access = cfg
+        .storage
+        .object
+        .access_key_ref
+        .resolve()
+        .map_err(|err| err.to_string())?;
+    let secret = cfg
+        .storage
+        .object
+        .secret_key_ref
+        .resolve()
+        .map_err(|err| err.to_string())?;
+    let store = storage_s3::S3ObjectStore::connect(
+        &cfg.storage.object.endpoint,
+        &cfg.storage.object.bucket,
+        &access,
+        &secret,
+    )
+    .map_err(|err| err.to_string())?;
+    store.ensure_bucket().await.map_err(|err| err.to_string())?;
+    Ok(store)
+}
+
 async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
     (
         axum::http::StatusCode::NOT_FOUND,
         axum::Json(ErrorBody {
             error: "not_found".into(),
-            message: "沒有這個路徑。V0.1 skeleton 提供 GET /health /ready /metrics 與 /api/v1/jobs"
-                .into(),
+            message:
+                "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs 與 POST /api/v1/import"
+                    .into(),
         }),
     )
 }

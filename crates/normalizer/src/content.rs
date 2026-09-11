@@ -1,11 +1,17 @@
 //! 內容型別判斷。未知型別記錄後跳過，不讓 consumer 掛掉。
 
-/// 這次要不要當 RSS／Atom／HTML 處理。JSON 走 Unsupported（V0.1 不拆 Document）。
+/// 這次要不要當 RSS／Atom／HTML 處理。
+///
+/// `Json`／`Csv` 單看 content-type 仍然是「不知道怎麼拆成 Document」——
+/// 任意 REST API 回傳的 JSON 沒有欄位對映可用。只有走 `POST /api/v1/import`
+/// 進來、`metadata.import` 帶著 `ImportSpec` 的那些才知道怎麼拆，
+/// 那條路徑由 `service.rs` 另外處理，不依賴這裡的分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentClass {
     RssOrAtom,
     Html,
     Json,
+    Csv,
     Unsupported,
 }
 
@@ -18,6 +24,9 @@ pub fn classify_content(
 ) -> ContentClass {
     if looks_like_json(content_type) || looks_like_json(mime_type) || path_looks_like_json(path) {
         return ContentClass::Json;
+    }
+    if looks_like_csv(content_type) || looks_like_csv(mime_type) || path_looks_like_csv(path) {
+        return ContentClass::Csv;
     }
     if looks_like_feed(content_type) || looks_like_feed(mime_type) || path_looks_like_feed(path) {
         return ContentClass::RssOrAtom;
@@ -85,6 +94,20 @@ fn path_looks_like_html(path: &str) -> bool {
 
 fn path_looks_like_json(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".json")
+}
+
+fn looks_like_csv(value: Option<&str>) -> bool {
+    let Some(lower) = media_type(value) else {
+        return false;
+    };
+    matches!(
+        lower.as_str(),
+        "text/csv" | "application/csv" | "text/comma-separated-values"
+    )
+}
+
+fn path_looks_like_csv(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".csv")
 }
 
 /// body 看起來像 RSS／Atom（content-type 缺失時的後備）。
@@ -163,6 +186,15 @@ mod tests {
             classify_content(None, None, "payload.json"),
             ContentClass::Json
         );
+    }
+
+    #[test]
+    fn csv_is_recognised() {
+        assert_eq!(
+            classify_content(Some("text/csv; charset=utf-8"), None, "x"),
+            ContentClass::Csv
+        );
+        assert_eq!(classify_content(None, None, "table.csv"), ContentClass::Csv);
     }
 
     #[test]

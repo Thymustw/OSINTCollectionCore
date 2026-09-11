@@ -18,6 +18,7 @@ members = [
     "crates/connector-rss",
     "crates/connector-static-web",
     "crates/connector-rest-api",
+    "crates/import-format",
     "crates/collector",
     "crates/normalizer",
 ]
@@ -35,6 +36,7 @@ async-trait = "0.1.92"
 axum = { version = "0.8.9", default-features = false, features = [
     "http1",
     "json",
+    "multipart",
     "query",
     "tokio",
     "tracing",
@@ -50,8 +52,10 @@ core-model = { path = "crates/core-model" }
 core-observability = { path = "crates/core-observability" }
 core-security = { path = "crates/core-security" }
 croner = { version = "4.0.0", default-features = false, features = ["chrono"] }
+csv = "1.4.0"
 feed-rs = "2.4.0"
 hex = "0.4.3"
+import-format = { path = "crates/import-format" }
 ipnet = "2.12.2"
 dotenvy = "0.15.7"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
@@ -104,4 +108,4 @@ tower-http = { version = "0.6.11", features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 url = "2.5.8"
-uuid = { version = "1.26.1", features = ["v7", "serde"] }
+uuid = { version = "1.26.1", features = ["v5", "v7", "serde"] }

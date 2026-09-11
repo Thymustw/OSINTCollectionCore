@@ -1,0 +1,16 @@
+[package]
+name = "import-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "JSON／CSV 匯入的欄位對映與有界解析（core-api 上傳驗證與 normalizer 共用）"
+
+[dependencies]
+chrono = { workspace = true }
+core-model = { workspace = true }
+csv = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
