@@ -14,6 +14,8 @@ members = [
     "crates/storage-opensearch",
     "crates/storage-redis",
     "crates/storage-s3",
+    "crates/connector-sdk",
+    "crates/connector-rss",
 ]
 
 [workspace.package]
@@ -36,16 +38,25 @@ axum = { version = "0.8.9", default-features = false, features = [
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 config = "0.15.25"
+connector-sdk = { path = "crates/connector-sdk" }
 core-config = { path = "crates/core-config" }
 core-events = { path = "crates/core-events" }
 core-jobs = { path = "crates/core-jobs" }
 core-model = { path = "crates/core-model" }
 core-observability = { path = "crates/core-observability" }
 core-security = { path = "crates/core-security" }
+feed-rs = "2.4.0"
+hex = "0.4.3"
+ipnet = "2.12.2"
 dotenvy = "0.15.7"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 opensearch = { version = "2.4.0", default-features = false, features = ["rustls-tls"] }
 rand = { version = "0.8.5", features = ["std"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "rustls",
+    "http2",
+    "charset",
+] }
 # 不用 cmake-build：librdkafka 的 #cmakedefine01 WITH_OAUTHBEARER_OIDC
 # 在關閉時仍寫成 `#define WITH_OAUTHBEARER_OIDC 0`，C 端 `#ifdef` 仍為真，
 # 因而 #include <curl/curl.h>。系統沒有 libcurl-dev。
@@ -60,6 +71,7 @@ redis = { version = "=1.2.2", default-features = false, features = ["tokio-comp"
 # aws feature 內建 reqwest/rustls + aws-lc-rs，不開 native-tls。default-features
 # 關掉是因為 crate 預設帶 `fs`（本機檔案系統），我們只接 MinIO。
 object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
+sha2 = "0.10.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
 sqlx = { version = "0.9.0", default-features = false, features = [

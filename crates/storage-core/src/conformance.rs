@@ -10,8 +10,8 @@ use std::time::Duration;
 use chrono::{TimeZone, Utc};
 use core_model::{
     Collection, Connector, Document, DocumentType, DuplicateGroup, Entity, EntityExtraction,
-    EntityType, Event, Job, JobStatus, Provenance, RawEvidence, Relationship, RelationshipEvidence,
-    RelationshipType, Source, SourceType,
+    EntityType, Event, Job, JobStatus, NetworkRule, Provenance, RawEvidence, Relationship,
+    RelationshipEvidence, RelationshipType, Source, SourceType,
 };
 use serde_json::json;
 use url::Url;
@@ -165,6 +165,48 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入的 source 讀不到".into(),
         })?;
     assert_eq_debug("source", &source, &got);
+
+    let rule = NetworkRule {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        cidr_or_host: "10.1.2.0/24".into(),
+        ports: Some(vec![443]),
+        reason: "conformance private API".into(),
+        approved_by: "operator@example.invalid".into(),
+        expires_at: None,
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+    };
+    store.put_network_rule(&rule).await?;
+    let got = store
+        .get_network_rule(rule.id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "剛寫入的 network_rule 讀不到".into(),
+        })?;
+    assert_eq_debug("network_rule", &rule, &got);
+    let listed = store.list_network_rules(source.id).await?;
+    if listed.len() != 1 || listed[0] != rule {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_network_rules 應回 1 筆相符規則，實際 {} 筆",
+                listed.len()
+            ),
+        });
+    }
+    if !store.delete_network_rule(rule.id).await? {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "delete_network_rule 應刪到剛寫入的規則".into(),
+        });
+    }
+    if store.get_network_rule(rule.id).await?.is_some() {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "刪除後 get_network_rule 仍讀得到".into(),
+        });
+    }
 
     let connector = Connector {
         id: Uuid::now_v7(),

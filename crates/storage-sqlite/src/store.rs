@@ -6,8 +6,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
     DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, Event, EventId, Job,
-    JobId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship,
-    RelationshipEvidence, RelationshipEvidenceId, RelationshipId, Source, SourceId,
+    JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence,
+    RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId, RelationshipId,
+    Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -54,6 +55,20 @@ fn opt_uuid_text(id: Option<Uuid>) -> Option<String> {
 
 fn bool_int(value: bool) -> i64 {
     i64::from(value)
+}
+
+fn ports_text(ports: Option<&[u16]>) -> Result<Option<String>, StorageError> {
+    match ports {
+        None => Ok(None),
+        Some(ports) => {
+            serde_json::to_string(ports)
+                .map(Some)
+                .map_err(|err| StorageError::Unknown {
+                    backend: "sqlite",
+                    message: format!("序列化 source_network_rules.ports 失敗：{err}"),
+                })
+        }
+    }
 }
 
 impl SqliteEmbeddedStore {
@@ -229,6 +244,70 @@ impl RelationalStore for SqliteEmbeddedStore {
 
     async fn delete_source(&self, id: SourceId) -> Result<bool, StorageError> {
         self.delete_id("DELETE FROM sources WHERE id = ?", id).await
+    }
+
+    async fn put_network_rule(&self, rule: &NetworkRule) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO source_network_rules (
+                id, source_id, cidr_or_host, ports, reason, approved_by,
+                expires_at, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                source_id = excluded.source_id,
+                cidr_or_host = excluded.cidr_or_host,
+                ports = excluded.ports,
+                reason = excluded.reason,
+                approved_by = excluded.approved_by,
+                expires_at = excluded.expires_at,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(uuid_text(rule.id))
+        .bind(uuid_text(rule.source_id))
+        .bind(&rule.cidr_or_host)
+        .bind(ports_text(rule.ports.as_deref())?)
+        .bind(&rule.reason)
+        .bind(&rule.approved_by)
+        .bind(opt_rfc3339(rule.expires_at))
+        .bind(rfc3339(rule.created_at))
+        .bind(rfc3339(rule.updated_at))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_network_rule(
+        &self,
+        id: NetworkRuleId,
+    ) -> Result<Option<NetworkRule>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM source_network_rules WHERE id = ?",
+            id,
+            mapping::network_rule,
+        )
+        .await
+    }
+
+    async fn list_network_rules(
+        &self,
+        source_id: SourceId,
+    ) -> Result<Vec<NetworkRule>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM source_network_rules WHERE source_id = ? ORDER BY created_at, id",
+        )
+        .bind(uuid_text(source_id))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::network_rule).collect()
+    }
+
+    async fn delete_network_rule(&self, id: NetworkRuleId) -> Result<bool, StorageError> {
+        self.delete_id("DELETE FROM source_network_rules WHERE id = ?", id)
+            .await
     }
 
     async fn put_connector(&self, connector: &Connector) -> Result<(), StorageError> {

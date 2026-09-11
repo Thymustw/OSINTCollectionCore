@@ -1,6 +1,6 @@
 use core_model::{
     Collection, Connector, Document, DuplicateGroup, Entity, EntityExtraction, Event, Job,
-    Provenance, RawEvidence, Relationship, RelationshipEvidence, Source,
+    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -33,6 +33,44 @@ pub fn source(row: &PgRow) -> Result<Source, StorageError> {
         updated_at: get(row, "updated_at")?,
         last_seen: get(row, "last_seen")?,
     })
+}
+
+pub fn network_rule(row: &PgRow) -> Result<NetworkRule, StorageError> {
+    Ok(NetworkRule {
+        id: get(row, "id")?,
+        source_id: get(row, "source_id")?,
+        cidr_or_host: get(row, "cidr_or_host")?,
+        ports: decode_ports(get::<Option<Value>>(row, "ports")?)?,
+        reason: get(row, "reason")?,
+        approved_by: get(row, "approved_by")?,
+        expires_at: get(row, "expires_at")?,
+        created_at: get(row, "created_at")?,
+        updated_at: get(row, "updated_at")?,
+    })
+}
+
+fn decode_ports(value: Option<Value>) -> Result<Option<Vec<u16>>, StorageError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => {
+            let mut ports = Vec::with_capacity(items.len());
+            for item in items {
+                let n = item
+                    .as_u64()
+                    .ok_or_else(|| StorageError::CorruptionSuspected {
+                        message: format!("source_network_rules.ports 含非數字：{item}"),
+                    })?;
+                let port = u16::try_from(n).map_err(|_| StorageError::CorruptionSuspected {
+                    message: format!("source_network_rules.ports 含超出 u16 的值：{n}"),
+                })?;
+                ports.push(port);
+            }
+            Ok(Some(ports))
+        }
+        Some(other) => Err(StorageError::CorruptionSuspected {
+            message: format!("source_network_rules.ports 應為 JSON 陣列或 NULL，實際是 {other}"),
+        }),
+    }
 }
 
 pub fn connector(row: &PgRow) -> Result<Connector, StorageError> {

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use core_model::{
     Collection, Connector, Document, DuplicateGroup, Entity, EntityExtraction, Event, Job,
-    Provenance, RawEvidence, Relationship, RelationshipEvidence, Source,
+    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -92,6 +92,56 @@ pub fn source(row: &SqliteRow) -> Result<Source, StorageError> {
         updated_at: ts(row, "updated_at")?,
         last_seen: opt_ts(row, "last_seen")?,
     })
+}
+
+pub fn network_rule(row: &SqliteRow) -> Result<NetworkRule, StorageError> {
+    Ok(NetworkRule {
+        id: uuid_from(row, "id")?,
+        source_id: uuid_from(row, "source_id")?,
+        cidr_or_host: get_str(row, "cidr_or_host")?,
+        ports: decode_ports(get_opt_str(row, "ports")?)?,
+        reason: get_str(row, "reason")?,
+        approved_by: get_str(row, "approved_by")?,
+        expires_at: opt_ts(row, "expires_at")?,
+        created_at: ts(row, "created_at")?,
+        updated_at: ts(row, "updated_at")?,
+    })
+}
+
+fn decode_ports(raw: Option<String>) -> Result<Option<Vec<u16>>, StorageError> {
+    match raw {
+        None => Ok(None),
+        Some(s) if s.is_empty() || s == "null" => Ok(None),
+        Some(s) => {
+            let value: Value =
+                serde_json::from_str(&s).map_err(|err| StorageError::CorruptionSuspected {
+                    message: format!("source_network_rules.ports 不是合法 JSON：{err}"),
+                })?;
+            match value {
+                Value::Array(items) => {
+                    let mut ports = Vec::with_capacity(items.len());
+                    for item in items {
+                        let n = item
+                            .as_u64()
+                            .ok_or_else(|| StorageError::CorruptionSuspected {
+                                message: format!("source_network_rules.ports 含非數字：{item}"),
+                            })?;
+                        let port =
+                            u16::try_from(n).map_err(|_| StorageError::CorruptionSuspected {
+                                message: format!("source_network_rules.ports 含超出 u16 的值：{n}"),
+                            })?;
+                        ports.push(port);
+                    }
+                    Ok(Some(ports))
+                }
+                other => Err(StorageError::CorruptionSuspected {
+                    message: format!(
+                        "source_network_rules.ports 應為 JSON 陣列或 NULL，實際是 {other}"
+                    ),
+                }),
+            }
+        }
+    }
 }
 
 pub fn connector(row: &SqliteRow) -> Result<Connector, StorageError> {

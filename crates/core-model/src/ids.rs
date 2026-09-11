@@ -3,6 +3,7 @@
 use uuid::Uuid;
 
 pub type SourceId = Uuid;
+pub type NetworkRuleId = Uuid;
 pub type ConnectorId = Uuid;
 pub type CollectionId = Uuid;
 pub type WorkspaceId = Uuid;

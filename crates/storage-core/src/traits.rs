@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
     DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, Event, EventId, Job,
-    JobId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship,
-    RelationshipEvidence, RelationshipEvidenceId, RelationshipId, Source, SourceId,
+    JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence,
+    RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId, RelationshipId,
+    Source, SourceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +25,17 @@ pub trait RelationalStore: HealthProvider {
     async fn put_source(&self, source: &Source) -> Result<(), StorageError>;
     async fn get_source(&self, id: SourceId) -> Result<Option<Source>, StorageError>;
     async fn delete_source(&self, id: SourceId) -> Result<bool, StorageError>;
+
+    async fn put_network_rule(&self, rule: &NetworkRule) -> Result<(), StorageError>;
+    async fn get_network_rule(
+        &self,
+        id: NetworkRuleId,
+    ) -> Result<Option<NetworkRule>, StorageError>;
+    async fn list_network_rules(
+        &self,
+        source_id: SourceId,
+    ) -> Result<Vec<NetworkRule>, StorageError>;
+    async fn delete_network_rule(&self, id: NetworkRuleId) -> Result<bool, StorageError>;
 
     async fn put_connector(&self, connector: &Connector) -> Result<(), StorageError>;
     async fn get_connector(&self, id: ConnectorId) -> Result<Option<Connector>, StorageError>;

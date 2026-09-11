@@ -33,7 +33,7 @@ allow = [
     "CDLA-Permissive-2.0",
     "BSL-1.0",
 ]
-# 我們自己的 13 個 crate 用自訂 LICENSE（license-file），不是 SPDX 識別碼，
+# 我們自己的 workspace crate 用自訂 LICENSE（license-file），不是 SPDX 識別碼，
 # 不應該被上面的 allow list 擋下來——workspace 成員一律排除授權檢查。
 private = { ignore = true }
 

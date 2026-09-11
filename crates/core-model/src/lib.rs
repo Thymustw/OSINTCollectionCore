@@ -13,6 +13,7 @@ pub mod event;
 pub mod extraction;
 pub mod ids;
 pub mod job;
+pub mod network_rule;
 pub mod provenance;
 pub mod raw_evidence;
 pub mod relationship;
@@ -28,6 +29,7 @@ pub use event::Event;
 pub use extraction::EntityExtraction;
 pub use ids::*;
 pub use job::Job;
+pub use network_rule::NetworkRule;
 pub use provenance::Provenance;
 pub use raw_evidence::RawEvidence;
 pub use relationship::{Relationship, RelationshipEvidence};
@@ -263,6 +265,21 @@ mod tests {
             updated_at: ts(),
         };
         assert_eq!(round_trip(&collection), collection);
+
+        let rule = NetworkRule {
+            id: id(),
+            source_id: id(),
+            cidr_or_host: "10.0.0.0/8".into(),
+            ports: Some(vec![443, 8443]),
+            reason: "內部 REST API".into(),
+            approved_by: "operator@example.invalid".into(),
+            expires_at: Some(ts()),
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        assert_eq!(round_trip(&rule), rule);
+        assert!(rule.is_expired(ts()));
+        assert!(!rule.is_expired(ts() - chrono::Duration::seconds(1)));
     }
 
     #[test]
