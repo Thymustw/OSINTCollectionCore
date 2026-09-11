@@ -66,6 +66,17 @@ simhash_scan_limit = 500
 # 3 是 SimHash 論文與多數實務的慣用值；理由見 crates/deduplicator/src/simhash.rs。
 simhash_max_distance = 3
 
+[entity_worker]
+bind = "127.0.0.1:18084"
+consumer_group = "osint-entity-worker"
+# SPEC §17 抽取的上限。兩個都是硬上限，沒有「不限」：
+# 一篇塞滿 IOC 的傾印檔若不設限，單份 Document 就能產生上萬列 entity_extractions。
+# 超過 max_extractions 會截斷並記 warn（不是靜默少抽）。
+# 取捨與實測依據見 crates/entity-worker/src/extract.rs 的 ExtractionBounds。
+max_extractions = 500
+# 只掃描 title + summary + body 的前 N 個 byte（256 KiB）。
+max_scan_bytes = 262144
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

@@ -737,6 +737,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "url",
  "uuid",
 ]
 
@@ -1057,7 +1058,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -1291,6 +1291,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "entity-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "collector",
+ "core-config",
+ "core-events",
+ "core-jobs",
+ "core-model",
+ "core-observability",
+ "deduplicator",
+ "normalizer",
+ "regex",
+ "serde_json",
+ "sqlx",
+ "storage-core",
+ "storage-postgres",
+ "storage-s3",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]

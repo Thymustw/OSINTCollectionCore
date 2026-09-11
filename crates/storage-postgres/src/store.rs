@@ -3,10 +3,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
-    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, Event, EventId, Job,
-    JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence,
-    RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId, RelationshipId,
-    Source, SourceId,
+    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, EntityType, Event,
+    EventId, Job, JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
+    RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
+    RelationshipId, Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::PgPool;
@@ -106,6 +106,22 @@ impl PostgresCanonicalStore {
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// `entity_extractions` 的兩個反查共用：一個 UUID 鍵 + 上限。
+    async fn entity_extractions(
+        &self,
+        sql: &'static str,
+        key: uuid::Uuid,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError> {
+        let rows = sqlx::query(sql)
+            .bind(key)
+            .bind(clamp_limit(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_extraction).collect()
     }
 
     /// Stage 1／2／3 的候選查詢共用：一個字串鍵 + 「只看 id 比 before 小的」+ 上限。
@@ -738,6 +754,42 @@ impl RelationalStore for PostgresCanonicalStore {
             .await
     }
 
+    async fn find_entity_by_normalized_name(
+        &self,
+        entity_type: EntityType,
+        normalized_name: &str,
+    ) -> Result<Option<Entity>, StorageError> {
+        let row =
+            sqlx::query("SELECT * FROM entities WHERE entity_type = $1 AND normalized_name = $2")
+                .bind(encode_enum(&entity_type)?)
+                .bind(normalized_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        row.as_ref().map(mapping::entity).transpose()
+    }
+
+    async fn list_entities(
+        &self,
+        after: Option<EntityId>,
+        limit: u32,
+    ) -> Result<Vec<Entity>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM entities
+            WHERE ($1::uuid IS NULL OR id < $1)
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(after)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity).collect()
+    }
+
     async fn put_relationship(&self, relationship: &Relationship) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -790,6 +842,27 @@ impl RelationalStore for PostgresCanonicalStore {
             .await
     }
 
+    async fn list_relationships_by_object(
+        &self,
+        object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM relationships
+            WHERE source_object_id = $1 OR target_object_id = $1
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(object_id)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::relationship).collect()
+    }
+
     async fn put_relationship_evidence(
         &self,
         evidence: &RelationshipEvidence,
@@ -831,6 +904,27 @@ impl RelationalStore for PostgresCanonicalStore {
             mapping::relationship_evidence,
         )
         .await
+    }
+
+    async fn list_relationship_evidence(
+        &self,
+        relationship_id: RelationshipId,
+        limit: u32,
+    ) -> Result<Vec<RelationshipEvidence>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM relationship_evidence
+            WHERE relationship_id = $1
+            ORDER BY created_at ASC, id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(relationship_id)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::relationship_evidence).collect()
     }
 
     async fn put_event(&self, event: &Event) -> Result<(), StorageError> {
@@ -1218,6 +1312,32 @@ impl RelationalStore for PostgresCanonicalStore {
             "SELECT * FROM entity_extractions WHERE id = $1",
             id,
             mapping::entity_extraction,
+        )
+        .await
+    }
+
+    async fn list_entity_extractions_by_object(
+        &self,
+        object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError> {
+        self.entity_extractions(
+            "SELECT * FROM entity_extractions WHERE object_id = $1 ORDER BY id ASC LIMIT $2",
+            object_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_entity_extractions_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError> {
+        self.entity_extractions(
+            "SELECT * FROM entity_extractions WHERE entity_id = $1 ORDER BY id ASC LIMIT $2",
+            entity_id,
+            limit,
         )
         .await
     }

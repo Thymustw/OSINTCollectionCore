@@ -1,6 +1,6 @@
 //! `osint-cli documents ...`
 
-use core_model::{DuplicateGroup, Provenance, RawEvidence};
+use core_model::{DuplicateGroup, Entity, EntityExtraction, Provenance, RawEvidence};
 use serde::Serialize;
 use storage_core::RelationalStore;
 use storage_core::codec::encode_enum;
@@ -75,10 +75,27 @@ struct DocumentDetail {
     duplicate_of: Option<DuplicateGroup>,
     /// 這份是 canonical 時，指向它的 duplicate group（最多 `DUPLICATE_PAGE` 筆）。
     duplicates: Vec<DuplicateGroup>,
+    /// 從這份 Document 抽出的 Entity（SPEC §17），含抽取紀錄本身。
+    entities: Vec<ExtractedEntity>,
+}
+
+/// 一筆抽取紀錄 + 它指向的 Entity。
+///
+/// 兩個一起回傳而不是只回 Entity：`extraction` 帶的是「在這份 Document 的哪個位置、
+/// 用哪條規則、信心多少」，那是判斷這個抽取結果可不可信的依據；只看 Entity 會失去語境。
+#[derive(Debug, Serialize)]
+struct ExtractedEntity {
+    extraction: EntityExtraction,
+    /// 理論上一定查得到（有外鍵）。真的是 `None` 代表資料被外力改壞了，
+    /// 所以不隱藏這一筆，讓它顯示成異常而不是憑空消失。
+    entity: Option<Entity>,
 }
 
 /// `documents show` 最多列幾個 duplicate。CLI 是唯讀查詢工具，不做無界查詢。
 const DUPLICATE_PAGE: u32 = 100;
+
+/// `documents show` 最多列幾筆抽取紀錄。
+const EXTRACTION_PAGE: u32 = 100;
 
 async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
     let store = ctx.store().await?;
@@ -119,6 +136,16 @@ async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
             .await?
     };
 
+    // SPEC §17：這份 Document 抽出了哪些 Entity。
+    let mut entities = Vec::new();
+    for extraction in store
+        .list_entity_extractions_by_object(document.id, EXTRACTION_PAGE)
+        .await?
+    {
+        let entity = store.get_entity(extraction.entity_id).await?;
+        entities.push(ExtractedEntity { extraction, entity });
+    }
+
     if ctx.format == Format::Json {
         return print_json(&DocumentDetail {
             document,
@@ -126,6 +153,7 @@ async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
             raw_evidence,
             duplicate_of,
             duplicates,
+            entities,
         });
     }
 
@@ -184,6 +212,9 @@ async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
         "：這個 Document 沒有 provenance 紀錄。正常流程一定會寫一列，沒有代表資料是繞過 normalizer 塞進來的。",
     );
 
+    println!();
+    print_entity_section(&provenance, &entities)?;
+
     if !raw_evidence.is_empty() {
         println!();
         println!("來源 RawEvidence：");
@@ -207,6 +238,83 @@ async fn show(ctx: &Context, id: Uuid) -> Result<(), CliError> {
     }
     Ok(())
 }
+
+/// 抽出的 Entity（SPEC §17）。
+///
+/// 「沒有 Entity」有兩種完全不同的原因，必須分辨得出來，否則操作人員會把
+/// 「還沒跑抽取」誤判成「這篇文章沒有任何 IOC」：
+/// * provenance 沒有 `entity_extracted` 那一列 → entity-worker 還沒處理過它
+///   （或它是重複文件，被刻意跳過）
+/// * 有那一列但抽取數為 0 → 處理過了，真的什麼都沒抽到
+fn print_entity_section(
+    provenance: &[Provenance],
+    entities: &[ExtractedEntity],
+) -> Result<(), CliError> {
+    let extracted = provenance
+        .iter()
+        .any(|p| p.action == ENTITY_EXTRACTED_ACTION);
+
+    if entities.is_empty() {
+        if extracted {
+            println!("抽出的 Entity：無。entity-worker 處理過這份 Document，但沒有命中任何規則。");
+        } else {
+            println!(
+                "抽出的 Entity：無。**provenance 沒有 `{ENTITY_EXTRACTED_ACTION}` 那一列**，\
+                 代表 osint-entity-worker 還沒處理過它，或它是重複文件而被刻意跳過\
+                 （重複文件不抽取，見上方去重關係）。"
+            );
+        }
+        return Ok(());
+    }
+
+    println!("抽出的 Entity（SPEC §17）：");
+    let mut rows = Vec::with_capacity(entities.len());
+    for item in entities {
+        let (kind, name) = match &item.entity {
+            Some(entity) => (
+                encode_enum(&entity.entity_type)?,
+                entity.normalized_name.clone(),
+            ),
+            None => (
+                "?".to_string(),
+                format!(
+                    "（查不到 entity {}，資料可能被外力刪過）",
+                    item.extraction.entity_id
+                ),
+            ),
+        };
+        rows.push(vec![
+            item.extraction.entity_id.to_string(),
+            kind,
+            truncate(&name, 44),
+            format!(
+                "{} {}",
+                item.extraction.extractor, item.extraction.extractor_version
+            ),
+            format!("{:.2}", item.extraction.confidence),
+            item.extraction
+                .text_offset
+                .map_or_else(|| "-".into(), |o| o.to_string()),
+        ]);
+    }
+    print_table(
+        &["Entity ID", "型別", "正規化名稱", "抽取器", "信心", "位置"],
+        rows,
+        "",
+    );
+    if entities.len() as u32 == EXTRACTION_PAGE {
+        println!("（只列出前 {EXTRACTION_PAGE} 筆，可能還有更多）");
+    }
+    println!("提示：`osint-cli entities show <Entity ID>` 可看到它的關聯與證據。");
+    Ok(())
+}
+
+/// entity-worker 的 provenance 動作名。
+///
+/// 這裡刻意**不**依賴 `entity-worker` crate：CLI 只要讀資料庫，把一支服務的
+/// 整個相依樹（含 broker client）拉進唯讀查詢工具不划算。
+/// 代價是字串重複了一次——由 `entity_extracted_action_matches_the_worker` 這個測試釘住。
+const ENTITY_EXTRACTED_ACTION: &str = "entity_extracted";
 
 /// 去重關係（SPEC §16）。三種狀態要能分辨：
 /// 是重複、是 canonical 且有人指向它、尚未被 deduplicator 處理或確定獨一無二。
@@ -269,5 +377,19 @@ fn print_duplicate_section(duplicate_of: Option<&DuplicateGroup>, duplicates: &[
     );
     if duplicates.len() as u32 == DUPLICATE_PAGE {
         println!("（只列出前 {DUPLICATE_PAGE} 筆，可能還有更多）");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entity_extracted_action_matches_the_worker() {
+        // entity-worker 的 `ACTION_ENTITY_EXTRACTED` 與
+        // `migrations/*/0005_entity_natural_key.sql` 的部分索引都用這個字串。
+        // 三處必須一致；只改其中一處不會有任何編譯錯誤，只會讓這裡的判斷
+        // 永遠落在「還沒處理過」那一支——**靜默的錯誤提示**。
+        assert_eq!(ENTITY_EXTRACTED_ACTION, "entity_extracted");
     }
 }

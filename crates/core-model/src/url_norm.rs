@@ -4,6 +4,19 @@
 //! remove known tracking params、preserve meaningful query params。
 //! 這個模組就是那五件事的實作，外加兩項規格沒寫但必要的處理（去 userinfo、排序 query），
 //! 每一項都在下面說明為什麼。
+//!
+//! # 為什麼放在 `core-model`
+//!
+//! 原本住在 `crates/deduplicator/src/url_norm.rs`。entity-worker 抽出 URL Entity 時，
+//! `normalized_name` 必須與 deduplicator 的 `documents.canonical_url` 用**同一套**規則——
+//! 兩邊各留一份實作的話，只要有人改了其中一份，同一個 URL 就會產生兩種正規化結果，
+//! 而且不會報錯：Entity 只是悄悄多出一個「看起來一樣但字串不同」的重複列。
+//!
+//! 這與 `content.rs`（SPEC §15 Stage 3 的 content hash）放在 core-model 的理由相同：
+//! **跨服務必須一致的定義就放在 core-model**，不要用 crate 相依把 deduplicator 拉進
+//! entity-worker（那會讓一支只做抽取的服務背上整個去重模組）。
+//!
+//! `deduplicator` 仍以 `pub use core_model::url_norm;` 對外提供同名路徑，既有呼叫端不受影響。
 
 use std::borrow::Cow;
 

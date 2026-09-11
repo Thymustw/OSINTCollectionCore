@@ -6,10 +6,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
-    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, Event, EventId, Job,
-    JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence,
-    RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId, RelationshipId,
-    Source, SourceId,
+    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, EntityType, Event,
+    EventId, Job, JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
+    RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
+    RelationshipId, Source, SourceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -117,6 +117,30 @@ pub trait RelationalStore: HealthProvider {
     async fn put_entity(&self, entity: &Entity) -> Result<(), StorageError>;
     async fn get_entity(&self, id: EntityId) -> Result<Option<Entity>, StorageError>;
     async fn delete_entity(&self, id: EntityId) -> Result<bool, StorageError>;
+    /// 依 Entity 的**自然鍵** `(entity_type, normalized_name)` 查出既有 Entity。
+    ///
+    /// 這是 entity-worker 的去重依據：同一個 `CVE-2026-0001` 出現在一百篇文章裡，
+    /// 應該對到**同一個** Entity（更新 `last_seen`），而不是建一百個。
+    /// `0005_entity_natural_key.sql` 的 unique index 保證最多只會有一列。
+    ///
+    /// ⚠️ `normalized_name` 由呼叫端負責正規化（大小寫、IPv6 壓縮形式等），
+    /// 這裡是**完全相等**比對，不做大小寫折疊——把折疊放進 SQL 會讓查詢走不到索引，
+    /// 而且兩個 backend 的 collation 規則不同，等於在 PG 與 SQLite 上有兩種語意。
+    async fn find_entity_by_normalized_name(
+        &self,
+        entity_type: EntityType,
+        normalized_name: &str,
+    ) -> Result<Option<Entity>, StorageError>;
+    /// 依 `id` 遞減、cursor 分頁列出 Entity。`osint-cli entities list` 用。
+    ///
+    /// ⚠️ 這裡**不能**說「最新的在前」。Entity 的 id 是 UUID v5
+    /// （entity-worker 由 `(entity_type, normalized_name)` 推導，為了冪等），沒有時間序。
+    /// 要按時間看請自己比對 `last_seen`。理由同 [`RelationalStore::list_connectors`]。
+    async fn list_entities(
+        &self,
+        after: Option<EntityId>,
+        limit: u32,
+    ) -> Result<Vec<Entity>, StorageError>;
 
     async fn put_relationship(&self, relationship: &Relationship) -> Result<(), StorageError>;
     async fn get_relationship(
@@ -124,6 +148,19 @@ pub trait RelationalStore: HealthProvider {
         id: RelationshipId,
     ) -> Result<Option<Relationship>, StorageError>;
     async fn delete_relationship(&self, id: RelationshipId) -> Result<bool, StorageError>;
+    /// 列出「這個物件參與的」Relationship——`source_object_id` **或** `target_object_id`
+    /// 命中都算，依 `id` 遞減，`limit` 夾在 1..=100。
+    ///
+    /// 刻意合成一個方法而不是分成 `by_source` / `by_target`：SPEC §26 Acceptance E 要從
+    /// **Entity** 往回走（Entity 在 `mentions` 裡是 target），CLI 的 `documents show` 要從
+    /// **Document** 往下走（Document 是 source）。拆成兩個方法只會讓每個呼叫端都得各查一次
+    /// 再自己合併去重。`idx_relationships_source` 與 `idx_relationships_target` 兩個索引都在，
+    /// PostgreSQL 會走 bitmap OR。
+    async fn list_relationships_by_object(
+        &self,
+        object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError>;
 
     async fn put_relationship_evidence(
         &self,
@@ -133,6 +170,16 @@ pub trait RelationalStore: HealthProvider {
         &self,
         id: RelationshipEvidenceId,
     ) -> Result<Option<RelationshipEvidence>, StorageError>;
+    /// 一條 Relationship 的證據列，依 `created_at` 升序，`limit` 夾在 1..=100。
+    ///
+    /// **SPEC §12「任何 relationship 必須能回查 evidence」就是靠這個方法落地的。**
+    /// 沒有它，`relationship_evidence` 只能用主鍵單筆取回——等於知道答案才查得到，
+    /// 那條可追溯性要求形同虛設。
+    async fn list_relationship_evidence(
+        &self,
+        relationship_id: RelationshipId,
+        limit: u32,
+    ) -> Result<Vec<RelationshipEvidence>, StorageError>;
 
     async fn put_event(&self, event: &Event) -> Result<(), StorageError>;
     async fn get_event(&self, id: EventId) -> Result<Option<Event>, StorageError>;
@@ -243,6 +290,20 @@ pub trait RelationalStore: HealthProvider {
         &self,
         id: EntityExtractionId,
     ) -> Result<Option<EntityExtraction>, StorageError>;
+    /// 某一份 Document（或其他 object）身上的 extraction 列，依 `id` 遞增，
+    /// `limit` 夾在 1..=100。entity-worker 的冪等檢查與 `osint-cli documents show` 都用它。
+    async fn list_entity_extractions_by_object(
+        &self,
+        object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError>;
+    /// 某一個 Entity 被哪些 object 抽出過，依 `id` 遞增，`limit` 夾在 1..=100。
+    /// `osint-cli entities show` 用它回答「這個 CVE 在哪幾篇文章出現」。
+    async fn list_entity_extractions_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError>;
 }
 
 /// Dedup Stage 4 的候選列。

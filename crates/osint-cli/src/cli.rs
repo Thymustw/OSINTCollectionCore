@@ -57,6 +57,11 @@ pub enum Command {
         #[command(subcommand)]
         action: DocumentAction,
     },
+    /// 抽取出的實體（Entity）
+    Entities {
+        #[command(subcommand)]
+        action: EntityAction,
+    },
     /// 工作（Job）
     Jobs {
         #[command(subcommand)]
@@ -138,6 +143,26 @@ pub enum DocumentAction {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum EntityAction {
+    /// 列出 Entity
+    ///
+    /// ⚠️ 排序依 `id` 遞減，而 Entity 的 id 是 UUID v5（由 entity_type + normalized_name
+    /// 推導），**沒有時間序**。要看最新的請改用 `--json` 後自己依 `last_seen` 排。
+    List {
+        #[command(flatten)]
+        list: ListArgs,
+        /// 只列出這個型別（例如 `vulnerability`／`ip`／`domain`／`email`／`hash`）
+        #[arg(long, value_name = "TYPE")]
+        entity_type: Option<String>,
+    },
+    /// 顯示單一 Entity，含它出現在哪些 Document 與相關的 Relationship
+    Show {
+        /// Entity 的 UUID
+        id: Uuid,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum JobAction {
     /// 列出 Job
     List(ListArgs),
@@ -174,6 +199,32 @@ mod tests {
     fn limit_zero_is_rejected() {
         // limit 0 沒有意義，要在 parse 階段就擋下來，而不是送到 SQL 再被夾成 1。
         assert!(Cli::try_parse_from(["osint-cli", "jobs", "list", "--limit", "0"]).is_err());
+    }
+
+    #[test]
+    fn entities_list_accepts_a_type_filter() {
+        let cli =
+            Cli::try_parse_from(["osint-cli", "entities", "list", "--entity-type", "ip"]).unwrap();
+        match cli.command {
+            Command::Entities {
+                action: EntityAction::List { entity_type, .. },
+            } => assert_eq!(entity_type.as_deref(), Some("ip")),
+            other => panic!("預期 entities list，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entities_show_requires_a_uuid() {
+        assert!(Cli::try_parse_from(["osint-cli", "entities", "show", "CVE-2026-0001"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "osint-cli",
+                "entities",
+                "show",
+                "0199f3aa-1b2c-7d3e-8f40-a1b2c3d4e5f6"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

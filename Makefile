@@ -4,7 +4,7 @@
 
 .PHONY: help check build test lint fmt audit secret-scan docker-scan \
 	compose-up compose-down compose-ps migrate-postgres migrate-sqlite \
-	run-api run-collector run-normalizer run-deduplicator run-cli
+	run-api run-collector run-normalizer run-deduplicator run-entity-worker run-cli
 
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 CARGO ?= cargo
@@ -32,6 +32,7 @@ help:
 	@echo "  make run-collector     啟動 osint-collector（需 compose 與 .env）"
 	@echo "  make run-normalizer    啟動 osint-normalizer（需 compose 與 .env）"
 	@echo "  make run-deduplicator  啟動 osint-deduplicator（需 compose 與 .env）"
+	@echo "  make run-entity-worker 啟動 osint-entity-worker（需 compose 與 .env）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
 
 check:
@@ -88,6 +89,12 @@ run-normalizer:
 # 設計與已知限制見 docs/developer/deduplicator.md。
 run-deduplicator:
 	$(CARGO) run -p deduplicator --bin osint-deduplicator
+
+# SPEC §17 entity extraction + §11／§12 relationship/evidence。訂閱 dedup.completed，
+# 只處理 canonical（非重複）Document。V0.1 只有確定性規則，**沒有 AI/NER**。
+# 抽取規則、public suffix 取捨與已知誤判見 docs/developer/entity-worker.md。
+run-entity-worker:
+	$(CARGO) run -p entity-worker --bin osint-entity-worker
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。

@@ -2,6 +2,7 @@
 
 pub mod connectors;
 pub mod documents;
+pub mod entities;
 pub mod health;
 pub mod jobs;
 pub mod raw;

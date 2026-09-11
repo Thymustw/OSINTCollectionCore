@@ -1,38 +1,43 @@
 [package]
-name = "deduplicator"
+name = "entity-worker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "object.normalized → SPEC §15 五階段去重 → DuplicateGroup（冪等，不刪證據）"
+description = "dedup.completed → SPEC §17 entity extraction → Relationship/RelationshipEvidence（確定性規則，無 NER；冪等）"
 
 [[bin]]
-name = "osint-deduplicator"
+name = "osint-entity-worker"
 path = "src/main.rs"
 
 [dependencies]
-async-trait = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 core-config = { workspace = true }
 core-events = { workspace = true }
 core-model = { workspace = true }
 core-observability = { workspace = true }
+# 確定性抽取規則（SPEC §17）。regex 1.13 已經在相依樹裡（tracing-subscriber 的
+# env-filter 帶進來的），所以這一行不會新增任何 crate 到樹上，授權面也沒有變化。
+regex = { workspace = true }
 serde_json = { workspace = true }
-# SimHash 的 token 雜湊。自己實作 SimHash（見 src/simhash.rs 的說明），
-# 只借用 SHA256 當分布均勻的 64-bit 雜湊來源。
-sha2 = { workspace = true }
 storage-core = { workspace = true }
 storage-postgres = { path = "../storage-postgres" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# URL entity 的 scheme/host 解析。正規化本身走 core_model::url_norm（同一份規則）。
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
 collector = { path = "../collector" }
 core-jobs = { workspace = true }
+deduplicator = { path = "../deduplicator" }
 normalizer = { path = "../normalizer" }
+# e2e 的「claim 前 crash」情境要直接刪掉一列 provenance，那沒有（也不該有）
+# RelationalStore 方法——delete_provenance 會讓溯源鏈可被抹除。測試專用。
+sqlx = { workspace = true }
 storage-s3 = { path = "../storage-s3" }

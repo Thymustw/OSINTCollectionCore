@@ -22,6 +22,7 @@ members = [
     "crates/collector",
     "crates/normalizer",
     "crates/deduplicator",
+    "crates/entity-worker",
     "crates/osint-cli",
 ]
 
@@ -67,6 +68,10 @@ dotenvy = "0.15.7"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
 opensearch = { version = "2.4.0", default-features = false, features = ["rustls-tls"] }
 rand = { version = "0.8.5", features = ["std"] }
+# entity-worker 的確定性抽取規則（SPEC §17）。
+# 這個版本本來就已經在相依樹裡（tracing-subscriber 的 env-filter 帶進來），
+# 明確宣告成 workspace 相依不會新增任何 crate。MIT OR Apache-2.0。
+regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = [
     "rustls",
     "http2",

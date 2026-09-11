@@ -56,6 +56,7 @@ async fn run(cli: Cli) -> Result<bool, CliError> {
         Command::Connectors { action } => commands::connectors::run(&ctx, action).await?,
         Command::Raw { action } => commands::raw::run(&ctx, action).await?,
         Command::Documents { action } => commands::documents::run(&ctx, action).await?,
+        Command::Entities { action } => commands::entities::run(&ctx, action).await?,
         Command::Jobs { action } => commands::jobs::run(&ctx, action).await?,
         Command::Health => return commands::health::run(&ctx).await,
     }

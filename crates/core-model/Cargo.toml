@@ -15,6 +15,9 @@ hex = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
+# canonical URL 正規化（SPEC §15 Stage 2）。放在 core-model 讓 deduplicator 與
+# entity-worker 共用同一份規則，見 src/url_norm.rs 開頭的說明。
+url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

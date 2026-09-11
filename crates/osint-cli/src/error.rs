@@ -32,6 +32,11 @@ pub enum CliError {
         list_hint: &'static str,
     },
 
+    /// 參數值不合法。**要在查詢之前就擋下來**——打錯字的篩選值若直接送進查詢，
+    /// 使用者看到的會是「沒有資料」，於是以為資料庫是空的，而不是自己少打一個字母。
+    #[error("參數不合法：{message}")]
+    InvalidArgument { message: String },
+
     #[error("Redpanda 查詢失敗：{message}")]
     Broker { message: String },
 

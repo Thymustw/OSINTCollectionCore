@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
-    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, Event, EventId, Job,
-    JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence,
-    RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId, RelationshipId,
-    Source, SourceId,
+    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, EntityType, Event,
+    EventId, Job, JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
+    RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
+    RelationshipId, Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -161,6 +161,22 @@ impl SqliteEmbeddedStore {
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// `entity_extractions` 的兩個反查共用：一個 UUID 鍵 + 上限。
+    async fn entity_extractions(
+        &self,
+        sql: &'static str,
+        key: Uuid,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError> {
+        let rows = sqlx::query(sql)
+            .bind(uuid_text(key))
+            .bind(clamp_limit(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_extraction).collect()
     }
 
     /// Stage 1／2／3 的候選查詢共用：一個字串鍵 + 「只看 id 比 before 小的」+ 上限。
@@ -775,6 +791,44 @@ impl RelationalStore for SqliteEmbeddedStore {
             .await
     }
 
+    async fn find_entity_by_normalized_name(
+        &self,
+        entity_type: EntityType,
+        normalized_name: &str,
+    ) -> Result<Option<Entity>, StorageError> {
+        // 用 `=` 而不是 SQLite 的 NOCASE collation：折疊大小寫是呼叫端的責任
+        // （見 trait 說明），在這裡多做一次會讓 SQLite 與 PostgreSQL 的語意分岔。
+        let row =
+            sqlx::query("SELECT * FROM entities WHERE entity_type = ?1 AND normalized_name = ?2")
+                .bind(encode_enum(&entity_type)?)
+                .bind(normalized_name)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        row.as_ref().map(mapping::entity).transpose()
+    }
+
+    async fn list_entities(
+        &self,
+        after: Option<EntityId>,
+        limit: u32,
+    ) -> Result<Vec<Entity>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM entities
+            WHERE (?1 IS NULL OR id < ?1)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity).collect()
+    }
+
     async fn put_relationship(&self, relationship: &Relationship) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -827,6 +881,27 @@ impl RelationalStore for SqliteEmbeddedStore {
             .await
     }
 
+    async fn list_relationships_by_object(
+        &self,
+        object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM relationships
+            WHERE source_object_id = ?1 OR target_object_id = ?1
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(uuid_text(object_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::relationship).collect()
+    }
+
     async fn put_relationship_evidence(
         &self,
         evidence: &RelationshipEvidence,
@@ -868,6 +943,30 @@ impl RelationalStore for SqliteEmbeddedStore {
             mapping::relationship_evidence,
         )
         .await
+    }
+
+    async fn list_relationship_evidence(
+        &self,
+        relationship_id: RelationshipId,
+        limit: u32,
+    ) -> Result<Vec<RelationshipEvidence>, StorageError> {
+        // created_at 是 RFC 3339 TEXT，在 SQLite 上按字串排序。同一個 UTC 位移下
+        // RFC 3339 的字典序等同時間序，而本 schema 寫入時一律是 `Z`（見 rfc3339()），
+        // 所以排序結果與 PostgreSQL 的 TIMESTAMPTZ 一致。
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM relationship_evidence
+            WHERE relationship_id = ?1
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(uuid_text(relationship_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::relationship_evidence).collect()
     }
 
     async fn put_event(&self, event: &Event) -> Result<(), StorageError> {
@@ -1260,6 +1359,32 @@ impl RelationalStore for SqliteEmbeddedStore {
             "SELECT * FROM entity_extractions WHERE id = ?",
             id,
             mapping::entity_extraction,
+        )
+        .await
+    }
+
+    async fn list_entity_extractions_by_object(
+        &self,
+        object_id: ObjectId,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError> {
+        self.entity_extractions(
+            "SELECT * FROM entity_extractions WHERE object_id = ?1 ORDER BY id ASC LIMIT ?2",
+            object_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_entity_extractions_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityExtraction>, StorageError> {
+        self.entity_extractions(
+            "SELECT * FROM entity_extractions WHERE entity_id = ?1 ORDER BY id ASC LIMIT ?2",
+            entity_id,
+            limit,
         )
         .await
     }

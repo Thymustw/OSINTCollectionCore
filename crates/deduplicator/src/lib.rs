@@ -19,7 +19,12 @@ mod service;
 
 pub mod semantic;
 pub mod simhash;
-pub mod url_norm;
+
+/// Stage 2 的 canonical URL 正規化。
+///
+/// 實作已搬到 `core_model::url_norm`，讓 entity-worker 抽 URL Entity 時能用**同一套**規則
+/// （理由見該模組開頭）。這裡保留 `deduplicator::url_norm` 這個路徑，既有呼叫端不必改。
+pub use core_model::url_norm;
 
 pub use error::DeduplicatorError;
 pub use health::serve as serve_health;

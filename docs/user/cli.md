@@ -246,10 +246,11 @@ provenance 鏈（由舊到新）：
 接著就能用上面的 `raw_evidence_id` 去 `osint-cli raw show <id> --body` 看原始內容——
 這就是完整的「Document → Provenance → RawEvidence → 原始位元組」追溯路徑。
 
-`documents show --json` 會輸出一份包含三段的物件：
+`documents show --json` 會輸出一份包含各段的物件：
 
 ```bash
 osint-cli documents show <id> --json | jq '.provenance[].processor'
+osint-cli documents show <id> --json | jq '.entities[].entity.normalized_name'
 ```
 
 ```json
@@ -258,7 +259,8 @@ osint-cli documents show <id> --json | jq '.provenance[].processor'
   "provenance": [ ... ],
   "raw_evidence": [ ... ],
   "duplicate_of": null,
-  "duplicates": [ ... ]
+  "duplicates": [ ... ],
+  "entities": [ { "extraction": { ... }, "entity": { ... } } ]
 }
 ```
 
@@ -299,6 +301,69 @@ osint-cli documents show <id> --json | jq '.provenance[].processor'
 各自的判準見 `docs/developer/deduplicator.md`。
 
 如果 provenance 表是空的，代表這筆 Document 是繞過 normalizer 塞進來的——那是異常。
+
+### 抽出的 Entity（SPEC §17）
+
+`documents show` 最後會列出這份 Document 抽出了哪些 Entity，
+以及每一筆是**用哪條規則、在第幾個字元、信心多少**抽到的：
+
+```text
+抽出的 Entity（SPEC §17）：
+┌──────────────────────────────────────┬───────────────┬─────────────────────┬──────────────────┬──────┬──────┐
+│ Entity ID                            ┆ 型別          ┆ 正規化名稱          ┆ 抽取器           ┆ 信心 ┆ 位置 │
+╞══════════════════════════════════════╪═══════════════╪═════════════════════╪══════════════════╪══════╪══════╡
+│ 3f1c...                              ┆ vulnerability ┆ CVE-2026-0001       ┆ regex-cve 1      ┆ 1.00 ┆ 5    │
+│ 9a24...                              ┆ ip            ┆ 203.0.113.5         ┆ regex-ipv4 1     ┆ 0.75 ┆ 42   │
+│ c7e0...                              ┆ domain        ┆ example.com         ┆ derived-url-host ┆ 0.95 ┆ 88   │
+└──────────────────────────────────────┴───────────────┴─────────────────────┴──────────────────┴──────┴──────┘
+```
+
+**「沒有 Entity」有兩種完全不同的意思**，輸出會分辨：
+
+- provenance **有** `entity_extracted` 那一列 → 處理過了，真的什麼都沒抽到
+- provenance **沒有** 那一列 → `osint-entity-worker` 還沒處理過它，
+  **或者它是重複文件而被刻意跳過**（重複文件不抽取）
+
+把這兩者混為一談會讓人把「還沒跑」誤判成「這篇沒有 IOC」。
+
+### `entities list`
+
+```bash
+osint-cli entities list --limit 20
+osint-cli entities list --entity-type vulnerability
+```
+
+> `--entity-type` 是在**取回的前 N 筆之內**過濾，不是資料庫層篩選。
+> 要看更多請調高 `--limit`（CLI 會印出提示）。
+> 打錯型別名稱會在查詢前就回錯誤並列出可用值。
+
+> ⚠️ 排序依 `id` 遞減，而 Entity 的 id 是 UUID v5（由 `entity_type` + `normalized_name` 推導），
+> **沒有時間序**。要看最新的請用 `--json` 後自己依 `last_seen` 排。
+
+### `entities show <id>`
+
+印出 Entity 本身、它出現在哪些 Document（抽取紀錄），
+以及它參與的關聯與每條關聯的證據數（SPEC §11／§12）：
+
+```text
+關聯與證據（SPEC §11／§12）：
+┌────────────────────────────────────────────┬──────┬────────┬──────────────────────────────────────┐
+│ 關聯                                       ┆ 信心 ┆ 證據數 ┆ RawEvidence（第一筆）                │
+╞════════════════════════════════════════════╪══════╪════════╪══════════════════════════════════════╡
+│ 01a091e3-... ──mentions──> 本實體          ┆ 1.00 ┆ 2      ┆ 01a091e3-c05f-7...                   │
+└────────────────────────────────────────────┴──────┴────────┴──────────────────────────────────────┘
+```
+
+最後一欄是 **SPEC §26 Acceptance E 的接續點**：拿那個 id 去
+`osint-cli raw show <id>`，就看得到它的 Source 與 Connector。
+整條鏈是：
+
+```text
+Entity → Relationship → RelationshipEvidence → RawEvidence → Source / Connector
+```
+
+抽取規則與已知誤判（版本號會被當成 IPv4、40 位 hex 分不出 SHA1 與 git commit）
+見 `docs/developer/entity-worker.md`。
 
 ### `jobs list`
 
@@ -378,4 +443,5 @@ until osint-cli health --json | jq -e 'all(.healthy)' >/dev/null; do sleep 2; do
 - `docs/developer/storage-adapters.md` — CLI 用到的 `RelationalStore` cursor 分頁契約
 - `docs/developer/import-api.md` — 要**寫入**資料時走的路徑
 - `docs/developer/collector-normalizer.md` — RawEvidence 與 Document 是怎麼產生的
+- `docs/developer/entity-worker.md` — Entity／Relationship 是怎麼抽出來的，以及已知誤判
 - `docs/operations/OPERATIONS.md` — 服務層級的運維程序

@@ -432,11 +432,15 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
 
     assert_dedup_queries(store, &updated).await?;
 
+    // ⚠️ `normalized_name` 必須含 run-specific UUID。0005 之後
+    // `(entity_type, normalized_name)` 是 UNIQUE，寫死字串的話第二次跑（或 PG 與 SQLite
+    // 共用同一顆 DB 時）會直接違反唯一鍵——那不是測到了什麼，只是 fixture 自己撞自己。
+    let entity_name = format!("CVE-2026-{}", Uuid::now_v7().simple());
     let entity = Entity {
         id: Uuid::now_v7(),
         entity_type: EntityType::Vulnerability,
-        name: "CVE-2026-0001".into(),
-        normalized_name: "cve-2026-0001".into(),
+        name: entity_name.clone(),
+        normalized_name: entity_name.to_ascii_lowercase(),
         description: None,
         confidence: 1.0,
         first_seen: fixture_ts(),
@@ -449,6 +453,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         &entity,
         &store.get_entity(entity.id).await?.expect("entity"),
     );
+    assert_entity_queries(store, &entity).await?;
 
     let relationship = Relationship {
         id: Uuid::now_v7(),
@@ -490,6 +495,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             .await?
             .expect("rel_ev"),
     );
+    assert_relationship_queries(store, &relationship, &rel_ev, entity.id).await?;
 
     let event = Event {
         id: Uuid::now_v7(),
@@ -602,6 +608,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             .await?
             .expect("extraction"),
     );
+    assert_extraction_queries(store, &extraction).await?;
 
     let missing = Uuid::now_v7();
     if store.get_document(missing).await?.is_some() {
@@ -617,6 +624,172 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         });
     }
 
+    Ok(())
+}
+
+/// SPEC §17 的 Entity 反查能力：自然鍵查詢 + cursor 列出。
+///
+/// 這兩個方法是 entity-worker「同一個 CVE 只建一個 Entity」的**唯一**依據。
+/// 少了自然鍵查詢，worker 只能每次都建新的——不會報錯，只會讓 Entity 表無聲地長出
+/// 一堆同名列，直到有人去數才發現。
+async fn assert_entity_queries<S: RelationalStore>(
+    store: &S,
+    entity: &Entity,
+) -> Result<(), StorageError> {
+    let found = store
+        .find_entity_by_normalized_name(entity.entity_type, &entity.normalized_name)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: format!(
+                "find_entity_by_normalized_name({:?}, `{}`) 查不到剛寫入的 Entity。\
+                 entity-worker 靠這個方法重用既有 Entity，查不到就會每篇文章都建一個新的",
+                entity.entity_type, entity.normalized_name
+            ),
+        })?;
+    assert_eq_debug("find_entity_by_normalized_name", entity, &found);
+
+    // 同名但 entity_type 不同不可以命中——自然鍵是 (type, name) 兩欄，
+    // 只比 name 的話 `example.invalid` 這種 Domain 會跟同名的 Hostname 混在一起。
+    if store
+        .find_entity_by_normalized_name(EntityType::Location, &entity.normalized_name)
+        .await?
+        .is_some()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_entity_by_normalized_name 忽略了 entity_type，只比對 normalized_name"
+                .into(),
+        });
+    }
+
+    // 不存在的名字要回 None，不能回「隨便一列」。
+    if store
+        .find_entity_by_normalized_name(entity.entity_type, &format!("{}-absent", Uuid::now_v7()))
+        .await?
+        .is_some()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_entity_by_normalized_name 對不存在的名稱回了資料".into(),
+        });
+    }
+
+    let listed = store.list_entities(None, 100).await?;
+    if listed.len() > 100 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_entities 沒有把 limit 夾在 1..=100".into(),
+        });
+    }
+    // cursor 契約：`after` 是「嚴格小於」，所以傳 id+1 必須還看得到自己。
+    let page = store.list_entities(Some(next_uuid(entity.id)), 10).await?;
+    assert_cursor_page("list_entities", entity.id, page.iter().map(|i| i.id))
+}
+
+/// SPEC §11／§12：Relationship 的物件反查，以及「任何 relationship 必須能回查 evidence」。
+async fn assert_relationship_queries<S: RelationalStore>(
+    store: &S,
+    relationship: &Relationship,
+    evidence: &RelationshipEvidence,
+    entity_id: Uuid,
+) -> Result<(), StorageError> {
+    // source 端（Document）與 target 端（Entity）都要查得到同一條邊。
+    for (label, object_id) in [
+        ("source_object_id", relationship.source_object_id),
+        ("target_object_id", entity_id),
+    ] {
+        let rows = store.list_relationships_by_object(object_id, 100).await?;
+        if !rows.iter().any(|r| r.id == relationship.id) {
+            return Err(StorageError::NotFound {
+                message: format!(
+                    "list_relationships_by_object 從 {label} 這一端查不到剛寫入的 Relationship。\
+                     SPEC §26 Acceptance E 要從 Entity 往回走，只支援 source 端等於走不通"
+                ),
+            });
+        }
+    }
+
+    let rows = store
+        .list_relationship_evidence(relationship.id, 100)
+        .await?;
+    if !rows.iter().any(|e| e.id == evidence.id) {
+        return Err(StorageError::NotFound {
+            message: "list_relationship_evidence 查不到剛寫入的 RelationshipEvidence。\
+                      SPEC §12 要求任何 relationship 都能回查 evidence"
+                .into(),
+        });
+    }
+    if rows.iter().any(|e| e.relationship_id != relationship.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_relationship_evidence 回了不屬於該 relationship 的列".into(),
+        });
+    }
+    // 不存在的 relationship 要回空陣列，不是回全部。
+    if !store
+        .list_relationship_evidence(Uuid::now_v7(), 100)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_relationship_evidence 對不存在的 relationship_id 回了資料".into(),
+        });
+    }
+    Ok(())
+}
+
+/// SPEC §17：extraction 的兩個反查（依 object、依 entity）。
+async fn assert_extraction_queries<S: RelationalStore>(
+    store: &S,
+    extraction: &EntityExtraction,
+) -> Result<(), StorageError> {
+    let by_object = store
+        .list_entity_extractions_by_object(extraction.object_id, 100)
+        .await?;
+    if !by_object.iter().any(|e| e.id == extraction.id) {
+        return Err(StorageError::NotFound {
+            message: "list_entity_extractions_by_object 查不到剛寫入的 EntityExtraction".into(),
+        });
+    }
+    if by_object
+        .iter()
+        .any(|e| e.object_id != extraction.object_id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_entity_extractions_by_object 回了不屬於該 object 的列".into(),
+        });
+    }
+
+    let by_entity = store
+        .list_entity_extractions_by_entity(extraction.entity_id, 100)
+        .await?;
+    if !by_entity.iter().any(|e| e.id == extraction.id) {
+        return Err(StorageError::NotFound {
+            message: "list_entity_extractions_by_entity 查不到剛寫入的 EntityExtraction".into(),
+        });
+    }
+    if by_entity
+        .iter()
+        .any(|e| e.entity_id != extraction.entity_id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_entity_extractions_by_entity 回了不屬於該 entity 的列".into(),
+        });
+    }
+
+    if !store
+        .list_entity_extractions_by_object(Uuid::now_v7(), 100)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_entity_extractions_by_object 對不存在的 object_id 回了資料".into(),
+        });
+    }
     Ok(())
 }
 

@@ -30,6 +30,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub deduplicator: DeduplicatorSection,
     #[serde(default)]
+    pub entity_worker: EntityWorkerSection,
+    #[serde(default)]
     pub import: ImportSection,
 }
 
@@ -189,6 +191,32 @@ impl Default for DeduplicatorSection {
     }
 }
 
+/// entity-worker consumer 與 SPEC §17 抽取的上限設定。
+///
+/// 兩個上限都必須有值，沒有「不限」這個選項：一篇塞滿 IOC 的傾印檔若不設上限，
+/// 會讓單份 Document 產生上萬列 entity_extractions 並拖垮整個 consumer group。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityWorkerSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// 單份 Document 最多留幾筆抽取命中。超過就截斷並記 warn。
+    /// 預設值的取捨見 `crates/entity-worker/src/extract.rs` 的 `ExtractionBounds`。
+    pub max_extractions: usize,
+    /// 只掃描 `title + summary + body` 的前 N 個 byte。
+    pub max_scan_bytes: usize,
+}
+
+impl Default for EntityWorkerSection {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18084".into(),
+            consumer_group: "osint-entity-worker".into(),
+            max_extractions: 500,
+            max_scan_bytes: 256 * 1024,
+        }
+    }
+}
+
 /// `POST /api/v1/import` 的上傳與解析上限。每一項都必須有值，沒有「不限」這個選項。
 ///
 /// `max_upload_bytes` 與 `[http].request_body_limit_bytes` 是兩條獨立的界線：
@@ -334,6 +362,10 @@ mod tests {
         assert_eq!(cfg.deduplicator.candidate_limit, 20);
         assert_eq!(cfg.deduplicator.simhash_scan_limit, 500);
         assert_eq!(cfg.deduplicator.simhash_max_distance, 3);
+        assert_eq!(cfg.entity_worker.bind, "127.0.0.1:18084");
+        assert_eq!(cfg.entity_worker.consumer_group, "osint-entity-worker");
+        assert_eq!(cfg.entity_worker.max_extractions, 500);
+        assert_eq!(cfg.entity_worker.max_scan_bytes, 262_144);
         assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.import.max_records, 10_000);
         assert_eq!(cfg.import.max_record_bytes, 262_144);

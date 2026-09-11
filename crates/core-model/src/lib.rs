@@ -19,6 +19,7 @@ pub mod provenance;
 pub mod raw_evidence;
 pub mod relationship;
 pub mod source;
+pub mod url_norm;
 
 pub use collection::Collection;
 pub use connector::Connector;
