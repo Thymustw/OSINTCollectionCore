@@ -409,9 +409,9 @@ async fn unknown_connector_type_is_skipped() {
     let source = Source {
         id: Uuid::now_v7(),
         name: "e2e-unknown-source".into(),
-        source_type: SourceType::StaticWeb,
+        source_type: SourceType::ManualUpload,
         platform: None,
-        base_url: Some("http://127.0.0.1/page".into()),
+        base_url: Some("http://127.0.0.1/file".into()),
         description: None,
         language: None,
         country: None,
@@ -425,8 +425,8 @@ async fn unknown_connector_type_is_skipped() {
     let connector = Connector {
         id: Uuid::now_v7(),
         source_id: source.id,
-        name: "e2e-static-web".into(),
-        connector_type: "static_web".into(),
+        name: "e2e-manual-upload".into(),
+        connector_type: "manual_upload".into(),
         version: "0.1.0".into(),
         enabled: true,
         configuration: json!({}),
@@ -449,7 +449,7 @@ async fn unknown_connector_type_is_skipped() {
     assert_eq!(
         outcome,
         CollectOutcome::SkippedUnknownType {
-            connector_type: "static_web".into()
+            connector_type: "manual_upload".into()
         }
     );
 }
@@ -551,5 +551,222 @@ async fn unknown_content_type_is_skipped_not_panic() {
     assert!(
         rows.is_empty(),
         "跳過時不該寫 provenance／Document，實際 {rows:?}"
+    );
+}
+
+const HTML: &str = r#"<!doctype html>
+<html>
+<head>
+  <title>CVE-2026-0001 advisory</title>
+  <meta name="description" content="fixture page">
+</head>
+<body>
+  <article>
+    <p>This is the main body text.</p>
+  </article>
+</body>
+</html>
+"#;
+
+const JSON_API: &str = r#"{"items":[{"id":"CVE-2026-0001"}]}"#;
+
+async fn serve_html() -> String {
+    let app = Router::new().route(
+        "/page.html",
+        get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                HTML,
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://127.0.0.1:{}/page.html", addr.port())
+}
+
+async fn serve_json() -> String {
+    let app = Router::new().route(
+        "/v1/items",
+        get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                JSON_API,
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://127.0.0.1:{}/v1/items", addr.port())
+}
+
+async fn seed_http_connector(
+    pg: &PostgresCanonicalStore,
+    url: &str,
+    source_type: SourceType,
+    connector_type: &str,
+    configuration: serde_json::Value,
+) -> Connector {
+    let now = Utc::now();
+    let source = Source {
+        id: Uuid::now_v7(),
+        name: format!("e2e-{connector_type}-{}", Uuid::now_v7()),
+        source_type,
+        platform: None,
+        base_url: Some(url.to_string()),
+        description: Some("local fixture".into()),
+        language: Some("en".into()),
+        country: None,
+        enabled: true,
+        collection_policy: json!({}),
+        created_at: now,
+        updated_at: now,
+        last_seen: None,
+    };
+    pg.put_source(&source).await.expect("source");
+    let rule = NetworkRule {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        cidr_or_host: "127.0.0.1".into(),
+        ports: None,
+        reason: "e2e 本機假 HTTP".into(),
+        approved_by: "operator@example.invalid".into(),
+        expires_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    pg.put_network_rule(&rule).await.expect("rule");
+    let connector = Connector {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        name: format!("e2e-{connector_type}-connector-{}", Uuid::now_v7()),
+        connector_type: connector_type.into(),
+        version: "0.1.0".into(),
+        enabled: true,
+        configuration,
+        credential_reference: None,
+        schedule: Some("*/15 * * * *".into()),
+        rate_limit: json!({ "per_second": 10.0, "burst": 10.0 }),
+        timeout: json!({}),
+        proxy_reference: None,
+        checkpoint: json!({}),
+        last_run: None,
+        last_success: None,
+        status: "idle".into(),
+        error_count: 0,
+    };
+    pg.put_connector(&connector).await.expect("connector");
+    connector
+}
+
+#[tokio::test]
+async fn static_web_collect_normalize_webpage() {
+    let stack = connect_stack().await;
+    let page_url = serve_html().await;
+    let connector = seed_http_connector(
+        &stack.pg,
+        &page_url,
+        SourceType::StaticWeb,
+        "static_web",
+        json!({ "url": page_url }),
+    )
+    .await;
+    let producer =
+        Arc::new(EventProducer::connect(&stack.brokers, "collector-e2e-web").expect("producer"));
+    let collector = runner(&stack, producer);
+    let outcome = collector.run_connector(connector).await.expect("collect");
+    let CollectOutcome::Collected { raw_evidence_id } = outcome else {
+        panic!("預期 Collected，得到 {outcome:?}");
+    };
+
+    let normalizer = Normalizer::new(
+        stack.pg.clone(),
+        stack.s3.clone(),
+        None,
+        MetricsRegistry::new(),
+    );
+    let created = normalizer
+        .normalize_raw(raw_evidence_id)
+        .await
+        .expect("normalize");
+    let NormalizeOutcome::Created { document_ids } = created else {
+        panic!("預期 Created，得到 {created:?}");
+    };
+    assert_eq!(document_ids.len(), 1);
+    let doc = stack
+        .pg
+        .get_document(document_ids[0])
+        .await
+        .expect("get document")
+        .expect("Document 應寫進 Postgres");
+    assert_eq!(doc.object_type, core_model::DocumentType::WebPage);
+    assert_eq!(doc.title.as_deref(), Some("CVE-2026-0001 advisory"));
+    assert_eq!(doc.summary.as_deref(), Some("fixture page"));
+    assert!(
+        doc.body
+            .as_deref()
+            .is_some_and(|b| b.contains("main body text")),
+        "正文應抽出，實際 {:?}",
+        doc.body
+    );
+}
+
+#[tokio::test]
+async fn rest_api_collect_normalize_skips_json() {
+    let stack = connect_stack().await;
+    let api_url = serve_json().await;
+    let connector = seed_http_connector(
+        &stack.pg,
+        &api_url,
+        SourceType::RestApi,
+        "rest_api",
+        json!({ "url": api_url, "method": "GET" }),
+    )
+    .await;
+    let producer =
+        Arc::new(EventProducer::connect(&stack.brokers, "collector-e2e-rest").expect("producer"));
+    let collector = runner(&stack, producer);
+    let outcome = collector.run_connector(connector).await.expect("collect");
+    let CollectOutcome::Collected { raw_evidence_id } = outcome else {
+        panic!("預期 Collected，得到 {outcome:?}");
+    };
+    let meta = stack
+        .pg
+        .get_raw_evidence(raw_evidence_id)
+        .await
+        .expect("get meta")
+        .expect("RawEvidence 應寫進 Postgres");
+    assert_eq!(meta.mime_type.as_deref(), Some("application/json"));
+
+    let normalizer = Normalizer::new(
+        stack.pg.clone(),
+        stack.s3.clone(),
+        None,
+        MetricsRegistry::new(),
+    );
+    let outcome = normalizer
+        .normalize_raw(raw_evidence_id)
+        .await
+        .expect("JSON 必須安全跳過，不可 panic");
+    assert_eq!(
+        outcome,
+        NormalizeOutcome::SkippedUnsupported {
+            content_type: Some("application/json".into())
+        }
+    );
+    let rows = stack
+        .pg
+        .list_provenance_by_raw_evidence(raw_evidence_id)
+        .await
+        .expect("list");
+    assert!(
+        rows.is_empty(),
+        "JSON 跳過時不該寫 provenance／Document，實際 {rows:?}"
     );
 }

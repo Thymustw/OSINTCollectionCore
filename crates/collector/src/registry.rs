@@ -5,6 +5,10 @@
 pub enum KnownConnectorKind {
     /// RSS 2.0 與 Atom 1.0 共用 `RssConnector`。
     RssOrAtom,
+    /// 靜態 HTML 頁。
+    StaticWeb,
+    /// REST JSON API。
+    RestApi,
 }
 
 /// 未知種類不 panic，回 `None` 讓呼叫端記 log 後跳過。
@@ -12,6 +16,8 @@ pub enum KnownConnectorKind {
 pub fn classify_connector_type(connector_type: &str) -> Option<KnownConnectorKind> {
     match connector_type.trim().to_ascii_lowercase().as_str() {
         "rss" | "atom" => Some(KnownConnectorKind::RssOrAtom),
+        "static_web" | "static-web" | "web" => Some(KnownConnectorKind::StaticWeb),
+        "rest_api" | "rest-api" | "rest" => Some(KnownConnectorKind::RestApi),
         _ => None,
     }
 }
@@ -33,9 +39,21 @@ mod tests {
     }
 
     #[test]
+    fn static_web_and_rest_api_are_known() {
+        assert_eq!(
+            classify_connector_type("static_web"),
+            Some(KnownConnectorKind::StaticWeb)
+        );
+        assert_eq!(
+            classify_connector_type("REST_API"),
+            Some(KnownConnectorKind::RestApi)
+        );
+    }
+
+    #[test]
     fn unknown_type_does_not_panic() {
-        assert_eq!(classify_connector_type("static_web"), None);
-        assert_eq!(classify_connector_type("rest_api"), None);
+        assert_eq!(classify_connector_type("manual_upload"), None);
+        assert_eq!(classify_connector_type("json_import"), None);
         assert_eq!(classify_connector_type(""), None);
     }
 }

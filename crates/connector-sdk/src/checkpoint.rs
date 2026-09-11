@@ -10,11 +10,15 @@ use storage_core::RelationalStore;
 use crate::ConnectorError;
 
 /// RSS／HTTP 常見的增量欄位。
+///
+/// `content_sha256` 給沒有 ETag／Last-Modified 的來源（Static Web／REST）比對內容有沒有變。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConnectorCheckpoint {
     pub last_retrieved_at: Option<DateTime<Utc>>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    #[serde(default)]
+    pub content_sha256: Option<String>,
 }
 
 impl ConnectorCheckpoint {
@@ -29,6 +33,7 @@ impl ConnectorCheckpoint {
             "last_retrieved_at": self.last_retrieved_at,
             "etag": self.etag,
             "last_modified": self.last_modified,
+            "content_sha256": self.content_sha256,
         })
     }
 }

@@ -25,5 +25,6 @@ pub use fetch::{FetchedResponse, GuardedFetcher};
 pub use network_rule::{MatchingRule, validate_network_rule};
 pub use policy::{RateLimitConfig, SourcePolicy};
 pub use rate_limit::DomainRateLimiter;
+pub use reqwest::Method;
 pub use retry::RetryPolicy;
 pub use ssrf::{SsrfDecision, SsrfGuard};

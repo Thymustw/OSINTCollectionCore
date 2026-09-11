@@ -66,12 +66,27 @@ impl GuardedFetcher {
         url: &str,
         extra_headers: &[(&str, &str)],
     ) -> Result<FetchedResponse, ConnectorError> {
+        self.request(Method::GET, url, extra_headers, None).await
+    }
+
+    /// 受 SSRF Guard 保護的任意 HTTP 方法。每次 hop 都重跑 Guard。
+    ///
+    /// 301／302／303 轉成 GET 且丟掉 body（常見瀏覽器語意）；307／308 保留原方法與 body。
+    pub async fn request(
+        &self,
+        method: Method,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<FetchedResponse, ConnectorError> {
         let mut current = Url::parse(url).map_err(|err| ConnectorError::InvalidUrl {
             url: url.to_string(),
             message: err.to_string(),
         })?;
         let mut hops = 0;
         let started = Instant::now();
+        let mut method = method;
+        let mut body = body.map(Vec::from);
         loop {
             let now = Utc::now();
             let decision = self.guard.check(&current, now).await?;
@@ -88,9 +103,12 @@ impl GuardedFetcher {
                     message: format!("建立 HTTP client 失敗：{err}"),
                 })?;
 
-            let mut req = client.request(Method::GET, current.clone());
+            let mut req = client.request(method.clone(), current.clone());
             for (k, v) in extra_headers {
                 req = req.header(*k, *v);
+            }
+            if let Some(bytes) = &body {
+                req = req.body(bytes.clone());
             }
 
             let response = req
@@ -136,6 +154,12 @@ impl GuardedFetcher {
                         url: location.to_string(),
                         message: format!("redirect Location 無效：{err}"),
                     })?;
+                if status != StatusCode::TEMPORARY_REDIRECT
+                    && status != StatusCode::PERMANENT_REDIRECT
+                {
+                    method = Method::GET;
+                    body = None;
+                }
                 continue;
             }
 

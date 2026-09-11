@@ -2,6 +2,7 @@
 
 use chrono::Utc;
 use connector_rss::parse_feed;
+use connector_static_web::parse_html;
 use core_events::{EventProducer, EventTopic};
 use core_model::{Document, DocumentType, Provenance, RawEvidence};
 use core_observability::MetricsRegistry;
@@ -12,7 +13,7 @@ use storage_postgres::PostgresCanonicalStore;
 use storage_s3::S3ObjectStore;
 use uuid::Uuid;
 
-use crate::content::{ContentClass, body_looks_like_feed, classify_content};
+use crate::content::{ContentClass, body_looks_like_feed, body_looks_like_html, classify_content};
 use crate::error::NormalizerError;
 
 pub const PROCESSOR: &str = "normalizer";
@@ -111,30 +112,54 @@ impl Normalizer {
                 path: evidence.storage_path.clone(),
             })?;
 
-        let treat_as_feed = class == ContentClass::RssOrAtom || body_looks_like_feed(&body);
-        if !treat_as_feed {
-            tracing::info!(
-                raw_evidence_id = %evidence.id,
-                content_type = ?evidence.content_type,
-                "不支援的 content type，跳過正規化"
-            );
-            return Ok(NormalizeOutcome::SkippedUnsupported {
-                content_type: evidence.content_type.clone(),
-            });
-        }
+        let class = match class {
+            ContentClass::Unsupported if body_looks_like_feed(&body) => ContentClass::RssOrAtom,
+            ContentClass::Unsupported if body_looks_like_html(&body) => ContentClass::Html,
+            other => other,
+        };
 
-        let items = match parse_feed(&body) {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(
+        match class {
+            ContentClass::Json | ContentClass::Unsupported => {
+                tracing::info!(
                     raw_evidence_id = %evidence.id,
-                    error = %err,
-                    "feed-rs 無法解析，記錄後繼續消費下一則"
+                    content_type = ?evidence.content_type,
+                    "不支援的 content type，跳過正規化"
                 );
-                return Ok(NormalizeOutcome::SkippedUnparseable {
-                    message: err.to_string(),
+                return Ok(NormalizeOutcome::SkippedUnsupported {
+                    content_type: evidence.content_type.clone(),
                 });
             }
+            ContentClass::RssOrAtom | ContentClass::Html => {}
+        }
+
+        let items = match class {
+            ContentClass::RssOrAtom => match parse_feed(&body) {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!(
+                        raw_evidence_id = %evidence.id,
+                        error = %err,
+                        "feed-rs 無法解析，記錄後繼續消費下一則"
+                    );
+                    return Ok(NormalizeOutcome::SkippedUnparseable {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            ContentClass::Html => match parse_html(&body) {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!(
+                        raw_evidence_id = %evidence.id,
+                        error = %err,
+                        "HTML 無法抽取，記錄後繼續消費下一則"
+                    );
+                    return Ok(NormalizeOutcome::SkippedUnparseable {
+                        message: err.to_string(),
+                    });
+                }
+            },
+            ContentClass::Json | ContentClass::Unsupported => unreachable!(),
         };
 
         let now = Utc::now();
@@ -142,18 +167,32 @@ impl Normalizer {
         for item in items {
             let title = item.title.clone();
             let summary = item.summary.clone();
-            let source_url = item.url.clone();
+            let body_text = item
+                .attributes
+                .get("body_text")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let source_url = item
+                .url
+                .clone()
+                .or_else(|| Some(evidence.source_url.clone()));
             let hash_src = format!(
-                "{}|{}",
+                "{}|{}|{}",
                 title.as_deref().unwrap_or(""),
-                summary.as_deref().unwrap_or("")
+                summary.as_deref().unwrap_or(""),
+                body_text.as_deref().unwrap_or("")
             );
+            let object_type = if class == ContentClass::Html {
+                DocumentType::WebPage
+            } else {
+                DocumentType::Article
+            };
             let doc = Document {
                 id: Uuid::now_v7(),
-                object_type: DocumentType::Article,
+                object_type,
                 schema_version: SCHEMA_VERSION.into(),
                 title,
-                body: None,
+                body: body_text,
                 summary,
                 language: None,
                 author: None,

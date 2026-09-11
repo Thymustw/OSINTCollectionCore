@@ -1,0 +1,26 @@
+[package]
+name = "connector-static-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "Static Web connector（GuardedFetcher + scraper 內容抽取）"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+connector-sdk = { workspace = true }
+core-model = { workspace = true }
+scraper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+core-security = { workspace = true }
+storage-core = { workspace = true }
+storage-postgres = { path = "../storage-postgres" }
+storage-s3 = { path = "../storage-s3" }
+tokio = { workspace = true }
+uuid = { workspace = true }

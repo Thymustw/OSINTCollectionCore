@@ -3,12 +3,14 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use connector_rest_api::RestApiConnector;
 use connector_rss::RssConnector;
 use connector_sdk::{
-    CollectContext, ConnectorCheckpoint, ConnectorTrait, DomainRateLimiter, GuardedFetcher,
-    RateLimitConfig, RelationalCheckpointStore, SourcePolicy, SsrfGuard, StoreEvidenceSink,
-    SystemResolver,
+    CollectContext, CollectResult, ConnectorCheckpoint, ConnectorTrait, DomainRateLimiter,
+    EvidenceSink, GuardedFetcher, RateLimitConfig, RelationalCheckpointStore, SourcePolicy,
+    SsrfGuard, StoreEvidenceSink, SystemResolver,
 };
+use connector_static_web::StaticWebConnector;
 use core_events::{EventProducer, EventTopic};
 use core_jobs::JobService;
 use core_model::{Connector, JobStatus, Source};
@@ -147,7 +149,7 @@ impl CollectorRunner {
         connector: Connector,
     ) -> Result<CollectOutcome, CollectorError> {
         match classify_connector_type(&connector.connector_type) {
-            Some(KnownConnectorKind::RssOrAtom) => self.run_rss(connector).await,
+            Some(kind) => self.run_known(kind, connector).await,
             None => {
                 tracing::warn!(
                     connector_id = %connector.id,
@@ -161,7 +163,11 @@ impl CollectorRunner {
         }
     }
 
-    async fn run_rss(&self, connector: Connector) -> Result<CollectOutcome, CollectorError> {
+    async fn run_known(
+        &self,
+        kind: KnownConnectorKind,
+        connector: Connector,
+    ) -> Result<CollectOutcome, CollectorError> {
         let source = self
             .store
             .get_source(connector.source_id)
@@ -177,7 +183,7 @@ impl CollectorRunner {
             tracing::warn!(error = %err, job_id = %job.id, "job 轉 running 失敗，仍繼續收集");
         }
 
-        match self.collect_rss(&source, &connector).await {
+        match self.collect_known(kind, &source, &connector).await {
             Ok(outcome) => {
                 if let Err(err) = self
                     .jobs
@@ -223,8 +229,9 @@ impl CollectorRunner {
         }
     }
 
-    async fn collect_rss(
+    async fn collect_known(
         &self,
+        kind: KnownConnectorKind,
         source: &Source,
         connector: &Connector,
     ) -> Result<CollectOutcome, CollectorError> {
@@ -247,8 +254,6 @@ impl CollectorRunner {
         let fetcher = GuardedFetcher::new(guard, limiter);
         let sink = StoreEvidenceSink::new(self.store.clone(), self.objects.clone());
         let checkpoints = RelationalCheckpointStore::new(self.store.clone());
-        let rss = RssConnector::new(fetcher, sink, checkpoints);
-
         let ctx = CollectContext {
             source: source.clone(),
             connector: running.clone(),
@@ -256,12 +261,45 @@ impl CollectorRunner {
             checkpoint: ConnectorCheckpoint::from_value(&connector.checkpoint),
             now,
         };
-        let collected = rss.collect(&ctx).await?;
-        rss.update_checkpoint(&running, &collected.checkpoint)
-            .await?;
 
+        let collected = match kind {
+            KnownConnectorKind::RssOrAtom => {
+                let rss = RssConnector::new(fetcher, sink, checkpoints);
+                let collected = rss.collect(&ctx).await?;
+                rss.update_checkpoint(&running, &collected.checkpoint)
+                    .await?;
+                collected
+            }
+            KnownConnectorKind::StaticWeb => {
+                let web = StaticWebConnector::new(fetcher, sink, checkpoints);
+                let collected = web.collect(&ctx).await?;
+                web.update_checkpoint(&running, &collected.checkpoint)
+                    .await?;
+                collected
+            }
+            KnownConnectorKind::RestApi => {
+                let rest = RestApiConnector::new(fetcher, sink, checkpoints);
+                let collected = rest.collect(&ctx).await?;
+                rest.update_checkpoint(&running, &collected.checkpoint)
+                    .await?;
+                collected
+            }
+        };
+
+        self.finish_collect(source, connector, &running, now, collected)
+            .await
+    }
+
+    async fn finish_collect(
+        &self,
+        source: &Source,
+        connector: &Connector,
+        running: &Connector,
+        now: chrono::DateTime<Utc>,
+        collected: CollectResult,
+    ) -> Result<CollectOutcome, CollectorError> {
         if !collected.fetched {
-            mark_success(&self.store, &running, now, None).await?;
+            mark_success(&self.store, running, now, None).await?;
             return Ok(CollectOutcome::Unchanged);
         }
 
@@ -272,8 +310,9 @@ impl CollectorRunner {
                     .into(),
             })?;
         let bytes = evidence.body.len() as u64;
-        let stored = rss.create_raw_evidence(evidence).await?;
-        mark_success(&self.store, &running, now, Some(&stored)).await?;
+        let sink = StoreEvidenceSink::new(self.store.clone(), self.objects.clone());
+        let stored = sink.persist(evidence).await?;
+        mark_success(&self.store, running, now, Some(&stored)).await?;
 
         self.metrics.inc_collected(1);
         self.metrics.add_raw_bytes(bytes);

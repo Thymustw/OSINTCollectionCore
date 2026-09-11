@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "raw.collected → RSS／Atom Document 正規化（冪等）"
+description = "raw.collected → RSS／Atom／Static Web Document 正規化（冪等；JSON 跳過）"
 
 [[bin]]
 name = "osint-normalizer"
@@ -15,6 +15,7 @@ path = "src/main.rs"
 axum = { workspace = true }
 chrono = { workspace = true }
 connector-rss = { path = "../connector-rss" }
+connector-static-web = { path = "../connector-static-web" }
 core-config = { workspace = true }
 core-events = { workspace = true }
 core-model = { workspace = true }

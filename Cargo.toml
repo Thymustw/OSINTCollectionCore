@@ -16,6 +16,8 @@ members = [
     "crates/storage-s3",
     "crates/connector-sdk",
     "crates/connector-rss",
+    "crates/connector-static-web",
+    "crates/connector-rest-api",
     "crates/collector",
     "crates/normalizer",
 ]
@@ -68,6 +70,8 @@ rdkafka = { version = "0.39.0", default-features = false, features = [
     "tokio",
     "libz",
 ] }
+# default-features 關掉 `main`（getopts CLI）。只當 HTML 解析庫用。
+scraper = { version = "0.27.0", default-features = false, features = ["errors"] }
 # 1.3+ 的 rust-version 是 1.88；workspace 鎖 1.85。必須用 `=` 精確釘版，
 # 否則 caret `1.2.2` 仍會解析到 1.7.0（MSRV 1.88）。
 redis = { version = "=1.2.2", default-features = false, features = ["tokio-comp"] }
