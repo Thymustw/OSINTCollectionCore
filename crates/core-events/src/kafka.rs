@@ -7,7 +7,7 @@ use rdkafka::TopicPartitionList;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Message, ToBytes};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::topic_partition_list::Offset;
 use serde_json::Value;
 
@@ -42,6 +42,29 @@ impl EventProducer {
         Ok(Self {
             inner,
             source_service: source_service.into(),
+        })
+    }
+
+    /// 抓一次 cluster metadata，回 `(broker 數, topic 數)`。連不上時回 [`EventError::Produce`]。
+    ///
+    /// librdkafka 的 `fetch_metadata` 是同步阻塞呼叫，直接在 Tokio executor thread 上跑
+    /// 會擋住整個 worker（連不上時會卡滿 `timeout`）。所以丟進 `spawn_blocking`。
+    pub async fn cluster_metadata(&self, timeout: Duration) -> Result<(usize, usize), EventError> {
+        let client = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            client
+                .client()
+                .fetch_metadata(None, timeout)
+                .map(|md| (md.brokers().len(), md.topics().len()))
+        })
+        .await
+        .map_err(|err| EventError::Produce {
+            topic: "(metadata)".into(),
+            message: format!("metadata 查詢任務中斷：{err}"),
+        })?;
+        result.map_err(|err| EventError::Produce {
+            topic: "(metadata)".into(),
+            message: err.to_string(),
         })
     }
 

@@ -57,6 +57,11 @@ fn bool_int(value: bool) -> i64 {
     i64::from(value)
 }
 
+/// list cursor 分頁的每頁上限。呼叫端傳 0 或超大值都夾回 1..=100，避免無界查詢。
+fn clamp_limit(limit: u32) -> i64 {
+    i64::from(limit.clamp(1, 100))
+}
+
 fn ports_text(ports: Option<&[u16]>) -> Result<Option<String>, StorageError> {
     match ports {
         None => Ok(None),
@@ -246,6 +251,27 @@ impl RelationalStore for SqliteEmbeddedStore {
         self.delete_id("DELETE FROM sources WHERE id = ?", id).await
     }
 
+    async fn list_sources(
+        &self,
+        after: Option<SourceId>,
+        limit: u32,
+    ) -> Result<Vec<Source>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM sources
+            WHERE (?1 IS NULL OR id < ?1)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::source).collect()
+    }
+
     async fn put_network_rule(&self, rule: &NetworkRule) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -382,6 +408,27 @@ impl RelationalStore for SqliteEmbeddedStore {
         rows.iter().map(mapping::connector).collect()
     }
 
+    async fn list_connectors(
+        &self,
+        after: Option<ConnectorId>,
+        limit: u32,
+    ) -> Result<Vec<Connector>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM connectors
+            WHERE (?1 IS NULL OR id < ?1)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::connector).collect()
+    }
+
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -509,6 +556,50 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
     }
 
+    async fn list_raw_evidence(
+        &self,
+        after: Option<RawEvidenceId>,
+        limit: u32,
+    ) -> Result<Vec<RawEvidence>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM raw_evidence
+            WHERE (?1 IS NULL OR id < ?1)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::raw_evidence).collect()
+    }
+
+    async fn list_raw_evidence_by_source(
+        &self,
+        source_id: SourceId,
+        after: Option<RawEvidenceId>,
+        limit: u32,
+    ) -> Result<Vec<RawEvidence>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM raw_evidence
+            WHERE source_id = ?1 AND (?2 IS NULL OR id < ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(uuid_text(source_id))
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::raw_evidence).collect()
+    }
+
     async fn put_document(&self, document: &Document) -> Result<(), StorageError> {
         let labels =
             serde_json::to_string(&document.labels).map_err(|err| StorageError::Unknown {
@@ -578,6 +669,27 @@ impl RelationalStore for SqliteEmbeddedStore {
     async fn delete_document(&self, id: DocumentId) -> Result<bool, StorageError> {
         self.delete_id("DELETE FROM documents WHERE id = ?", id)
             .await
+    }
+
+    async fn list_documents(
+        &self,
+        after: Option<DocumentId>,
+        limit: u32,
+    ) -> Result<Vec<Document>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM documents
+            WHERE (?1 IS NULL OR id < ?1)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::document).collect()
     }
 
     async fn put_entity(&self, entity: &Entity) -> Result<(), StorageError> {
@@ -817,6 +929,19 @@ impl RelationalStore for SqliteEmbeddedStore {
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
+        rows.iter().map(mapping::provenance).collect()
+    }
+
+    async fn list_provenance_by_subject(
+        &self,
+        subject_id: ObjectId,
+    ) -> Result<Vec<Provenance>, StorageError> {
+        let rows =
+            sqlx::query("SELECT * FROM provenance WHERE subject_id = ? ORDER BY timestamp, id")
+                .bind(uuid_text(subject_id))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
         rows.iter().map(mapping::provenance).collect()
     }
 

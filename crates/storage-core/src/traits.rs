@@ -25,6 +25,12 @@ pub trait RelationalStore: HealthProvider {
     async fn put_source(&self, source: &Source) -> Result<(), StorageError>;
     async fn get_source(&self, id: SourceId) -> Result<Option<Source>, StorageError>;
     async fn delete_source(&self, id: SourceId) -> Result<bool, StorageError>;
+    /// 依 UUID v7 由新到舊列出。cursor 語意同 [`RelationalStore::list_jobs`]。
+    async fn list_sources(
+        &self,
+        after: Option<SourceId>,
+        limit: u32,
+    ) -> Result<Vec<Source>, StorageError>;
 
     async fn put_network_rule(&self, rule: &NetworkRule) -> Result<(), StorageError>;
     async fn get_network_rule(
@@ -42,6 +48,19 @@ pub trait RelationalStore: HealthProvider {
     async fn delete_connector(&self, id: ConnectorId) -> Result<bool, StorageError>;
     /// `enabled = true` 的 connector，依 id 升序。collector 排程迴圈用。
     async fn list_enabled_connectors(&self) -> Result<Vec<Connector>, StorageError>;
+    /// 全部 connector（含 `enabled = false`），依 `id` 遞減、cursor 分頁。
+    /// 與 [`RelationalStore::list_enabled_connectors`] 的差別是不過濾 `enabled`，
+    /// 排程迴圈不該用這個——它會把停用的 connector 也跑起來。
+    ///
+    /// ⚠️ 這裡**不能**說「最新的在前」。connector 的 id 不保證是 UUID v7：
+    /// `POST /api/v1/import` 建立的 connector 用的是 UUID v5
+    /// （`core-api::import` 以 source + format 推導，為了冪等），沒有時間序。
+    /// 其他 list 方法（source／raw evidence／document／job）的 id 都是 v7，才有時間序。
+    async fn list_connectors(
+        &self,
+        after: Option<ConnectorId>,
+        limit: u32,
+    ) -> Result<Vec<Connector>, StorageError>;
 
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError>;
     async fn get_collection(&self, id: CollectionId) -> Result<Option<Collection>, StorageError>;
@@ -68,10 +87,32 @@ pub trait RelationalStore: HealthProvider {
         &self,
         id: RawEvidenceId,
     ) -> Result<Option<RawEvidence>, StorageError>;
+    /// 依 UUID v7 由新到舊列出。排序用 `id` 而不是 `retrieved_at`：cursor 是 id，
+    /// 排序鍵與 cursor 必須是同一欄，否則同一 `retrieved_at` 的多筆會在翻頁時漏掉或重複。
+    /// UUID v7 前 48 bit 是毫秒時間戳，實務上等同「最新的在前」。
+    async fn list_raw_evidence(
+        &self,
+        after: Option<RawEvidenceId>,
+        limit: u32,
+    ) -> Result<Vec<RawEvidence>, StorageError>;
+    /// 同 [`RelationalStore::list_raw_evidence`]，但只含指定 source。
+    async fn list_raw_evidence_by_source(
+        &self,
+        source_id: SourceId,
+        after: Option<RawEvidenceId>,
+        limit: u32,
+    ) -> Result<Vec<RawEvidence>, StorageError>;
 
     async fn put_document(&self, document: &Document) -> Result<(), StorageError>;
     async fn get_document(&self, id: DocumentId) -> Result<Option<Document>, StorageError>;
     async fn delete_document(&self, id: DocumentId) -> Result<bool, StorageError>;
+    /// 依 UUID v7 由新到舊列出。排序鍵同樣是 `id` 而非 `observed_at`，理由見
+    /// [`RelationalStore::list_raw_evidence`]。
+    async fn list_documents(
+        &self,
+        after: Option<DocumentId>,
+        limit: u32,
+    ) -> Result<Vec<Document>, StorageError>;
 
     async fn put_entity(&self, entity: &Entity) -> Result<(), StorageError>;
     async fn get_entity(&self, id: EntityId) -> Result<Option<Entity>, StorageError>;
@@ -103,6 +144,12 @@ pub trait RelationalStore: HealthProvider {
     async fn list_provenance_by_raw_evidence(
         &self,
         raw_evidence_id: RawEvidenceId,
+    ) -> Result<Vec<Provenance>, StorageError>;
+    /// 依 subject（Document／Entity 等衍生物件）查出溯源列，依時間升序。
+    /// `osint-cli documents show` 用來把「Document ← 哪個 processor ← 哪筆 RawEvidence」串起來。
+    async fn list_provenance_by_subject(
+        &self,
+        subject_id: ObjectId,
     ) -> Result<Vec<Provenance>, StorageError>;
 
     async fn put_job(&self, job: &Job) -> Result<(), StorageError>;

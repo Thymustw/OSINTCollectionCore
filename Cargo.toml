@@ -21,6 +21,7 @@ members = [
     "crates/import-format",
     "crates/collector",
     "crates/normalizer",
+    "crates/osint-cli",
 ]
 
 [workspace.package]
@@ -43,6 +44,10 @@ axum = { version = "0.8.9", default-features = false, features = [
 ] }
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.6", features = ["derive"] }
+# 表格輸出只需要純字串排版。default-features 會帶 crossterm（終端機寬度偵測），
+# 對一支唯讀查詢 CLI 是多餘的相依面，關掉。
+comfy-table = { version = "8.0.0", default-features = false }
 config = "0.15.25"
 connector-sdk = { path = "crates/connector-sdk" }
 core-config = { path = "crates/core-config" }

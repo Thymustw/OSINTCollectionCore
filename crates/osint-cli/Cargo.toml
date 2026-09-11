@@ -1,0 +1,36 @@
+[package]
+name = "osint-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "本機唯讀查詢 CLI：直連 Core 資料庫列出 Source／Connector／RawEvidence／Document／Job 與服務健康狀態"
+
+[[bin]]
+name = "osint-cli"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+core-config = { workspace = true }
+core-events = { workspace = true }
+core-model = { workspace = true }
+dotenvy = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+storage-core = { workspace = true }
+storage-opensearch = { path = "../storage-opensearch" }
+storage-postgres = { path = "../storage-postgres" }
+storage-redis = { path = "../storage-redis" }
+storage-s3 = { path = "../storage-s3" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+clap = { workspace = true, features = ["derive"] }

@@ -165,6 +165,33 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入的 source 讀不到".into(),
         })?;
     assert_eq_debug("source", &source, &got);
+    // 共用表裡有其他測試同時寫入的列，不能假設「剛寫入的一定在第一頁」。
+    // 改用 cursor = id+1：strictly-less-than 之下，第一筆必定就是這筆。
+    let listed = store.list_sources(Some(next_uuid(source.id)), 10).await?;
+    assert_cursor_page("list_sources", source.id, listed.iter().map(|i| i.id))?;
+    // cursor 是 strictly-less-than：用自己的 id 當 cursor 就不該再看到自己。
+    if store
+        .list_sources(Some(source.id), 10)
+        .await?
+        .iter()
+        .any(|item| item.id == source.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_sources 的 cursor 應嚴格小於 after，自己不該再出現".into(),
+        });
+    }
+    // limit 必須真的限制筆數，且 0 被夾成 1（不可變成無界查詢）。
+    let clamped = store.list_sources(None, 0).await?;
+    if clamped.len() != 1 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_sources(limit=0) 應夾成 1 筆，實際 {} 筆。limit 沒有被夾住等於無界查詢",
+                clamped.len()
+            ),
+        });
+    }
 
     let rule = NetworkRule {
         id: Uuid::now_v7(),
@@ -241,6 +268,31 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入且 enabled 的 connector 沒有出現在 list_enabled_connectors".into(),
         });
     }
+    let listed = store
+        .list_connectors(Some(next_uuid(connector.id)), 10)
+        .await?;
+    assert_cursor_page("list_connectors", connector.id, listed.iter().map(|i| i.id))?;
+    // list_connectors 必須含停用的 connector——這正是它和 list_enabled_connectors 的差別。
+    let mut disabled = connector.clone();
+    disabled.id = Uuid::now_v7();
+    disabled.name = "conformance-connector-disabled".into();
+    disabled.enabled = false;
+    store.put_connector(&disabled).await?;
+    let listed = store
+        .list_connectors(Some(next_uuid(disabled.id)), 10)
+        .await?;
+    assert_cursor_page("list_connectors", disabled.id, listed.iter().map(|i| i.id))?;
+    if store
+        .list_enabled_connectors()
+        .await?
+        .iter()
+        .any(|item| item.id == disabled.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "停用的 connector 不該出現在 list_enabled_connectors".into(),
+        });
+    }
 
     let collection = Collection {
         id: Uuid::now_v7(),
@@ -300,6 +352,40 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         }
     }
 
+    let listed = store
+        .list_raw_evidence(Some(next_uuid(evidence.id)), 10)
+        .await?;
+    assert_cursor_page(
+        "list_raw_evidence",
+        evidence.id,
+        listed.iter().map(|i| i.id),
+    )?;
+    let by_source = store
+        .list_raw_evidence_by_source(source.id, Some(next_uuid(evidence.id)), 10)
+        .await?;
+    assert_cursor_page(
+        "list_raw_evidence_by_source",
+        evidence.id,
+        by_source.iter().map(|i| i.id),
+    )?;
+    if by_source.iter().any(|item| item.source_id != source.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_raw_evidence_by_source 回了不屬於該 source 的列".into(),
+        });
+    }
+    // 換一個不存在的 source id 必須是空結果，不能退化成「全部列出」。
+    if !store
+        .list_raw_evidence_by_source(Uuid::now_v7(), None, 10)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_raw_evidence_by_source 用不存在的 source_id 應回空頁".into(),
+        });
+    }
+
     let document = Document {
         id: Uuid::now_v7(),
         object_type: DocumentType::Advisory,
@@ -331,6 +417,10 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入的 document 讀不到".into(),
         })?;
     assert_eq_debug("document", &updated, &got);
+    let listed = store
+        .list_documents(Some(next_uuid(document.id)), 10)
+        .await?;
+    assert_cursor_page("list_documents", document.id, listed.iter().map(|i| i.id))?;
     store
         .link_collection_object(collection.id, document.id)
         .await?;
@@ -437,6 +527,18 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入的 provenance 沒有出現在 list_provenance_by_raw_evidence".into(),
         });
     }
+    let by_subject = store.list_provenance_by_subject(document.id).await?;
+    if !by_subject.iter().any(|item| item.id == provenance.id) {
+        return Err(StorageError::NotFound {
+            message: "剛寫入的 provenance 沒有出現在 list_provenance_by_subject".into(),
+        });
+    }
+    if by_subject.iter().any(|item| item.subject_id != document.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_provenance_by_subject 回了不屬於該 subject 的列".into(),
+        });
+    }
 
     let job = Job {
         id: Uuid::now_v7(),
@@ -508,6 +610,52 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         });
     }
 
+    Ok(())
+}
+
+/// UUID 的「下一個值」（big-endian +1）。
+///
+/// list 方法的 cursor 是 strictly-less-than，所以拿 `id + 1` 當 cursor 時，
+/// 目標列必定是結果的第一筆——共用表裡有多少其他測試的資料都不影響。
+/// 直接用 `list_*(None, 10)` 再找自己的 id 是不可靠的：其他 e2e 測試會同時
+/// 往同一個 Postgres 寫入更新的 UUID v7，把這筆擠出第一頁。
+fn next_uuid(id: Uuid) -> Uuid {
+    let mut bytes = id.into_bytes();
+    for byte in bytes.iter_mut().rev() {
+        if *byte == 0xff {
+            *byte = 0;
+        } else {
+            *byte += 1;
+            break;
+        }
+    }
+    Uuid::from_bytes(bytes)
+}
+
+/// 驗證一頁 cursor 結果：非空、第一筆是預期的 id、整體依 id 由大到小。
+fn assert_cursor_page(
+    label: &str,
+    expected_first: Uuid,
+    ids: impl Iterator<Item = Uuid>,
+) -> Result<(), StorageError> {
+    let ids: Vec<Uuid> = ids.collect();
+    let Some(&first) = ids.first() else {
+        return Err(StorageError::NotFound {
+            message: format!("{label} 以 cursor=id+1 查詢卻回空頁，剛寫入的那筆不見了"),
+        });
+    };
+    if first != expected_first {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("{label} 第一筆應為 {expected_first}，實際是 {first}"),
+        });
+    }
+    if ids.windows(2).any(|w| w[0] <= w[1]) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("{label} 必須依 id 嚴格遞減（最新在前），實際順序：{ids:?}"),
+        });
+    }
     Ok(())
 }
 
