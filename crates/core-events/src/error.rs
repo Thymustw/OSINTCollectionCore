@@ -21,4 +21,6 @@ pub enum EventError {
     InvalidEnvelope { message: String },
     #[error("broker 設定不正確：{message}")]
     Configuration { message: String },
+    #[error("提交 consumer offset 失敗：{message}。請確認 Redpanda 在跑，或稍後重試")]
+    Commit { message: String },
 }

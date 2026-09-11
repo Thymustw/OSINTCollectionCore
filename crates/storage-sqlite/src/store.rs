@@ -374,6 +374,14 @@ impl RelationalStore for SqliteEmbeddedStore {
             .await
     }
 
+    async fn list_enabled_connectors(&self) -> Result<Vec<Connector>, StorageError> {
+        let rows = sqlx::query("SELECT * FROM connectors WHERE enabled = 1 ORDER BY id")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter().map(mapping::connector).collect()
+    }
+
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -796,6 +804,20 @@ impl RelationalStore for SqliteEmbeddedStore {
             mapping::provenance,
         )
         .await
+    }
+
+    async fn list_provenance_by_raw_evidence(
+        &self,
+        raw_evidence_id: RawEvidenceId,
+    ) -> Result<Vec<Provenance>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM provenance WHERE raw_evidence_id = ? ORDER BY timestamp, id",
+        )
+        .bind(uuid_text(raw_evidence_id))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::provenance).collect()
     }
 
     async fn put_job(&self, job: &Job) -> Result<(), StorageError> {

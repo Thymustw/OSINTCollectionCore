@@ -235,6 +235,12 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入的 connector 讀不到".into(),
         })?;
     assert_eq_debug("connector", &connector, &got);
+    let enabled = store.list_enabled_connectors().await?;
+    if !enabled.iter().any(|item| item.id == connector.id) {
+        return Err(StorageError::NotFound {
+            message: "剛寫入且 enabled 的 connector 沒有出現在 list_enabled_connectors".into(),
+        });
+    }
 
     let collection = Collection {
         id: Uuid::now_v7(),
@@ -425,6 +431,12 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         &provenance,
         &store.get_provenance(provenance.id).await?.expect("prov"),
     );
+    let by_raw = store.list_provenance_by_raw_evidence(evidence.id).await?;
+    if !by_raw.iter().any(|item| item.id == provenance.id) {
+        return Err(StorageError::NotFound {
+            message: "剛寫入的 provenance 沒有出現在 list_provenance_by_raw_evidence".into(),
+        });
+    }
 
     let job = Job {
         id: Uuid::now_v7(),

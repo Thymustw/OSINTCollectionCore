@@ -1,0 +1,42 @@
+[package]
+name = "normalizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "raw.collected → RSS／Atom Document 正規化（冪等）"
+
+[[bin]]
+name = "osint-normalizer"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+chrono = { workspace = true }
+connector-rss = { path = "../connector-rss" }
+core-config = { workspace = true }
+core-events = { workspace = true }
+core-model = { workspace = true }
+core-observability = { workspace = true }
+dotenvy = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+storage-core = { workspace = true }
+storage-postgres = { path = "../storage-postgres" }
+storage-s3 = { path = "../storage-s3" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+collector = { path = "../collector" }
+connector-sdk = { workspace = true }
+core-jobs = { workspace = true }
+core-security = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+url = { workspace = true }

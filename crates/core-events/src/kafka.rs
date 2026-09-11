@@ -1,11 +1,14 @@
 //! Redpanda producer／consumer。librdkafka 走 mklove（不開 cmake-build／ssl-vendored）。
 
+use std::sync::Mutex;
 use std::time::Duration;
 
+use rdkafka::TopicPartitionList;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Message, ToBytes};
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::topic_partition_list::Offset;
 use serde_json::Value;
 
 use crate::envelope::EventEnvelope;
@@ -96,8 +99,11 @@ impl EventProducer {
 }
 
 /// 單一 consumer group 的 StreamConsumer 封裝。
+///
+/// `enable.auto.commit=false`：呼叫端處理完後自己 [`Self::commit_last`]。
 pub struct EventConsumer {
     inner: StreamConsumer,
+    last: Mutex<Option<TopicPartitionList>>,
 }
 
 impl EventConsumer {
@@ -130,7 +136,10 @@ impl EventConsumer {
             .map_err(|err| EventError::ConsumerCreate {
                 message: format!("subscribe {topics:?} 失敗：{err}"),
             })?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            last: Mutex::new(None),
+        })
     }
 
     /// 等到下一則合法 envelope，或逾時。
@@ -168,14 +177,52 @@ impl EventConsumer {
                     let payload = msg.payload().ok_or_else(|| EventError::InvalidEnvelope {
                         message: "訊息沒有 payload".into(),
                     })?;
-                    return serde_json::from_slice(payload).map_err(|err| {
+                    let envelope = serde_json::from_slice(payload).map_err(|err| {
                         EventError::InvalidEnvelope {
                             message: err.to_string(),
                         }
-                    });
+                    })?;
+                    remember_offset(&self.last, msg.topic(), msg.partition(), msg.offset());
+                    return Ok(envelope);
                 }
             }
         }
+    }
+
+    /// 提交上一則成功解析的 envelope 的 offset（offset+1）。沒有上一則時是 no-op。
+    pub fn commit_last(&self) -> Result<(), EventError> {
+        let stored = self
+            .last
+            .lock()
+            .map_err(|_| EventError::Commit {
+                message: "consumer offset lock 被毒化。請重啟行程".into(),
+            })?
+            .clone();
+        let Some(list) = stored else {
+            return Ok(());
+        };
+        self.inner
+            .commit(&list, CommitMode::Sync)
+            .map_err(|err| EventError::Commit {
+                message: err.to_string(),
+            })
+    }
+}
+
+fn remember_offset(
+    last: &Mutex<Option<TopicPartitionList>>,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) {
+    let mut list = TopicPartitionList::new();
+    // Kafka 約定：提交的是「下一筆要讀」的 offset。
+    let next = Offset::Offset(offset.saturating_add(1));
+    if list.add_partition_offset(topic, partition, next).is_err() {
+        return;
+    }
+    if let Ok(mut guard) = last.lock() {
+        *guard = Some(list);
     }
 }
 

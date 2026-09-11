@@ -43,3 +43,14 @@ request_body_limit_bytes = 1048576
 jwt_secret_ref = "env:JWT_SECRET"
 jwt_issuer = "osint-core"
 jwt_ttl_secs = 3600
+
+[collector]
+# 本工作站 8080 是 OpenCTI。collector health 預設 18081。
+bind = "127.0.0.1:18081"
+tick_secs = 5
+global_inflight = 4
+per_domain_inflight = 1
+
+[normalizer]
+bind = "127.0.0.1:18082"
+consumer_group = "osint-normalizer"

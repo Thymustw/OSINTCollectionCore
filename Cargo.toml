@@ -16,6 +16,8 @@ members = [
     "crates/storage-s3",
     "crates/connector-sdk",
     "crates/connector-rss",
+    "crates/collector",
+    "crates/normalizer",
 ]
 
 [workspace.package]
@@ -45,6 +47,7 @@ core-jobs = { path = "crates/core-jobs" }
 core-model = { path = "crates/core-model" }
 core-observability = { path = "crates/core-observability" }
 core-security = { path = "crates/core-security" }
+croner = { version = "4.0.0", default-features = false, features = ["chrono"] }
 feed-rs = "2.4.0"
 hex = "0.4.3"
 ipnet = "2.12.2"

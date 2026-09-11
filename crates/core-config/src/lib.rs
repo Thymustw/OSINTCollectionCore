@@ -23,6 +23,10 @@ pub struct AppConfig {
     pub http: HttpSection,
     #[serde(default)]
     pub auth: AuthSection,
+    #[serde(default)]
+    pub collector: CollectorSection,
+    #[serde(default)]
+    pub normalizer: NormalizerSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +116,42 @@ impl Default for AuthSection {
             jwt_secret_ref: SecretRef::parse("env:JWT_SECRET").expect("literal SecretRef"),
             jwt_issuer: "osint-core".into(),
             jwt_ttl_secs: 3600,
+        }
+    }
+}
+
+/// collector 排程與併發上限。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectorSection {
+    pub bind: String,
+    pub tick_secs: u64,
+    pub global_inflight: u32,
+    pub per_domain_inflight: u32,
+}
+
+impl Default for CollectorSection {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18081".into(),
+            tick_secs: 5,
+            global_inflight: 4,
+            per_domain_inflight: 1,
+        }
+    }
+}
+
+/// normalizer consumer 設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizerSection {
+    pub bind: String,
+    pub consumer_group: String,
+}
+
+impl Default for NormalizerSection {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18082".into(),
+            consumer_group: "osint-normalizer".into(),
         }
     }
 }
@@ -217,6 +257,11 @@ mod tests {
         assert_eq!(cfg.http.bind, "127.0.0.1:18080");
         assert_eq!(cfg.auth.jwt_secret_ref.as_str(), "env:JWT_SECRET");
         assert_eq!(cfg.auth.jwt_issuer, "osint-core");
+        assert_eq!(cfg.collector.bind, "127.0.0.1:18081");
+        assert_eq!(cfg.collector.global_inflight, 4);
+        assert_eq!(cfg.collector.per_domain_inflight, 1);
+        assert_eq!(cfg.normalizer.bind, "127.0.0.1:18082");
+        assert_eq!(cfg.normalizer.consumer_group, "osint-normalizer");
     }
 
     #[test]

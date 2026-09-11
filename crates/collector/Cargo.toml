@@ -1,0 +1,40 @@
+[package]
+name = "collector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "Connector 排程服務：cron 觸發、有界併發、RawEvidence 落地、raw.collected／raw.failed"
+
+[[bin]]
+name = "osint-collector"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+connector-rss = { path = "../connector-rss" }
+connector-sdk = { workspace = true }
+core-config = { workspace = true }
+core-events = { workspace = true }
+core-jobs = { workspace = true }
+core-model = { workspace = true }
+core-observability = { workspace = true }
+core-security = { workspace = true }
+croner = { workspace = true }
+dotenvy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+storage-core = { workspace = true }
+storage-postgres = { path = "../storage-postgres" }
+storage-s3 = { path = "../storage-s3" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

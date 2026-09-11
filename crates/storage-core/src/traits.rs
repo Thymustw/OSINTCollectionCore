@@ -40,6 +40,8 @@ pub trait RelationalStore: HealthProvider {
     async fn put_connector(&self, connector: &Connector) -> Result<(), StorageError>;
     async fn get_connector(&self, id: ConnectorId) -> Result<Option<Connector>, StorageError>;
     async fn delete_connector(&self, id: ConnectorId) -> Result<bool, StorageError>;
+    /// `enabled = true` 的 connector，依 id 升序。collector 排程迴圈用。
+    async fn list_enabled_connectors(&self) -> Result<Vec<Connector>, StorageError>;
 
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError>;
     async fn get_collection(&self, id: CollectionId) -> Result<Option<Collection>, StorageError>;
@@ -97,6 +99,11 @@ pub trait RelationalStore: HealthProvider {
 
     async fn put_provenance(&self, provenance: &Provenance) -> Result<(), StorageError>;
     async fn get_provenance(&self, id: ProvenanceId) -> Result<Option<Provenance>, StorageError>;
+    /// 依 RawEvidence 查出溯源列。normalizer 用來判斷同一筆是否已正規化。
+    async fn list_provenance_by_raw_evidence(
+        &self,
+        raw_evidence_id: RawEvidenceId,
+    ) -> Result<Vec<Provenance>, StorageError>;
 
     async fn put_job(&self, job: &Job) -> Result<(), StorageError>;
     async fn get_job(&self, id: JobId) -> Result<Option<Job>, StorageError>;
