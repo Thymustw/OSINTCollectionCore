@@ -2,7 +2,7 @@
 # audit / secret-scan / docker-scan 依賴尚未納入 bootstrap 的外部工具；
 # 目標先寫成直接呼叫，工具未安裝時應失敗而不是假裝通過。
 
-.PHONY: help check build test lint fmt audit secret-scan docker-scan \
+.PHONY: help check build test lint fmt audit secret-scan secret-scan-canary docker-scan \
 	compose-up compose-down compose-ps migrate-postgres migrate-sqlite \
 	run-api run-collector run-normalizer run-deduplicator run-entity-worker \
 	run-indexer rebuild-index rebuild-index-drop run-cli \
@@ -31,6 +31,7 @@ help:
 	@echo "  make migrate-sqlite    對本機 SQLite 檔跑 sqlx migrate"
 	@echo "  make audit             cargo audit（需已安裝 cargo-audit）"
 	@echo "  make secret-scan       gitleaks detect（需已安裝 gitleaks）"
+	@echo "  make secret-scan-canary 植入假 key 證明 gitleaks 真的抓得到（§30 Acceptance 1）"
 	@echo "  make docker-scan       trivy fs docker/（需已安裝 trivy）"
 	@echo "  make run-api           啟動 osint-api（需 JWT_SECRET 與 compose）"
 	@echo "  make run-collector     啟動 osint-collector（需 compose 與 .env）"
@@ -85,6 +86,12 @@ audit:
 
 secret-scan:
 	gitleaks detect --source . --no-banner
+
+# SPEC §30 Acceptance 1：證明 secret scanner 不是裝飾品。
+# 對 $(TMPDIR) 底下的拋棄式 repo 植入假 key，斷言 gitleaks 抓得到。
+# 沒裝 gitleaks 就明確失敗，不假裝通過。GITLEAKS_BIN=/path 可指定路徑。
+secret-scan-canary:
+	bash scripts/secret-scan-canary.sh
 
 docker-scan:
 	trivy fs --scanners vuln,misconfig,secret docker
