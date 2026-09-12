@@ -23,7 +23,9 @@ use serde_json::{Value, json};
 use storage_core::conformance::{
     assert_opensearch_identity, load_workspace_dotenv, required_env, verify_not_opencti_search,
 };
-use storage_core::{RelationalStore, SearchDocument, SearchHits, SearchStore};
+use storage_core::{
+    ProjectionStore, RebuildState, RelationalStore, SearchDocument, SearchHits, SearchStore,
+};
 use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
 use uuid::Uuid;
@@ -91,7 +93,13 @@ fn worker(stack: &Stack) -> EntityWorker {
 }
 
 /// 測試結束時把一次性 index 刪掉。留著會讓叢集慢慢長出幾百個測試 index。
+///
+/// **投影狀態也要清。** V0.2 Phase 0f 起每次 flush／rebuild 都會在
+/// `osint-projection-state` 裡留一列（`_id` = 投影名 = 這個一次性 index 名）。
+/// 刪掉 index 不會連帶刪掉那一列——那是刻意的（`--drop` 時狀態要留著），
+/// 所以測試得自己 `reset_projection`，否則每跑一次 e2e 就多幾列孤兒狀態。
 async fn cleanup(stack: &Stack, index: &str) {
+    let _ = stack.os.reset_projection(index).await;
     let _ = stack.os.delete_index(index).await;
 }
 
@@ -1016,6 +1024,121 @@ async fn rebuild_from_postgres_matches_the_canonical_document_count() {
         "重建兩次不該讓同一份文件出現兩筆"
     );
 
+    cleanup(&stack, &index).await;
+}
+
+/// V0.2 Phase 0f：rebuild 之後 `ProjectionStore` 的狀態要對得上 report。
+///
+/// # 為什麼斷言長這樣
+///
+/// e2e 是並行跑的，但這裡的投影名就是**本測試專屬**的 index 名，狀態列的 `_id`
+/// 就是投影名，所以這一列沒有別的測試會碰——下面四條在並行下嚴格成立：
+///
+/// 1. `state == Completed`（不是 Running：外層無論成功失敗都要寫最終狀態）；
+/// 2. `written >= report.indexed`：本次 rebuild 寫了幾筆至少要記到
+///    （`>=` 而不是 `==` 是因為每頁都會更新一次，而狀態是**累積**的 report 值——
+///    若之後有人在 rebuild 裡加上重試，`written` 只會更大，不會更小）；
+/// 3. checkpoint 存在且 `last_object_id` 有值：投影寫了東西就要有進度標記；
+/// 4. lag 算得出來（`Some`）。`None` 代表 checkpoint 沒有來源時間戳，
+///    那正是 `collected_at` 欄位被改名時會發生的靜默失效。
+#[tokio::test]
+async fn rebuild_records_projection_checkpoint_and_status() {
+    let stack = connect_stack().await;
+    let index = test_index();
+    let service = indexer_for(&stack, &index);
+
+    let fx = Fixture::new();
+    let source = seed_source(&stack.pg).await;
+    let connector = seed_connector(&stack.pg, &source).await;
+    let document = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        DocSpec::new(
+            &format!("{} checkpoint canonical", fx.tag),
+            &format!("{} checkpoint body", fx.tag),
+        ),
+    )
+    .await;
+    worker(&stack)
+        .extract_document(document.id)
+        .await
+        .expect("extract");
+
+    // drop_index=true 會先 reset_projection，所以起手狀態是乾淨的。
+    let report = service
+        .rebuild(RebuildOptions {
+            drop_index: true,
+            page_size: 100,
+        })
+        .await
+        .expect("rebuild");
+    assert!(report.indexed >= 1, "至少要寫進本次建立的那一份");
+
+    let status = stack
+        .os
+        .rebuild_status(&index)
+        .await
+        .expect("rebuild_status");
+    assert_eq!(
+        status.state,
+        RebuildState::Completed,
+        "rebuild 結束後狀態必須是 Completed，實際 {status:?}"
+    );
+    assert!(
+        status.started_at.is_some() && status.finished_at.is_some(),
+        "Completed 必須同時有開始與結束時間：{status:?}"
+    );
+    assert!(
+        status.written >= report.indexed,
+        "rebuild 狀態的 written（{}）不該少於 report.indexed（{}）",
+        status.written,
+        report.indexed
+    );
+    assert_eq!(status.failed, report.failed.len() as u64);
+    assert_eq!(status.last_error, None, "沒失敗就不該留錯誤訊息");
+
+    let checkpoint = stack
+        .os
+        .checkpoint(&index)
+        .await
+        .expect("checkpoint")
+        .expect("rebuild 寫了文件就必須有 checkpoint");
+    assert!(
+        checkpoint.last_object_id.is_some(),
+        "checkpoint 必須記得最後一筆成功寫入的物件 id：{checkpoint:?}"
+    );
+    assert!(
+        checkpoint.objects_written >= report.indexed,
+        "checkpoint 累積計數（{}）不該少於本次寫入數（{}）",
+        checkpoint.objects_written,
+        report.indexed
+    );
+    let lag = stack
+        .os
+        .projection_lag(&index, Utc::now())
+        .await
+        .expect("projection_lag");
+    assert!(
+        lag.lag_seconds.is_some(),
+        "checkpoint 有來源時間戳時 lag 必須算得出來；None 代表投影的 collected_at 讀不到"
+    );
+
+    // 狀態列是這個測試建立的，要自己清掉（CLAUDE.md §15）。
+    stack
+        .os
+        .reset_projection(&index)
+        .await
+        .expect("reset_projection");
+    assert!(
+        stack
+            .os
+            .checkpoint(&index)
+            .await
+            .expect("checkpoint")
+            .is_none(),
+        "reset 之後 checkpoint 應該不見了"
+    );
     cleanup(&stack, &index).await;
 }
 

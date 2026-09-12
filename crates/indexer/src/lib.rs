@@ -50,5 +50,6 @@ pub use search::{
     EntityFilter, SearchRequest, SearchRequestError, build as build_search, next_cursor,
 };
 pub use service::{
-    FlushReport, IndexBounds, Indexer, PrepareOutcome, RebuildOptions, RebuildReport,
+    BatchProgress, FlushReport, IndexBounds, Indexer, PrepareOutcome, RebuildOptions,
+    RebuildReport, SourceMark,
 };

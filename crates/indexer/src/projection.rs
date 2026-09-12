@@ -113,7 +113,7 @@ pub fn build_body(
 
     map.insert(schema::F_PUBLISHED_AT.into(), json!(document.published_at));
     map.insert(schema::F_OBSERVED_AT.into(), json!(document.observed_at));
-    map.insert("collected_at".into(), json!(document.collected_at));
+    map.insert(schema::F_COLLECTED_AT.into(), json!(document.collected_at));
     map.insert(
         schema::F_EFFECTIVE_DATE.into(),
         json!(effective_date(document)),
@@ -145,6 +145,26 @@ pub fn build_body(
     map.insert("entity_count".into(), json!(entities.len()));
 
     Value::Object(map)
+}
+
+/// 從投影 `_source` 取回「這一份來源物件的時間戳」，給 projection checkpoint 算 lag 用。
+///
+/// # 為什麼是 `collected_at` 而不是 `effective_date` / `published_at`
+///
+/// lag 要回答的是「投影落後 canonical store 多久」。`published_at` 是**外部來源**
+/// 宣稱的發布時間：匯入一篇 2019 年的文章時它是 2019 年，lag 會變成七年——
+/// 那個數字與投影健不健康完全無關，只會讓門檻永遠是紅的。
+/// `collected_at` 是本系統取得它的時間，是 `Document` 上最接近「何時進入 pipeline」
+/// 的欄位（`Document` **沒有** `updated_at`，見 `core_model::Document`）。
+///
+/// 讀不到（欄位被改名、或投影是舊版寫的）時回 `None`，checkpoint 就不會前進——
+/// 寧可讓 lag 停在 `None`（看得出來不對）也不要塞一個現在的時間戳假裝沒落後。
+#[must_use]
+pub fn source_timestamp(body: &Value) -> Option<DateTime<Utc>> {
+    body.get(schema::F_COLLECTED_AT)
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|at| at.with_timezone(&Utc))
 }
 
 /// `published_at` 有值時用它，否則退回 `observed_at`。
@@ -274,6 +294,24 @@ mod tests {
         let published = Utc::now() - chrono::Duration::days(3);
         doc.published_at = Some(published);
         assert_eq!(effective_date(&doc), published);
+    }
+
+    #[test]
+    fn source_timestamp_reads_back_what_the_projection_wrote() {
+        // 這一條在防欄位改名：`source_timestamp` 讀不到就回 None，
+        // checkpoint 於是永遠不前進、lag 永遠是 None——不會報錯，也不會有人發現。
+        let doc = document();
+        let body = build_body(&doc, Provenance::default(), &[], Utc::now(), 4096);
+        assert_eq!(
+            source_timestamp(&body),
+            Some(doc.collected_at),
+            "投影寫的 collected_at 必須被 source_timestamp 讀得回來"
+        );
+    }
+
+    #[test]
+    fn source_timestamp_of_an_unrelated_body_is_none() {
+        assert_eq!(source_timestamp(&json!({"title": "x"})), None);
     }
 
     #[test]

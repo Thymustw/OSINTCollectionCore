@@ -841,7 +841,11 @@ pub struct StructuredSearch {
     pub highlight_fields: Vec<String>,
 }
 
-/// 搜尋投影。V0.1 不包含 rebuild/checkpoint（那是 V0.2 `ProjectionStore`）。
+/// 搜尋投影的**寫入與查詢**。
+///
+/// 進度／lag／重建狀態不在這裡，在 [`ProjectionStore`]（V0.2 Phase 0f）。
+/// 兩個 trait 由同一個 adapter 實作，但刻意分開：只讀搜尋的呼叫端
+/// （core-api 的 `POST /search`）不需要也不該碰得到 `reset_projection`。
 #[async_trait]
 pub trait SearchStore: HealthProvider {
     async fn index(&self, document: SearchDocument) -> Result<(), StorageError>;
@@ -855,6 +859,214 @@ pub trait SearchStore: HealthProvider {
     /// 結構化搜尋。面向使用者的路徑走這個。
     async fn search(&self, query: StructuredSearch) -> Result<SearchHits, StorageError>;
     async fn delete(&self, index: &str, id: &str) -> Result<bool, StorageError>;
+}
+
+// ---------------------------------------------------------------------------
+// ProjectionStore（V0.2 Phase 0f）
+// ---------------------------------------------------------------------------
+
+/// 一個投影的進度標記。
+///
+/// `projection` 就是目標 index／graph 名（例 `"osint-documents"`），不是後端名——
+/// 同一個後端可以同時承載多個投影，用後端名當鍵會讓它們互相覆寫。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionCheckpoint {
+    pub projection: String,
+    /// 最後一筆成功寫入的**來源物件**的時間戳。lag 由此算。
+    ///
+    /// 「來源物件的時間」不是「投影寫入的時間」。寫入時間永遠是「剛剛」，
+    /// 用它算 lag 會永遠得到接近 0——一個看起來很健康但毫無資訊的數字。
+    pub last_source_at: Option<DateTime<Utc>>,
+    /// 與 `last_source_at` **成對**的那一筆物件 id（不是本批最後一筆）。
+    pub last_object_id: Option<ObjectId>,
+    /// 累積寫入計數。rebuild（`reset_projection`）會重置。
+    pub objects_written: u64,
+    /// 這一列最後被更新的時間。
+    pub updated_at: DateTime<Utc>,
+}
+
+impl ProjectionCheckpoint {
+    /// 一個還沒寫過任何東西的 checkpoint。
+    #[must_use]
+    pub fn empty(projection: impl Into<String>, now: DateTime<Utc>) -> Self {
+        Self {
+            projection: projection.into(),
+            last_source_at: None,
+            last_object_id: None,
+            objects_written: 0,
+            updated_at: now,
+        }
+    }
+
+    /// 併入一批新進度：`objects_written` **累加**，`last_source_at` **只前進不後退**。
+    ///
+    /// # 為什麼時間戳只能前進
+    ///
+    /// 重建是依 `id DESC`（最新在前）掃過來的，所以第二頁的來源時間戳比第一頁**舊**。
+    /// 若直接覆寫，一次成功的 rebuild 結束後 checkpoint 會停在**最舊**那一頁的時間，
+    /// lag 看起來像是落後好幾個月——而實際上投影是完整的。這不會報錯，
+    /// 只會讓運維在對著一個假的落後數字找不存在的問題。
+    ///
+    /// `last_object_id` 跟著 `last_source_at` 一起換，兩者必須是同一筆物件；
+    /// 分開更新會產生「時間是 A 的、id 是 B 的」這種對不起來的紀錄。
+    pub fn advance(
+        &mut self,
+        source_at: Option<DateTime<Utc>>,
+        object_id: Option<ObjectId>,
+        written: u64,
+        now: DateTime<Utc>,
+    ) {
+        self.objects_written = self.objects_written.saturating_add(written);
+        self.updated_at = now;
+        // 刻意不用 let-chain：workspace 的 rust-version 是 1.85，let-chain 要 1.88。
+        if let Some(source_at) = source_at {
+            if self
+                .last_source_at
+                .is_none_or(|current| source_at > current)
+            {
+                self.last_source_at = Some(source_at);
+                self.last_object_id = object_id;
+            }
+        }
+    }
+}
+
+/// 投影落後多久。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionLag {
+    pub checkpoint: Option<ProjectionCheckpoint>,
+    /// `now - last_source_at` 的秒數。
+    ///
+    /// **沒有 checkpoint（或 checkpoint 沒有來源時間戳）時是 `None`，不是 `0`。**
+    /// 0 會被讀成「完全沒落後」，而實際狀況是「這個投影從來沒寫過東西」——
+    /// 那是需要有人去看的狀態，不是健康狀態。
+    pub lag_seconds: Option<i64>,
+}
+
+impl ProjectionLag {
+    /// 由 checkpoint 算 lag。**adapter 一律呼叫這個**，不要各自算一遍——
+    /// 「沒有 checkpoint 時回 0 還是 None」這種決定重複實作幾次就會分岔一次。
+    #[must_use]
+    pub fn from_checkpoint(checkpoint: Option<ProjectionCheckpoint>, now: DateTime<Utc>) -> Self {
+        let lag_seconds = checkpoint
+            .as_ref()
+            .and_then(|cp| cp.last_source_at)
+            .map(|at| (now - at).num_seconds());
+        Self {
+            checkpoint,
+            lag_seconds,
+        }
+    }
+}
+
+/// 重建進行到哪裡。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebuildState {
+    /// 沒有重建紀錄，或上一次重建的紀錄已被清掉。
+    #[default]
+    Idle,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// 最近一次（或正在進行的）重建狀態。
+///
+/// 存在的理由是 SPEC_V0.2 §27 的 Operations Center 要回答「上次 reindex 是什麼時候、
+/// 寫了幾筆、失敗了嗎」。這個資訊**只存在於投影端**：canonical store 不知道有人跑過重建。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildStatus {
+    pub projection: String,
+    pub state: RebuildState,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub scanned: u64,
+    pub written: u64,
+    pub failed: u64,
+    /// 失敗原因。**寫入前必須過 [`StorageError::sanitize`]**：重建的錯誤訊息常常
+    /// 含後端 URL 或 DSN，而這一列會被 Operations Center 顯示出來。
+    pub last_error: Option<String>,
+}
+
+impl RebuildStatus {
+    /// 「沒有任何重建紀錄」的狀態。[`ProjectionStore::rebuild_status`] 查不到記錄時回這個。
+    #[must_use]
+    pub fn idle(projection: impl Into<String>) -> Self {
+        Self {
+            projection: projection.into(),
+            state: RebuildState::Idle,
+            started_at: None,
+            finished_at: None,
+            scanned: 0,
+            written: 0,
+            failed: 0,
+            last_error: None,
+        }
+    }
+}
+
+/// 投影的進度與重建狀態（`STORAGE_ARCHITECTURE.md` §12、SPEC_V0.2「Projection Storage
+/// Contracts」）。OpenSearch 與（V0.2 之後的）Neo4j adapter 都實作它。
+///
+/// # 為什麼這裡沒有 upsert／delete
+///
+/// `STORAGE_ARCHITECTURE.md` §7 的示意寫了 `upsert_projection` / `delete_projection`，
+/// 那一段明說是 illustrative。實際上「把一個物件寫進投影」已經由各後端自己的能力介面
+/// 涵蓋了（搜尋投影是 [`SearchStore::index`]／[`SearchStore::bulk_index`]／
+/// [`SearchStore::delete`]，圖投影會是 `GraphStore`）。再疊一套後端中立的
+/// `ProjectionObject` 寫入介面，代價是**兩條寫入路徑**：
+///
+/// * bulk 的逐筆失敗（[`BulkFailure`]）、mapping 衝突、nested 欄位這些東西在中立介面裡
+///   無處可放，只能退化成「成功／失敗」——那正是 [`BulkIndexResult`] 的註解在講的
+///   靜默丟資料。
+/// * 兩條路徑遲早分岔，而分岔的那一條只在其中一個呼叫端上跑，最難被測到。
+///
+/// 所以這個 trait 只管**狀態**：checkpoint、lag、rebuild 狀態、重置。
+/// 「寫入」由 capability 專屬介面負責。差異已記在
+/// `docs/architecture/STORAGE_ARCHITECTURE.md` §7 與 `docs/developer/storage-adapters.md`。
+#[async_trait]
+pub trait ProjectionStore: HealthProvider {
+    /// 這個投影的 checkpoint。從來沒寫過的投影回 `None`（不是零值 checkpoint——
+    /// 「沒寫過」與「寫過但來源時間戳是 epoch」必須分得出來）。
+    async fn checkpoint(
+        &self,
+        projection: &str,
+    ) -> Result<Option<ProjectionCheckpoint>, StorageError>;
+
+    /// 覆寫 checkpoint。
+    ///
+    /// **累加與「只前進」的合併邏輯不在這裡**，由呼叫端先用
+    /// [`ProjectionCheckpoint::advance`] 算好再寫；adapter 只負責存。
+    /// 把合併放進 adapter 會讓每個後端各實作一次同一套規則。
+    ///
+    /// 寫入必須是「寫完就讀得到」（OpenSearch adapter 用 `refresh=true`；
+    /// `wait_for` 也正確但會等滿一個 refresh 週期，實測數字見該 adapter 的註解）：
+    /// 投影 worker 的下一批會先讀 checkpoint 再累加，讀到舊值等於計數永遠停在原地。
+    async fn save_checkpoint(&self, checkpoint: &ProjectionCheckpoint) -> Result<(), StorageError>;
+
+    /// `now - last_source_at`。`now` 由呼叫端傳入而不是 adapter 取 `Utc::now()`，
+    /// 否則測試無法斷言，批次查詢多個投影時每個的基準時間也會不同。
+    async fn projection_lag(
+        &self,
+        projection: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProjectionLag, StorageError>;
+
+    /// 最近一次重建狀態。**沒有記錄時回 [`RebuildStatus::idle`]，不是 `Err`**：
+    /// 「還沒有人跑過重建」是正常狀態，讓它變成錯誤會逼每個呼叫端去分辨
+    /// 「查不到」與「真的壞了」，而那兩者在錯誤型別上長得一樣。
+    async fn rebuild_status(&self, projection: &str) -> Result<RebuildStatus, StorageError>;
+
+    /// 覆寫重建狀態。`last_error` 必須已經過 [`StorageError::sanitize`]。
+    async fn set_rebuild_status(&self, status: &RebuildStatus) -> Result<(), StorageError>;
+
+    /// 清掉這個投影的 checkpoint 與重建狀態（`--drop` 重建時用）。
+    ///
+    /// 不存在時也回 `Ok`（冪等）。**這是唯一會讓狀態消失的操作**——
+    /// 刪掉投影本身（drop index）不會動到狀態，理由見
+    /// `docs/developer/storage-adapters.md` 的「為什麼狀態放獨立 index」。
+    async fn reset_projection(&self, projection: &str) -> Result<(), StorageError>;
 }
 
 /// 快取／暫存鍵值。
@@ -879,4 +1091,107 @@ pub trait ObjectStore: HealthProvider {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError>;
     async fn delete(&self, key: &str) -> Result<bool, StorageError>;
     async fn exists(&self, key: &str) -> Result<bool, StorageError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_757_000_000 + secs, 0).unwrap()
+    }
+
+    #[test]
+    fn lag_without_checkpoint_is_none_not_zero() {
+        // 0 會被讀成「完全沒落後」。「從沒寫過」必須長得跟「剛寫過」不一樣，
+        // 否則一個從來沒啟動過的投影在儀表板上看起來是健康的。
+        let lag = ProjectionLag::from_checkpoint(None, ts(0));
+        assert_eq!(lag.lag_seconds, None);
+        assert!(lag.checkpoint.is_none());
+    }
+
+    #[test]
+    fn lag_with_checkpoint_but_no_source_timestamp_is_also_none() {
+        // 投影寫過東西、但來源物件沒有可用的時間戳。仍然算不出 lag。
+        let lag = ProjectionLag::from_checkpoint(
+            Some(ProjectionCheckpoint::empty("osint-documents", ts(0))),
+            ts(600),
+        );
+        assert_eq!(lag.lag_seconds, None);
+        assert!(lag.checkpoint.is_some(), "checkpoint 本身要照樣回傳");
+    }
+
+    #[test]
+    fn lag_is_now_minus_last_source_at() {
+        let mut cp = ProjectionCheckpoint::empty("osint-documents", ts(0));
+        cp.advance(Some(ts(100)), Some(ObjectId::nil()), 1, ts(100));
+        let lag = ProjectionLag::from_checkpoint(Some(cp), ts(460));
+        assert_eq!(lag.lag_seconds, Some(360));
+    }
+
+    #[test]
+    fn advance_accumulates_written_count() {
+        let mut cp = ProjectionCheckpoint::empty("osint-documents", ts(0));
+        cp.advance(Some(ts(10)), Some(ObjectId::nil()), 200, ts(10));
+        cp.advance(Some(ts(20)), Some(ObjectId::nil()), 150, ts(20));
+        assert_eq!(
+            cp.objects_written, 350,
+            "計數要累加，不是覆寫成最後一批的量"
+        );
+        assert_eq!(cp.updated_at, ts(20));
+    }
+
+    #[test]
+    fn advance_never_moves_the_source_timestamp_backwards() {
+        // rebuild 是 id DESC 掃過來的，第二頁比第一頁舊。覆寫的話 checkpoint 會停在
+        // 最舊那一頁，lag 看起來像落後好幾個月，而投影其實是完整的。
+        let newer = ObjectId::from_u128(2);
+        let older = ObjectId::from_u128(1);
+        let mut cp = ProjectionCheckpoint::empty("osint-documents", ts(0));
+        cp.advance(Some(ts(1_000)), Some(newer), 100, ts(1_000));
+        cp.advance(Some(ts(10)), Some(older), 100, ts(1_010));
+
+        assert_eq!(cp.last_source_at, Some(ts(1_000)));
+        assert_eq!(
+            cp.last_object_id,
+            Some(newer),
+            "id 必須跟著 last_source_at 一起留在同一筆物件上"
+        );
+        assert_eq!(cp.objects_written, 200, "時間戳不前進，但計數照樣累加");
+    }
+
+    #[test]
+    fn advance_without_a_source_timestamp_only_counts() {
+        let mut cp = ProjectionCheckpoint::empty("osint-documents", ts(0));
+        cp.advance(Some(ts(500)), Some(ObjectId::from_u128(7)), 1, ts(500));
+        cp.advance(None, None, 3, ts(600));
+        assert_eq!(cp.last_source_at, Some(ts(500)));
+        assert_eq!(cp.last_object_id, Some(ObjectId::from_u128(7)));
+        assert_eq!(cp.objects_written, 4);
+    }
+
+    #[test]
+    fn rebuild_status_default_is_idle_with_no_history() {
+        let status = RebuildStatus::idle("osint-documents");
+        assert_eq!(status.state, RebuildState::Idle);
+        assert_eq!(status.started_at, None);
+        assert_eq!(status.finished_at, None);
+        assert_eq!((status.scanned, status.written, status.failed), (0, 0, 0));
+        assert_eq!(status.last_error, None);
+        assert_eq!(RebuildState::default(), RebuildState::Idle);
+    }
+
+    #[test]
+    fn rebuild_state_serialises_as_snake_case() {
+        // 存進投影後端的是這個字串。改掉它等於讓既有的狀態列讀不回來。
+        assert_eq!(
+            serde_json::to_value(RebuildState::Completed).unwrap(),
+            Value::String("completed".into())
+        );
+        assert_eq!(
+            serde_json::from_value::<RebuildState>(Value::String("running".into())).unwrap(),
+            RebuildState::Running
+        );
+    }
 }

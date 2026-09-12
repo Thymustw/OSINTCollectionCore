@@ -21,8 +21,9 @@ use uuid::Uuid;
 
 use crate::error::StorageError;
 use crate::traits::{
-    CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore, RelationalStore, SearchDocument,
-    SearchQuery, SearchStore, StructuredSearch, TransactionalStore,
+    CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore, ProjectionCheckpoint,
+    ProjectionStore, RebuildState, RebuildStatus, RelationalStore, SearchDocument, SearchQuery,
+    SearchStore, StructuredSearch, TransactionalStore,
 };
 
 /// 從 workspace 根目錄載入 `.env`（若存在）。已設定的環境變數不被覆蓋。
@@ -2033,6 +2034,161 @@ async fn retry_search<S: SearchStore>(
         last = store.search(query.clone()).await?;
     }
     Ok(last)
+}
+
+/// `ProjectionStore` 的契約（V0.2 Phase 0f）。
+///
+/// **未來的 `storage-neo4j` 也必須通過這一支。** 這裡驗的五件事全部都是
+/// 「做錯了不會報錯，只會讓運維看到一個假的數字」的那一類：
+///
+/// 1. 沒有 checkpoint 時 lag 是 `None` 而不是 `0`——0 會被讀成「沒落後」，
+///    一個從來沒跑過的投影在儀表板上就變成健康的。
+/// 2. checkpoint 寫完立刻讀得到（OpenSearch 需要明確 refresh）。
+///    讀到舊值的話下一批的累加會從舊值開始，計數永遠停在原地。
+/// 3. 沒有重建記錄時回 `Idle` 而不是 `Err`。
+/// 4. `save_checkpoint` 與 `set_rebuild_status` **不會互相蓋掉**——
+///    兩者若存在同一列而用整列覆寫實作，寫 checkpoint 就會清掉上次的重建紀錄。
+/// 5. `reset_projection` 之後回到初始狀態，且對不存在的投影也是 `Ok`（冪等）。
+///
+/// `projection` 必須是**本次測試專屬**的名字：這一列的鍵就是投影名，
+/// 寫死的話多個測試會互相覆寫對方的 checkpoint。
+pub async fn assert_projection_store_contract<S: ProjectionStore>(
+    store: &S,
+    projection: &str,
+) -> Result<(), StorageError> {
+    let fail = |message: String| StorageError::Unknown {
+        backend: "conformance",
+        message,
+    };
+
+    let health = store.health().await?;
+    if !health.healthy {
+        return Err(StorageError::Unavailable {
+            backend: "projection",
+            message: health.message,
+        });
+    }
+
+    // --- 1. 初始狀態 ------------------------------------------------------
+    if store.checkpoint(projection).await?.is_some() {
+        return Err(fail(format!(
+            "投影 `{projection}` 從沒寫過，checkpoint 卻有值——測試用的投影名撞到了別人"
+        )));
+    }
+    let now = fixture_ts();
+    let lag = store.projection_lag(projection, now).await?;
+    if lag.lag_seconds.is_some() || lag.checkpoint.is_some() {
+        return Err(fail(format!(
+            "沒有 checkpoint 時 lag 必須是 None，實際 {:?}。\
+             回 0 會被讀成「沒落後」，而實際狀況是這個投影從來沒寫過東西",
+            lag.lag_seconds
+        )));
+    }
+    let status = store.rebuild_status(projection).await?;
+    if status.state != RebuildState::Idle {
+        return Err(fail(format!(
+            "沒有重建記錄時 rebuild_status 應為 Idle，實際 {:?}",
+            status.state
+        )));
+    }
+
+    // --- 2. checkpoint round-trip ----------------------------------------
+    let source_at = fixture_ts() - chrono::Duration::seconds(300);
+    let object_id = Uuid::now_v7();
+    let mut checkpoint = ProjectionCheckpoint::empty(projection, now);
+    checkpoint.advance(Some(source_at), Some(object_id), 42, now);
+    store.save_checkpoint(&checkpoint).await?;
+
+    let got = store
+        .checkpoint(projection)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: format!(
+                "save_checkpoint 之後立刻 checkpoint() 讀不到 `{projection}`。\
+                 OpenSearch 類後端要用 refresh=wait_for 寫入，否則下一批的累加會從舊值開始"
+            ),
+        })?;
+    assert_eq_debug("projection_checkpoint", &checkpoint, &got);
+
+    let lag = store.projection_lag(projection, now).await?;
+    if lag.lag_seconds != Some(300) {
+        return Err(fail(format!(
+            "lag 應為 now - last_source_at = 300 秒，實際 {:?}",
+            lag.lag_seconds
+        )));
+    }
+
+    // --- 3. rebuild 狀態 round-trip --------------------------------------
+    let running = RebuildStatus {
+        projection: projection.to_string(),
+        state: RebuildState::Running,
+        started_at: Some(now),
+        finished_at: None,
+        scanned: 7,
+        written: 5,
+        failed: 2,
+        last_error: Some("conformance 寫入的假錯誤".into()),
+    };
+    store.set_rebuild_status(&running).await?;
+    assert_eq_debug(
+        "rebuild_status_running",
+        &running,
+        &store.rebuild_status(projection).await?,
+    );
+
+    // --- 4. 兩者不可互相蓋掉 ----------------------------------------------
+    // checkpoint 與重建狀態常常被實作成同一列。整列覆寫的話，一次 flush 的
+    // checkpoint 寫入就會把「上次 rebuild 何時、寫了幾筆」清掉——而那正是
+    // SPEC_V0.2 §27 要顯示的東西。
+    let mut advanced = got.clone();
+    advanced.advance(
+        Some(source_at + chrono::Duration::seconds(60)),
+        Some(Uuid::now_v7()),
+        8,
+        now,
+    );
+    store.save_checkpoint(&advanced).await?;
+    let status = store.rebuild_status(projection).await?;
+    if status.state != RebuildState::Running || status.scanned != 7 {
+        return Err(fail(format!(
+            "寫 checkpoint 之後重建狀態被蓋掉了（state={:?} scanned={}）。\
+             兩者必須能各自更新，否則每次 flush 都會清掉上次 rebuild 的紀錄",
+            status.state, status.scanned
+        )));
+    }
+    let completed = RebuildStatus {
+        state: RebuildState::Completed,
+        finished_at: Some(now + chrono::Duration::seconds(30)),
+        last_error: None,
+        ..running.clone()
+    };
+    store.set_rebuild_status(&completed).await?;
+    let after = store
+        .checkpoint(projection)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "寫重建狀態之後 checkpoint 不見了——兩者必須能各自更新".into(),
+        })?;
+    assert_eq_debug("projection_checkpoint_after_status", &advanced, &after);
+
+    // --- 5. reset ---------------------------------------------------------
+    store.reset_projection(projection).await?;
+    if store.checkpoint(projection).await?.is_some() {
+        return Err(fail(
+            "reset_projection 之後 checkpoint 應回到 None（`--rebuild --drop` 要重新計數)".into(),
+        ));
+    }
+    let status = store.rebuild_status(projection).await?;
+    if status.state != RebuildState::Idle || status.written != 0 {
+        return Err(fail(format!(
+            "reset_projection 之後 rebuild_status 應回到 Idle 零值，實際 {status:?}"
+        )));
+    }
+    // 冪等：清一個不存在的投影不是錯誤。`--drop` 在第一次重建時就會走到這條路。
+    store
+        .reset_projection(&format!("{projection}-absent"))
+        .await?;
+    Ok(())
 }
 
 /// KeyValueStore：get/set/del/expire。

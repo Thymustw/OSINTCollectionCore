@@ -18,7 +18,7 @@ use core_config::AppConfig;
 use core_events::{EventConsumer, EventProducer, EventTopic};
 use core_observability::{MetricsRegistry, init_tracing};
 use indexer::batch::{BatchController, FlushReason, backpressure};
-use indexer::service::RebuildOptions;
+use indexer::service::{BatchProgress, RebuildOptions};
 use indexer::{IndexBounds, Indexer, PrepareOutcome, serve_health};
 use storage_core::SearchDocument;
 use storage_core::conformance::{
@@ -341,6 +341,8 @@ async fn flush_once(
     reason: FlushReason,
 ) {
     let submitted = batch.len();
+    // flush 會吃掉批次，所以 checkpoint 要的 (id, 來源時間戳) 得先留下來。
+    let marks = Indexer::source_marks(batch);
     let documents = std::mem::take(batch);
     let document_ids = std::mem::take(ids);
     match service.flush(documents).await {
@@ -353,6 +355,11 @@ async fn flush_once(
                 ?reason,
                 "bulk 索引完成"
             );
+            // checkpoint 在 offset 提交之前寫：失敗只 warn（見 record_checkpoint），
+            // 所以順序不影響正確性，但放在這裡才能讓「已索引」與「進度」盡量同時成立。
+            service
+                .record_checkpoint(BatchProgress::from_marks(&marks, &report))
+                .await;
             if let Err(err) = service.publish_completed(&document_ids, &report).await {
                 tracing::warn!(error = %err, "發 search.index.completed 失敗（文件已經寫進 index）");
             }

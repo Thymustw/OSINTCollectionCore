@@ -35,6 +35,12 @@ pub const F_CONNECTOR_ID: &str = "connector_id";
 pub const F_RAW_EVIDENCE_ID: &str = "raw_evidence_id";
 pub const F_PUBLISHED_AT: &str = "published_at";
 pub const F_OBSERVED_AT: &str = "observed_at";
+/// collector 取得這一份的時間。
+///
+/// 除了顯示之外，它還是 **projection checkpoint 的來源時間戳**
+/// （`ProjectionCheckpoint::last_source_at`，見 `crate::service`）。
+/// 改掉這個欄位名要同時改 `projection::source_timestamp`，否則 lag 會靜默變成 None。
+pub const F_COLLECTED_AT: &str = "collected_at";
 /// `published_at` 有值時等於它，否則等於 `observed_at`。date range 的預設過濾欄位。
 pub const F_EFFECTIVE_DATE: &str = "effective_date";
 pub const F_DUPLICATE_OF: &str = "duplicate_of";

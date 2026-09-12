@@ -1,6 +1,6 @@
 use storage_core::conformance::{
-    assert_opensearch_identity, assert_search_round_trip, assert_structured_search,
-    load_workspace_dotenv, required_env, verify_not_opencti_search,
+    assert_opensearch_identity, assert_projection_store_contract, assert_search_round_trip,
+    assert_structured_search, load_workspace_dotenv, required_env, verify_not_opencti_search,
 };
 use storage_opensearch::OpenSearchStore;
 
@@ -63,4 +63,35 @@ async fn opensearch_search_conformance() {
 
     // 一次性 index 用完刪掉，免得叢集慢慢長出幾百個 conformance index。
     store.delete_index(&index).await.expect("刪除測試 index");
+}
+
+/// `ProjectionStore`（V0.2 Phase 0f）：checkpoint／lag／rebuild 狀態／reset。
+///
+/// 狀態 index 用 **per-run 名稱**而不是正式的 `osint-projection-state`：
+/// 這一支會 `reset_projection`，跑在正式那個 index 上等於把真的 indexer 進度清掉。
+/// 用完整個刪除（`CLAUDE.md` §15：測試不可以留下 index）。
+#[tokio::test]
+async fn opensearch_projection_store_conformance() {
+    load_workspace_dotenv();
+    let url = required_env("OPENSEARCH_URL").expect("OPENSEARCH_URL");
+    let _parsed = verify_not_opencti_search(&url).expect("URL 格式或本機嚴格模式檢查失敗");
+
+    let state_index = format!("osint-core-conformance-state-{}", uuid::Uuid::now_v7());
+    let store = OpenSearchStore::connect(&url)
+        .expect("建立 client")
+        .with_projection_state_index(state_index.as_str());
+
+    let info = store.cluster_info().await.expect("GET /");
+    assert_opensearch_identity(&info).expect("必須是 OpenSearch 不是 Elasticsearch");
+    assert_eq!(store.projection_state_index(), state_index);
+
+    let projection = format!("osint-conformance-projection-{}", uuid::Uuid::now_v7());
+    let result = assert_projection_store_contract(&store, &projection).await;
+
+    // 先刪 index 再 unwrap：契約失敗時也不要留下 index。
+    store
+        .delete_index(&state_index)
+        .await
+        .expect("刪除投影狀態測試 index");
+    result.expect("ProjectionStore 契約");
 }

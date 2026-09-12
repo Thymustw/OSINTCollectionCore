@@ -1,17 +1,32 @@
 //! OpenSearch SearchStore adapter。連線 URL 由呼叫端／設定注入，不寫死 9200。
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use opensearch::http::Url;
 use opensearch::http::request::JsonBody;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::indices::{IndicesCreateParts, IndicesPutMappingParts, IndicesRefreshParts};
-use opensearch::{BulkParts, DeleteParts, IndexParts, OpenSearch, SearchParts};
+use opensearch::params::Refresh;
+use opensearch::{
+    BulkParts, DeleteParts, GetParts, IndexParts, OpenSearch, SearchParts, UpdateParts,
+};
 use serde_json::{Value, json};
 use storage_core::{
-    BulkFailure, BulkIndexResult, CapabilityDescriptor, HealthProvider, QueryExpr, SearchDocument,
+    BulkFailure, BulkIndexResult, CapabilityDescriptor, HealthProvider, ProjectionCheckpoint,
+    ProjectionLag, ProjectionStore, QueryExpr, RebuildState, RebuildStatus, SearchDocument,
     SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery, SearchStore, StorageAdapter,
     StorageError, StorageHealth, StructuredSearch,
 };
+use uuid::Uuid;
+
+/// 投影狀態的預設 index 名。
+///
+/// **刻意與被投影的 index 分開。** 放在 `osint-documents` 裡的話，
+/// `osint-indexer --rebuild --drop` 刪掉那個 index 的同一瞬間，
+/// 「上次 rebuild 何時、寫了幾筆、失敗了嗎」也一起消失——而那正是重建當下
+/// 最需要回報的東西（SPEC_V0.2 §27）。要清掉狀態只能明確呼叫
+/// [`ProjectionStore::reset_projection`]。
+pub const PROJECTION_STATE_INDEX: &str = "osint-projection-state";
 
 /// OpenSearch 搜尋投影。
 #[derive(Debug, Clone)]
@@ -19,6 +34,8 @@ pub struct OpenSearchStore {
     client: OpenSearch,
     /// 測試用：每次寫入後 refresh。正式環境應為 false。
     refresh_on_write: bool,
+    /// 投影狀態存在哪個 index。測試會換成 per-run 名稱以免互相覆寫。
+    projection_state_index: String,
 }
 
 impl OpenSearchStore {
@@ -39,6 +56,7 @@ impl OpenSearchStore {
         Ok(Self {
             client: OpenSearch::new(transport),
             refresh_on_write: false,
+            projection_state_index: PROJECTION_STATE_INDEX.to_string(),
         })
     }
 
@@ -46,6 +64,23 @@ impl OpenSearchStore {
     pub fn with_refresh_on_write(mut self, yes: bool) -> Self {
         self.refresh_on_write = yes;
         self
+    }
+
+    /// 換掉投影狀態 index 的名稱。
+    ///
+    /// **只給測試用。** conformance 與 e2e 共用同一個叢集，用預設名稱的話測試會
+    /// 往正式的狀態 index 寫東西；用 per-run 名稱才能在測試結尾整個刪掉
+    /// （`CLAUDE.md` §15：測試不可以留下 index）。
+    #[must_use]
+    pub fn with_projection_state_index(mut self, index: impl Into<String>) -> Self {
+        self.projection_state_index = index.into();
+        self
+    }
+
+    /// 目前使用的投影狀態 index 名。
+    #[must_use]
+    pub fn projection_state_index(&self) -> &str {
+        &self.projection_state_index
     }
 
     /// GET `/` 的叢集身分 JSON。測試用來確認不是 Elasticsearch。
@@ -308,9 +343,14 @@ impl HealthProvider for OpenSearchStore {
 
 impl StorageAdapter for OpenSearchStore {
     fn descriptor(&self) -> CapabilityDescriptor {
-        CapabilityDescriptor::new("opensearch", env!("CARGO_PKG_VERSION"), &["search"])
-            .with_feature("vector", Value::Bool(false))
-            .with_feature("bulk_write", Value::Bool(true))
+        CapabilityDescriptor::new(
+            "opensearch",
+            env!("CARGO_PKG_VERSION"),
+            // projection：V0.2 Phase 0f 起也實作 ProjectionStore（checkpoint／lag／rebuild 狀態）。
+            &["search", "projection"],
+        )
+        .with_feature("vector", Value::Bool(false))
+        .with_feature("bulk_write", Value::Bool(true))
     }
 }
 
@@ -487,6 +527,277 @@ impl SearchStore for OpenSearchStore {
             code => Err(StorageError::Unknown {
                 backend: "opensearch",
                 message: format!("delete 失敗：{code}"),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProjectionStore（V0.2 Phase 0f）
+// ---------------------------------------------------------------------------
+
+/// 狀態 index 的 mapping。`dynamic: strict` 的理由同 `osint-documents`：
+/// 打錯一個欄位名會被 400 擋下來，而不是靜默長出一個型別由第一筆資料猜出來的新欄位。
+fn projection_state_mappings() -> Value {
+    json!({
+        "dynamic": "strict",
+        "properties": {
+            "projection": { "type": "keyword" },
+            // checkpoint。`checkpoint_updated_at` 的「有沒有值」就是
+            // 「這個投影寫過東西沒有」——checkpoint() 靠它回 None 而不是零值。
+            "last_source_at": { "type": "date" },
+            "last_object_id": { "type": "keyword" },
+            "objects_written": { "type": "long" },
+            "checkpoint_updated_at": { "type": "date" },
+            // rebuild 狀態。`rebuild_state` 缺值代表沒有重建紀錄（Idle）。
+            "rebuild_state": { "type": "keyword" },
+            "rebuild_started_at": { "type": "date" },
+            "rebuild_finished_at": { "type": "date" },
+            "rebuild_scanned": { "type": "long" },
+            "rebuild_written": { "type": "long" },
+            "rebuild_failed": { "type": "long" },
+            // 錯誤原文可能很長（OpenSearch 的 keyword 上限 32766 bytes）。
+            // 不需要查詢它，所以 index: false。
+            "rebuild_last_error": { "type": "text", "index": false }
+        }
+    })
+}
+
+impl OpenSearchStore {
+    /// 建立（或補齊）投影狀態 index。冪等，可以每次寫入前呼叫。
+    pub async fn ensure_projection_state_index(&self) -> Result<(), StorageError> {
+        self.ensure_index_with(
+            &self.projection_state_index,
+            &json!({ "number_of_shards": 1, "number_of_replicas": 0 }),
+            &projection_state_mappings(),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// 讀狀態列的 `_source`。index 或文件不存在時回 `None`。
+    async fn projection_state_doc(&self, projection: &str) -> Result<Option<Value>, StorageError> {
+        let response = self
+            .client
+            .get(GetParts::IndexId(&self.projection_state_index, projection))
+            .send()
+            .await
+            .map_err(map_os)?;
+        let code = response.status_code().as_u16();
+        if code == 404 {
+            // 兩種 404 都是「還沒有狀態」：index 沒建（indexer 從沒跑過）
+            // 或這個投影沒有列。都不是錯誤。
+            return Ok(None);
+        }
+        if !response.status_code().is_success() {
+            return Err(StorageError::Unavailable {
+                backend: "opensearch",
+                message: format!(
+                    "讀投影狀態 `{projection}`（index `{}`）失敗：{code}",
+                    self.projection_state_index
+                ),
+            });
+        }
+        let body: Value = response.json().await.map_err(map_os)?;
+        Ok(body.get("_source").cloned())
+    }
+
+    /// 部分更新狀態列（`doc_as_upsert`）。
+    ///
+    /// **必須是部分更新，不能整列覆寫。** checkpoint 與 rebuild 狀態同在一列
+    /// （`_id` 就是投影名），整列覆寫的話每次 flush 寫 checkpoint 都會把
+    /// 「上次 rebuild 何時、寫了幾筆」清成 null——而那是 `--drop` 之後唯一還留著的資訊。
+    ///
+    /// 「寫完就讀得到」不是為了測試方便：投影 worker 下一批會先讀 checkpoint 再累加，
+    /// 讀到 refresh 前的舊值等於累積計數永遠停在原地。
+    ///
+    /// # 為什麼是 `refresh=true` 而不是 `wait_for`
+    ///
+    /// 兩者都保證讀得到，但 `wait_for` 是**等到下一次排程 refresh**，也就是等滿
+    /// `index.refresh_interval`（預設 1 秒）。2026-09-12 在本機 19200 實測同一個
+    /// 單 shard index：5 次 `_update` 用 `wait_for` 共 4985 ms（≈1 秒／次），
+    /// 用 `true` 共 44 ms（≈9 ms／次）。
+    ///
+    /// rebuild 每頁會寫兩次狀態（checkpoint + 進度），用 `wait_for` 等於每 100 份
+    /// 文件多花 2 秒純等待——重建一萬筆就是多三分鐘，而且那段時間完全沒在做事。
+    /// 這個 index 只有一個 shard、幾列文件、每批才寫一次，強制 refresh 的成本
+    /// （刷一個極小的 segment）遠低於等一個 refresh 週期。
+    ///
+    /// ⚠️ 同樣的推論**不適用於** `osint-documents`：那裡是高頻 bulk，
+    /// 每批強制 refresh 會把 segment 數量炸開。不要把這個選擇複製過去。
+    async fn update_projection_state(
+        &self,
+        projection: &str,
+        doc: Value,
+    ) -> Result<(), StorageError> {
+        self.ensure_projection_state_index().await?;
+        let response = self
+            .client
+            .update(UpdateParts::IndexId(
+                &self.projection_state_index,
+                projection,
+            ))
+            .refresh(Refresh::True)
+            .body(json!({ "doc": doc, "doc_as_upsert": true }))
+            .send()
+            .await
+            .map_err(map_os)?;
+        if response.status_code().is_success() {
+            return Ok(());
+        }
+        let code = response.status_code().as_u16();
+        let detail: Value = response.json().await.unwrap_or(Value::Null);
+        Err(StorageError::Unknown {
+            backend: "opensearch",
+            message: format!(
+                "寫投影狀態 `{projection}`（index `{}`）失敗（{code}）：{}。\
+                 400 strict_dynamic_mapping_exception 代表狀態欄位有新增卻沒改 mapping，\
+                 請看 storage-opensearch 的 projection_state_mappings()",
+                self.projection_state_index,
+                StorageError::sanitize(&detail.to_string())
+            ),
+        })
+    }
+}
+
+fn state_ts(source: &Value, key: &str) -> Option<DateTime<Utc>> {
+    source
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|at| at.with_timezone(&Utc))
+}
+
+fn state_u64(source: &Value, key: &str) -> u64 {
+    source.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+#[async_trait]
+impl ProjectionStore for OpenSearchStore {
+    async fn checkpoint(
+        &self,
+        projection: &str,
+    ) -> Result<Option<ProjectionCheckpoint>, StorageError> {
+        let Some(source) = self.projection_state_doc(projection).await? else {
+            return Ok(None);
+        };
+        // 只有 rebuild 狀態、沒有 checkpoint 的列是正常的（跑了 rebuild 但一筆都沒寫）。
+        // 那種情況要回 None，不是回一個 objects_written = 0 的假 checkpoint。
+        let Some(updated_at) = state_ts(&source, "checkpoint_updated_at") else {
+            return Ok(None);
+        };
+        Ok(Some(ProjectionCheckpoint {
+            projection: projection.to_string(),
+            last_source_at: state_ts(&source, "last_source_at"),
+            last_object_id: source
+                .get("last_object_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok()),
+            objects_written: state_u64(&source, "objects_written"),
+            updated_at,
+        }))
+    }
+
+    async fn save_checkpoint(&self, checkpoint: &ProjectionCheckpoint) -> Result<(), StorageError> {
+        self.update_projection_state(
+            &checkpoint.projection,
+            json!({
+                "projection": checkpoint.projection,
+                "last_source_at": checkpoint.last_source_at,
+                "last_object_id": checkpoint.last_object_id.map(|id| id.to_string()),
+                "objects_written": checkpoint.objects_written,
+                "checkpoint_updated_at": checkpoint.updated_at,
+            }),
+        )
+        .await
+    }
+
+    async fn projection_lag(
+        &self,
+        projection: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProjectionLag, StorageError> {
+        Ok(ProjectionLag::from_checkpoint(
+            self.checkpoint(projection).await?,
+            now,
+        ))
+    }
+
+    async fn rebuild_status(&self, projection: &str) -> Result<RebuildStatus, StorageError> {
+        let Some(source) = self.projection_state_doc(projection).await? else {
+            return Ok(RebuildStatus::idle(projection));
+        };
+        let Some(state) = source.get("rebuild_state") else {
+            return Ok(RebuildStatus::idle(projection));
+        };
+        // 認不出來的狀態字串**不能**默默當成 Idle：那會讓「重建中」看起來像
+        // 「沒有人在重建」，於是有人再開一個重建。寧可回錯誤讓人去看那一列。
+        let state: RebuildState =
+            serde_json::from_value(state.clone()).map_err(|err| StorageError::Unknown {
+                backend: "opensearch",
+                message: format!(
+                    "投影 `{projection}` 的 rebuild_state 是無法識別的值 {state}：{err}。\
+                     請檢查 index `{}` 的那一列",
+                    self.projection_state_index
+                ),
+            })?;
+        Ok(RebuildStatus {
+            projection: projection.to_string(),
+            state,
+            started_at: state_ts(&source, "rebuild_started_at"),
+            finished_at: state_ts(&source, "rebuild_finished_at"),
+            scanned: state_u64(&source, "rebuild_scanned"),
+            written: state_u64(&source, "rebuild_written"),
+            failed: state_u64(&source, "rebuild_failed"),
+            last_error: source
+                .get("rebuild_last_error")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    async fn set_rebuild_status(&self, status: &RebuildStatus) -> Result<(), StorageError> {
+        self.update_projection_state(
+            &status.projection,
+            json!({
+                "projection": status.projection,
+                "rebuild_state": status.state,
+                "rebuild_started_at": status.started_at,
+                "rebuild_finished_at": status.finished_at,
+                "rebuild_scanned": status.scanned,
+                "rebuild_written": status.written,
+                "rebuild_failed": status.failed,
+                // 呼叫端應該已經 sanitize 過（trait 契約）。這裡再過一次：
+                // 少一個地方忘了過就是一次 DSN 外洩，而成本只是一次字串掃描。
+                "rebuild_last_error": status
+                    .last_error
+                    .as_deref()
+                    .map(StorageError::sanitize),
+            }),
+        )
+        .await
+    }
+
+    async fn reset_projection(&self, projection: &str) -> Result<(), StorageError> {
+        let response = self
+            .client
+            .delete(DeleteParts::IndexId(
+                &self.projection_state_index,
+                projection,
+            ))
+            .refresh(Refresh::True)
+            .send()
+            .await
+            .map_err(map_os)?;
+        match response.status_code().as_u16() {
+            // 404 有兩種（index 不存在／列不存在），都代表「已經沒有狀態了」。
+            200 | 201 | 404 => Ok(()),
+            code => Err(StorageError::Unknown {
+                backend: "opensearch",
+                message: format!(
+                    "清除投影狀態 `{projection}`（index `{}`）失敗：{code}",
+                    self.projection_state_index
+                ),
             }),
         }
     }

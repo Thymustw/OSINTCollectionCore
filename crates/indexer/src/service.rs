@@ -29,12 +29,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use core_events::{EventProducer, EventTopic};
 use core_model::Document;
 use core_observability::MetricsRegistry;
 use serde_json::{Value, json};
-use storage_core::{BulkFailure, RelationalStore, SearchDocument, SearchStore};
+use storage_core::{
+    BulkFailure, ProjectionCheckpoint, ProjectionStore, RebuildState, RebuildStatus,
+    RelationalStore, SearchDocument, SearchStore, StorageError,
+};
 use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
 use uuid::Uuid;
@@ -96,6 +99,65 @@ pub enum PrepareOutcome {
     },
     /// 事件提到的 Document 不在 DB。
     Missing { document_id: Uuid },
+}
+
+/// 批次裡一筆文件的 (id, 來源時間戳)。
+///
+/// 存在的理由是 [`Indexer::flush`] **會吃掉整個批次**（`Vec<SearchDocument>` by value），
+/// 而 checkpoint 要在 flush **之後**才能知道哪幾筆成功。所以在 flush 之前先留下這份
+/// 精簡副本；整批 clone 一次只為了寫 checkpoint 是白花的記憶體（`_source` 可含 256 KiB 正文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMark {
+    /// OpenSearch 的 `_id`，也就是 `Document.id` 的字串形式。
+    pub id: String,
+    pub source_at: Option<DateTime<Utc>>,
+}
+
+/// 一批寫入對 projection checkpoint 的貢獻。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BatchProgress {
+    /// 本批**成功寫入者**之中最大的來源時間戳。
+    pub last_source_at: Option<DateTime<Utc>>,
+    /// 與 `last_source_at` 成對的那一筆 document id。
+    pub last_object_id: Option<Uuid>,
+    /// 成功寫入的筆數。
+    pub written: u64,
+}
+
+impl BatchProgress {
+    /// 從本批的 [`SourceMark`] 與 flush 結果算出進度。
+    ///
+    /// **永久性失敗的那幾筆會被排除。** checkpoint 的語意是「最後一筆**成功寫入**的
+    /// 來源物件」；把失敗的那筆算進去，checkpoint 就會宣稱進度已經過了它，
+    /// 而它其實不在 index 裡——lag 看起來正常，資料卻少一筆。
+    #[must_use]
+    pub fn from_marks(marks: &[SourceMark], report: &FlushReport) -> Self {
+        let failed: Vec<&str> = report
+            .permanent_failures
+            .iter()
+            .map(|failure| failure.id.as_str())
+            .collect();
+        let mut progress = Self {
+            written: u64::from(report.indexed),
+            ..Self::default()
+        };
+        for mark in marks {
+            if failed.contains(&mark.id.as_str()) {
+                continue;
+            }
+            let Some(source_at) = mark.source_at else {
+                continue;
+            };
+            if progress
+                .last_source_at
+                .is_none_or(|current| source_at > current)
+            {
+                progress.last_source_at = Some(source_at);
+                progress.last_object_id = Uuid::parse_str(&mark.id).ok();
+            }
+        }
+        progress
+    }
 }
 
 /// 一次 flush 的結果。
@@ -161,7 +223,13 @@ impl Indexer {
     }
 
     /// 建立（或補齊）index 的 settings 與 mapping。啟動時與 rebuild 前都會呼叫。
+    ///
+    /// 同時建立投影狀態 index（`osint-projection-state`）。在這裡一起做是為了
+    /// **啟動時就發現 mapping 寫錯**——留到第一次 flush 才建的話，那個 400 會出現在
+    /// 一個只 warn 的路徑上（見 [`Indexer::record_checkpoint`]），等於永遠沒有 checkpoint
+    /// 而服務看起來完全正常。
     pub async fn ensure_index(&self) -> Result<bool, IndexerError> {
+        self.search.ensure_projection_state_index().await?;
         let created = self
             .search
             .ensure_index_with(
@@ -370,6 +438,84 @@ impl Indexer {
         Ok(report)
     }
 
+    /// 本批每一筆的 (id, 來源時間戳)。**在 [`Indexer::flush`] 之前呼叫**——
+    /// flush 會吃掉批次。
+    #[must_use]
+    pub fn source_marks(batch: &[SearchDocument]) -> Vec<SourceMark> {
+        batch
+            .iter()
+            .map(|document| SourceMark {
+                id: document.id.clone(),
+                source_at: projection::source_timestamp(&document.body),
+            })
+            .collect()
+    }
+
+    /// 把一批的進度寫進 projection checkpoint。
+    ///
+    /// # 失敗只 warn，不回錯
+    ///
+    /// checkpoint 是**可觀測性**，不是資料路徑：文件已經進 OpenSearch 了，
+    /// 為了一筆進度寫不進去而讓整批重送（或讓 offset 不提交）只會把問題放大。
+    /// 但 warn 必須講清楚後果——**lag 會停在舊值**，於是儀表板上看起來像投影卡住，
+    /// 而實際卡住的只有這個計數器。沒寫清楚的話下一個人會去查一個不存在的 backlog。
+    ///
+    /// # 併發限制（已知）
+    ///
+    /// 累加是「讀 → 加 → 寫」，沒有 `if_seq_no` 樂觀鎖。同一個投影跑**兩個以上**
+    /// indexer 實例時 `objects_written` 會少算（後寫的覆蓋前寫的）。
+    /// `last_source_at` 因為只前進，最壞情況是慢一批才更新。
+    /// V0.2 的部署假設是一個投影一個 writer；要多 writer 得加上 seq_no 條件更新。
+    pub async fn record_checkpoint(&self, progress: BatchProgress) {
+        if progress.written == 0 && progress.last_source_at.is_none() {
+            return;
+        }
+        let now = Utc::now();
+        let existing = match self.search.checkpoint(&self.index).await {
+            Ok(existing) => existing,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    projection = %self.index,
+                    "讀不到 projection checkpoint，本批的進度不會被累加。\
+                     索引本身不受影響；後果是 projection lag 會停在舊值（看起來像投影落後）"
+                );
+                return;
+            }
+        };
+        let mut checkpoint =
+            existing.unwrap_or_else(|| ProjectionCheckpoint::empty(&self.index, now));
+        checkpoint.advance(
+            progress.last_source_at,
+            progress.last_object_id,
+            progress.written,
+            now,
+        );
+        if let Err(err) = self.search.save_checkpoint(&checkpoint).await {
+            tracing::warn!(
+                error = %err,
+                projection = %self.index,
+                objects_written = checkpoint.objects_written,
+                "寫不進 projection checkpoint。索引本身不受影響（文件已經在 index 裡），\
+                 後果是 projection lag 會停在舊值、累積計數少算這一批——\
+                 看起來像投影落後，實際落後的只有這個計數器"
+            );
+        }
+    }
+
+    /// 寫重建狀態；失敗只 warn。理由同 [`Indexer::record_checkpoint`]。
+    async fn record_rebuild_status(&self, status: &RebuildStatus) {
+        if let Err(err) = self.search.set_rebuild_status(status).await {
+            tracing::warn!(
+                error = %err,
+                projection = %self.index,
+                state = ?status.state,
+                "寫不進 rebuild 狀態。重建本身照常進行；後果是 Operations Center 會顯示\
+                 過時的（或完全沒有）重建進度，`--rebuild` 的最終結果請看本行之後的 log 與 exit code"
+            );
+        }
+    }
+
     /// 發 `search.index.completed`。
     pub async fn publish_completed(
         &self,
@@ -464,7 +610,19 @@ impl Indexer {
     /// 每處理完一頁就記一次 info log（掃過幾筆、寫了幾筆）。V0.1 沒有可查詢的
     /// 進度 endpoint；長時間重建請看 log 或 `/metrics`。
     pub async fn rebuild(&self, options: RebuildOptions) -> Result<RebuildReport, IndexerError> {
+        let started_at = Utc::now();
         if options.drop_index {
+            // 狀態要在刪 index **之前**清掉，順序不能反：先寫 Running 再 reset，
+            // 那個 Running 會被 reset 一起清掉，於是重建過程中 rebuild_status 是 Idle——
+            // 看起來像沒有人在重建，於是有人再開一個。
+            if let Err(err) = self.search.reset_projection(&self.index).await {
+                tracing::warn!(
+                    error = %err,
+                    projection = %self.index,
+                    "清不掉舊的 projection 狀態。重建照常進行，但 objects_written 會從舊值\
+                     繼續累加（--drop 之後應該歸零），那個計數之後會偏高"
+                );
+            }
             let existed = self.search.delete_index(&self.index).await?;
             tracing::warn!(
                 index = %self.index,
@@ -474,6 +632,47 @@ impl Indexer {
         }
         self.ensure_index().await?;
 
+        let mut status = RebuildStatus {
+            projection: self.index.clone(),
+            state: RebuildState::Running,
+            started_at: Some(started_at),
+            finished_at: None,
+            scanned: 0,
+            written: 0,
+            failed: 0,
+            last_error: None,
+        };
+        self.record_rebuild_status(&status).await;
+
+        let result = self.rebuild_pages(options, &mut status).await;
+
+        status.finished_at = Some(Utc::now());
+        match &result {
+            Ok(report) => {
+                status.state = RebuildState::Completed;
+                status.scanned = report.scanned;
+                status.written = report.indexed;
+                status.failed = report.failed.len() as u64;
+                // 部分文件永久性失敗**仍然是 Completed**：重建確實跑完了，
+                // 失敗筆數在 `failed` 欄位。把它當 Failed 會讓「跑不完」與
+                // 「跑完了但有 3 筆 mapping 不符」變成同一個狀態，處理方式完全不同。
+            }
+            Err(err) => {
+                status.state = RebuildState::Failed;
+                status.last_error = Some(StorageError::sanitize(&err.to_string()));
+            }
+        }
+        self.record_rebuild_status(&status).await;
+        result
+    }
+
+    /// `rebuild` 的主迴圈。拆出來是為了讓外層無論成功或失敗都能寫一次最終狀態——
+    /// 內層到處是 `?`，混在一起寫的話早退路徑會讓狀態永遠停在 `Running`。
+    async fn rebuild_pages(
+        &self,
+        options: RebuildOptions,
+        status: &mut RebuildStatus,
+    ) -> Result<RebuildReport, IndexerError> {
         let page_size = options.page_size.clamp(1, 100);
         let mut report = RebuildReport::default();
         let mut cursor: Option<Uuid> = None;
@@ -509,13 +708,25 @@ impl Indexer {
             }
 
             if !batch.is_empty() {
+                let marks = Self::source_marks(&batch);
                 let flushed = self.flush(batch).await?;
                 report.indexed += u64::from(flushed.indexed);
                 report
                     .failed
                     .extend(flushed.permanent_failures.iter().map(|f| f.id.clone()));
+                // checkpoint 在重建時照樣寫。掃描是 id DESC（最新在前），所以第二頁
+                // 之後的來源時間戳比第一頁舊——靠 `ProjectionCheckpoint::advance`
+                // 的「只前進」保證 checkpoint 不會被倒退回最舊那一頁。
+                self.record_checkpoint(BatchProgress::from_marks(&marks, &flushed))
+                    .await;
                 self.publish_completed(&ids, &flushed).await?;
             }
+
+            // 每頁更新一次進度，長時間重建才看得到它在動（SPEC_V0.2 §27 的 reindex jobs）。
+            status.scanned = report.scanned;
+            status.written = report.indexed;
+            status.failed = report.failed.len() as u64;
+            self.record_rebuild_status(status).await;
 
             tracing::info!(
                 scanned = report.scanned,
@@ -582,6 +793,125 @@ mod tests {
         );
         assert!(bounds.max_field_bytes > 0);
         assert!(bounds.lag_threshold > 0);
+    }
+
+    fn mark(id: Uuid, source_at: DateTime<Utc>) -> SourceMark {
+        SourceMark {
+            id: id.to_string(),
+            source_at: Some(source_at),
+        }
+    }
+
+    #[test]
+    fn batch_progress_takes_the_newest_source_timestamp() {
+        let older = Uuid::now_v7();
+        let newer = Uuid::now_v7();
+        let now = Utc::now();
+        let marks = vec![
+            mark(older, now - chrono::Duration::seconds(600)),
+            mark(newer, now),
+        ];
+        let report = FlushReport {
+            submitted: 2,
+            indexed: 2,
+            ..FlushReport::default()
+        };
+        let progress = BatchProgress::from_marks(&marks, &report);
+        assert_eq!(progress.last_source_at, Some(now));
+        assert_eq!(progress.last_object_id, Some(newer));
+        assert_eq!(progress.written, 2);
+    }
+
+    #[test]
+    fn batch_progress_skips_permanently_failed_documents() {
+        // 失敗那筆若被算進 checkpoint，進度就宣稱已經過了它，而它不在 index 裡——
+        // lag 看起來正常，資料卻少一筆。
+        let ok = Uuid::now_v7();
+        let bad = Uuid::now_v7();
+        let now = Utc::now();
+        let marks = vec![
+            mark(ok, now - chrono::Duration::seconds(60)),
+            mark(bad, now),
+        ];
+        let report = FlushReport {
+            submitted: 2,
+            indexed: 1,
+            permanent_failures: vec![BulkFailure {
+                id: bad.to_string(),
+                status: 400,
+                reason: "mapping 不符".into(),
+            }],
+            retries: 0,
+        };
+        let progress = BatchProgress::from_marks(&marks, &report);
+        assert_eq!(progress.last_object_id, Some(ok));
+        assert_eq!(
+            progress.last_source_at,
+            Some(now - chrono::Duration::seconds(60))
+        );
+        assert_eq!(progress.written, 1);
+    }
+
+    #[test]
+    fn batch_progress_without_timestamps_still_counts() {
+        // 舊版投影寫的文件沒有可解析的 collected_at。計數要照算，
+        // 但 last_source_at 維持 None——不要編一個時間戳進去假裝沒落後。
+        let marks = vec![SourceMark {
+            id: Uuid::now_v7().to_string(),
+            source_at: None,
+        }];
+        let report = FlushReport {
+            submitted: 1,
+            indexed: 1,
+            ..FlushReport::default()
+        };
+        let progress = BatchProgress::from_marks(&marks, &report);
+        assert_eq!(progress.last_source_at, None);
+        assert_eq!(progress.last_object_id, None);
+        assert_eq!(progress.written, 1);
+    }
+
+    #[test]
+    fn source_marks_are_read_from_the_projection_body() {
+        let document = Document {
+            id: Uuid::now_v7(),
+            object_type: core_model::DocumentType::Article,
+            schema_version: "1".into(),
+            title: None,
+            body: None,
+            summary: None,
+            language: None,
+            author: None,
+            published_at: None,
+            modified_at: None,
+            observed_at: Utc::now(),
+            collected_at: Utc::now(),
+            source_url: None,
+            canonical_url: None,
+            normalized_content_hash: None,
+            confidence: 1.0,
+            labels: Vec::new(),
+            attributes: json!({}),
+            external_key: None,
+            simhash: None,
+            duplicate_of: None,
+        };
+        let batch = vec![projection::build_search_document(
+            "osint-documents-test",
+            &document,
+            Provenance::default(),
+            &[],
+            Utc::now(),
+            4096,
+        )];
+        let marks = Indexer::source_marks(&batch);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].id, document.id.to_string());
+        assert_eq!(
+            marks[0].source_at,
+            Some(document.collected_at),
+            "checkpoint 的來源時間戳必須從投影裡讀得回來"
+        );
     }
 
     #[test]
