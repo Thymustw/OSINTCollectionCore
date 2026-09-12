@@ -1,4 +1,4 @@
-# Repository layout（V0.2 Phase 1c：26 個 crate；V0.1 的 6 個服務仍在，resolver 目前是函式庫）
+# Repository layout（V0.2 Phase 1e：27 個 crate；V0.1 的 6 個服務仍在，resolver／merge 目前是函式庫）
 
 Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.85.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 stable channel。
 
@@ -33,6 +33,7 @@ crates/
   deduplicator/          去重服務（osint-deduplicator）：object.normalized → DuplicateGroup（SPEC §15／§16）
   entity-worker/         抽取服務（osint-entity-worker）：dedup.completed → Entity/Relationship/Evidence（SPEC §17／§11／§12）
   resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／graph_context；無獨立 binary
+  merge/                 Entity merge／undo（SPEC_V0.2 §7）：execute_merge／undo_merge；無獨立 binary
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/MinIO，不經 core-api
   acceptance/            跨服務驗收測試（SPEC §26 Acceptance F、failure/recovery）。無生產程式碼

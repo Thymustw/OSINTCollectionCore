@@ -175,6 +175,8 @@ SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / 
 `put_resolution_candidate`，以及 `EmbeddingProvider`／`GraphStore`。
 `entity_identifiers` 的寫入衝突路徑仍由 entity-worker 呼叫
 `find_entity_identifier_owner`／`put_resolution_candidate`。
+`crates/merge` 會在交易裡呼叫 `list_*`／`put_*`／`delete_relationship`／
+`put_merge_history`（見 `docs/developer/merge.md`）。
 graph-worker／DLQ 重放仍沒有生產呼叫端。
 
 | 方法 | 排序／契約 |

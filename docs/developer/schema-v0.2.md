@@ -36,7 +36,10 @@ V0.1 的 schema 慣例（PG vs SQLite 型別對照、cursor 分頁規則）見 `
 > `entity-worker` 會為 Domain／Ip／Url／Email／Vulnerability 寫
 > `entity_identifiers`（Hash／Person／Organization 刻意不寫，見
 > `docs/developer/entity-worker.md`）。
-> `entity_aliases`／`merge_history`／`failed_events` 仍沒有生產寫入者。
+> `crates/merge` 會寫 `merge_history`（含 `repointed_references`／`merged_relationships`）
+> 並改 `entities.merged_into`、repoint alias／identifier／extraction／relationship。
+> `entity_aliases` 目前只有 merge 會改寫既有列，還沒有獨立的生產寫入者。
+> `failed_events` 仍沒有生產寫入者。
 
 ### 規格沒寫、資料表必須補的欄位
 
@@ -130,8 +133,9 @@ ADR-008 指定 V0.2 用 canonical 表而不是 Redpanda DLQ topic（topic 會過
 `migrations/postgres/0008_v0_2_entity_merge_columns.sql` 與
 `migrations/sqlite/0008_v0_2_entity_merge_columns.sql`。
 
-這次**只擴欄位**，沒有 merge 執行邏輯（那是下一棒）。兩個欄位都是為了讓 merge
-可以 undo，而且不違反既有外鍵。
+兩個欄位都是為了讓 merge 可以 undo，而且不違反既有外鍵。
+執行邏輯在 `crates/merge`（`MergeService::execute_merge`／`undo_merge`），
+見 `docs/developer/merge.md`。
 
 | 欄位 | 型別（PG / SQLite） | 用途 |
 |---|---|---|

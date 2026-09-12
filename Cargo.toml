@@ -24,6 +24,7 @@ members = [
     "crates/deduplicator",
     "crates/entity-worker",
     "crates/resolver",
+    "crates/merge",
     "crates/indexer",
     "crates/osint-cli",
     # 跨服務驗收測試（SPEC §26 Acceptance F、TEST_STRATEGY §6）。沒有生產程式碼。
@@ -116,6 +117,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 ] }
 storage-core = { path = "crates/storage-core" }
 resolver = { path = "crates/resolver" }
+merge = { path = "crates/merge" }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal"] }
 tower = { version = "0.5.3", features = ["limit", "util"] }
