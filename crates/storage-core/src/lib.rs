@@ -8,14 +8,18 @@ pub mod codec;
 pub mod conformance;
 pub mod error;
 pub mod health;
+pub mod mock;
 pub mod traits;
 
 pub use capability::{CapabilityDescriptor, StorageAdapter};
 pub use error::StorageError;
 pub use health::{HealthProvider, StorageHealth};
 pub use traits::{
-    BulkFailure, BulkIndexResult, CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore,
+    BulkFailure, BulkIndexResult, CanonicalStore, EmbeddedStore, EmbeddingKind, EmbeddingModelRef,
+    EmbeddingProvider, EmbeddingRequest, EmbeddingVector, GraphEdge, GraphNode, GraphPath,
+    GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, KeyValueStore, ObjectStore,
     ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr, RebuildState, RebuildStatus,
     RelationalStore, SearchDocument, SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery,
     SearchStore, SimhashCandidate, SortField, StructuredSearch, Transaction, TransactionalStore,
+    embedding_content_hash,
 };

@@ -1069,6 +1069,302 @@ pub trait ProjectionStore: HealthProvider {
     async fn reset_projection(&self, projection: &str) -> Result<(), StorageError>;
 }
 
+// ---------------------------------------------------------------------------
+// GraphStore（V0.2 Phase 0g）
+// ---------------------------------------------------------------------------
+
+/// 圖投影上的一個節點。
+///
+/// `entity_type` 用 `String` 而不是 [`core_model::EntityType`]：圖投影的節點
+/// 不保證都來自那份封閉列舉（之後 STIX 匯入、文件節點都可能進來），
+/// Neo4j label 本身也是字串。過濾條件 [`GraphTraversalOptions::entity_types`]
+/// 同樣是字串，呼叫端自己負責與寫入時一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub entity_id: EntityId,
+    pub entity_type: String,
+    pub display_name: String,
+    pub attributes: Value,
+}
+
+/// 圖投影上的一條邊。對應 canonical 的 [`Relationship`]，但只帶投影查詢需要的欄位。
+///
+/// PostgreSQL 仍是 relationship truth（SPEC_V0.2 §8）；這裡是投影視圖，
+/// 重建後必須能從 canonical 完整還原。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub relationship_id: RelationshipId,
+    pub source: EntityId,
+    pub target: EntityId,
+    pub relationship_type: String,
+    pub confidence: f64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+/// 圖遍歷的共用過濾條件。對齊 SPEC_V0.2 §9：one hop / multi hop、
+/// relation type filter、entity type filter、confidence threshold、time range。
+///
+/// `max_hops` 沒有後端中立的上限，但**不可無界**——adapter 必須自己夾一個
+/// 硬上限（mock 夾 32）。`u32::MAX` 丟進 Neo4j 會變成一次掃完整張圖。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphTraversalOptions {
+    /// `1` = 一跳鄰居。`0` 表示不走邊（neighbors／relationships 回空）。
+    pub max_hops: u32,
+    pub relationship_types: Option<Vec<String>>,
+    pub entity_types: Option<Vec<String>>,
+    pub min_confidence: Option<f64>,
+    /// 邊的觀測區間必須與這個閉區間**重疊**（`first_seen <= to && last_seen >= from`）。
+    /// 用 `last_seen` 落在區間內會漏掉「很早就出現、一直活到現在」的邊。
+    pub time_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
+}
+
+impl GraphTraversalOptions {
+    /// 一跳、不過濾。Graph API 的預設。
+    #[must_use]
+    pub fn one_hop() -> Self {
+        Self {
+            max_hops: 1,
+            relationship_types: None,
+            entity_types: None,
+            min_confidence: None,
+            time_range: None,
+        }
+    }
+}
+
+impl Default for GraphTraversalOptions {
+    fn default() -> Self {
+        Self::one_hop()
+    }
+}
+
+/// `POST /graph/query` 的結構化查詢形狀。
+///
+/// # 為什麼不是字串
+///
+/// 理由同 [`SearchQuery`]：使用者輸入的 Cypher／Gremlin **永遠不能**進到後端。
+/// 那條路徑等於把整張圖的任意讀（以及部分寫，視授權）交給呼叫端，
+/// 而且每個 adapter 的查詢語言不同，domain 一旦依賴字串就再也換不了後端。
+/// 呼叫端把意圖編成這棵樹，adapter 再翻成 Cypher／Gremlin。
+///
+/// 沒有「原始查詢字串」的後門方法。運維臨時查詢走 Neo4j Browser，不走這個 trait。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphQuery {
+    /// 遍歷起點。空的回 [`StorageError::ConstraintViolation`]——「從哪裡開始」
+    /// 是查詢的一部分，缺了就不是查詢。
+    pub starts: Vec<EntityId>,
+    pub pattern: GraphPattern,
+    pub options: GraphTraversalOptions,
+}
+
+/// 結構化圖查詢要走的形狀。對齊 SPEC_V0.2 §9 的四種讀 API。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum GraphPattern {
+    /// 從 `starts` 出發、最多 `max_hops` 跳的鄰居節點。每個結果 path 是
+    /// `[start, …, neighbor]`。
+    Neighbors,
+    /// 同上，但呼叫端要的是邊上的資料而不是節點。每個結果 path 至少含一條邊。
+    Relationships,
+    /// 從 `starts` 的每一點走到 `to` 的最短路徑。找不到回空 vec，不是 `Err`。
+    ShortestPath { to: EntityId },
+    /// 有界散步：從 `starts` 出發、最多 `max_hops` 跳。`end` 有值時只保留
+    /// 停在那些節點的 path。
+    BoundedWalk { end: Option<Vec<EntityId>> },
+}
+
+/// 一條遍歷結果。`nodes[i] --edges[i]--> nodes[i+1]`，所以
+/// `edges.len() + 1 == nodes.len()`（單節點、沒有邊的 path 也合法，
+/// 例如 `shortest_path(a, a)`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphPath {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// 圖投影的寫入與查詢（SPEC_V0.2 §8／§9）。
+///
+/// PostgreSQL 仍是 relationship truth；Neo4j 只是投影。寫入面對應
+/// graph-worker 同步進來的實體／關係，查詢面對應 Graph API 的五個端點
+/// （rebuild 走 [`ProjectionStore`]，不在這裡）。
+///
+/// # 與 `ProjectionStore` 的關係
+///
+/// Neo4j adapter（V0.2 Phase 2 的 `storage-neo4j`）**通常也需要實作
+/// [`ProjectionStore`]**（見 Phase 0f）：checkpoint／lag／rebuild 狀態
+/// 是投影契約，跟圖遍歷是兩件事。同一個 adapter 實作兩個 trait，
+/// 但呼叫端（core-api 的 `GET /graph/...`）不需要也不該碰得到
+/// `reset_projection`。
+///
+/// # 邊的方向
+///
+/// `neighbors`／`relationships`／`shortest_path`／`query` 都把邊當**無向**
+/// 來看——情報圖問「這個實體連到誰」時，incoming 與 outgoing 同等重要。
+/// 過濾 `relationship_types` 看的是型別字串，不看方向。
+#[async_trait]
+pub trait GraphStore: HealthProvider {
+    async fn upsert_node(&self, node: &GraphNode) -> Result<(), StorageError>;
+    async fn upsert_edge(&self, edge: &GraphEdge) -> Result<(), StorageError>;
+    /// 刪節點，並**連帶刪掉**所有以它為端點的邊。
+    ///
+    /// 不連帶刪的話，圖上會留下指向不存在節點的邊，shortest path 與
+    /// rebuild 對帳都會 silently 算錯。不存在時也回 `Ok`（冪等）。
+    async fn delete_node(&self, entity_id: &EntityId) -> Result<(), StorageError>;
+    /// 刪單一邊。不存在時也回 `Ok`（冪等）。
+    async fn delete_edge(&self, relationship_id: &RelationshipId) -> Result<(), StorageError>;
+    async fn neighbors(
+        &self,
+        entity_id: &EntityId,
+        options: &GraphTraversalOptions,
+    ) -> Result<Vec<GraphNode>, StorageError>;
+    async fn relationships(
+        &self,
+        entity_id: &EntityId,
+        options: &GraphTraversalOptions,
+    ) -> Result<Vec<GraphEdge>, StorageError>;
+    /// 找不到路徑回 `Ok(None)`，不是 `Err`——「這兩點沒連上」是查詢結果，
+    /// 不是儲存故障。起點或終點節點不存在也回 `None`（同一理由）。
+    async fn shortest_path(
+        &self,
+        from: &EntityId,
+        to: &EntityId,
+        options: &GraphTraversalOptions,
+    ) -> Result<Option<GraphPath>, StorageError>;
+    /// `POST /graph/query` 對應的自由查詢面。吃 [`GraphQuery`]，
+    /// **不吃**使用者原始 Cypher／Gremlin 字串。
+    async fn query(&self, query: &GraphQuery) -> Result<Vec<GraphPath>, StorageError>;
+}
+
+// ---------------------------------------------------------------------------
+// EmbeddingProvider（V0.2 Phase 0g）
+// ---------------------------------------------------------------------------
+
+/// 這段文字在非對稱 embedding 裡扮演哪一端。
+///
+/// e5 系列的模型卡要求查詢加 `query: `、被索引的文件加 `passage: `。
+/// MiniLM **不加**前綴。要不要加、加哪個，是實作依選中的模型決定的——
+/// 呼叫端只宣告意圖，不要自己拼前綴（拼錯或漏拼會靜默降低召回率，
+/// 見 `docs/developer/embedding.md` §5.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingKind {
+    Query,
+    Passage,
+}
+
+/// 一次 embedding 請求。
+///
+/// `language` 是 **BCP 47 主語言**（`en`／`zh`／`zh-Hant`），由**呼叫端**偵測後傳入。
+/// 本 trait **不做語言偵測**——OpenSearch 沒有內建偵測 processor，偵測放在
+/// Core（Rust）端；provider 只負責「這個語言用哪個模型」。
+///
+/// `None` 的語意是「語言未知」→ 走多語模型（目前是 e5），**不是**英文 MiniLM。
+/// MiniLM 的中文檢索 top-1 只有 2/5（`embedding.md` §5.2），未知語言丟給它
+/// 會靜默得到無意義的鄰居。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    pub text: String,
+    pub kind: EmbeddingKind,
+    pub language: Option<String>,
+}
+
+/// 目前會處理這個語言的模型識別。給呼叫端在**送出推論之前**決定
+/// 向量要寫進哪個 k-NN 欄位／index。
+///
+/// # 向量空間不相通
+///
+/// MiniLM 與 e5 維度都是 384，mapping 可以共用，但**兩個模型的向量空間
+/// 不相通**，混在同一個 k-NN 欄位會得到無意義的鄰居。呼叫端必須用
+/// [`EmbeddingProvider::model_for`]（或回傳的 [`EmbeddingVector::model`]）
+/// 決定目的地，不能假設「維度相同就能比」。k-NN 欄位要怎麼拆仍是
+/// SPEC §14 的未決事項；本 trait 只保證「你一定問得到是哪個模型」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingModelRef {
+    /// 例如 `"huggingface/sentence-transformers/all-MiniLM-L6-v2"` 或
+    /// `"intfloat/multilingual-e5-small-int8"`。
+    pub model: String,
+    /// 上游版本。ml-commons 的 `model_version` 欄位是它自己的遞增序號，
+    /// **不是**上游版本（`embedding.md` §2：註冊 `1.0.2` 之後文件裡是 `"1"`）。
+    /// 上游沒有可讀版本時，用內容雜湊（`model_content_hash_value`）頂替，
+    /// 不要填 `"1"`——那會讓 re-generate 判斷永遠命中不了該換模型的紀錄。
+    pub model_version: String,
+    /// 這個模型產出的維度。不要假設等於 [`EmbeddingProvider::dimensions`]。
+    pub dimensions: usize,
+}
+
+/// 一次推論的完整結果。欄位對齊 SPEC_V0.2 §11 Embedding record
+/// （`model`／`model_version`／`dimensions`／`content_hash`）——必須夠寫進
+/// 那筆 record，**不是**只回一個裸 `Vec<f32>`。
+///
+/// `content_hash` 是**原始文字**的 SHA-256（見 [`embedding_content_hash`]），
+/// 不含前綴、不含模型名。re-generate 比的是「這段內容有沒有變」，
+/// 把前綴或模型算進去會讓換前綴策略／換模型時所有 hash 一起失效，
+/// 看起來像整庫內容都被改過。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingVector {
+    pub model: String,
+    pub model_version: String,
+    pub dimensions: usize,
+    pub content_hash: String,
+    pub vector: Vec<f32>,
+}
+
+/// SPEC §11 `content_hash` 的**唯一**定義：SHA-256（小寫十六進位）打在
+/// 原始文字的 UTF-8 bytes 上，不做正規化。
+///
+/// 放在這裡而不是各呼叫端自己算，理由同 [`core_model::content_hash`]：
+/// 兩份實作遲早分岔，分岔之後 re-generate 會靜默比不中。
+///
+/// **不做** `normalize_content` 那種空白折疊——embedding 對空白敏感
+/// （前綴後面的那個空格就是語意的一部分），正規化會讓「加不加前綴」
+/// 與「原文有沒有變」纏在一起。
+#[must_use]
+pub fn embedding_content_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// 「文字 → 向量」的能力（SPEC_V0.2 §11–§14）。
+///
+/// 這不是資料庫 port。生產實作會包 OpenSearch ml-commons 的 `_predict`
+/// （或之後換的 runtime）；Phase 1 的 semantic similarity 可先注入
+/// [`crate::mock::MockEmbeddingProvider`]，或設成回
+/// [`StorageError::UnsupportedCapability`] 測「還沒接語意」的路徑。
+///
+/// # 硬約束（不要在實作裡簡化掉）
+///
+/// 1. **per-language 路由**：英文走 MiniLM、中文／其他走 e5。呼叫
+///    [`EmbeddingProvider::model_for`] 問，不要綁死一個 `model_id`。
+/// 2. **維度可問、不可寫死**：兩個模型目前都是 384，但換模型就會變。
+///    [`EmbeddingProvider::dimensions`] 回的是「這個 provider 目前的預設維度」，
+///    [`EmbeddingProvider::dimensions_for`] 回指定語言那一個。
+/// 3. **非對稱前綴**：[`EmbeddingKind`] 區分查詢與文件；實作依模型決定
+///    加不加。MiniLM 不加，e5 加。
+/// 4. **回傳必須能寫進 Embedding record**：見 [`EmbeddingVector`]。
+/// 5. **向量空間不相通**：見 [`EmbeddingModelRef`]。
+#[async_trait]
+pub trait EmbeddingProvider: HealthProvider {
+    /// 這個 provider 目前的預設維度（語言未知時會用的那個模型）。
+    ///
+    /// **不是**編譯期常數。呼叫端建 k-NN mapping 或配置向量欄位時問這裡，
+    /// 不要寫 `384`。
+    fn dimensions(&self) -> usize;
+
+    /// 指定語言會用的模型的維度。`language` 語意同 [`EmbeddingRequest::language`]。
+    fn dimensions_for(&self, language: Option<&str>) -> usize;
+
+    /// 指定語言會用哪個模型。呼叫端在推論**之前**就要知道，才能決定
+    /// 向量寫進哪個欄位／index。
+    fn model_for(&self, language: Option<&str>) -> EmbeddingModelRef;
+
+    async fn embed(&self, request: &EmbeddingRequest) -> Result<EmbeddingVector, StorageError>;
+    async fn embed_batch(
+        &self,
+        requests: &[EmbeddingRequest],
+    ) -> Result<Vec<EmbeddingVector>, StorageError>;
+}
+
 /// 快取／暫存鍵值。
 #[async_trait]
 pub trait KeyValueStore: HealthProvider {
