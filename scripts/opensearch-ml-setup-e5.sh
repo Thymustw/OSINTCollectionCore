@@ -51,7 +51,10 @@ HF_REPO="intfloat/multilingual-e5-small"
 #   curl -s https://huggingface.co/api/models/intfloat/multilingual-e5-small/tree/main/onnx
 ONNX_SHA256="dd476dd0c2514e9b9be83aeb3853fac0763e0bdf4a71645407587d77c48a2d88"
 ONNX_REMOTE="onnx/model_qint8_avx512_vnni.onnx"
-TOKENIZER_SHA256="0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39"
+# gitleaks 的 generic-api-key 規則會把「TOKENizer」當成 token 關鍵字（實測
+# 8.24.3，CI run 34690790743）。這是公開檔案 tokenizer.json 的 SHA-256，
+# 不是憑證；同檔的 ONNX_SHA256／ZIP_SHA256 沒有被抓，證明觸發的是變數名。
+TOKENIZER_SHA256="0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39" # gitleaks:allow
 
 # 打包後 zip 的 SHA-256。**這是冪等檢查唯一可靠的鍵**（理由同
 # opensearch-ml-setup.sh：ml-commons 不會存上游版本號）。
