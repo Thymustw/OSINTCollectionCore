@@ -462,6 +462,17 @@ mod tests {
         unsafe {
             std::env::remove_var("OSINT__APP__ENVIRONMENT");
             std::env::remove_var("OSINT__STORAGE__CANONICAL__POOL_MAX");
+            // GraphStorage（Phase 2 Step 2）四個欄位都有 CI/docker-compose 會設的
+            // OSINT__ 覆寫（目前只有 HTTP_URL 真的設了，但 BOLT_URI／USERNAME／
+            // PASSWORD_SECRET_REF 是同一個結構的手足欄位，清單先補齊四個，
+            // 免得下次哪個 workflow 也加了對應覆寫又重演這次的漏清問題）。
+            // 2026-09-13 CI run 34724946970 實測：clear 清單漏了 HTTP_URL，
+            // ci.yml 的 job env 設 OSINT__STORAGE__GRAPH__HTTP_URL=http://localhost:7474，
+            // 滲進 load_default_toml，斷言 "127.0.0.1" 對不上而 panic。
+            std::env::remove_var("OSINT__STORAGE__GRAPH__HTTP_URL");
+            std::env::remove_var("OSINT__STORAGE__GRAPH__BOLT_URI");
+            std::env::remove_var("OSINT__STORAGE__GRAPH__USERNAME");
+            std::env::remove_var("OSINT__STORAGE__GRAPH__PASSWORD_SECRET_REF");
         }
     }
 
