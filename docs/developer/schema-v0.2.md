@@ -30,9 +30,11 @@ V0.1 的 schema 慣例（PG vs SQLite 型別對照、cursor 分頁規則）見 `
 「是誰 undo 的」不放 `MergeHistory`，走 V0.1 既有的 `audit_log`（migration 0006）——
 那張表本來就是記「誰對哪個資源做了什麼」的地方。
 
-> ⚠️ **這個 migration 只建 schema。** V0.2 Phase 0 沒有任何服務寫這五張表
-> （resolver / graph-worker / DLQ 重放都還沒做）。跑完看到五張空表是預期結果。
-> 這與 0006 對 SQLite 的處理方式相同。
+> ⚠️ **Phase 0 只建 schema。** Phase 1c 的 `crates/resolver` 會寫
+> `resolution_candidates`（目前只有 `normalized_name` 方法會產生列）。
+> `entity_aliases`／`entity_identifiers`／`merge_history`／`failed_events`
+> 仍沒有生產寫入者（graph-worker／DLQ 重放／identifier 寫入都還沒做）。
+> 跑完 migration 看到那四張空表是預期結果。
 
 ### 規格沒寫、資料表必須補的欄位
 
@@ -74,6 +76,8 @@ SQLite 比的是 UUID 的**文字**形式，PG 比的是 16 個位元組。兩�
 代價是：**兩個 Entity 宣稱同一個識別碼時，第二次寫入會回 `StorageError::Conflict`。**
 那不是錯誤處理的邊角，那正是 resolution 要偵測的訊號。寫入端收到 `Conflict`
 應該去建一筆 `resolution_candidate`；**吞掉的話識別碼會少記一筆而且毫無跡象**。
+組候選用 `resolver::resolution_candidate_from_identifier_conflict`（純函式，不寫 store）。
+目前沒有呼叫端——entity-worker 還沒寫識別碼，見 `docs/developer/resolver.md`。
 
 ### `namespace` 與 V0.1 報告 T10
 

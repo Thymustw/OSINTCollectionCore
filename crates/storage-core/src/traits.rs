@@ -445,6 +445,15 @@ pub trait RelationalStore: HealthProvider {
         entity_id: EntityId,
         limit: u32,
     ) -> Result<Vec<EntityAlias>, StorageError>;
+    /// 反向查詢：哪些 Entity 擁有這個 alias 文字（**精確比對**，不做大小寫／正規化折疊——
+    /// 理由同 [`RelationalStore::find_entity_by_normalized_name`]：折疊放進 SQL 會走不到索引，
+    /// 兩個 backend 的 collation 規則也不同）。用 `idx_entity_aliases_alias` 索引。
+    /// 是 SPEC §6「alias」這條 resolution method 的資料來源。`limit` 夾在 1..=100。
+    async fn find_entity_aliases_by_text(
+        &self,
+        alias: &str,
+        limit: u32,
+    ) -> Result<Vec<EntityAlias>, StorageError>;
 
     /// 依主鍵 upsert 一筆識別碼。
     ///
@@ -466,6 +475,15 @@ pub trait RelationalStore: HealthProvider {
         entity_id: EntityId,
         limit: u32,
     ) -> Result<Vec<EntityIdentifier>, StorageError>;
+    /// 反向查詢：`(namespace, normalized_value)` 這個識別碼目前屬於哪個 Entity。
+    /// `entity_identifiers` 有這兩欄的 UNIQUE constraint（`idx_entity_identifiers_natural`），
+    /// 所以最多一筆——回 `Option`，不是 `Vec`。是 SPEC §6「exact identifier」／
+    /// 「domain」／「email」／「external ID」等方法反查既有 owner 的資料來源。
+    async fn find_entity_identifier_owner(
+        &self,
+        namespace: &str,
+        normalized_value: &str,
+    ) -> Result<Option<EntityIdentifier>, StorageError>;
 
     /// 依主鍵 upsert 一筆合併候選。
     ///

@@ -169,14 +169,18 @@ SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / 
 ## `RelationalStore` 的 V0.2 方法（Phase 0c）
 
 `traits.rs` 裡以 `// ===== V0.2 =====` 分隔。表在 migration `0007`。
-**目前沒有任何服務呼叫它們**（resolver / graph-worker / DLQ 重放都還沒做）。
+`crates/resolver`（Phase 1c）會呼叫 `get_entity`、`find_entity_by_normalized_name`、
+`put_resolution_candidate`。其餘 V0.2 方法（alias／identifier／merge_history／failed_events）
+以及 graph-worker／DLQ 重放仍沒有生產呼叫端。
 
 | 方法 | 排序／契約 |
 |---|---|
 | `put_entity_alias` / `get_entity_alias` | 依主鍵 upsert |
 | `list_entity_aliases_by_entity(entity_id, limit)` | `id ASC`，`limit` 1..=100 |
+| `find_entity_aliases_by_text(alias, limit)` | 精確比對 alias 文字，`id ASC`，`limit` 1..=100。resolver 反查「這個名字目前掛在哪些 Entity」 |
 | `put_entity_identifier` / `get_entity_identifier` | 依主鍵 upsert；`(namespace, normalized_value)` UNIQUE |
 | `list_entity_identifiers_by_entity(entity_id, limit)` | `id ASC`，`limit` 1..=100 |
+| `find_entity_identifier_owner(namespace, normalized_value)` | 自然鍵反查既有 owner，最多一筆。resolver 的 exact identifier／domain／email／external ID 用它找衝突 |
 | `put_resolution_candidate` / `get_resolution_candidate` | 依主鍵 upsert；CHECK `a < b` + UNIQUE `(a, b, method)` |
 | `list_resolution_candidates(status, after, limit)` | `id DESC`，cursor；`status` **在 SQL 裡**過濾，`None` = 不過濾 |
 | `put_merge_history` / `get_merge_history` | 依主鍵 upsert |

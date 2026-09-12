@@ -1,4 +1,4 @@
-# Repository layout（V0.1 Phase 7：25 個 crate、6 個服務、container image 與驗收測試）
+# Repository layout（V0.2 Phase 1c：26 個 crate；V0.1 的 6 個服務仍在，resolver 目前是函式庫）
 
 Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.85.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 stable channel。
 
@@ -32,6 +32,7 @@ crates/
   normalizer/            正規化服務（osint-normalizer）：raw.collected → Document
   deduplicator/          去重服務（osint-deduplicator）：object.normalized → DuplicateGroup（SPEC §15／§16）
   entity-worker/         抽取服務（osint-entity-worker）：dedup.completed → Entity/Relationship/Evidence（SPEC §17／§11／§12）
+  resolver/              Entity resolution（SPEC_V0.2 §5／§6）：目前只實作 normalized_name；無獨立 binary
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/MinIO，不經 core-api
   acceptance/            跨服務驗收測試（SPEC §26 Acceptance F、failure/recovery）。無生產程式碼
@@ -62,7 +63,7 @@ Manual／JSON／CSV import 不是 connector，也沒有 crate：它們是 push �
 用同一套正規化規則——兩份實作分岔不會報錯，只會悄悄產生「看起來一樣但字串不同」的重複 Entity。
 `deduplicator::url_norm` 仍以 re-export 保留原路徑。
 
-尚未加入：`storage-neo4j`、semantic search（V0.2）、自由文本 NER（V0.3，見 `entity-worker.md`）。`NetworkRule` 寫入 API 尚未接到 `core-api`（驗證函式在 `connector-sdk::validate_network_rule`）。
+尚未加入：`storage-neo4j`、resolver 的事件消費者（Phase 1h）、其餘 8 種 resolution method（見 `docs/developer/resolver.md`）、semantic search、自由文本 NER（V0.3，見 `entity-worker.md`）。`NetworkRule` 寫入 API 尚未接到 `core-api`（驗證函式在 `connector-sdk::validate_network_rule`）。
 
 API token **已經**持久化到 Postgres（Phase 6a 的 `PostgresApiTokenStore`，
 migration 0006 建 `api_tokens` 表）。SQLite 版的 `ApiTokenStore` 與 `AuditLog`

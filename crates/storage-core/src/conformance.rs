@@ -997,7 +997,7 @@ async fn assert_dedup_queries<S: RelationalStore>(
 
 /// V0.2 §3／§4／§5／§7：alias／identifier／resolution candidate／merge history。
 ///
-/// 這裡驗的重點不是「寫得進去讀得回來」，而是**四個做錯了不會報錯的地方**：
+/// 這裡驗的重點不是「寫得進去讀得回來」，而是**做錯了不會報錯的地方**：
 ///
 /// 1. `(namespace, normalized_value)` 的唯一鍵真的存在——沒有它，兩個 Entity
 ///    可以各自宣稱同一個 domain，「exact identifier」就不再是合併依據。
@@ -1132,6 +1132,37 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
     };
     store.put_entity_identifier(&other_namespace).await?;
 
+    // 反查既有 owner：UNIQUE (namespace, normalized_value) 保證最多一筆。
+    // 兩個欄位都要比到——只比其中一個會讓 resolver 把別人的識別碼當成自己的。
+    let owner = store
+        .find_entity_identifier_owner(&namespace, "example.com")
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "find_entity_identifier_owner 查不到剛寫入的識別碼".into(),
+        })?;
+    assert_eq_debug("find_entity_identifier_owner", &identifier, &owner);
+    if store
+        .find_entity_identifier_owner(&namespace, &format!("absent-{run}"))
+        .await?
+        .is_some()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_entity_identifier_owner 對不存在的 normalized_value 回了資料".into(),
+        });
+    }
+    if store
+        .find_entity_identifier_owner(&format!("{namespace}-absent"), "example.com")
+        .await?
+        .is_some()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_entity_identifier_owner 只比對了 normalized_value、忽略了 namespace"
+                .into(),
+        });
+    }
+
     // --- §5 resolution candidate -----------------------------------------
     // 需要第二個 Entity。normalized_name 必須含 run-specific UUID，理由同上面
     // 的 entity fixture：(entity_type, normalized_name) 是 UNIQUE。
@@ -1148,6 +1179,61 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
         attributes: json!({}),
     };
     store.put_entity(&other_entity).await?;
+
+    // 反向查詢 alias 文字：兩個不同 Entity 可以共用同一個別名（「Apple」可以是
+    // 公司也可以是水果）。SPEC §6 的 alias 方法就是靠這條找出候選對。
+    let shared_alias_text = format!("shared-alias-{run}");
+    let alias_on_first = EntityAlias {
+        id: Uuid::now_v7(),
+        entity_id: entity.id,
+        alias: shared_alias_text.clone(),
+        alias_type: "shared".into(),
+        source_id: Some(source_id),
+        confidence: 0.6,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+    };
+    let alias_on_second = EntityAlias {
+        id: Uuid::now_v7(),
+        entity_id: other_entity.id,
+        alias: shared_alias_text.clone(),
+        alias_type: "shared".into(),
+        source_id: None,
+        confidence: 0.55,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+    };
+    store.put_entity_alias(&alias_on_first).await?;
+    store.put_entity_alias(&alias_on_second).await?;
+    let by_text = store
+        .find_entity_aliases_by_text(&shared_alias_text, 100)
+        .await?;
+    if !by_text.iter().any(|a| a.id == alias_on_first.id)
+        || !by_text.iter().any(|a| a.id == alias_on_second.id)
+    {
+        return Err(StorageError::NotFound {
+            message: format!(
+                "find_entity_aliases_by_text 應回兩個 Entity 的同名 alias，實際 {} 筆",
+                by_text.len()
+            ),
+        });
+    }
+    if by_text.iter().any(|a| a.alias != shared_alias_text) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_entity_aliases_by_text 回了 alias 文字不符的列".into(),
+        });
+    }
+    if !store
+        .find_entity_aliases_by_text(&format!("absent-alias-{run}"), 100)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_entity_aliases_by_text 對不存在的文字回了資料".into(),
+        });
+    }
 
     let (a, b) = ResolutionCandidate::ordered_pair(entity.id, other_entity.id);
     let candidate = ResolutionCandidate {

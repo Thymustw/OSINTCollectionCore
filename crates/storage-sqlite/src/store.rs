@@ -1797,6 +1797,21 @@ impl RelationalStore for SqliteEmbeddedStore {
         rows.iter().map(mapping::entity_alias).collect()
     }
 
+    async fn find_entity_aliases_by_text(
+        &self,
+        alias: &str,
+        limit: u32,
+    ) -> Result<Vec<EntityAlias>, StorageError> {
+        let rows =
+            sqlx::query("SELECT * FROM entity_aliases WHERE alias = ?1 ORDER BY id ASC LIMIT ?2")
+                .bind(alias)
+                .bind(clamp_limit(limit))
+                .fetch_all(self.conn().await?.as_mut())
+                .await
+                .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_alias).collect()
+    }
+
     async fn put_entity_identifier(
         &self,
         identifier: &EntityIdentifier,
@@ -1859,6 +1874,24 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity_identifier).collect()
+    }
+
+    async fn find_entity_identifier_owner(
+        &self,
+        namespace: &str,
+        normalized_value: &str,
+    ) -> Result<Option<EntityIdentifier>, StorageError> {
+        // `fetch_optional_mapped` 只綁一個 UUID 主鍵；這條走自然鍵兩欄字串，
+        // 寫法同 `find_entity_by_normalized_name`。
+        let row = sqlx::query(
+            "SELECT * FROM entity_identifiers WHERE namespace = ?1 AND normalized_value = ?2",
+        )
+        .bind(namespace)
+        .bind(normalized_value)
+        .fetch_optional(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        row.as_ref().map(mapping::entity_identifier).transpose()
     }
 
     async fn put_resolution_candidate(
