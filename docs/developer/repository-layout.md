@@ -32,7 +32,7 @@ crates/
   normalizer/            正規化服務（osint-normalizer）：raw.collected → Document
   deduplicator/          去重服務（osint-deduplicator）：object.normalized → DuplicateGroup（SPEC §15／§16）
   entity-worker/         抽取服務（osint-entity-worker）：dedup.completed → Entity/Relationship/Evidence（SPEC §17／§11／§12）
-  resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／graph_context；無獨立 binary
+  resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／graph_context／account_handle；無獨立 binary
   merge/                 Entity merge／undo（SPEC_V0.2 §7）：execute_merge／undo_merge；無獨立 binary
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/MinIO，不經 core-api
@@ -64,7 +64,7 @@ Manual／JSON／CSV import 不是 connector，也沒有 crate：它們是 push �
 用同一套正規化規則——兩份實作分岔不會報錯，只會悄悄產生「看起來一樣但字串不同」的重複 Entity。
 `deduplicator::url_norm` 仍以 re-export 保留原路徑。
 
-尚未加入：`storage-neo4j`、resolver 的事件消費者（Phase 1h）、`account_handle`／`email`／`external_id` 掃描方法（見 `docs/developer/resolver.md`）、semantic search、自由文本 NER（V0.3，見 `entity-worker.md`）。`NetworkRule` 寫入 API 尚未接到 `core-api`（驗證函式在 `connector-sdk::validate_network_rule`）。
+尚未加入：`storage-neo4j`、resolver 的事件消費者（Phase 1h）、`email`／`external_id` 掃描方法（**刻意不做**，見 `docs/developer/resolver.md`）、自由文本 NER（V0.3，見 `entity-worker.md`）。`NetworkRule` 寫入 API 尚未接到 `core-api`（驗證函式在 `connector-sdk::validate_network_rule`）。`account_handle` 已實作。
 
 API token **已經**持久化到 Postgres（Phase 6a 的 `PostgresApiTokenStore`，
 migration 0006 建 `api_tokens` 表）。SQLite 版的 `ApiTokenStore` 與 `AuditLog`

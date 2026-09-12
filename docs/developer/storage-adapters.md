@@ -164,14 +164,16 @@ migrations/postgres/   Core canonical（sqlx migrate；adapter 也可 `PostgresC
 migrations/sqlite/     Embedded / App / projection（`SqliteEmbeddedStore::migrate`）
 ```
 
-SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / TIMESTAMPTZ）。見 `docs/developer/schema-v0.1.md`；V0.2 的 `0007`（Entity Resolution + `failed_events`）與 `0008`（Entity Merge 欄位）見 `docs/developer/schema-v0.2.md`。
+SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / TIMESTAMPTZ）。見 `docs/developer/schema-v0.1.md`；V0.2 的 `0007`（Entity Resolution + `failed_events`）、`0008`（Entity Merge 欄位）與 `0009`（`entity_identifiers.normalized_value` 單欄索引）見 `docs/developer/schema-v0.2.md`。
 
 ## `RelationalStore` 的 V0.2 方法（Phase 0c）
 
-`traits.rs` 裡以 `// ===== V0.2 =====` 分隔。表在 migration `0007`；`entities.merged_into` 與 `merge_history.merged_relationships` 在 `0008`。
+`traits.rs` 裡以 `// ===== V0.2 =====` 分隔。表在 migration `0007`；`entities.merged_into` 與 `merge_history.merged_relationships` 在 `0008`；
+`idx_entity_identifiers_normalized_value` 在 `0009`。
 `crates/resolver`（Phase 1c）掃描式聚合會呼叫 `get_entity`、
 `find_entity_by_normalized_name`、`list_entity_aliases_by_entity`、
 `find_entity_aliases_by_text`、`list_relationships_by_object`、
+`list_entity_identifiers_by_entity`、`find_entity_identifiers_by_normalized_value`、
 `put_resolution_candidate`，以及 `EmbeddingProvider`／`GraphStore`。
 `entity_identifiers` 的寫入衝突路徑仍由 entity-worker 呼叫
 `find_entity_identifier_owner`／`put_resolution_candidate`。
@@ -186,7 +188,8 @@ graph-worker／DLQ 重放仍沒有生產呼叫端。
 | `find_entity_aliases_by_text(alias, limit)` | 精確比對 alias 文字，`id ASC`，`limit` 1..=100。resolver 反查「這個名字目前掛在哪些 Entity」 |
 | `put_entity_identifier` / `get_entity_identifier` | 依主鍵 upsert；`(namespace, normalized_value)` UNIQUE |
 | `list_entity_identifiers_by_entity(entity_id, limit)` | `id ASC`，`limit` 1..=100 |
-| `find_entity_identifier_owner(namespace, normalized_value)` | 自然鍵反查既有 owner，最多一筆。resolver 的 exact identifier／domain／email／external ID 用它找衝突 |
+| `find_entity_identifier_owner(namespace, normalized_value)` | 自然鍵反查既有 owner，最多一筆。entity-worker 寫入衝突時用它找既有 owner |
+| `find_entity_identifiers_by_normalized_value(normalized_value, limit)` | **不限 namespace**，`id ASC`，`limit` 1..=100。`check_account_handle` 找「同一個 handle 出現在不同平台」 |
 | `put_resolution_candidate` / `get_resolution_candidate` | 依主鍵 upsert；CHECK `a < b` + UNIQUE `(a, b, method)` |
 | `list_resolution_candidates(status, after, limit)` | `id DESC`，cursor；`status` **在 SQL 裡**過濾，`None` = 不過濾 |
 | `list_resolution_candidates_by_entity(entity_id, status, after, limit)` | `id DESC`，cursor；`entity_a_id` **或** `entity_b_id` 命中都算；`status` 在 SQL 裡過濾 |

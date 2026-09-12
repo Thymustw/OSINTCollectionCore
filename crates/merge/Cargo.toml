@@ -9,13 +9,14 @@ description = "執行 Entity merge／undo（SPEC_V0.2 §7）；不產生候選"
 
 [dependencies]
 chrono = { workspace = true }
+core-events = { workspace = true }
 core-model = { workspace = true }
+serde_json = { workspace = true }
 storage-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 storage-sqlite = { path = "../storage-sqlite" }
 tokio = { workspace = true }

@@ -1166,6 +1166,35 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
         });
     }
 
+    // 不限 namespace：同一個 normalized_value 掛在兩個 namespace 下都要回。
+    // 這是 account_handle 的查詢形狀，不是 exact_identifier 的精確 owner 查詢。
+    let by_value = store
+        .find_entity_identifiers_by_normalized_value("example.com", 100)
+        .await?;
+    if !by_value.iter().any(|i| i.id == identifier.id) {
+        return Err(StorageError::NotFound {
+            message: "find_entity_identifiers_by_normalized_value 查不到剛寫入的識別碼".into(),
+        });
+    }
+    if !by_value.iter().any(|i| i.id == other_namespace.id) {
+        return Err(StorageError::NotFound {
+            message:
+                "find_entity_identifiers_by_normalized_value 必須回所有 namespace 底下同值的列，\
+                 不能只回第一筆"
+                    .into(),
+        });
+    }
+    if !store
+        .find_entity_identifiers_by_normalized_value(&format!("absent-{run}"), 100)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_entity_identifiers_by_normalized_value 對不存在的值回了資料".into(),
+        });
+    }
+
     // --- §5 resolution candidate -----------------------------------------
     // 需要第二個 Entity。normalized_name 必須含 run-specific UUID，理由同上面
     // 的 entity fixture：(entity_type, normalized_name) 是 UNIQUE。

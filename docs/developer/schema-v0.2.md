@@ -33,9 +33,9 @@ V0.1 的 schema 慣例（PG vs SQLite 型別對照、cursor 分頁規則）見 `
 > ⚠️ **Phase 0 只建 schema；Phase 1c 起開始有寫入者。**
 > `crates/resolver` 會寫 `resolution_candidates`（`normalized_name` 掃描，以及
 > entity-worker 在 identifier 衝突時寫入的 `exact_identifier` 列）。
-> `entity-worker` 會為 Domain／Ip／Url／Email／Vulnerability 寫
-> `entity_identifiers`（Hash／Person／Organization 刻意不寫，見
-> `docs/developer/entity-worker.md`）。
+> `entity-worker` 會為 Domain／Ip／Url／Email／Vulnerability 以及 Account
+> （per-platform `{platform}_handle`）寫 `entity_identifiers`
+> （Hash／Person／Organization 刻意不寫，見 `docs/developer/entity-worker.md`）。
 > `crates/merge` 會寫 `merge_history`（含 `repointed_references`／`merged_relationships`）
 > 並改 `entities.merged_into`、repoint alias／identifier／extraction／relationship。
 > `entity_aliases` 目前只有 merge 會改寫既有列，還沒有獨立的生產寫入者。
@@ -178,6 +178,19 @@ merge 把指向 merged Entity 的端點改成 survivor 時，可能撞到 surviv
 讀到解不開的內容時回 `CorruptionSuspected`，與 `repointed_references` 同一套理由。
 
 對應型別：`MergedRelationship`、`AbsorberSnapshot`（`crates/core-model/src/merge.rs`）。
+
+## Migration 0009：`entity_identifiers.normalized_value` 單欄索引
+
+`migrations/postgres/0009_v0_2_identifier_normalized_value_index.sql` 與
+`migrations/sqlite/0009_v0_2_identifier_normalized_value_index.sql`。
+
+`check_account_handle` 要找「這個 handle 不管掛在哪個 namespace 下」。
+既有 `idx_entity_identifiers_natural (namespace, normalized_value)` 的前導欄
+是 namespace，只查 `normalized_value` 走不到那條索引。
+
+`(normalized_value, id)` 把排序欄也蓋進去，讓 `ORDER BY id ASC LIMIT n`
+不必再回表排序。這不是 UNIQUE——同一個值出現在不同 namespace 是這個方法
+要抓的訊號。
 
 ## 對照 V0.1 的 `/ops/dlq`
 

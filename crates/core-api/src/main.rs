@@ -124,7 +124,7 @@ async fn run() -> Result<(), String> {
                 }
             };
             let jobs = Some(Arc::new(JobService::new(store.clone(), producer.clone())));
-            let merge = Some(Arc::new(MergeService::new(store.clone())));
+            let merge = Some(Arc::new(MergeService::new(store.clone(), producer.clone())));
             // MockEmbeddingProvider::unsupported() 讓 semantic_similarity 誠實回空；
             // 空的 MockGraphStore 讓 graph_context 誠實回空。不是假裝已接上。
             let resolver = Some(Arc::new(ResolverService::new(

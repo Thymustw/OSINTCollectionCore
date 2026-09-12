@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::error::ResolverError;
 use crate::graph_context::check_graph_context;
-use crate::identifier_methods::{check_alias, check_domain};
+use crate::identifier_methods::{check_account_handle, check_alias, check_domain};
 use crate::semantic::check_semantic_similarity;
 
 /// SPEC §10 的 13 種 EntityType。新增變體時下面的 match 會編譯失敗，
@@ -90,9 +90,10 @@ impl<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> ResolverService<S,
     /// 依序跑所有目前已實作的掃描方法，回傳**這次新寫入**的 candidate。
     ///
     /// 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity`
-    /// → `graph_context`。某一筆候選已經存在（`StorageError::Conflict`）視為
-    /// 已處理，記一行 log 後繼續，不讓整次 resolve 失敗。底層 storage 錯誤
-    /// （含 semantic／graph 路徑）用 `?` 往上傳播，只有 persist 那一層吞 Conflict。
+    /// → `graph_context` → `account_handle`。某一筆候選已經存在
+    /// （`StorageError::Conflict`）視為已處理，記一行 log 後繼續，不讓整次
+    /// resolve 失敗。底層 storage 錯誤（含 semantic／graph 路徑）用 `?` 往上
+    /// 傳播，只有 persist 那一層吞 Conflict。
     pub async fn resolve_entity(
         &self,
         entity_id: EntityId,
@@ -117,6 +118,7 @@ impl<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> ResolverService<S,
         );
         candidates
             .extend(check_graph_context(&self.graph, entity_id, GRAPH_CONTEXT_THRESHOLD).await?);
+        candidates.extend(check_account_handle(&self.store, &entity).await?);
 
         let mut written = Vec::new();
         for candidate in candidates {
@@ -254,8 +256,8 @@ mod tests {
     /// resolver 單元測試用的最小 RelationalStore。
     ///
     /// 實作 `get_entity`／`find_entity_by_normalized_name`／
-    /// `put_resolution_candidate`／alias 查詢／`list_relationships_by_object`；
-    /// 其餘方法回 `UnsupportedCapability`。**不要**把這個當生產 adapter。
+    /// `put_resolution_candidate`／alias 查詢／`list_relationships_by_object`／
+    /// identifier 反查；其餘方法回 `UnsupportedCapability`。**不要**把這個當生產 adapter。
     struct MemoryStore {
         inner: Mutex<Inner>,
     }
@@ -267,6 +269,7 @@ mod tests {
         candidates: HashMap<(EntityId, EntityId, String), ResolutionCandidate>,
         aliases: Vec<EntityAlias>,
         relationships: Vec<Relationship>,
+        identifiers: Vec<EntityIdentifier>,
         queried_types: Vec<EntityType>,
         /// 下一次 `put_resolution_candidate` 強制回 Conflict，測完自動清掉。
         force_conflict: bool,
@@ -281,6 +284,7 @@ mod tests {
                     candidates: HashMap::new(),
                     aliases: Vec::new(),
                     relationships: Vec::new(),
+                    identifiers: Vec::new(),
                     queried_types: Vec::new(),
                     force_conflict: false,
                 }),
@@ -297,6 +301,10 @@ mod tests {
 
         fn seed_alias(&self, row: EntityAlias) {
             self.inner.lock().expect("mutex").aliases.push(row);
+        }
+
+        fn seed_identifier(&self, row: EntityIdentifier) {
+            self.inner.lock().expect("mutex").identifiers.push(row);
         }
 
         fn force_next_put_conflict(&self) {
@@ -836,10 +844,19 @@ mod tests {
         }
         async fn list_entity_identifiers_by_entity(
             &self,
-            _: EntityId,
-            _: u32,
+            entity_id: EntityId,
+            limit: u32,
         ) -> Result<Vec<EntityIdentifier>, StorageError> {
-            Self::unsupported("list_entity_identifiers_by_entity")
+            let inner = self.inner.lock().expect("mutex");
+            let mut items: Vec<EntityIdentifier> = inner
+                .identifiers
+                .iter()
+                .filter(|i| i.entity_id == entity_id)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| a.id);
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn find_entity_identifier_owner(
             &self,
@@ -847,6 +864,22 @@ mod tests {
             _: &str,
         ) -> Result<Option<EntityIdentifier>, StorageError> {
             Self::unsupported("find_entity_identifier_owner")
+        }
+        async fn find_entity_identifiers_by_normalized_value(
+            &self,
+            normalized_value: &str,
+            limit: u32,
+        ) -> Result<Vec<EntityIdentifier>, StorageError> {
+            let inner = self.inner.lock().expect("mutex");
+            let mut items: Vec<EntityIdentifier> = inner
+                .identifiers
+                .iter()
+                .filter(|i| i.normalized_value == normalized_value)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| a.id);
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn get_resolution_candidate(
             &self,
@@ -1045,5 +1078,47 @@ mod tests {
             assert_eq!(c.entity_b_id, org_id);
             assert_eq!(c.status, ResolutionStatus::Pending);
         }
+    }
+
+    fn identifier(entity_id: EntityId, namespace: &str, handle: &str) -> EntityIdentifier {
+        EntityIdentifier {
+            id: Uuid::now_v7(),
+            entity_id,
+            namespace: namespace.into(),
+            value: handle.into(),
+            normalized_value: handle.to_ascii_lowercase(),
+            confidence: 0.75,
+            source_id: None,
+            first_seen: ts(),
+            last_seen: ts(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_entity_aggregates_account_handle() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let b_id = Uuid::from_u128(0x2222);
+        store.seed(entity(a_id, EntityType::Account, "github:alice"));
+        store.seed(entity(b_id, EntityType::Account, "twitter:alice"));
+        store.seed_identifier(identifier(a_id, "github_handle", "alice"));
+        store.seed_identifier(identifier(b_id, "twitter_handle", "alice"));
+        let svc = svc(store);
+        let written = svc.resolve_entity(a_id).await.expect("resolve");
+        let hits: Vec<_> = written
+            .iter()
+            .filter(|c| c.method == "account_handle")
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "Account 跨平台同 handle 應出現在 resolve_entity 聚合結果，實際 {written:?}"
+        );
+        assert_eq!(hits[0].entity_a_id, a_id);
+        assert_eq!(hits[0].entity_b_id, b_id);
+        assert_eq!(
+            hits[0].score,
+            crate::identifier_methods::ACCOUNT_HANDLE_SCORE
+        );
     }
 }

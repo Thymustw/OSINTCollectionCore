@@ -1,6 +1,6 @@
-//! SPEC §6 的 `alias`／`domain` resolution method。
+//! SPEC §6 的 `alias`／`domain`／`account_handle` resolution method。
 //!
-//! 兩個函式都由 [`crate::ResolverService::resolve_entity`] 聚合呼叫；也仍以
+//! 三個函式都由 [`crate::ResolverService::resolve_entity`] 聚合呼叫；也仍以
 //! 自由函式公開，方便單測直接斷言組出來的候選。**不寫 candidate 表**——
 //! 寫入由 `resolve_entity` 的 `persist_candidate` 負責。
 //!
@@ -48,8 +48,17 @@ pub const ALIAS_SCORE: f64 = 0.55;
 /// （共用主機、轉售、資料髒了都常見），0.30 只夠進 Review。
 pub const DOMAIN_SCORE: f64 = 0.30;
 
+/// 跨平台同 handle 的分數。
+///
+/// 放在 `domain`（0.30）之上、`alias`（0.55）之下：同一個 username 出現在
+/// GitHub 與 Twitter 比「剛好共用一台主機」稍強一點，但仍遠不到能自動合併。
+/// SPEC §6 明文禁止只因同 username 就判定同一真實人物——0.35 只夠進 Review，
+/// evidence 也帶這句警告。
+pub const ACCOUNT_HANDLE_SCORE: f64 = 0.35;
+
 const METHOD_ALIAS: &str = RESOLUTION_METHODS[2];
 const METHOD_DOMAIN: &str = RESOLUTION_METHODS[3];
+const METHOD_ACCOUNT_HANDLE: &str = RESOLUTION_METHODS[5];
 const LIST_LIMIT: u32 = 100;
 
 /// SPEC §6「alias」：這個 Entity 的 alias 文字，有沒有被別的 Entity 用過。
@@ -195,6 +204,83 @@ const fn relationship_type_str(t: RelationshipType) -> &'static str {
     }
 }
 
+/// SPEC §6「account_handle」：同一個 handle 出現在不同平台。
+///
+/// 只對 [`EntityType::Account`] 有意義。非 Account 直接回空，**不查 store**。
+///
+/// 步驟：
+/// 1. 列出自己的 identifier，只留 namespace 以 `_handle` 結尾的
+///    （`github_handle`／`twitter_handle`／`telegram_handle`）。
+/// 2. 對每個 handle 的 `normalized_value` 做不限 namespace 的反查。
+/// 3. 丟掉自己、丟掉同 namespace（同平台不是這個方法要抓的訊號；
+///    生產路徑上 UNIQUE 本來就擋得掉，記憶體 double 沒有 UNIQUE，所以這裡顯式排除）。
+/// 4. 丟掉對方 namespace 不是 `_handle` 的列（`email`／`cve` 碰巧同字串不算帳號）。
+/// 5. 同一對因多個平台命中多次時只留第一筆。
+pub async fn check_account_handle<S: RelationalStore>(
+    store: &S,
+    entity: &Entity,
+) -> Result<Vec<ResolutionCandidate>, ResolverError> {
+    if entity.entity_type != core_model::EntityType::Account {
+        return Ok(Vec::new());
+    }
+    let own = store
+        .list_entity_identifiers_by_entity(entity.id, LIST_LIMIT)
+        .await?;
+    let mut seen: HashSet<(EntityId, EntityId)> = HashSet::new();
+    let mut out = Vec::new();
+    for own_id in own
+        .into_iter()
+        .filter(|i| is_handle_namespace(&i.namespace))
+    {
+        let hits = store
+            .find_entity_identifiers_by_normalized_value(&own_id.normalized_value, LIST_LIMIT)
+            .await?;
+        for other in hits {
+            if other.entity_id == entity.id {
+                continue;
+            }
+            if other.namespace == own_id.namespace {
+                continue;
+            }
+            if !is_handle_namespace(&other.namespace) {
+                continue;
+            }
+            let (entity_a_id, entity_b_id) =
+                ResolutionCandidate::ordered_pair(entity.id, other.entity_id);
+            if !seen.insert((entity_a_id, entity_b_id)) {
+                continue;
+            }
+            let (entity_a_namespace, entity_b_namespace) = if entity_a_id == entity.id {
+                (own_id.namespace.clone(), other.namespace.clone())
+            } else {
+                (other.namespace.clone(), own_id.namespace.clone())
+            };
+            out.push(ResolutionCandidate {
+                id: Uuid::now_v7(),
+                entity_a_id,
+                entity_b_id,
+                score: ACCOUNT_HANDLE_SCORE,
+                method: METHOD_ACCOUNT_HANDLE.to_string(),
+                evidence: json!({
+                    "method": METHOD_ACCOUNT_HANDLE,
+                    "handle": own_id.normalized_value,
+                    "entity_a_namespace": entity_a_namespace,
+                    "entity_b_namespace": entity_b_namespace,
+                    "warning": "SPEC §6 禁止僅依 username 判定同人",
+                }),
+                status: ResolutionStatus::Pending,
+                created_at: Utc::now(),
+                reviewed_at: None,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn is_handle_namespace(namespace: &str) -> bool {
+    namespace.ends_with("_handle")
+}
+
 fn domain_candidate(
     entity_id: EntityId,
     other_id: EntityId,
@@ -294,10 +380,10 @@ mod tests {
         }
     }
 
-    /// alias／domain 單元測試用的最小 RelationalStore。
+    /// alias／domain／account_handle 單元測試用的最小 RelationalStore。
     ///
-    /// 只實作 `list_entity_aliases_by_entity`／`find_entity_aliases_by_text`／
-    /// `list_relationships_by_object`。其餘方法回 `UnsupportedCapability`。
+    /// 只實作 alias／relationship／identifier 相關查詢。其餘方法回
+    /// `UnsupportedCapability`。
     struct MemoryStore {
         inner: Mutex<Inner>,
     }
@@ -305,6 +391,9 @@ mod tests {
     struct Inner {
         aliases: Vec<EntityAlias>,
         relationships: Vec<Relationship>,
+        identifiers: Vec<EntityIdentifier>,
+        list_identifier_calls: u32,
+        find_by_value_calls: u32,
     }
 
     impl MemoryStore {
@@ -313,6 +402,9 @@ mod tests {
                 inner: Mutex::new(Inner {
                     aliases: Vec::new(),
                     relationships: Vec::new(),
+                    identifiers: Vec::new(),
+                    list_identifier_calls: 0,
+                    find_by_value_calls: 0,
                 }),
             }
         }
@@ -323,6 +415,15 @@ mod tests {
 
         fn seed_relationship(&self, row: Relationship) {
             self.inner.lock().expect("mutex").relationships.push(row);
+        }
+
+        fn seed_identifier(&self, row: EntityIdentifier) {
+            self.inner.lock().expect("mutex").identifiers.push(row);
+        }
+
+        fn identifier_query_counts(&self) -> (u32, u32) {
+            let inner = self.inner.lock().expect("mutex");
+            (inner.list_identifier_calls, inner.find_by_value_calls)
         }
 
         fn unsupported<T>(capability: &'static str) -> Result<T, StorageError> {
@@ -793,10 +894,20 @@ mod tests {
         }
         async fn list_entity_identifiers_by_entity(
             &self,
-            _: EntityId,
-            _: u32,
+            entity_id: EntityId,
+            limit: u32,
         ) -> Result<Vec<EntityIdentifier>, StorageError> {
-            Self::unsupported("list_entity_identifiers_by_entity")
+            let mut inner = self.inner.lock().expect("mutex");
+            inner.list_identifier_calls += 1;
+            let mut items: Vec<EntityIdentifier> = inner
+                .identifiers
+                .iter()
+                .filter(|i| i.entity_id == entity_id)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| a.id);
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn find_entity_identifier_owner(
             &self,
@@ -804,6 +915,23 @@ mod tests {
             _: &str,
         ) -> Result<Option<EntityIdentifier>, StorageError> {
             Self::unsupported("find_entity_identifier_owner")
+        }
+        async fn find_entity_identifiers_by_normalized_value(
+            &self,
+            normalized_value: &str,
+            limit: u32,
+        ) -> Result<Vec<EntityIdentifier>, StorageError> {
+            let mut inner = self.inner.lock().expect("mutex");
+            inner.find_by_value_calls += 1;
+            let mut items: Vec<EntityIdentifier> = inner
+                .identifiers
+                .iter()
+                .filter(|i| i.normalized_value == normalized_value)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| a.id);
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn put_resolution_candidate(
             &self,
@@ -1022,6 +1150,103 @@ mod tests {
             hits[0].evidence["relationship_types"],
             json!(["associated_with", "belongs_to"]),
             "第一段是查詢端（Email），第二段是另一端（URL）"
+        );
+    }
+
+    fn identifier(entity_id: EntityId, namespace: &str, handle: &str) -> EntityIdentifier {
+        EntityIdentifier {
+            id: Uuid::now_v7(),
+            entity_id,
+            namespace: namespace.into(),
+            value: handle.into(),
+            normalized_value: handle.to_ascii_lowercase(),
+            confidence: 0.75,
+            source_id: None,
+            first_seen: ts(),
+            last_seen: ts(),
+        }
+    }
+
+    #[tokio::test]
+    async fn check_account_handle_cross_platform_same_handle_yields_candidate() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let b_id = Uuid::from_u128(0x2222);
+        let a = entity(a_id, EntityType::Account, "github:alice");
+        store.seed_identifier(identifier(a_id, "github_handle", "alice"));
+        store.seed_identifier(identifier(b_id, "twitter_handle", "alice"));
+        let hits = check_account_handle(&store, &a).await.expect("check");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let c = &hits[0];
+        assert_eq!(c.entity_a_id, a_id);
+        assert_eq!(c.entity_b_id, b_id);
+        assert_eq!(c.score, ACCOUNT_HANDLE_SCORE);
+        assert_eq!(c.method, "account_handle");
+        assert_eq!(c.status, ResolutionStatus::Pending);
+        assert_eq!(c.evidence["method"], "account_handle");
+        assert_eq!(c.evidence["handle"], "alice");
+        assert_eq!(c.evidence["entity_a_namespace"], "github_handle");
+        assert_eq!(c.evidence["entity_b_namespace"], "twitter_handle");
+        assert_eq!(c.evidence["warning"], "SPEC §6 禁止僅依 username 判定同人");
+    }
+
+    #[tokio::test]
+    async fn check_account_handle_same_entity_two_platforms_is_not_a_candidate() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let a = entity(a_id, EntityType::Account, "github:alice");
+        store.seed_identifier(identifier(a_id, "github_handle", "alice"));
+        store.seed_identifier(identifier(a_id, "twitter_handle", "alice"));
+        let hits = check_account_handle(&store, &a).await.expect("check");
+        assert!(
+            hits.is_empty(),
+            "同一個 Entity 自己跨平台掛同一個 handle 不算候選，得到 {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_account_handle_non_account_does_not_query_store() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let a = entity(a_id, EntityType::Person, "alice");
+        store.seed_identifier(identifier(a_id, "github_handle", "alice"));
+        let hits = check_account_handle(&store, &a).await.expect("check");
+        assert!(hits.is_empty(), "非 Account 應直接回空，得到 {hits:?}");
+        assert_eq!(
+            store.identifier_query_counts(),
+            (0, 0),
+            "非 Account 連 identifier 查詢都不該發，否則空結果可能只是碰巧沒資料"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_account_handle_same_namespace_is_not_cross_platform() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let b_id = Uuid::from_u128(0x2222);
+        let a = entity(a_id, EntityType::Account, "github:alice");
+        store.seed_identifier(identifier(a_id, "github_handle", "alice"));
+        store.seed_identifier(identifier(b_id, "github_handle", "alice"));
+        let hits = check_account_handle(&store, &a).await.expect("check");
+        assert!(
+            hits.is_empty(),
+            "同平台同 handle 不是 account_handle 要抓的訊號（生產路徑由 UNIQUE 擋）；\
+             記憶體 double 沒有 UNIQUE，必須顯式排除，得到 {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_account_handle_ignores_non_handle_namespaces() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let b_id = Uuid::from_u128(0x2222);
+        let a = entity(a_id, EntityType::Account, "github:alice");
+        store.seed_identifier(identifier(a_id, "github_handle", "alice"));
+        store.seed_identifier(identifier(b_id, "email", "alice"));
+        let hits = check_account_handle(&store, &a).await.expect("check");
+        assert!(
+            hits.is_empty(),
+            "email namespace 碰巧同字串不算跨平台帳號，得到 {hits:?}"
         );
     }
 }

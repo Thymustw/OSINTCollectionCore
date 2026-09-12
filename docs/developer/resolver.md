@@ -20,7 +20,8 @@ SPEC §6 列了十種方法（`core_model::RESOLUTION_METHODS` 是拼法來源�
 | `alias` | **已實作，接進 `resolve_entity` 聚合** | 讀 `entity_aliases`；V0.2 還沒有生產寫入者，真實表可能仍空 |
 | `domain` | **已實作（走 Relationship，接進 `resolve_entity` 聚合）** | 見下文；舊版 identifier 反查是結構性死碼 |
 | `url` | **已併入 `domain`，函式退場** | URL／Email 共用網域都由 entity-worker 寫成 Relationship |
-| `account_handle`／`email`／`external_id` | 不做 | 同一個 UNIQUE 限制，需要各自的跨欄位設計，不是抄舊版 `check_domain` 的形狀 |
+| `account_handle` | **已實作，接進 `resolve_entity` 聚合** | 跨平台同 handle（namespace 字串不同，UNIQUE 擋不住）；分數 0.35 |
+| `email`／`external_id` | **刻意不做** | 訊號已被 `exact_identifier` 寫入衝突機制蓋掉（entity-worker 寫 `email`／`cve` namespace 時，UNIQUE 撞號會直接觸發 `exact_identifier` 候選）。批次掃描版本會是跟舊版 `check_domain` 一樣的結構性死碼 |
 | `semantic_similarity` | **已實作，接進 `resolve_entity` 聚合** | 暴力 cosine，只適合驗證 plumbing；門檻 `SEMANTIC_SIMILARITY_THRESHOLD` |
 | `graph_context` | **已實作，接進 `resolve_entity` 聚合** | 只依賴 `GraphStore`，不查 Entity 本體；門檻 `GRAPH_CONTEXT_THRESHOLD` |
 
@@ -36,9 +37,11 @@ SPEC §6 列了十種方法（`core_model::RESOLUTION_METHODS` 是拼法來源�
 - `check_semantic_similarity` 誠實回空（不是假造相似度）
 - `check_graph_context` 誠實回空（圖上沒有邊，本來就沒有鄰居）
 
-因此 `POST /api/v1/entities/{id}/resolve` **目前只有** `normalized_name`／`alias`／`domain`
-三種方法會真的產生候選。這不是 workaround，是已知限制——等 Phase 2
-（`storage-neo4j`）與 ml-commons adapter 接上才會補齊，不要假裝已經接上。
+因此 `POST /api/v1/entities/{id}/resolve` **目前會真的產生候選的**是
+`normalized_name`／`alias`／`domain`／`account_handle`。
+`semantic_similarity` 與 `graph_context` 在 API 組裝路徑上仍因 mock embedder／空圖
+而誠實回空。這不是 workaround，是已知限制——等 Phase 2（`storage-neo4j`）與
+ml-commons adapter 接上才會補齊，不要假裝已經接上。
 
 | 方法 | 路徑 | 角色 | 成功碼 |
 |---|---|---|---|
@@ -58,12 +61,13 @@ ResolverService<S: RelationalStore, E: EmbeddingProvider, G: GraphStore>
 ```
 
 - `resolve_entity` 先 `get_entity`。找不到回 `ResolverError::EntityNotFound`，不 panic。
-- 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity` → `graph_context`。
+- 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity` → `graph_context` → `account_handle`。
 - 組好的 candidate 經 `put_resolution_candidate` 寫入。`StorageError::Conflict`
   （同一對同一方法已存在）視為已處理：記一行 log、continue，不讓整次 resolve 失敗。
   其他 storage 錯誤（含 semantic／graph 路徑）用 `?` 往上傳播。
 - `check_normalized_name`／`check_alias`／`check_domain`／`check_semantic_similarity`／
-  `check_graph_context` **不寫 store**，只組候選；寫入由 `resolve_entity` 負責。
+  `check_graph_context`／`check_account_handle` **不寫 store**，只組候選；寫入由
+  `resolve_entity` 負責。
 - `SEMANTIC_SIMILARITY_THRESHOLD = 0.85`、`GRAPH_CONTEXT_THRESHOLD = 0.5` 是合理預設，
   之後應該可設定，不是最終定案。
 
@@ -98,8 +102,9 @@ ResolverService<S: RelationalStore, E: EmbeddingProvider, G: GraphStore>
 ## `alias`／`domain`
 
 ```text
-check_alias(store, entity)  -> Result<Vec<ResolutionCandidate>, ResolverError>
-check_domain(store, entity) -> Result<Vec<ResolutionCandidate>, ResolverError>
+check_alias(store, entity)           -> Result<Vec<ResolutionCandidate>, ResolverError>
+check_domain(store, entity)          -> Result<Vec<ResolutionCandidate>, ResolverError>
+check_account_handle(store, entity)  -> Result<Vec<ResolutionCandidate>, ResolverError>
 ```
 
 兩個都是自由函式，**不寫 candidate 表**；`resolve_entity` 會呼叫它們再 persist。
@@ -176,6 +181,54 @@ evidence：
 
 `url` 方法已併入這條路徑，函式本體退場。SPEC §6 清單仍保留 `"url"` 這個名字，
 只是 crate 不再實作獨立掃描。
+
+### `account_handle` 規則
+
+只對 `EntityType::Account` 有意義。非 Account 直接回空，**不查 store**。
+
+1. `list_entity_identifiers_by_entity(entity.id, 100)`，只留 namespace 以 `_handle`
+   結尾的（`github_handle`／`twitter_handle`／`telegram_handle`）。
+2. 對每個 handle 的 `normalized_value` 呼叫
+   `find_entity_identifiers_by_normalized_value`（**不限 namespace**）。
+3. 丟掉自己、丟掉同 namespace（同平台不是這個方法要抓的訊號；生產路徑上
+   UNIQUE 本來就擋得掉，記憶體 double 沒有 UNIQUE，所以顯式排除）、
+   丟掉對方 namespace 不是 `_handle` 的列（`email` 碰巧同字串不算帳號）。
+4. 同一對因多個平台命中多次時只留第一筆。
+5. 命中：`score = 0.35`、`method = "account_handle"`。
+
+0.35 放在 `domain`（0.30）之上、`alias`（0.55）之下：同一個 username 出現在
+GitHub 與 Twitter 比「剛好共用一台主機」稍強一點，但仍遠不到能自動合併。
+SPEC §6 明文禁止只因同 username 就判定同一真實人物。
+
+evidence：
+
+```json
+{
+  "method": "account_handle",
+  "handle": "alice",
+  "entity_a_namespace": "github_handle",
+  "entity_b_namespace": "twitter_handle",
+  "warning": "SPEC §6 禁止僅依 username 判定同人"
+}
+```
+
+`entity_a_namespace`／`entity_b_namespace` 對齊排序後的 a／b。
+
+這個方法能做，是因為跨平台 namespace 字串不同，UNIQUE 擋不住
+`github_handle=alice` 與 `twitter_handle=alice`。同 namespace 的訊號
+（兩個 Entity 都寫 `email=alice@x`）走 `exact_identifier` 寫入衝突，
+不要再做一批掃描。
+
+## `email`／`external_id`（刻意不做）
+
+這兩個方法的「兩個 Entity 宣稱同一個值」訊號，早就被 `exact_identifier`
+蓋掉：entity-worker 寫 `email`／`cve` namespace 時，撞到
+`entity_identifiers` 的 `(namespace, normalized_value)` UNIQUE 就會觸發
+衝突候選。做一個批次掃描版本會是第二個舊版 `check_domain` 式的死碼——
+同一個 UNIQUE 保證「查自己 identifier 的目前 owner」永遠是自己。
+
+SPEC §6 清單仍保留這兩個名字，crate 不再實作獨立掃描，也不要把「未做」
+讀成待辦。
 
 ## `semantic_similarity`
 
@@ -306,7 +359,8 @@ resolution_candidate_from_identifier_conflict(
   同一真實人物，namespace 衝突同樣可能是帳號共用或資料髒了。
 
 **entity-worker 是第一個呼叫端。** `upsert_entity` 對 Domain／Ip／Url／Email／CVE
-寫 `entity_identifiers`，撞到 `(namespace, normalized_value)` UNIQUE 時呼叫這個
+以及 Account（per-platform `{platform}_handle`）寫 `entity_identifiers`，
+撞到 `(namespace, normalized_value)` UNIQUE 時呼叫這個
 helper 再 `put_resolution_candidate`。這**不是** `ResolverService::resolve_entity`
 裡的掃描式方法——掃描式 `exact_identifier` 還沒做，不要把「寫入衝突會產候選」
 理解成「resolve_entity 已經會跑 exact identifier」。

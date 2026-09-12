@@ -484,6 +484,18 @@ pub trait RelationalStore: HealthProvider {
         namespace: &str,
         normalized_value: &str,
     ) -> Result<Option<EntityIdentifier>, StorageError>;
+    /// 反向查詢：所有 namespace 底下 `normalized_value` 相同的識別碼。
+    ///
+    /// 與 [`RelationalStore::find_entity_identifier_owner`] 不同：那條是精確
+    /// `(namespace, normalized_value)`，最多一筆。這條**不限 namespace**，
+    /// 給 SPEC §6 `account_handle` 找「同一個 handle 出現在不同平台」
+    /// （`github_handle` vs `twitter_handle`）。過濾同 namespace／同
+    /// `entity_id` 是呼叫端的責任。`limit` 夾在 1..=100，依 `id` 升序。
+    async fn find_entity_identifiers_by_normalized_value(
+        &self,
+        normalized_value: &str,
+        limit: u32,
+    ) -> Result<Vec<EntityIdentifier>, StorageError>;
 
     /// 依主鍵 upsert 一筆合併候選。
     ///

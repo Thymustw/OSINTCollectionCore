@@ -1,12 +1,16 @@
 //! [`MergeService`]：在一筆交易裡執行 merge／undo。
 
+use std::sync::Arc;
+
 use chrono::Utc;
+use core_events::{EventProducer, EventTopic};
 use core_model::{
     AbsorberSnapshot, Entity, EntityId, MergeHistory, MergeHistoryId, MergedRelationship,
-    Relationship, RelationshipEvidence, RepointedReference,
+    Relationship, RelationshipEvidence, RelationshipType, RepointedReference,
 };
+use serde_json::json;
 use storage_core::{RelationalStore, TransactionalStore};
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::collision::classify_relationships;
@@ -26,14 +30,54 @@ pub const MERGE_REF_CAP: u32 = 100;
 /// 用具體型別參數 `S: TransactionalStore`，不包 `Arc<dyn TransactionalStore>`：
 /// `begin()` 已經回 `Box<dyn Transaction>`，再包一層 dyn 沒有額外的 object-safety
 /// 收益，測試與呼叫端直接持有 adapter 即可。
+///
+/// `producer` 為 `None` 時不發 `relationship.changed`（SQLite 本機開發、測試）。
 pub struct MergeService<S: TransactionalStore> {
     store: S,
+    producer: Option<Arc<EventProducer>>,
+}
+
+/// 一則 `relationship.changed` 要帶的內容。在交易內組好，commit 成功後才送。
+#[derive(Debug, Clone, PartialEq)]
+struct RelationshipChange {
+    relationship_id: Uuid,
+    source_object_id: Uuid,
+    target_object_id: Uuid,
+    relationship_type: RelationshipType,
+    change_kind: ChangeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeKind {
+    Upserted,
+    Deleted,
+}
+
+impl ChangeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Upserted => "upserted",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
+impl RelationshipChange {
+    fn from_relationship(rel: &Relationship, change_kind: ChangeKind) -> Self {
+        Self {
+            relationship_id: rel.id,
+            source_object_id: rel.source_object_id,
+            target_object_id: rel.target_object_id,
+            relationship_type: rel.relationship_type,
+            change_kind,
+        }
+    }
 }
 
 impl<S: TransactionalStore> MergeService<S> {
     #[must_use]
-    pub fn new(store: S) -> Self {
-        Self { store }
+    pub fn new(store: S, producer: Option<Arc<EventProducer>>) -> Self {
+        Self { store, producer }
     }
 
     /// 把 `merged_id` 併進 `survivor_id`。成功回這次的 [`MergeHistory`]。
@@ -75,11 +119,17 @@ impl<S: TransactionalStore> MergeService<S> {
         }
 
         let tx = self.store.begin().await?;
-        let history = {
+        let (history, changes) = {
             let db = tx.store();
             execute_in_tx(db, survivor, merged, reason, operator).await?
         };
         tx.commit().await?;
+        // commit 已成功，merge 本身落地。事件發送失敗只代表 graph-worker 這次
+        // 沒被通知（下次 rebuild 會補齊）。這裡不把 Err 往上拋：execute_merge
+        // 重跑會被 `AlreadyMerged` 擋住，沒有「重跑再發一次」的安全路徑；
+        // 把整個函式改成失敗會讓呼叫端以為 merge 沒做完，但其實 canonical
+        // store 已經改完了。
+        self.publish_relationship_changes(&changes).await;
         Ok(history)
     }
 
@@ -112,11 +162,13 @@ impl<S: TransactionalStore> MergeService<S> {
         self.require_entity(history.merged_id).await?;
 
         let tx = self.store.begin().await?;
-        {
+        let changes = {
             let db = tx.store();
-            undo_in_tx(db, history).await?;
-        }
+            undo_in_tx(db, history).await?
+        };
         tx.commit().await?;
+        // 理由同 `execute_merge`：commit 已成功，事件失敗不能假裝 undo 沒做完。
+        self.publish_relationship_changes(&changes).await;
         Ok(())
     }
 
@@ -126,6 +178,44 @@ impl<S: TransactionalStore> MergeService<S> {
             .await?
             .ok_or(MergeError::EntityNotFound { entity_id })
     }
+
+    /// 送出交易內組好的 `relationship.changed`。沒接 Kafka 時整段跳過。
+    ///
+    /// 單則失敗只記 error、繼續送剩下的，不回傳 Err。理由見
+    /// [`Self::execute_merge`]：canonical store 已經 commit，把 merge／undo
+    /// 本身標成失敗會誤導呼叫端。
+    async fn publish_relationship_changes(&self, changes: &[RelationshipChange]) {
+        let Some(producer) = &self.producer else {
+            return;
+        };
+        for change in changes {
+            let key = change.relationship_id.to_string();
+            let payload = json!({
+                "relationship_id": change.relationship_id,
+                "source_object_id": change.source_object_id,
+                "target_object_id": change.target_object_id,
+                "relationship_type": change.relationship_type,
+                "change_kind": change.change_kind.as_str(),
+            });
+            if let Err(err) = producer
+                .publish(
+                    EventTopic::RelationshipChanged,
+                    Some(&key),
+                    Some(change.relationship_id),
+                    payload,
+                )
+                .await
+            {
+                error!(
+                    error = %err,
+                    relationship_id = %change.relationship_id,
+                    change_kind = change.change_kind.as_str(),
+                    "relationship.changed 發送失敗。merge／undo 已 commit，圖投影這次不會被通知；\
+                     請用 graph rebuild 補齊，不要重跑 execute_merge（會被 AlreadyMerged 擋住）"
+                );
+            }
+        }
+    }
 }
 
 async fn execute_in_tx(
@@ -134,7 +224,7 @@ async fn execute_in_tx(
     mut merged: Entity,
     reason: String,
     operator: String,
-) -> Result<MergeHistory, MergeError> {
+) -> Result<(MergeHistory, Vec<RelationshipChange>), MergeError> {
     let survivor_id = survivor.id;
     let merged_id = merged.id;
 
@@ -174,10 +264,15 @@ async fn execute_in_tx(
 
     let mut repointed_references = Vec::new();
     let mut merged_relationships = Vec::new();
+    let mut changes = Vec::new();
 
     for rel in self_loops {
         let snapshot = rel.clone();
         db.delete_relationship(rel.id).await?;
+        changes.push(RelationshipChange::from_relationship(
+            &snapshot,
+            ChangeKind::Deleted,
+        ));
         merged_relationships.push(MergedRelationship {
             absorbed_relationship_id: rel.id,
             absorber_relationship_id: None,
@@ -222,6 +317,14 @@ async fn execute_in_tx(
         };
         db.put_relationship(&updated_absorber).await?;
         db.delete_relationship(absorbed.id).await?;
+        changes.push(RelationshipChange::from_relationship(
+            &absorbed,
+            ChangeKind::Deleted,
+        ));
+        changes.push(RelationshipChange::from_relationship(
+            &updated_absorber,
+            ChangeKind::Upserted,
+        ));
         merged_relationships.push(MergedRelationship {
             absorbed_relationship_id: absorbed.id,
             absorber_relationship_id: Some(absorber.id),
@@ -248,6 +351,10 @@ async fn execute_in_tx(
             ..rel.clone()
         };
         db.put_relationship(&updated).await?;
+        changes.push(RelationshipChange::from_relationship(
+            &updated,
+            ChangeKind::Upserted,
+        ));
         repointed_references.push(repointed("relationships", rel.id, column, merged_id));
     }
 
@@ -308,16 +415,29 @@ async fn execute_in_tx(
         undone_at: None,
     };
     db.put_merge_history(&history).await?;
-    Ok(history)
+    Ok((history, changes))
 }
 
-async fn undo_in_tx(db: &dyn RelationalStore, mut history: MergeHistory) -> Result<(), MergeError> {
+async fn undo_in_tx(
+    db: &dyn RelationalStore,
+    mut history: MergeHistory,
+) -> Result<Vec<RelationshipChange>, MergeError> {
+    let mut changes = Vec::new();
     for r in history.repointed_references.iter().rev() {
-        restore_reference(db, r).await?;
+        if let Some(restored) = restore_reference(db, r).await? {
+            changes.push(RelationshipChange::from_relationship(
+                &restored,
+                ChangeKind::Upserted,
+            ));
+        }
     }
 
     for mr in history.merged_relationships.iter().rev() {
         db.put_relationship(&mr.absorbed_snapshot).await?;
+        changes.push(RelationshipChange::from_relationship(
+            &mr.absorbed_snapshot,
+            ChangeKind::Upserted,
+        ));
         if let Some(absorber_id) = mr.absorber_relationship_id {
             for ev_id in &mr.moved_evidence_ids {
                 let ev = db.get_relationship_evidence(*ev_id).await?.ok_or(
@@ -354,6 +474,10 @@ async fn undo_in_tx(db: &dyn RelationalStore, mut history: MergeHistory) -> Resu
             absorber.last_seen = pre.last_seen;
             absorber.updated_at = Utc::now();
             db.put_relationship(&absorber).await?;
+            changes.push(RelationshipChange::from_relationship(
+                &absorber,
+                ChangeKind::Upserted,
+            ));
         } else {
             warn!(
                 absorbed_relationship_id = %mr.absorbed_relationship_id,
@@ -374,13 +498,17 @@ async fn undo_in_tx(db: &dyn RelationalStore, mut history: MergeHistory) -> Resu
 
     history.undone_at = Some(Utc::now());
     db.put_merge_history(&history).await?;
-    Ok(())
+    Ok(changes)
 }
 
+/// 還原一筆 [`RepointedReference`]。
+///
+/// 若這筆是 relationship 列，回傳還原後的完整列，給 undo 發
+/// `relationship.changed` 用。其他表回 `None`。
 async fn restore_reference(
     db: &dyn RelationalStore,
     r: &RepointedReference,
-) -> Result<(), MergeError> {
+) -> Result<Option<Relationship>, MergeError> {
     match r.table.as_str() {
         "relationships" => {
             let mut row =
@@ -404,6 +532,7 @@ async fn restore_reference(
             }
             row.updated_at = Utc::now();
             db.put_relationship(&row).await?;
+            return Ok(Some(row));
         }
         "entity_aliases" => {
             let mut row =
@@ -469,7 +598,7 @@ async fn restore_reference(
             });
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// 回傳筆數等於 [`MERGE_REF_CAP`] 就當成截斷並失敗。

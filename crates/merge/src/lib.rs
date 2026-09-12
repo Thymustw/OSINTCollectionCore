@@ -7,6 +7,7 @@
 //! 2. 在一筆交易裡 repoint 參照、處理 relationship UNIQUE 撞號、標記
 //!    `entities.merged_into`、寫 [`MergeHistory`]。
 //! 3. 依 [`MergeHistory`] 做可逆的 [`MergeService::undo_merge`]。
+//! 4. `tx.commit()` 成功後發 `relationship.changed`（沒接 Kafka 時跳過）。
 //!
 //! # 交易邊界
 //!

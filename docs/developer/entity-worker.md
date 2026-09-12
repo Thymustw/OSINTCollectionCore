@@ -63,6 +63,7 @@ canonical store 就會被 relationship 與（V0.2 的）圖投影引用，清理
 | Hash | `regex-hash` | 純 hex，長度 32/40/64 | 轉**小寫** |
 | Person | `field-author` | 只讀 `Document.author` | 小寫 + 空白壓成單一空格 |
 | Organization | `field-organization` | 只讀 `Document.attributes` 的指定欄位 | 小寫 + 空白壓成單一空格 |
+| Account | `regex-account-profile` | GitHub／Twitter／X／Telegram 個人檔案網址 | `{platform}:{handle}`，platform 為固定字串 `github`／`twitter`／`telegram` |
 
 `extractor` 字串會寫進 `entity_extractions.extractor`，並且是該列 UUID v5 的雜湊輸入之一。
 **改字串等於讓既有列無法對照**。
@@ -72,7 +73,8 @@ canonical store 就會被 relationship 與（V0.2 的）圖投影引用，清理
 
 ### `extractor_version`
 
-`crates/entity-worker/src/extract.rs` 的 `EXTRACTOR_VERSION`，目前是 `"1"`。
+`crates/entity-worker/src/extract.rs` 的 `EXTRACTOR_VERSION`，目前是 `"2"`
+（新增 Account 個人檔案網址抽取）。
 
 **規則改了就要往上加。** 那一欄（與 provenance metadata 裡的同名欄位）是之後判斷
 「哪些 Document 是舊規則抽的、需要重跑」的**唯一**依據。不要沿用 crate 版本——
@@ -203,6 +205,26 @@ commit id 都變成 IOC。**把判斷權留給有語境的下游。**
 
 **未處理的殘留**：文中若出現**已去掉連字號**的 UUID，仍會被當成 MD5。
 
+### Account 個人檔案網址（部分處理，清單不窮舉）
+
+辨識 `github.com`／`twitter.com`／`x.com`／`t.me` 的第一個路徑段當 handle。
+`x.com` 與 `twitter.com` 對到同一個 platform 字串 `twitter`，避免兩種寫法產生兩個 Entity。
+
+處理方式：
+
+- `confidence` 給 `0.75`（低於 URL 的 0.95）：路徑第一段常是行銷頁／組織頁／設定頁。
+- `ACCOUNT_RESERVED_PATHS` 擋常見非 handle 路徑（GitHub 的 `orgs`／`settings`／`marketplace`／
+  `sponsors`／`notifications`；Twitter／X 的 `home`／`explore`／`settings`／`i`；
+  Telegram 的 `share`／`joinchat`）。**這是已知誤判來源，清單不窮舉**——同 T10 風格，
+  發現新的就往清單加，不假裝擋完。
+- handle 字元集是 `[A-Za-z0-9_]{1,32}`。GitHub 實際允許連字號（`octo-cat`），
+  那些這次抽不到。`regex` crate 沒有 look-around，所以擷取後若 handle 下一個
+  位元組是 `-` 就整段丟掉——沒有這步的話 `octo-cat` 會抽出前綴 `octo`，
+  比漏抽更糟。放寬字元集會把散文片段（`github.com/alice-vs-bob`）也抓進來。
+- 平台清單不窮舉：沒有 Instagram／Reddit／LinkedIn／GitLab。
+
+同一份文件裡的 `https://github.com/alice` 仍會同時抽出 URL Entity（這是預期，不是重複）。
+
 ### Email local-part 的大小寫（刻意合併）
 
 嚴格來說 RFC 5321 的 local-part 是大小寫敏感的，`Bob@x` 與 `bob@x` 可以是兩個信箱。
@@ -229,7 +251,7 @@ SPEC §11 只列出可用的 13 種 type，沒有規定哪種 entity 配哪種�
 | Person（來自 `author`） | `authored_by` | 語意精確：這個人**寫了**這份文件 |
 | Organization（來自 `attributes`） | `published_by` | 發布者不等於作者 |
 | Url | `references` | 文件**引用**了這個連結，比 `mentions` 精確 |
-| 其餘（CVE／IP／Domain／Email／Hash） | `mentions` | 只知道「提到了」，不宜過度解讀 |
+| 其餘（CVE／IP／Domain／Email／Hash／Account） | `mentions` | 只知道「提到了」，不宜過度解讀 |
 
 刻意**不用** `affects`（Document affects CVE 語意不通）與 `links_to`
 （那是 URL→URL 的關係，不是 Document→URL）。
@@ -325,10 +347,12 @@ write-then-claim 的 crash window 只會造成重跑，而重跑因為第 2 點�
 公開函式（`crates/entity-worker/src/service.rs`）：
 
 - `identifier_namespace_for(entity_type)`：五種唯一鍵型別回 namespace 字串，其餘 `None`。
+  **Account 不走這條**（一個 `EntityType` 對一個固定 namespace 不夠），見下。
 - `identifier_id(namespace, entity_id, normalized_name)`：UUID v5，namespace 常數是
   `IDENTIFIER_NAMESPACE`（`0x0199_5c31_7e20_7a55_8b4c_2d3e_6f70_8095`）。
   seed 含 `entity_id`，這樣兩個 Entity 宣稱同一個識別碼會算出**不同**主鍵，
   UNIQUE `(namespace, normalized_value)` 才會回 `Conflict` 而不是被 `ON CONFLICT (id)` 覆寫。
+  Account 的第三個參數是**純 handle**，不是 `github:alice` 整串。
 
 | EntityType | namespace | value / normalized_value |
 |---|---|---|
@@ -337,12 +361,17 @@ write-then-claim 的 crash window 只會造成重跑，而重跑因為第 2 點�
 | Url | `url` | 同上 |
 | Email | `email` | 同上 |
 | Vulnerability | `cve` | 同上 |
+| Account | `{platform}_handle`（`github_handle`／`twitter_handle`／`telegram_handle`） | `entity.name`（原樣 handle）／純 handle（小寫，**不含** `{platform}:` 前綴） |
+
+Account 的 namespace 從 `attributes.platform` 決定，不是從 `entity_type`。
+`normalized_value` 優先取 `attributes.handle`；沒有那欄時才從 `normalized_name`
+用 `:` 切開取後半段。切不出 handle、或 platform 不在對照表裡，整筆不寫。
 
 其餘型別**不寫**：
 
 - **Hash**：T10，見上一節。
 - **Person／Organization**：`name` 是人看的名字，不是命名空間內的唯一鍵。這次也不寫 `entity_aliases`。
-- **Account／Software／Repository／Location／Hostname**：沒有清楚的 namespace 語意。
+- **Software／Repository／Location／Hostname**：沒有清楚的 namespace 語意。
 
 `source_id` 從 Document 的 RawEvidence 反查；查不到就留 `None`，不編造。
 
@@ -367,7 +396,8 @@ Document 重試、永遠過不了。
 
 e2e：`upsert_writes_identifiers_for_unique_key_types_and_skips_the_rest`、
 `rerunning_upsert_does_not_duplicate_identifiers`、
-`identifier_conflict_writes_exact_identifier_candidate`。
+`identifier_conflict_writes_exact_identifier_candidate`、
+`account_profile_url_writes_github_handle_identifier`。
 
 ---
 
@@ -498,7 +528,10 @@ CLI 的 `documents show` 要從 **Document** 往下走（Document 是 source）�
 
 ## 事件
 
-訂閱 `dedup.completed`，發布 `entity.extracted`。
+訂閱 `dedup.completed`，發布 `entity.extracted`，並對本次寫入／更新的每一條
+邊發一則 `relationship.changed`（`change_kind` 永遠是 `"upserted"`）。
+partition key 用 `relationship_id`，不是 `document_id`——理由見
+`docs/developer/events.md`。
 
 `entity.extracted` 的 payload：
 
@@ -510,7 +543,7 @@ CLI 的 `documents show` 要從 **Document** 往下走（Document 是 source）�
   "extraction_count": 9,
   "relationship_count": 9,
   "truncated": false,
-  "extractor_version": "1"
+  "extractor_version": "2"
 }
 ```
 
@@ -562,7 +595,7 @@ osint-cli documents show <document-id>       # 末段列出抽出的 Entity
 ## 測試
 
 ```bash
-cargo test -p entity-worker                      # 單元 59 + e2e 11
+cargo test -p entity-worker                      # 單元 + e2e
 cargo test -p entity-worker --test e2e -- --test-threads=1
 ```
 
@@ -579,6 +612,7 @@ e2e 對本機 Docker 真跑。涵蓋：
 | `extraction_limit_truncates_and_reports` | 截斷 + provenance 記錄 |
 | `person_and_organization_...` | 只從結構化欄位，**反向斷言**正文裡的名字不被抽出 |
 | `domain_is_linked_to_the_url_and_email_...` | 衍生關聯與它們的 evidence |
+| `relationship_changed_is_published_...` | 抽取後對每條邊發 `relationship.changed`（`change_kind=upserted`，correlation_id = relationship_id） |
 
 ### 共用 DB 的鐵則（比 deduplicator 更嚴格）
 

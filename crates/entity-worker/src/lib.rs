@@ -11,6 +11,7 @@
 //! | Hash | `regex-hash` | 轉小寫 |
 //! | Person | `field-author` | 小寫、空白正規化 |
 //! | Organization | `field-organization` | 小寫、空白正規化 |
+//! | Account | `regex-account-profile` | `{platform}:{handle}`，platform 為 github／twitter／telegram |
 //!
 //! # V0.1 的兩個硬性範圍限制
 //!

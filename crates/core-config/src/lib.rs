@@ -34,6 +34,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub indexer: IndexerSection,
     #[serde(default)]
+    pub graph_worker: GraphWorkerSection,
+    #[serde(default)]
     pub import: ImportSection,
 }
 
@@ -93,24 +95,39 @@ pub struct CacheStorage {
 
 /// 圖投影（Neo4j）。
 ///
-/// # 為什麼這裡只有 HTTP URL，沒有 Bolt URI／帳密
+/// `http_url`（7474）給 `/ops/health` 的 HTTP 探活用；真正的圖寫入走
+/// `bolt_uri`（7687），由 `storage-neo4j` 的 `Neo4jStore` 讀取。
+/// 密碼只存 [`SecretRef`]，與 PostgreSQL／Redis 同一套，不要寫明文。
 ///
-/// V0.2 Phase 0b **只把 Neo4j 加進 compose 並讓 `/ops/health` 看得到它**。
-/// 真正的圖寫入走 Bolt（7687），那是 Phase 2a `storage-neo4j` adapter 的事，
-/// 連同 driver 相依、憑證 SecretRef 與 capability 介面一起進來
-/// （CLAUDE.md §13：不要在 domain service 裡散落後端專屬細節）。
-///
-/// 現在就把 Bolt 憑證欄位放進設定，等於宣告一個還沒有人讀的契約——
-/// 之後 adapter 落地時十之八九形狀會改，而中間那段時間運維會以為它有在用。
-///
-/// HTTP `GET /`（7474）不需要認證就會回叢集的 discovery JSON，
-/// 拿來探活剛好夠，也不必為此引進 driver。
+/// 三個新欄位都有 `#[serde(default)]`：V0.1／Phase 0b 的設定檔只有
+/// `adapter` + `http_url`，缺欄位時必須仍能載入，不能整份解析失敗。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphStorage {
     pub adapter: String,
     /// Neo4j 的 HTTP 埠（7474）。空字串 = 未設定，`/ops/health` 會列進
     /// `not_configured` 而不是 `unhealthy`。
     pub http_url: String,
+    /// Bolt 連線字串。`storage-neo4j` 的 `Neo4jStore` 用這個，不是 `http_url`。
+    #[serde(default = "default_bolt_uri")]
+    pub bolt_uri: String,
+    #[serde(default = "default_neo4j_username")]
+    pub username: String,
+    /// 密碼走 SecretRef（例如 `env:NEO4J_PASSWORD`），與
+    /// `[storage.canonical].dsn_secret_ref` 同一套格式。
+    #[serde(default = "default_neo4j_password_secret_ref")]
+    pub password_secret_ref: SecretRef,
+}
+
+fn default_bolt_uri() -> String {
+    "bolt://127.0.0.1:7687".into()
+}
+
+fn default_neo4j_username() -> String {
+    "neo4j".into()
+}
+
+fn default_neo4j_password_secret_ref() -> SecretRef {
+    SecretRef::parse("env:NEO4J_PASSWORD").expect("literal SecretRef")
 }
 
 impl Default for GraphStorage {
@@ -118,6 +135,9 @@ impl Default for GraphStorage {
         Self {
             adapter: "neo4j".into(),
             http_url: "http://127.0.0.1:7474".into(),
+            bolt_uri: default_bolt_uri(),
+            username: default_neo4j_username(),
+            password_secret_ref: default_neo4j_password_secret_ref(),
         }
     }
 }
@@ -299,6 +319,34 @@ impl Default for IndexerSection {
     }
 }
 
+/// graph-worker consumer 與圖投影重建的上限設定。
+///
+/// `projection` 對 graph-worker 的角色等同 indexer 的 `index`：改名等於換一個
+/// 空投影，要跑 rebuild。`page_size` 必須有值，沒有「不限」這個選項——
+/// rebuild 掃 canonical store 時少了分頁就是一次把全部實體／關係載進記憶體。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphWorkerSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// ProjectionStore 用的投影名稱，等同 indexer 的 `index` 欄位角色。
+    pub projection: String,
+    /// rebuild 時每頁掃描筆數。
+    pub page_size: u32,
+}
+
+impl Default for GraphWorkerSection {
+    fn default() -> Self {
+        Self {
+            // 18080–18085 已分別是 api／collector／normalizer／deduplicator／
+            // entity-worker／indexer 的 health 埠。
+            bind: "127.0.0.1:18086".into(),
+            consumer_group: "osint-graph-worker".into(),
+            projection: "osint-graph".into(),
+            page_size: 100,
+        }
+    }
+}
+
 /// `POST /api/v1/import` 的上傳與解析上限。每一項都必須有值，沒有「不限」這個選項。
 ///
 /// `max_upload_bytes` 與 `[http].request_body_limit_bytes` 是兩條獨立的界線：
@@ -457,6 +505,18 @@ mod tests {
         assert_eq!(cfg.indexer.bulk_max_retries, 3);
         assert_eq!(cfg.indexer.lag_threshold, 5_000);
         assert_eq!(cfg.indexer.backpressure_sleep_ms, 200);
+        assert_eq!(cfg.storage.graph.adapter, "neo4j");
+        assert_eq!(cfg.storage.graph.http_url, "http://127.0.0.1:7474");
+        assert_eq!(cfg.storage.graph.bolt_uri, "bolt://127.0.0.1:7687");
+        assert_eq!(cfg.storage.graph.username, "neo4j");
+        assert_eq!(
+            cfg.storage.graph.password_secret_ref.as_str(),
+            "env:NEO4J_PASSWORD"
+        );
+        assert_eq!(cfg.graph_worker.bind, "127.0.0.1:18086");
+        assert_eq!(cfg.graph_worker.consumer_group, "osint-graph-worker");
+        assert_eq!(cfg.graph_worker.projection, "osint-graph");
+        assert_eq!(cfg.graph_worker.page_size, 100);
         assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.import.max_records, 10_000);
         assert_eq!(cfg.import.max_record_bytes, 262_144);
@@ -499,5 +559,60 @@ mod tests {
         clear_osint_overrides();
         let cfg = AppConfig::load_from(Some(&workspace_default()), Some(Path::new(""))).unwrap();
         assert_eq!(cfg.app.environment, "dev");
+    }
+
+    #[test]
+    fn graph_worker_section_default_values() {
+        let section = GraphWorkerSection::default();
+        assert_eq!(section.bind, "127.0.0.1:18086");
+        assert_eq!(section.consumer_group, "osint-graph-worker");
+        assert_eq!(section.projection, "osint-graph");
+        assert_eq!(section.page_size, 100);
+    }
+
+    #[test]
+    fn graph_storage_missing_bolt_fields_use_serde_defaults() {
+        // Phase 0b 設定檔只有 adapter + http_url；新欄位必須靠 serde default
+        // 補上，不能讓整份設定解析失敗。
+        let graph: GraphStorage =
+            serde_json::from_str(r#"{"adapter":"neo4j","http_url":"http://127.0.0.1:7474"}"#)
+                .unwrap();
+        assert_eq!(graph.bolt_uri, "bolt://127.0.0.1:7687");
+        assert_eq!(graph.username, "neo4j");
+        assert_eq!(graph.password_secret_ref.as_str(), "env:NEO4J_PASSWORD");
+        assert_eq!(graph, GraphStorage::default());
+    }
+
+    #[test]
+    fn graph_storage_deserializes_explicit_bolt_fields() {
+        let graph: GraphStorage = serde_json::from_str(
+            r#"{
+                "adapter": "neo4j",
+                "http_url": "http://neo4j:7474",
+                "bolt_uri": "bolt://neo4j:7687",
+                "username": "neo4j",
+                "password_secret_ref": "env:NEO4J_PASSWORD"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(graph.http_url, "http://neo4j:7474");
+        assert_eq!(graph.bolt_uri, "bolt://neo4j:7687");
+        assert_eq!(graph.username, "neo4j");
+        assert_eq!(graph.password_secret_ref.as_str(), "env:NEO4J_PASSWORD");
+    }
+
+    #[test]
+    fn missing_graph_worker_section_does_not_fail_load() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        // 既有設定檔沒有 [graph_worker] 時，#[serde(default)] 必須讓載入成功。
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        let parsed: AppConfig = {
+            // 用 JSON 模擬「整段 graph_worker 缺席」：先載入完整設定再拿掉該鍵。
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            value.as_object_mut().unwrap().remove("graph_worker");
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(parsed.graph_worker, GraphWorkerSection::default());
     }
 }

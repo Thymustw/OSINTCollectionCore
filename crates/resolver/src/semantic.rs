@@ -785,6 +785,13 @@ mod tests {
         ) -> Result<Option<EntityIdentifier>, StorageError> {
             Self::unsupported("find_entity_identifier_owner")
         }
+        async fn find_entity_identifiers_by_normalized_value(
+            &self,
+            _: &str,
+            _: u32,
+        ) -> Result<Vec<EntityIdentifier>, StorageError> {
+            Self::unsupported("find_entity_identifiers_by_normalized_value")
+        }
         async fn put_resolution_candidate(
             &self,
             _: &ResolutionCandidate,

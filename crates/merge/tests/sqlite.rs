@@ -137,7 +137,7 @@ async fn open_harness() -> Harness {
         .await
         .expect("開 SQLite reader");
     Harness {
-        service: MergeService::new(writer),
+        service: MergeService::new(writer, None),
         db,
         path,
     }

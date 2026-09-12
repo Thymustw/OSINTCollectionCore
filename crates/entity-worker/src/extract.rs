@@ -30,7 +30,9 @@ use regex::Regex;
 ///
 /// 規則改了就要往上加：那一欄是之後判斷「這筆是舊規則抽的、要不要重抽」的唯一依據。
 /// 沿用 crate 版本沒有用——crate 版本跟著整個 workspace 走，規則沒改也會變。
-pub const EXTRACTOR_VERSION: &str = "1";
+///
+/// `"2"`：新增 Account 個人檔案網址抽取（GitHub／Twitter／X／Telegram）。
+pub const EXTRACTOR_VERSION: &str = "2";
 
 /// excerpt 取命中位置前後各幾個字元。
 ///
@@ -122,6 +124,26 @@ static UUID_SHAPE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("UUID pattern")
 });
 
+/// 社交／程式碼平台的個人檔案網址。SPEC §10 的 Account。
+///
+/// 只抓第一個路徑段當 handle。`github.com/alice/repo` 的 handle 是 `alice`，
+/// 後面的 repo 路徑被 `(?:/|…)` 吃掉當結尾，不會把 `alice/repo` 當成一個 handle。
+///
+/// **已知限制（不假裝解決了）**：
+/// * handle 字元集是 `[A-Za-z0-9_]{1,32}`。GitHub 實際允許連字號（`octo-cat`），
+///   Telegram 允許更長；那些這次抽不到。放寬字元集會把 `github.com/alice-vs-bob`
+///   這種散文片段也抓進來，誤判成本高過漏抽。
+/// * `regex` crate 沒有 look-around。`octo-cat` 會在 `-` 處形成 ASCII word
+///   boundary，前綴 `octo` 會命中；[`extract_accounts`] 在擷取後丟掉這種前綴。
+/// * 平台清單不窮舉：沒有 Instagram／Reddit／LinkedIn／GitLab。要加就擴
+///   [`ACCOUNT_PROFILE`] 與 [`platform_from_host`]，不要在這裡發明第二套對照。
+static ACCOUNT_PROFILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?-u:\b)(?:https?://)?(?:www\.)?(github\.com|twitter\.com|x\.com|t\.me)/([A-Za-z0-9_]{1,32})(?:/|(?-u:\b))",
+    )
+    .expect("Account profile pattern")
+});
+
 /// 明顯不是網域、但形狀符合 `名稱.兩個以上字母` 的常見字串。
 ///
 /// 這是 `suffix.rs` 擋不住的那一類：副檔名與檔名剛好撞上真實 ccTLD
@@ -170,6 +192,64 @@ const DOMAIN_STOPWORDS: &[&str] = &[
     "index.html",
     "index.htm",
     "default.aspx",
+];
+
+/// 明顯不是個人檔案的第一段路徑。比對時一律小寫。
+///
+/// 這是**已知誤判來源，清單不窮舉**——同 T10 風格：發現新的就往這裡加，
+/// 不假裝已經擋完所有平台保留路徑。沒列到的（例如 GitHub 之後新加的
+/// 行銷落地頁）仍會被抽成 Account。
+///
+/// 三個平台共用一份清單是刻意偏保守：有人真的叫 `settings` 的 GitHub
+/// 帳號會被漏掉，那個代價低於把每個平台的設定頁都寫進 Entity 表。
+const ACCOUNT_RESERVED_PATHS: &[&str] = &[
+    // GitHub
+    "orgs",
+    "settings",
+    "marketplace",
+    "sponsors",
+    "notifications",
+    "login",
+    "signup",
+    "join",
+    "features",
+    "topics",
+    "collections",
+    "explore",
+    "about",
+    "pricing",
+    "enterprise",
+    "security",
+    "new",
+    "search",
+    "site",
+    "apps",
+    "gist",
+    "pulls",
+    "issues",
+    "organizations",
+    "users",
+    "account",
+    "copilot",
+    "codespaces",
+    "discussions",
+    // Twitter / X
+    "home",
+    "i",
+    "messages",
+    "compose",
+    "intent",
+    "hashtag",
+    "tos",
+    "privacy",
+    // Telegram
+    "share",
+    "joinchat",
+    "addstickers",
+    "proxy",
+    "socks",
+    "setlanguage",
+    "addlist",
 ];
 
 // ---------------------------------------------------------------------------
@@ -280,6 +360,7 @@ pub fn extract_all(input: &ExtractionInput, bounds: ExtractionBounds) -> Extract
     items.extend(emails.clone());
     items.extend(extract_domains(text, &index, &urls, &emails));
     items.extend(extract_hashes(text, &index));
+    items.extend(extract_accounts(text, &index));
     items.extend(extract_people(input.author.as_deref()));
     items.extend(extract_organizations(&input.organizations));
 
@@ -641,6 +722,63 @@ fn extract_hashes(text: &str, index: &CharIndex) -> Vec<Extracted> {
     out
 }
 
+/// 社交／程式碼平台的個人檔案網址 → Account。
+///
+/// `name` 用原樣 handle（保留大小寫），`normalized_name` 是
+/// `{platform}:{handle_lowercased}`。platform 用固定字串
+/// （`github`／`twitter`／`telegram`），不要用網域原文——否則
+/// `x.com/alice` 與 `twitter.com/alice` 會變成兩個 Entity。
+///
+/// confidence 0.75，低於 URL（0.95）：路徑第一段常是行銷頁、組織頁、
+/// 設定頁而不是個人檔案，[`ACCOUNT_RESERVED_PATHS`] 擋不完。
+/// 寧可抽到再靠低信心標記，也不要為了乾淨把真帳號丟掉。
+fn extract_accounts(text: &str, index: &CharIndex) -> Vec<Extracted> {
+    let mut out = Vec::new();
+    for caps in ACCOUNT_PROFILE.captures_iter(text) {
+        let whole = caps.get(0).expect("group 0 一定存在");
+        let host = caps.get(1).expect("ACCOUNT_PROFILE 有 host group").as_str();
+        let handle = caps.get(2).expect("ACCOUNT_PROFILE 有 handle group");
+        // `regex` crate 沒有 look-around。`octo-cat` 會在 `-` 處形成 word
+        // boundary，前綴 `octo` 會命中。下一個位元組是 `-` 就整段丟掉。
+        if text.as_bytes().get(handle.end()) == Some(&b'-') {
+            continue;
+        }
+        let handle_raw = handle.as_str();
+        let handle_lower = handle_raw.to_ascii_lowercase();
+        if ACCOUNT_RESERVED_PATHS.contains(&handle_lower.as_str()) {
+            continue;
+        }
+        let Some(platform) = platform_from_host(host) else {
+            continue;
+        };
+        let mut attributes = BTreeMap::new();
+        attributes.insert("platform".into(), serde_json::json!(platform));
+        attributes.insert("handle".into(), serde_json::json!(handle_lower));
+        out.push(Extracted {
+            entity_type: EntityType::Account,
+            name: handle_raw.to_string(),
+            normalized_name: format!("{platform}:{handle_lower}"),
+            extractor: "regex-account-profile",
+            confidence: 0.75,
+            text_offset: index.char_offset(whole.start()),
+            excerpt: Some(index.excerpt(whole.start(), whole.end())),
+            attributes,
+            derived_from: None,
+        });
+    }
+    out
+}
+
+/// 網域原文 → 固定 platform 字串。`x.com` 與 `twitter.com` 必須對到同一個。
+fn platform_from_host(host: &str) -> Option<&'static str> {
+    match host.to_ascii_lowercase().as_str() {
+        "github.com" => Some("github"),
+        "twitter.com" | "x.com" => Some("twitter"),
+        "t.me" => Some("telegram"),
+        _ => None,
+    }
+}
+
 /// Person：**只**從 `Document.author` 抽。自由文本 NER 是 V0.3。
 fn extract_people(author: Option<&str>) -> Vec<Extracted> {
     let Some(author) = author.map(str::trim).filter(|a| !a.is_empty()) else {
@@ -899,6 +1037,7 @@ mod tests {
             &*BARE_DOMAIN,
             &*HEX_RUN,
             &*UUID_SHAPE,
+            &*ACCOUNT_PROFILE,
         ] {
             let _ = regex.is_match("x");
         }
@@ -1362,6 +1501,115 @@ mod tests {
         let bounds = ExtractionBounds::default();
         assert_eq!(bounds.max_extractions, 500);
         assert_eq!(bounds.max_scan_bytes, 256 * 1024);
+    }
+
+    // ---- Account ----
+
+    fn account_of<'a>(items: &'a [Extracted], normalized: &str) -> &'a Extracted {
+        items
+            .iter()
+            .find(|i| i.entity_type == EntityType::Account && i.normalized_name == normalized)
+            .unwrap_or_else(|| {
+                panic!(
+                    "應抽出 Account `{normalized}`，實際 {:?}",
+                    names_of(items, EntityType::Account)
+                )
+            })
+    }
+
+    #[test]
+    fn github_profile_extracts_platform_and_handle() {
+        let items = run("見 https://github.com/Alice 的檔案。");
+        let account = account_of(&items, "github:alice");
+        assert_eq!(account.name, "Alice");
+        assert_eq!(account.attributes["platform"], serde_json::json!("github"));
+        assert_eq!(account.attributes["handle"], serde_json::json!("alice"));
+        assert_eq!(account.extractor, "regex-account-profile");
+        assert!(
+            (account.confidence - 0.75).abs() < f64::EPSILON,
+            "Account 誤判風險高於 URL，confidence 應為 0.75，實際 {}",
+            account.confidence
+        );
+    }
+
+    #[test]
+    fn twitter_and_x_collapse_to_the_same_platform() {
+        let items = run("https://twitter.com/Bob 與 https://x.com/Bob 是同一個帳號。");
+        let accounts: Vec<_> = items
+            .iter()
+            .filter(|i| i.entity_type == EntityType::Account)
+            .collect();
+        assert_eq!(
+            accounts.len(),
+            2,
+            "兩種網域寫法各抽一筆 extraction，但必須對到同一個 Entity 自然鍵"
+        );
+        assert!(
+            accounts.iter().all(|a| a.normalized_name == "twitter:bob"
+                && a.attributes["platform"] == serde_json::json!("twitter")),
+            "x.com 與 twitter.com 不可拆成兩個 platform，實際 {:?}",
+            accounts
+                .iter()
+                .map(|a| (&a.normalized_name, &a.attributes["platform"]))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn telegram_profile_extracts_telegram_platform() {
+        let items = run("聯絡 t.me/SocDesk");
+        let account = account_of(&items, "telegram:socdesk");
+        assert_eq!(account.name, "SocDesk");
+        assert_eq!(
+            account.attributes["platform"],
+            serde_json::json!("telegram")
+        );
+    }
+
+    #[test]
+    fn reserved_account_paths_are_not_handles() {
+        for text in [
+            "見 https://github.com/orgs/example",
+            "https://github.com/settings/profile",
+            "https://github.com/marketplace/actions",
+            "https://github.com/sponsors/alice",
+            "https://github.com/notifications",
+            "https://twitter.com/home",
+            "https://x.com/explore",
+            "https://x.com/settings",
+            "https://x.com/i/flow",
+            "https://t.me/share/url",
+            "https://t.me/joinchat/AAAA",
+        ] {
+            assert!(
+                names_of(&run(text), EntityType::Account).is_empty(),
+                "`{text}` 的第一段路徑是保留字，不該抽成 handle"
+            );
+        }
+    }
+
+    #[test]
+    fn github_hyphenated_handle_is_a_known_miss() {
+        // 已知限制，不是 bug。字元集不含 `-`，否則 `alice-vs-bob` 這種散文會誤判。
+        // `regex` crate 沒有 look-around，所以靠擷取後檢查丟掉前綴命中：
+        // 沒有那步的話 `octo-cat` 會抽出 `octo`。
+        assert!(
+            names_of(&run("https://github.com/octo-cat"), EntityType::Account).is_empty(),
+            "連字號 handle 這次刻意不抽，也不可把前綴當 handle"
+        );
+    }
+
+    #[test]
+    fn scheme_less_and_www_prefixed_profiles_are_extracted() {
+        let items = run("見 github.com/Carol 與 https://www.github.com/Carol");
+        let accounts: Vec<_> = names_of(&items, EntityType::Account);
+        assert_eq!(accounts, vec!["github:carol"]);
+    }
+
+    #[test]
+    fn account_glued_to_cjk_is_still_found() {
+        let items = run("帳號見https://github.com/alice詳情。");
+        assert_eq!(names_of(&items, EntityType::Account), vec!["github:alice"]);
     }
 
     // ---- Acceptance D 的五種型別 ----

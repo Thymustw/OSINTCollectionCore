@@ -32,13 +32,16 @@ url_secret_ref = "env:REDIS_URL"
 
 # 圖投影（SPEC_V0.2 §8）。PostgreSQL 仍是 canonical truth，這裡是可重建的投影。
 #
-# V0.2 Phase 0b 只用 HTTP（7474）給 /api/v1/ops/health 探活，**沒有** Bolt 連線。
-# Bolt URI 與憑證要等 Phase 2a 的 storage-neo4j adapter 一起進來；
-# 現在先放欄位等於宣告一個沒有人讀的契約。
-# 留空字串 = 未設定，/ops/health 會列進 not_configured 而不是 unhealthy。
+# http_url（7474）給 /api/v1/ops/health 的 HTTP 探活。空字串 = 未設定，
+# /ops/health 會列進 not_configured 而不是 unhealthy。
+# bolt_uri（7687）給 storage-neo4j 的 Neo4jStore；密碼只存 SecretRef，不要寫明文。
+# 容器內請用 OSINT__STORAGE__GRAPH__BOLT_URI=bolt://neo4j:7687 覆寫。
 [storage.graph]
 adapter = "neo4j"
 http_url = "http://127.0.0.1:7474"
+bolt_uri = "bolt://127.0.0.1:7687"
+username = "neo4j"
+password_secret_ref = "env:NEO4J_PASSWORD"
 
 [broker]
 brokers = "127.0.0.1:9092"
@@ -110,6 +113,16 @@ bulk_max_retries = 3
 # 讓上游採集端降速。設計理由見 crates/indexer/src/batch.rs。
 lag_threshold = 5000
 backpressure_sleep_ms = 200
+
+[graph_worker]
+# 18080–18085 已分別是 api／collector／normalizer／deduplicator／
+# entity-worker／indexer 的 health 埠。
+bind = "127.0.0.1:18086"
+consumer_group = "osint-graph-worker"
+# ProjectionStore 用的投影名稱。改名等於換一個空投影，要跑 rebuild。
+projection = "osint-graph"
+# rebuild 掃 canonical store 時每頁筆數。硬上限，沒有「不限」。
+page_size = 100
 
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：

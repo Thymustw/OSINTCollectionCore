@@ -15,12 +15,13 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
 use chrono::Utc;
 use collector::{CollectOutcome, CollectorRunner, RunBounds};
-use core_events::EventProducer;
+use core_events::{EventConsumer, EventProducer, EventTopic};
 use core_jobs::JobService;
 use core_model::{
     Connector, Document, DocumentType, Entity, EntityIdentifier, EntityType, NetworkRule,
@@ -1505,4 +1506,183 @@ async fn identifier_conflict_writes_exact_identifier_candidate() {
     assert_eq!(hit[0].evidence["namespace"], "domain");
     assert_eq!(hit[0].evidence["normalized_value"], fixture.domain);
     assert_eq!(hit[0].evidence["trigger"], "write_conflict");
+}
+
+/// 抽到 GitHub 個人檔案網址時，Account Entity 會寫 `namespace="github_handle"`。
+#[tokio::test]
+async fn account_profile_url_writes_github_handle_identifier() {
+    let stack = connect_stack().await;
+    let fixture = Fixture::new();
+    let source = seed_source(&stack.pg, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+    // handle 必須落在 `[A-Za-z0-9_]{1,32}`；用 run 衍生的純數字當後綴避免跨測試撞 Entity。
+    let serial = fixture.run.as_u128() % 10_000_000;
+    let handle = format!("u{serial:07}");
+    let document = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        "帳號文件",
+        &format!("作者檔案見 https://github.com/{handle} 。"),
+        None,
+        json!({}),
+        None,
+    )
+    .await;
+    worker(&stack)
+        .extract_document(document.id)
+        .await
+        .expect("extract");
+
+    let entity = stack
+        .pg
+        .find_entity_by_normalized_name(EntityType::Account, &format!("github:{handle}"))
+        .await
+        .expect("query")
+        .unwrap_or_else(|| panic!("應抽出 Account github:{handle}"));
+    assert_eq!(entity.name, handle);
+    assert_eq!(entity.attributes["platform"], json!("github"));
+    assert_eq!(entity.attributes["handle"], json!(handle));
+
+    let rows = stack
+        .pg
+        .list_entity_identifiers_by_entity(entity.id, PAGE)
+        .await
+        .expect("identifiers");
+    assert_eq!(
+        rows.len(),
+        1,
+        "Account 應剛好一筆 identifier，實際 {rows:?}"
+    );
+    assert_eq!(rows[0].namespace, "github_handle");
+    assert_eq!(
+        rows[0].normalized_value, handle,
+        "normalized_value 必須是純 handle，不能帶 github: 前綴"
+    );
+    assert_eq!(rows[0].value, handle);
+    assert_eq!(
+        rows[0].id,
+        identifier_id("github_handle", entity.id, &handle)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// relationship.changed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn relationship_changed_is_published_for_each_upserted_edge() {
+    let stack = connect_stack().await;
+    let fixture = Fixture::new();
+    let source = seed_source(&stack.pg, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+    let document = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        &format!("公告 {}", fixture.cve),
+        &format!("資安公告 {} 影響 {}。", fixture.cve, fixture.domain),
+        None,
+        json!({}),
+        None,
+    )
+    .await;
+
+    let group_id = format!("osint-e2e-entity-rel-{run}", run = fixture.run);
+    let consumer = EventConsumer::connect(
+        &stack.brokers,
+        &group_id,
+        &[EventTopic::RelationshipChanged.as_str()],
+    )
+    .expect("relationship.changed consumer");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let producer =
+        Arc::new(EventProducer::connect(&stack.brokers, "entity-e2e-rel").expect("producer"));
+    let service = EntityWorker::new(
+        stack.pg.clone(),
+        Some(producer),
+        MetricsRegistry::new(),
+        ExtractionBounds::default(),
+    );
+    let outcome = service
+        .extract_document(document.id)
+        .await
+        .expect("extract");
+    let (_, _, relationship_count) = extracted(&outcome);
+    assert!(
+        relationship_count >= 2,
+        "這份文件至少要有 CVE 與 Domain 兩條邊，實際 {relationship_count}"
+    );
+
+    // unique group + earliest 會先吃到 topic 上的歷史訊息。只認兩端含這份
+    // Document 的邊，不要對別人的 relationship_id 做 assert。
+    let related = stack
+        .pg
+        .list_relationships_by_object(document.id, PAGE)
+        .await
+        .expect("query");
+    let expected: HashSet<Uuid> = related.iter().map(|r| r.id).collect();
+    assert!(
+        expected.len() >= 2,
+        "Document 兩端至少要有兩條邊，實際 {}",
+        expected.len()
+    );
+
+    let mut seen = HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !expected.is_subset(&seen) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "等 relationship.changed 逾時（已收到 {} / {}）。\
+             請確認 Redpanda 在跑、topic 可自動建立",
+            seen.len(),
+            expected.len()
+        );
+        let envelope = consumer
+            .next_envelope(remaining)
+            .await
+            .expect("consume 失敗。請確認 osint-core-redpanda-1 在跑（埠 9092）");
+        if envelope.event_type != "relationship.changed" {
+            continue;
+        }
+        if envelope.payload["change_kind"] != json!("upserted") {
+            continue;
+        }
+        let Some(rel_id) = envelope
+            .payload
+            .get("relationship_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        else {
+            continue;
+        };
+        if !expected.contains(&rel_id) {
+            continue;
+        }
+        let stored = stack
+            .pg
+            .get_relationship(rel_id)
+            .await
+            .expect("query")
+            .expect("事件提到的 relationship 必須存在");
+        assert_eq!(
+            envelope.payload["source_object_id"],
+            json!(stored.source_object_id)
+        );
+        assert_eq!(
+            envelope.payload["target_object_id"],
+            json!(stored.target_object_id)
+        );
+        assert_eq!(
+            envelope.correlation_id,
+            Some(rel_id),
+            "correlation_id 必須是 relationship_id（publish 的第三個參數）"
+        );
+        // EventConsumer 不暴露 Kafka message key；partition key 在 produce 時
+        // 設成 relationship_id.to_string()，與 correlation_id 同一值。
+        let _ = consumer.commit_last();
+        seen.insert(rel_id);
+    }
 }

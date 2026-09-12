@@ -2334,6 +2334,7 @@ name = "merge"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "core-events",
  "core-model",
  "serde_json",
  "storage-core",

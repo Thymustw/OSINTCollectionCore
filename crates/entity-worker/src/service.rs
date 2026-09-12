@@ -27,7 +27,7 @@
 //! 會造成「宣稱處理過但其實沒寫」的靜默失效，而 write-then-claim 的 crash window
 //! 只會造成重跑——而且因為第 2 點是 v5 id，重跑連重複列都不會產生。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -244,7 +244,7 @@ impl EntityWorker {
 
         // ---- CPU-bound 的 regex 掃描 ----
         // CLAUDE.md §6：CPU-heavy work must not block Tokio executor threads。
-        // 一份 256 KiB 的文章要跑八組 regex，在 executor thread 上做會卡住
+        // 一份 256 KiB 的文章要跑九組 regex，在 executor thread 上做會卡住
         // 同一個 runtime 上的所有 I/O（含 health endpoint 與 broker 心跳）。
         let input = extraction_input(&document, self.bounds);
         let bounds = self.bounds;
@@ -278,7 +278,10 @@ impl EntityWorker {
         // 雜湊輸入是同一套，不會分岔。
         let mut entity_ids: BTreeMap<(String, String), Uuid> = BTreeMap::new();
         let mut extraction_count = 0_usize;
-        let mut relationship_ids: BTreeSet<Uuid> = BTreeSet::new();
+        // 用 relationship_id 當 key 去重：同一份 Document 多次提及同一個 Entity
+        // 會 upsert 同一條邊。收集完整欄位是為了發 `relationship.changed`，
+        // 不要寫完再查一次資料庫。
+        let mut relationships: BTreeMap<Uuid, RelationshipFact> = BTreeMap::new();
 
         for item in &result.items {
             let key = natural_key(item.entity_type, &item.normalized_name);
@@ -301,7 +304,14 @@ impl EntityWorker {
                 .await?;
             self.write_relationship_evidence(rel_id, &document, raw_evidence_id, item, now)
                 .await?;
-            relationship_ids.insert(rel_id);
+            relationships.insert(
+                rel_id,
+                RelationshipFact {
+                    source_object_id: document.id,
+                    relationship_type: rel_type,
+                    target_object_id: entity_id,
+                },
+            );
         }
 
         // Domain ↔ URL / Domain ↔ Email 的 relationship。
@@ -328,7 +338,14 @@ impl EntityWorker {
                 .await?;
             self.write_relationship_evidence(rel_id, &document, raw_evidence_id, item, now)
                 .await?;
-            relationship_ids.insert(rel_id);
+            relationships.insert(
+                rel_id,
+                RelationshipFact {
+                    source_object_id: *source_id,
+                    relationship_type: rel_type,
+                    target_object_id: *target_id,
+                },
+            );
         }
 
         // ---- claim（write-then-claim 的最後一步）----
@@ -336,7 +353,7 @@ impl EntityWorker {
             document_id,
             entity_count: entity_ids.len(),
             extraction_count,
-            relationship_count: relationship_ids.len(),
+            relationship_count: relationships.len(),
             truncated: result.truncated,
         };
         match self
@@ -361,17 +378,19 @@ impl EntityWorker {
         self.metrics
             .inc("osint_entities_total", entity_ids.len() as u64);
         self.metrics
-            .inc("osint_relationships_total", relationship_ids.len() as u64);
+            .inc("osint_relationships_total", relationships.len() as u64);
         tracing::info!(
             %document_id,
             entity_count = entity_ids.len(),
             extraction_count,
-            relationship_count = relationship_ids.len(),
+            relationship_count = relationships.len(),
             truncated = result.truncated,
             "entity 抽取完成"
         );
 
         self.publish(&outcome, &entity_ids).await?;
+        self.publish_relationship_changes(&outcome, &relationships)
+            .await?;
         Ok(outcome)
     }
 
@@ -463,7 +482,8 @@ impl EntityWorker {
 
     /// 對特定 `EntityType` 寫一筆 [`EntityIdentifier`]。
     ///
-    /// 只覆蓋「值本身就是命名空間內唯一鍵」的型別（Domain／Ip／Url／Email／CVE）。
+    /// 只覆蓋「值本身就是命名空間內唯一鍵」的型別（Domain／Ip／Url／Email／CVE）
+    /// 以及 Account（per-platform namespace，見 [`account_identifier_fields`]）。
     /// Hash／Person／Organization 等刻意跳過，理由見 [`identifier_namespace_for`]。
     ///
     /// # 錯誤處理：一律 log-only，不回傳失敗
@@ -481,15 +501,15 @@ impl EntityWorker {
     /// * 其他 `StorageError`：error log。DB 掛了下一筆 Entity 還是會失敗，
     ///   不會因為這裡吞掉而讓整次抽取假裝成功。
     async fn write_identifier_if_applicable(&self, entity: &Entity, source_id: Option<SourceId>) {
-        let Some(namespace) = identifier_namespace_for(entity.entity_type) else {
+        let Some((namespace, value, normalized_value)) = identifier_write_spec(entity) else {
             return;
         };
         let identifier = EntityIdentifier {
-            id: identifier_id(namespace, entity.id, &entity.normalized_name),
+            id: identifier_id(namespace, entity.id, &normalized_value),
             entity_id: entity.id,
             namespace: namespace.to_string(),
-            value: entity.name.clone(),
-            normalized_value: entity.normalized_name.clone(),
+            value,
+            normalized_value: normalized_value.clone(),
             confidence: entity.confidence,
             source_id,
             first_seen: entity.first_seen,
@@ -501,7 +521,7 @@ impl EntityWorker {
                 tracing::info!(
                     entity_id = %entity.id,
                     namespace,
-                    normalized_value = %entity.normalized_name,
+                    normalized_value = %normalized_value,
                     %message,
                     "entity_identifiers 自然鍵衝突：另一個 Entity 已宣稱這個識別碼，改寫 resolution candidate"
                 );
@@ -511,7 +531,7 @@ impl EntityWorker {
                 tracing::error!(
                     entity_id = %entity.id,
                     namespace,
-                    normalized_value = %entity.normalized_name,
+                    normalized_value = %normalized_value,
                     error = %err,
                     "寫入 entity_identifiers 失敗（非衝突）。Entity 已落地，識別碼這次略過；\
                      請查 Postgres 連線與 migration 0007 是否已套用"
@@ -777,6 +797,53 @@ impl EntityWorker {
             .await?;
         Ok(())
     }
+
+    /// 對本次抽取寫入／更新的每一條邊發一則 `relationship.changed`。
+    ///
+    /// 只在 [`ExtractOutcome::Extracted`] 發：跳過／已處理／找不到都不發，
+    /// 理由與 [`Self::publish`] 相同——重跑同一份文件不該重發事件。
+    ///
+    /// partition key 用 `relationship_id`（不是 `document_id`）：這條邊的 id 是
+    /// UUID v5（source+type+target），同一條邊的多次更新必須落在同一個
+    /// partition，graph-worker 才不會收到亂序更新。
+    async fn publish_relationship_changes(
+        &self,
+        outcome: &ExtractOutcome,
+        relationships: &BTreeMap<Uuid, RelationshipFact>,
+    ) -> Result<(), EntityWorkerError> {
+        let Some(producer) = &self.producer else {
+            return Ok(());
+        };
+        if !matches!(outcome, ExtractOutcome::Extracted { .. }) {
+            return Ok(());
+        }
+        for (relationship_id, fact) in relationships {
+            let key = relationship_id.to_string();
+            let payload = json!({
+                "relationship_id": relationship_id,
+                "source_object_id": fact.source_object_id,
+                "target_object_id": fact.target_object_id,
+                "relationship_type": fact.relationship_type,
+                "change_kind": "upserted",
+            });
+            producer
+                .publish(
+                    EventTopic::RelationshipChanged,
+                    Some(&key),
+                    Some(*relationship_id),
+                    payload,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// 發 `relationship.changed` 需要的欄位。在 upsert 當下就記，不事後查庫。
+struct RelationshipFact {
+    source_object_id: Uuid,
+    relationship_type: RelationshipType,
+    target_object_id: Uuid,
 }
 
 /// 數 evidence 時的上限。與 `RelationalStore` 的 1..=100 夾制一致；
@@ -882,7 +949,10 @@ pub fn extraction_id(
 ///   會把檔案雜湊與 commit id 誤判成同一個識別碼——false merge 比 false negative
 ///   危險。等抽取端能明確分辨雜湊型別再處理。
 /// * **Person／Organization**：`name` 是人看的名字，不是命名空間內的唯一鍵。
-/// * **Account／Software／Repository／Location／Hostname**：這次沒有清楚的
+/// * **Account**：同一個 `EntityType` 底下不同平台要寫進不同 namespace
+///   （`github_handle`／`twitter_handle`／`telegram_handle`），不能用
+///   一對一對照。寫入端走 [`account_identifier_fields`]，不走這條。
+/// * **Software／Repository／Location／Hostname**：這次沒有清楚的
 ///   namespace 語意，不寫。
 #[must_use]
 pub fn identifier_namespace_for(entity_type: EntityType) -> Option<&'static str> {
@@ -893,6 +963,61 @@ pub fn identifier_namespace_for(entity_type: EntityType) -> Option<&'static str>
         EntityType::Email => Some("email"),
         EntityType::Vulnerability => Some("cve"),
         _ => None,
+    }
+}
+
+/// 這次寫入 identifier 要用的 `(namespace, value, normalized_value)`。
+///
+/// Account 不能走 [`identifier_namespace_for`]（一對一對照不夠），其餘五種
+/// 維持原路徑。`normalized_value` 對 Account 是**純 handle**，不含
+/// `normalized_name` 的 `{platform}:` 前綴——resolver 的 `account_handle`
+/// 要比的就是跨平台的同一個 handle 字串。
+fn identifier_write_spec(entity: &Entity) -> Option<(&'static str, String, String)> {
+    if entity.entity_type == EntityType::Account {
+        return account_identifier_fields(entity);
+    }
+    let namespace = identifier_namespace_for(entity.entity_type)?;
+    Some((
+        namespace,
+        entity.name.clone(),
+        entity.normalized_name.clone(),
+    ))
+}
+
+/// Account 的 identifier：namespace 由 `attributes.platform` 決定。
+///
+/// `normalized_value` 優先取 `attributes.handle`（抽取器寫入的小寫 handle）。
+/// 沒有那欄時才從 `normalized_name` 用 `:` 切開取後半段——給舊列或手動
+/// 建立的 Entity 一條退路，切分失敗就整筆不寫，不要把 `github:alice`
+/// 整串塞進 handle namespace。
+fn account_identifier_fields(entity: &Entity) -> Option<(&'static str, String, String)> {
+    let platform = entity.attributes.get("platform").and_then(Value::as_str)?;
+    let namespace = match platform {
+        "github" => "github_handle",
+        "twitter" => "twitter_handle",
+        "telegram" => "telegram_handle",
+        _ => return None,
+    };
+    let handle = entity
+        .attributes
+        .get("handle")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .or_else(|| account_handle_from_normalized_name(&entity.normalized_name))?;
+    if handle.is_empty() {
+        return None;
+    }
+    Some((namespace, entity.name.clone(), handle))
+}
+
+/// `github:alice` → `alice`。沒有 `:`、或後半段是空的，回 `None`。
+fn account_handle_from_normalized_name(normalized_name: &str) -> Option<String> {
+    let (_, handle) = normalized_name.split_once(':')?;
+    let handle = handle.trim();
+    if handle.is_empty() {
+        None
+    } else {
+        Some(handle.to_ascii_lowercase())
     }
 }
 
@@ -1089,6 +1214,95 @@ mod tests {
         assert_eq!(identifier_namespace_for(EntityType::Location), None);
     }
 
+    fn account_entity(
+        platform: &str,
+        name: &str,
+        normalized: &str,
+        handle: Option<&str>,
+    ) -> Entity {
+        let mut attributes = serde_json::Map::new();
+        attributes.insert("platform".into(), json!(platform));
+        if let Some(handle) = handle {
+            attributes.insert("handle".into(), json!(handle));
+        }
+        Entity {
+            id: Uuid::from_u128(1),
+            entity_type: EntityType::Account,
+            name: name.into(),
+            normalized_name: normalized.into(),
+            description: None,
+            confidence: 0.75,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            merged_into: None,
+            attributes: Value::Object(attributes),
+        }
+    }
+
+    #[test]
+    fn account_identifier_uses_per_platform_namespace_and_bare_handle() {
+        let entity = account_entity("github", "Alice", "github:alice", Some("alice"));
+        let (namespace, value, normalized) =
+            identifier_write_spec(&entity).expect("Account 必須寫 identifier");
+        assert_eq!(namespace, "github_handle");
+        assert_eq!(value, "Alice");
+        assert_eq!(
+            normalized, "alice",
+            "normalized_value 必須是純 handle，不能把 github:alice 整串塞進去"
+        );
+        assert_eq!(
+            identifier_write_spec(&account_entity(
+                "twitter",
+                "Alice",
+                "twitter:alice",
+                Some("alice")
+            ))
+            .map(|(n, _, _)| n),
+            Some("twitter_handle")
+        );
+        assert_eq!(
+            identifier_write_spec(&account_entity(
+                "telegram",
+                "Alice",
+                "telegram:alice",
+                Some("alice")
+            ))
+            .map(|(n, _, _)| n),
+            Some("telegram_handle")
+        );
+    }
+
+    #[test]
+    fn account_identifier_falls_back_to_splitting_normalized_name() {
+        let entity = account_entity("github", "Alice", "github:Alice", None);
+        let (_, _, normalized) = identifier_write_spec(&entity)
+            .expect("沒有 attributes.handle 時應從 normalized_name 切開");
+        assert_eq!(normalized, "alice");
+    }
+
+    #[test]
+    fn account_identifier_skips_unknown_platform_and_empty_handle() {
+        assert!(
+            identifier_write_spec(&account_entity(
+                "linkedin",
+                "alice",
+                "linkedin:alice",
+                Some("alice")
+            ))
+            .is_none(),
+            "沒對照到的 platform 不該發明 namespace"
+        );
+        assert!(
+            identifier_write_spec(&account_entity("github", "Alice", "github:", None)).is_none(),
+            "切不出 handle 就整筆不寫，不要把空字串當識別碼"
+        );
+        let mut domain = account_entity("github", "example.com", "example.com", None);
+        domain.entity_type = EntityType::Domain;
+        domain.attributes = json!({});
+        let spec = identifier_write_spec(&domain).expect("Domain 仍走一對一 namespace");
+        assert_eq!(spec, ("domain", "example.com".into(), "example.com".into()));
+    }
+
     #[test]
     fn identifier_id_is_deterministic_and_owner_sensitive() {
         let a = Uuid::from_u128(1);
@@ -1201,6 +1415,7 @@ mod tests {
             EntityType::Domain,
             EntityType::Email,
             EntityType::Hash,
+            EntityType::Account,
         ] {
             assert_eq!(
                 mention_relationship_type(&make(kind)),

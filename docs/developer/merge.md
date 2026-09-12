@@ -12,7 +12,7 @@ crates/merge    函式庫；HTTP 入口在 osint-api
 
 ```text
 MergeService<S: TransactionalStore>
-  new(store)
+  new(store, producer: Option<Arc<EventProducer>>)
   execute_merge(survivor_id, merged_id, reason, operator) -> Result<MergeHistory, MergeError>
   undo_merge(merge_history_id) -> Result<(), MergeError>
 ```
@@ -50,6 +50,12 @@ tx.commit()
 任何一步 `Err` 都讓 `Transaction` drop 回滾（sqlx 保證）。狀態只剩「全在」或「全不在」，不會留下 `merged_into` 已寫、參照還沒改的半成品。
 
 `undo_merge` 同一套：檢查 `MergeHistory` 存在、尚未 undo、survivor 之後沒有再被併掉，然後開交易逆序還原。
+
+`tx.commit()` **成功之後**才發 `relationship.changed`（payload 與 partition key
+見 `docs/developer/events.md`）。交易內組好事件內容（含 absorber 合併後的
+完整列、repoint 後的完整列），不在 commit 後再查一次。`producer` 為 `None`
+時整段跳過。發送失敗只記 error，不讓 merge／undo 本身失敗——canonical store
+已經改完，重跑 `execute_merge` 會被 `AlreadyMerged` 擋住。
 
 ## `execute_merge` 做什麼
 
@@ -117,3 +123,14 @@ merged 與 survivor 之間原本的直接關聯，repoint 後兩端會變成同�
 | `ReferenceMissing`／`UnknownReferenceTable`／`UnknownReferenceColumn` | undo 時歷史與資料庫對不上 |
 | `MissingAbsorberSnapshot` | 碰撞紀錄缺少還原快照 |
 | `Storage` | 底層 storage 錯誤（含 Conflict） |
+
+## 測試
+
+```bash
+cargo test -p merge
+```
+
+`tests/sqlite.rs` 不接 Kafka（`producer = None`），只驗 merge／undo 的資料改寫。
+`tests/events.rs` 對本機 Redpanda 真跑：safe_repoint 發 `"upserted"`、自迴圈
+execute 發 `"deleted"`、undo 發 `"upserted"`。EventConsumer 不暴露 Kafka
+message key，partition key 以 `correlation_id == relationship_id` 間接驗證。

@@ -1870,6 +1870,22 @@ impl RelationalStore for PostgresCanonicalStore {
         row.as_ref().map(mapping::entity_identifier).transpose()
     }
 
+    async fn find_entity_identifiers_by_normalized_value(
+        &self,
+        normalized_value: &str,
+        limit: u32,
+    ) -> Result<Vec<EntityIdentifier>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM entity_identifiers WHERE normalized_value = $1 ORDER BY id ASC LIMIT $2",
+        )
+        .bind(normalized_value)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_identifier).collect()
+    }
+
     async fn put_resolution_candidate(
         &self,
         candidate: &ResolutionCandidate,

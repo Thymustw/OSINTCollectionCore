@@ -116,7 +116,10 @@ fn build_api_with_backends(
         jobs: producer
             .clone()
             .map(|p| Arc::new(JobService::new(stack.pg.clone(), Some(p)))),
-        merge: Some(Arc::new(merge::MergeService::new(stack.pg.clone()))),
+        merge: Some(Arc::new(merge::MergeService::new(
+            stack.pg.clone(),
+            producer.clone(),
+        ))),
         resolver: Some(Arc::new(resolver::ResolverService::new(
             stack.pg.clone(),
             storage_core::mock::MockEmbeddingProvider::unsupported(),
