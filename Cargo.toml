@@ -69,6 +69,11 @@ import-format = { path = "crates/import-format" }
 ipnet = "2.12.2"
 dotenvy = "0.15.7"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+# 只給 GET /api/v1/ops/metrics 的 Disk 指標用（statvfs）。std 沒有任何取得檔案系統
+# 剩餘空間的 API，而 §31 Required views 明列 "CPU/RAM/Disk metrics"。
+# libc 本來就已經在相依樹裡（tokio／rdkafka／sqlx 都拉它），明確宣告成 workspace
+# 相依不會新增任何 crate。MIT OR Apache-2.0。
+libc = { version = "0.2.180", default-features = false, features = ["std"] }
 opensearch = { version = "2.4.0", default-features = false, features = ["rustls-tls"] }
 rand = { version = "0.8.5", features = ["std"] }
 # entity-worker 的確定性抽取規則（SPEC §17）。

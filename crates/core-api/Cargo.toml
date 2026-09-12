@@ -29,6 +29,8 @@ import-format = { workspace = true }
 # 都只呼叫 indexer::search::build，不自己組查詢（理由見 crates/indexer/src/lib.rs）。
 indexer = { path = "../indexer" }
 hex = { workspace = true }
+# GET /api/v1/ops/metrics 的 Disk 指標（statvfs）。見 src/ops.rs 的 disk_usage。
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

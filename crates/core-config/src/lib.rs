@@ -239,7 +239,10 @@ pub struct IndexerSection {
     /// 暫時性 bulk 失敗最多重試幾次。
     pub bulk_max_retries: u32,
     /// consumer lag 超過這個值就在批次之間插入延遲，並把 lag 寫進
-    /// `osint_queue_depth` 讓上游降速。
+    /// `osint_queue_depth` gauge。
+    ///
+    /// 注意：那個 gauge 在 V0.1 **沒有任何程式讀它**，collector 不會自動降速
+    /// （跨服務 backpressure 是 V0.2）。這個門檻只影響 indexer 自己的節奏。
     pub lag_threshold: u64,
     /// 降速時的基礎延遲（毫秒）。實際延遲會依超出門檻的倍數放大，最多 8 倍。
     pub backpressure_sleep_ms: u64,

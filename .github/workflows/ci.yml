@@ -112,9 +112,14 @@ jobs:
     # OpenCTI port conflict that docker-compose.dev.yml works around, so the
     # override file is deliberately NOT used here.
     #
-    # Validated: `docker compose up --wait` against this file's healthchecks
-    # passes reliably on GitHub's ubuntu-latest runners (confirmed across
-    # multiple real runs, not just assumed).
+    # Validated on real runners: this file is exported to the public repo
+    # (github.com/Thymustw/OSINTCollectionCore, see docs/adr/ADR-003) and has
+    # run there on ubuntu-latest on every push since 2026-09-10 — 15+ green
+    # runs as of 2026-09-12. The private repo deliberately has NO git remote
+    # (ADR-003), so `git remote -v` being empty here says nothing about
+    # whether CI runs. A prior doc-sync pass misread that and rewrote this
+    # comment to "never executed"; corrected. Observed `--wait` time on the
+    # runner is well under the 180s ceiling (typically 60–110s).
     env:
       DATABASE_URL: postgres://osint:osint_dev@localhost:5432/osint_core
       SQLITE_URL: "sqlite:./var/osint-local.sqlite?mode=rwc"
@@ -130,9 +135,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      # taiki-e/install-action has no sqlx-cli tag (confirmed: not in its
-      # tags list) — that shorthand only works for tools it actually
-      # publishes prebuilt binaries for. Build from source instead, pinned
+      # taiki-e/install-action has no sqlx-cli tag — that shorthand only works
+      # for tools it actually publishes prebuilt binaries for.
+      # Re-confirmed 2026-09-12 via the GitHub contents API: none of the 103
+      # entries in taiki-e/install-action's manifests/ directory is sqlx.
+      # Build from source instead, pinned
       # to the exact features used locally (postgres+sqlite+rustls, no
       # native-tls/openssl).
       - run: cargo install sqlx-cli --version =0.9.0 --locked --no-default-features --features postgres,sqlite,rustls

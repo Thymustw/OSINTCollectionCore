@@ -402,8 +402,9 @@ async fn apply_backpressure(
             threshold = bounds.lag_threshold,
             sleep_ms = decision.sleep.as_millis() as u64,
             "consumer lag 超過門檻，批次之間降速。\
-             瓶頸多半在 OpenSearch；要讓 lag 下降請降低上游採集速率\
-             （collector 依 osint_queue_depth 判斷）"
+             瓶頸多半在 OpenSearch；要讓 lag 下降請降低上游採集速率——\
+             V0.1 沒有自動降速，請手動調 [collector].tick_secs／global_inflight，\
+             或先停用部分 connector"
         );
         tokio::time::sleep(decision.sleep).await;
     }

@@ -2,7 +2,8 @@
 //!
 //! * `GET /ops/health`：五個後端（PostgreSQL／物件儲存／Redis／OpenSearch／Redpanda）
 //!   的聚合健康。任一 down → 整體 **503**，回應裡指出是哪一個。
-//! * `GET /ops/metrics`：本行程的資源用量（RSS、CPU 時間、執行緒數）。
+//! * `GET /ops/metrics`：本行程的資源用量（RSS、CPU 時間、執行緒數、
+//!   以及工作目錄所在檔案系統的容量／剩餘空間）。
 //! * `GET /ops/connectors`：每個 connector 的採集健康（SPEC §31「connector health」）。
 //! * `GET /ops/queues`：四個 consumer group 的 lag（SPEC §31「queue summary」）。
 //! * `GET /ops/dlq`：失敗的 Job 清單（SPEC §31「basic DLQ view」）。
@@ -21,9 +22,10 @@
 //!
 //! # 為什麼不加 `sysinfo` crate
 //!
-//! 需要的東西只有 RSS 與 CPU 時間，`/proc/self/status` 與 `/proc/self/stat`
-//! 兩個檔就有。為了兩個數字引進一個會掃描全系統行程的相依（以及它的相依樹與
-//! 供應鏈稽核成本）不划算。代價是**只在 Linux 有效**，其他平台回 501。
+//! 需要的東西只有 RSS、CPU 時間與一次 `statvfs`：前兩者 `/proc/self/status` 與
+//! `/proc/self/stat` 兩個檔就有，後者走 `libc`（本來就在相依樹裡）。為了這幾個
+//! 數字引進一個會掃描全系統行程的相依（以及它的相依樹與供應鏈稽核成本）不划算。
+//! 代價是**只在 Linux 有效**，其他平台回 501。
 
 use std::sync::Arc;
 
@@ -172,6 +174,19 @@ pub struct ProcessMetrics {
     pub cpu_system_seconds: f64,
     /// 換算 CPU 時間用的每秒 tick 數。見 [`CLOCK_TICKS_PER_SEC`] 的說明。
     pub clock_ticks_per_sec: u64,
+    /// 量磁碟的是哪一條路徑（[`DISK_PATH`]）。回在 API 裡是因為
+    /// 「哪個檔案系統」決定了這兩個數字的意義——容器裡的 cwd 與主機 `/` 常常不同。
+    pub disk_path: &'static str,
+    /// `disk_path` 所在檔案系統的總容量。
+    ///
+    /// 量不到時是 `null`，**不是 0**：`0` 會讓「磁碟已滿」與「量不到」
+    /// 在面板上長得一模一樣（同 [`QueueEntry::lag`] 的理由）。
+    pub disk_bytes_total: Option<u64>,
+    /// 非特權行程還能寫入的剩餘空間（`f_bavail`，不是 `f_bfree`）。
+    ///
+    /// 用 `f_bavail` 是因為 ext4 預設保留 5% 給 root，用 `f_bfree` 會在
+    /// 一般行程早就寫不進去的時候還顯示「還有空間」。
+    pub disk_bytes_available: Option<u64>,
 }
 
 /// `/proc/self/stat` 的 CPU 時間單位。
@@ -181,6 +196,16 @@ pub struct ProcessMetrics {
 /// 不會為了相容性而改變。把假設寫成常數並回在 API 裡，比悄悄除以一個魔術數字好：
 /// 呼叫端若發現數字不對，至少看得到我們是用什麼換算的。
 const CLOCK_TICKS_PER_SEC: u64 = 100;
+
+/// 量磁碟容量的路徑。
+///
+/// 用 `/proc/self/cwd`（行程自己的工作目錄）而不是 `/`：會先把磁碟吃光的是
+/// **這個行程實際寫東西的那個檔案系統**（`target/`、`var/`、匯入暫存），
+/// 那不一定跟 `/` 是同一個掛載點——容器裡幾乎一定不是。
+///
+/// 量 host 整體磁碟不是這個端點的責任：`/ops/metrics` 的語意是
+/// 「**這個行程**的資源用量」（見模組開頭的分工說明）。
+const DISK_PATH: &str = "/proc/self/cwd";
 
 /// `GET /api/v1/ops/metrics`。viewer 以上。非 Linux 回 501。
 pub async fn metrics(
@@ -503,6 +528,8 @@ pub struct DlqView {
     /// offset（見三個 consumer 的 main.rs），不會被搬到另一個 topic。
     /// 因此「永久失敗的事件」在 V0.1 沒有任何地方查得到——
     /// 這個欄位是 `null` 就是在說這件事，而不是在說「目前沒有壞掉的東西」。
+    ///
+    /// 決策理由與 V0.2 的落地方向見 `docs/adr/ADR-008-no-dlq-topic-in-v0.1.md`。
     pub dlq_topic: Option<String>,
     pub note: String,
     /// `failed` 狀態的 Job。這是 V0.1 唯一真的落地的失敗紀錄。
@@ -551,7 +578,56 @@ pub async fn dlq(
 fn collect_process_metrics() -> Result<ProcessMetrics, ApiError> {
     let status = std::fs::read_to_string("/proc/self/status").map_err(proc_error)?;
     let stat = std::fs::read_to_string("/proc/self/stat").map_err(proc_error)?;
-    parse_process_metrics(&status, &stat)
+    let mut metrics = parse_process_metrics(&status, &stat)?;
+    if let Some((total, available)) = disk_usage() {
+        metrics.disk_bytes_total = Some(total);
+        metrics.disk_bytes_available = Some(available);
+    }
+    Ok(metrics)
+}
+
+/// [`DISK_PATH`] 所在檔案系統的 `(總容量, 非特權可用空間)`，單位 bytes。
+///
+/// 量不到回 `None` 而不是 `(0, 0)`，並且**會記 warn**：磁碟指標悄悄變成 0
+/// 會被讀成「磁碟滿了」，那是完全相反的結論。
+///
+/// 不引進 `sysinfo`／`nix`：需要的只有一次 `statvfs`，而 `libc` 本來就在相依樹裡
+/// （見 workspace `Cargo.toml` 的註解）。
+// `statvfs` 的欄位型別隨架構而異：x86_64 Linux 上 `f_frsize` 是 `u64`（所以 clippy
+// 說 `u64::try_from` 多餘），但在 32-bit target 上是 `u32`／`c_ulong`。寫成 `as u64`
+// 會在有朝一日型別變窄時靜默截斷，所以保留 try_from 並只關掉這一條 lint。
+#[allow(clippy::useless_conversion)]
+#[cfg(target_os = "linux")]
+fn disk_usage() -> Option<(u64, u64)> {
+    let path = c"/proc/self/cwd";
+    debug_assert_eq!(path.to_bytes(), DISK_PATH.as_bytes());
+
+    let mut raw = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` 是以 NUL 結尾的 C 字串字面值（存活於整個程式），
+    // `raw` 是大小正確且對齊的可寫緩衝區。statvfs 成功（回 0）時會把它完整初始化。
+    let rc = unsafe { libc::statvfs(path.as_ptr(), raw.as_mut_ptr()) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            path = DISK_PATH,
+            error = %err,
+            "statvfs 失敗，這輪 /ops/metrics 不回報 Disk 指標（欄位會是 null，不是 0）"
+        );
+        return None;
+    }
+    // SAFETY: statvfs 回 0，緩衝區已被核心初始化。
+    let stat = unsafe { raw.assume_init() };
+
+    // `f_frsize` 是「區塊大小」（fragment size），f_blocks／f_bavail 都以它為單位。
+    // 不要用 `f_bsize`：那是偏好的 I/O 大小，在某些檔案系統上與前者不同。
+    // 這些欄位的型別隨架構而異（c_ulong／u64），用 try_from 而不是 `as` 轉。
+    let frsize = u64::try_from(stat.f_frsize).ok()?;
+    let blocks = u64::try_from(stat.f_blocks).ok()?;
+    let available = u64::try_from(stat.f_bavail).ok()?;
+    Some((
+        frsize.saturating_mul(blocks),
+        frsize.saturating_mul(available),
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -603,6 +679,10 @@ fn parse_process_metrics(status: &str, stat: &str) -> Result<ProcessMetrics, Api
         cpu_user_seconds: utime as f64 / CLOCK_TICKS_PER_SEC as f64,
         cpu_system_seconds: stime as f64 / CLOCK_TICKS_PER_SEC as f64,
         clock_ticks_per_sec: CLOCK_TICKS_PER_SEC,
+        disk_path: DISK_PATH,
+        // Disk 由 collect_process_metrics 走 statvfs 補上（這裡是純解析函式，不碰系統）。
+        disk_bytes_total: None,
+        disk_bytes_available: None,
     })
 }
 
@@ -662,5 +742,32 @@ mod tests {
         let m = collect_process_metrics().expect("讀 /proc/self");
         assert!(m.rss_bytes > 0, "實際 RSS 不可能是 0：{m:?}");
         assert!(m.threads >= 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_statvfs_reports_a_non_zero_disk_total() {
+        let m = collect_process_metrics().expect("讀 /proc/self");
+        let total = m
+            .disk_bytes_total
+            .expect("statvfs 量得到 /proc/self/cwd 所在的檔案系統");
+        let available = m.disk_bytes_available.expect("同上");
+        // 「量不到」在這個 API 是 null；跑得起來的測試環境一定有檔案系統，
+        // 所以這裡出現 None 或 0 都代表 statvfs 的欄位解錯了，不是環境問題。
+        assert!(total > 0, "檔案系統總容量不可能是 0：{m:?}");
+        assert!(
+            available <= total,
+            "可用空間不可能大於總容量（多半是 f_frsize 用錯欄位）：{m:?}"
+        );
+        assert_eq!(m.disk_path, "/proc/self/cwd");
+    }
+
+    #[test]
+    fn pure_parser_leaves_disk_unmeasured() {
+        // parse_process_metrics 不碰系統，Disk 必須是 null 而不是 0——
+        // 0 會被讀成「磁碟滿了」。
+        let m = parse_process_metrics(STATUS, STAT).unwrap();
+        assert_eq!(m.disk_bytes_total, None);
+        assert_eq!(m.disk_bytes_available, None);
     }
 }

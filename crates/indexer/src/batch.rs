@@ -101,9 +101,11 @@ pub struct Backpressure {
 /// lag 高的時候瓶頸幾乎一定在 OpenSearch（bulk 佇列滿、CPU 吃滿），
 /// 這時候更用力送只會換到更多 429 與重試，對這台共用工作站上的其他 VM 也不友善。
 ///
-/// **真正往上游傳遞的 backpressure 是 `osint_queue_depth` 這個 gauge**
-/// （indexer 把 lag 寫進去）。collector 依 `RESOURCE_BUDGET.md` 依它降低採集速率——
-/// 那才是讓 lag 變小的那一端。這裡只負責不要把下游壓垮。
+/// 要讓 lag 真的變小得靠**上游降低採集速率**，而 **V0.1 沒有實作那條路徑**：
+/// indexer 會把 lag 寫進 `osint_queue_depth` gauge，但 `crates/collector` 完全
+/// 沒有讀它（主迴圈是固定 `tick_secs`）。那個 gauge 目前只是曝露給人／Prometheus 看。
+/// 跨服務 backpressure 是 V0.2 項目（見 `docs/developer/indexer.md`）。
+/// 這裡只負責不要把下游壓垮。
 #[must_use]
 pub fn backpressure(lag: u64, bounds: IndexBounds) -> Backpressure {
     if lag <= bounds.lag_threshold {

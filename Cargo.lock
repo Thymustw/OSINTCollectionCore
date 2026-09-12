@@ -691,6 +691,7 @@ dependencies = [
  "http-body-util",
  "import-format",
  "indexer",
+ "libc",
  "normalizer",
  "serde",
  "serde_json",

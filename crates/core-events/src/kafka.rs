@@ -216,8 +216,11 @@ impl EventConsumer {
     ///
     /// # 給誰用
     ///
-    /// 高吞吐 consumer 的 backpressure 判斷（CLAUDE.md §6）。也寫進
-    /// `osint_queue_depth` gauge，讓上游採集端知道下游追不上。
+    /// 高吞吐 consumer **自己**的 backpressure 判斷（CLAUDE.md §6）。也寫進
+    /// `osint_queue_depth` gauge 曝露出去。
+    ///
+    /// V0.1 **沒有**「上游讀這個 gauge 自動降速」的機制：collector 不會讀它
+    /// （見 `docs/developer/indexer.md`）。gauge 現在的用途是給人／Prometheus 看。
     ///
     /// # 為什麼要處理 runtime flavor
     ///
