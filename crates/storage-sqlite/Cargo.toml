@@ -14,7 +14,6 @@ core-model = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, default-features = false, features = ["sqlite"] }
 storage-core = { workspace = true }
-uuid = { workspace = true }
-
-[dev-dependencies]
+# 交易 handle 要在 `&self` 介面下拿到 `&mut sqlx::Transaction`，需要能跨 await 持有的鎖。
 tokio = { workspace = true }
+uuid = { workspace = true }

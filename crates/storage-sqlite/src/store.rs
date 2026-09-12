@@ -21,18 +21,37 @@ use storage_core::codec::encode_enum;
 use storage_core::conformance::assert_sqlite_path_safe;
 use storage_core::{
     CapabilityDescriptor, EmbeddedStore, HealthProvider, RelationalStore, SimhashCandidate,
-    StorageAdapter, StorageError, StorageHealth,
+    StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
 };
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::mapping;
 
+/// 一次查詢要用的連線。語意與取捨同 `storage-postgres` 的 `PgConn`：
+/// `RelationalStore` 只實作一次，執行對象在連線池與交易之間切換。
+enum SqliteConn<'a> {
+    Pooled(sqlx::pool::PoolConnection<sqlx::Sqlite>),
+    Tx(tokio::sync::MutexGuard<'a, sqlx::Transaction<'static, sqlx::Sqlite>>),
+}
+
+impl SqliteConn<'_> {
+    fn as_mut(&mut self) -> &mut sqlx::SqliteConnection {
+        match self {
+            SqliteConn::Pooled(conn) => conn,
+            SqliteConn::Tx(tx) => tx,
+        }
+    }
+}
+
 /// SQLite embedded + relational store。
 #[derive(Debug, Clone)]
 pub struct SqliteEmbeddedStore {
     pool: SqlitePool,
     path: PathBuf,
+    /// `Some` 代表這個 handle 綁在一條進行中的交易上。說明同
+    /// `PostgresCanonicalStore::tx`。
+    tx: Option<std::sync::Arc<tokio::sync::Mutex<sqlx::Transaction<'static, sqlx::Sqlite>>>>,
 }
 
 fn rfc3339(ts: DateTime<Utc>) -> String {
@@ -127,7 +146,18 @@ impl SqliteEmbeddedStore {
         Ok(Self {
             pool,
             path: path.to_path_buf(),
+            tx: None,
         })
+    }
+
+    /// 這次查詢要用哪條連線：綁了交易就用交易那條，否則向池子借。
+    async fn conn(&self) -> Result<SqliteConn<'_>, StorageError> {
+        match &self.tx {
+            Some(tx) => Ok(SqliteConn::Tx(tx.lock().await)),
+            None => Ok(SqliteConn::Pooled(
+                self.pool.acquire().await.map_err(map_sqlx)?,
+            )),
+        }
     }
 
     pub async fn migrate(&self) -> Result<(), StorageError> {
@@ -150,7 +180,7 @@ impl SqliteEmbeddedStore {
     {
         let row = sqlx::query(sql)
             .bind(uuid_text(id))
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         row.map(|r| map(&r)).transpose()
@@ -159,7 +189,7 @@ impl SqliteEmbeddedStore {
     async fn delete_id(&self, sql: &'static str, id: Uuid) -> Result<bool, StorageError> {
         let result = sqlx::query(sql)
             .bind(uuid_text(id))
-            .execute(&self.pool)
+            .execute(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
@@ -175,7 +205,7 @@ impl SqliteEmbeddedStore {
         let rows = sqlx::query(sql)
             .bind(uuid_text(key))
             .bind(clamp_limit(limit))
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity_extraction).collect()
@@ -193,7 +223,7 @@ impl SqliteEmbeddedStore {
             .bind(key)
             .bind(uuid_text(before))
             .bind(clamp_limit(limit))
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         rows.iter()
@@ -211,7 +241,7 @@ impl SqliteEmbeddedStore {
         let rows = sqlx::query(sql)
             .bind(uuid_text(collection_id))
             .bind(clamp_limit(limit))
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         rows.iter()
@@ -223,7 +253,7 @@ impl SqliteEmbeddedStore {
         sqlx::query(sql)
             .bind(uuid_text(left))
             .bind(uuid_text(right))
-            .execute(&self.pool)
+            .execute(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(())
@@ -234,7 +264,7 @@ impl SqliteEmbeddedStore {
 impl HealthProvider for SqliteEmbeddedStore {
     async fn health(&self) -> Result<StorageHealth, StorageError> {
         let (one,): (i64,) = sqlx::query_as("SELECT 1")
-            .fetch_one(&self.pool)
+            .fetch_one(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         if one != 1 {
@@ -253,11 +283,12 @@ impl StorageAdapter for SqliteEmbeddedStore {
         CapabilityDescriptor::new(
             "sqlite",
             env!("CARGO_PKG_VERSION"),
-            &["embedded", "relational"],
+            &["embedded", "relational", "transactional"],
         )
         .with_feature("json", Value::Bool(true))
         .with_feature("high_concurrent_write", Value::Bool(false))
         .with_feature("bulk_write", Value::Bool(true))
+        .with_feature("transactions", Value::Bool(true))
     }
 }
 
@@ -265,6 +296,73 @@ impl StorageAdapter for SqliteEmbeddedStore {
 impl EmbeddedStore for SqliteEmbeddedStore {
     fn database_path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[async_trait]
+impl TransactionalStore for SqliteEmbeddedStore {
+    /// ⚠️ **SQLite 只有一個寫入者。** 交易一旦寫入就握著整個資料庫的寫鎖，
+    /// 其他連線的寫入會等到 `busy_timeout`（5 秒）後失敗。
+    /// WAL 模式下讀取不受影響（讀到的是交易開始前的快照）。
+    /// 所以交易要短——不要在交易裡做網路 I/O 或呼叫模型。
+    async fn begin(&self) -> Result<Box<dyn Transaction>, StorageError> {
+        if self.tx.is_some() {
+            // 理由同 storage-postgres：巢狀交易的語意沒定義，先擋掉。
+            return Err(StorageError::UnsupportedCapability {
+                backend: "sqlite",
+                capability: "nested_transaction",
+            });
+        }
+        let tx = self.pool.begin().await.map_err(map_sqlx)?;
+        Ok(Box::new(SqliteTransaction {
+            store: SqliteEmbeddedStore {
+                pool: self.pool.clone(),
+                path: self.path.clone(),
+                tx: Some(std::sync::Arc::new(tokio::sync::Mutex::new(tx))),
+            },
+        }))
+    }
+}
+
+/// 一條進行中的 SQLite 交易。沒有 commit 就 drop 會回滾（sqlx `Transaction::drop`）。
+pub struct SqliteTransaction {
+    store: SqliteEmbeddedStore,
+}
+
+impl std::fmt::Debug for SqliteTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteTransaction").finish_non_exhaustive()
+    }
+}
+
+impl SqliteTransaction {
+    fn into_inner(self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>, StorageError> {
+        let arc = self.store.tx.ok_or_else(|| StorageError::Unknown {
+            backend: "sqlite",
+            message: "交易 handle 沒有帶交易連線。這是 adapter 內部錯誤，請回報".into(),
+        })?;
+        std::sync::Arc::try_unwrap(arc)
+            .map(tokio::sync::Mutex::into_inner)
+            .map_err(|_| StorageError::Unknown {
+                backend: "sqlite",
+                message: "交易仍被其他 handle 持有，無法結束。請確認沒有把交易 handle 複製出去"
+                    .into(),
+            })
+    }
+}
+
+#[async_trait]
+impl Transaction for SqliteTransaction {
+    fn store(&self) -> &dyn RelationalStore {
+        &self.store
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), StorageError> {
+        (*self).into_inner()?.commit().await.map_err(map_sqlx)
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), StorageError> {
+        (*self).into_inner()?.rollback().await.map_err(map_sqlx)
     }
 }
 
@@ -305,7 +403,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(rfc3339(source.created_at))
         .bind(rfc3339(source.updated_at))
         .bind(opt_rfc3339(source.last_seen))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -335,7 +433,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::source).collect()
@@ -368,7 +466,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_rfc3339(rule.expires_at))
         .bind(rfc3339(rule.created_at))
         .bind(rfc3339(rule.updated_at))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -394,7 +492,7 @@ impl RelationalStore for SqliteEmbeddedStore {
             "SELECT * FROM source_network_rules WHERE source_id = ? ORDER BY created_at, id",
         )
         .bind(uuid_text(source_id))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::network_rule).collect()
@@ -449,7 +547,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_rfc3339(connector.last_success))
         .bind(&connector.status)
         .bind(i64::from(connector.error_count))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -471,7 +569,7 @@ impl RelationalStore for SqliteEmbeddedStore {
 
     async fn list_enabled_connectors(&self) -> Result<Vec<Connector>, StorageError> {
         let rows = sqlx::query("SELECT * FROM connectors WHERE enabled = 1 ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
@@ -492,7 +590,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
@@ -516,7 +614,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_uuid_text(after))
         .bind(enabled.map(bool_int))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
@@ -546,7 +644,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(i64::from(collection.priority))
         .bind(rfc3339(collection.created_at))
         .bind(rfc3339(collection.updated_at))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -581,7 +679,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::collection).collect()
@@ -694,7 +792,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(json_text(&evidence.http_headers))
         .bind(json_text(&evidence.metadata))
         .bind(&evidence.collector_version)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -727,7 +825,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::raw_evidence).collect()
@@ -750,7 +848,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(uuid_text(source_id))
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::raw_evidence).collect()
@@ -814,7 +912,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(&document.external_key)
         .bind(document.simhash)
         .bind(opt_uuid_text(document.duplicate_of))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -849,7 +947,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::document).collect()
@@ -877,7 +975,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(object_type)
         .bind(bool_int(include_duplicates))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::document).collect()
@@ -910,7 +1008,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(rfc3339(entity.first_seen))
         .bind(rfc3339(entity.last_seen))
         .bind(json_text(&entity.attributes))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -937,7 +1035,7 @@ impl RelationalStore for SqliteEmbeddedStore {
             sqlx::query("SELECT * FROM entities WHERE entity_type = ?1 AND normalized_name = ?2")
                 .bind(encode_enum(&entity_type)?)
                 .bind(normalized_name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(self.conn().await?.as_mut())
                 .await
                 .map_err(map_sqlx)?;
         row.as_ref().map(mapping::entity).transpose()
@@ -958,7 +1056,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity).collect()
@@ -983,7 +1081,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_uuid_text(after))
         .bind(entity_type)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity).collect()
@@ -1018,7 +1116,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(i64::from(relationship.evidence_count))
         .bind(rfc3339(relationship.created_at))
         .bind(rfc3339(relationship.updated_at))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1056,7 +1154,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(uuid_text(object_id))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship).collect()
@@ -1077,7 +1175,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship).collect()
@@ -1102,7 +1200,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_uuid_text(after))
         .bind(relationship_type)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship).collect()
@@ -1133,7 +1231,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(&evidence.excerpt)
         .bind(evidence.confidence)
         .bind(rfc3339(evidence.created_at))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1169,7 +1267,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(uuid_text(relationship_id))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship_evidence).collect()
@@ -1206,7 +1304,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(json_text(&event.attributes))
         .bind(rfc3339(event.created_at))
         .bind(rfc3339(event.updated_at))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1236,7 +1334,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::event).collect()
@@ -1269,7 +1367,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(&provenance.processor_version)
         .bind(rfc3339(provenance.timestamp))
         .bind(json_text(&provenance.metadata))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1292,7 +1390,7 @@ impl RelationalStore for SqliteEmbeddedStore {
             "SELECT * FROM provenance WHERE raw_evidence_id = ? ORDER BY timestamp, id",
         )
         .bind(uuid_text(raw_evidence_id))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::provenance).collect()
@@ -1305,7 +1403,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         let rows =
             sqlx::query("SELECT * FROM provenance WHERE subject_id = ? ORDER BY timestamp, id")
                 .bind(uuid_text(subject_id))
-                .fetch_all(&self.pool)
+                .fetch_all(self.conn().await?.as_mut())
                 .await
                 .map_err(map_sqlx)?;
         rows.iter().map(mapping::provenance).collect()
@@ -1338,7 +1436,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_rfc3339(job.completed_at))
         .bind(i64::from(job.retry_count))
         .bind(&job.error)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1366,7 +1464,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(after_text)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::job).collect()
@@ -1389,7 +1487,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(encode_enum(&status)?)
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::job).collect()
@@ -1477,7 +1575,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(uuid_text(before))
         .bind(clamp_scan_limit(scan_limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
 
@@ -1516,7 +1614,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(&group.method)
         .bind(group.similarity)
         .bind(rfc3339(group.first_seen))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1561,7 +1659,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(uuid_text(canonical_object_id))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::duplicate_group).collect()
@@ -1595,7 +1693,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(extraction.confidence)
         .bind(extraction.text_offset.map(i64::from))
         .bind(&extraction.excerpt)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1665,7 +1763,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(alias.confidence)
         .bind(rfc3339(alias.first_seen))
         .bind(rfc3339(alias.last_seen))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1693,7 +1791,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(uuid_text(entity_id))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity_alias).collect()
@@ -1729,7 +1827,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_uuid_text(identifier.source_id))
         .bind(rfc3339(identifier.first_seen))
         .bind(rfc3339(identifier.last_seen))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1757,7 +1855,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(uuid_text(entity_id))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity_identifier).collect()
@@ -1793,7 +1891,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(encode_enum(&candidate.status)?)
         .bind(rfc3339(candidate.created_at))
         .bind(opt_rfc3339(candidate.reviewed_at))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1830,7 +1928,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_uuid_text(after))
         .bind(status)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::resolution_candidate).collect()
@@ -1867,7 +1965,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(rfc3339(history.timestamp))
         .bind(repointed)
         .bind(opt_rfc3339(history.undone_at))
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1900,7 +1998,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(uuid_text(entity_id))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::merge_history).collect()
@@ -1937,7 +2035,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(rfc3339(event.first_seen))
         .bind(rfc3339(event.last_seen))
         .bind(opt_rfc3339(event.replayed_at))
-        .fetch_one(&self.pool)
+        .fetch_one(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         mapping::failed_event(&row)
@@ -1970,7 +2068,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         )
         .bind(opt_uuid_text(after))
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::failed_event).collect()
@@ -1984,7 +2082,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         let result = sqlx::query("UPDATE failed_events SET replayed_at = ?2 WHERE id = ?1")
             .bind(uuid_text(id))
             .bind(rfc3339(replayed_at))
-            .execute(&self.pool)
+            .execute(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)

@@ -8,7 +8,7 @@ use core_model::{Document, DocumentType, Provenance, RawEvidence};
 use core_observability::MetricsRegistry;
 use import_format::{ImportKind, ImportSpec};
 use serde_json::{Value, json};
-use storage_core::{ObjectStore, RelationalStore};
+use storage_core::{ObjectStore, RelationalStore, TransactionalStore};
 use storage_postgres::PostgresCanonicalStore;
 use storage_s3::S3ObjectStore;
 use uuid::Uuid;
@@ -290,20 +290,21 @@ impl Normalizer {
         now: DateTime<Utc>,
     ) -> Result<NormalizeOutcome, NormalizerError> {
         let raw_evidence_id = evidence.id;
-        // write-then-claim（刻意的選擇，不是 claim-first）：先寫 Document，最後才佔
-        // unique index（action=normalized）。storage-core 目前沒有跨表交易能力，兩個寫入
-        // 順序都無法完全原子化，兩種失效模式代價不對等，故意選代價較小的一邊：
-        //   - write-then-claim：Document 寫完、claim 前 crash → 重跑會重新產生一組
-        //     「重複」Document。資料還在，且 SPEC Phase 4 的 dedup pipeline本來就會處理
-        //     這種重複，是可回收的代價。
-        //   - claim-first（曾經改過去，已改回）：claim 成功、Document 還沒寫就 crash →
-        //     之後永遠回報 AlreadyDone，但 Document 根本不存在——靜默資料遺失，無法偵測
-        //     也無法回收，違反「不遺失證據」的核心目的，代價遠高於前者。
-        // 併發雙寫的邊界案例（兩個 consumer 同時通過上面的「尚未正規化」檢查）目前仍可能
-        // 各自寫出一組 Document，只有其中一個 claim 會成功——這跟 crash-window 重複是
-        // 同一類可回收風險，不是新增的問題。
+        // Document + derived_from + normalized claim 在**同一個交易**裡。
+        //
+        // V0.2 Phase 0e 之前這裡是 write-then-claim：先寫 Document，最後才佔 unique
+        // index（action=normalized）。那個順序刻意接受一個 crash window——Document 寫完、
+        // claim 前 crash，重跑會再產生一組重複 Document，留給 dedup pipeline 收。
+        // `storage-core` 補上 `TransactionalStore` 之後那個取捨不再需要：
+        // 中途死掉就整批回滾（連沒 commit 就 drop 都會回滾），
+        // 狀態只剩「全在」或「全不在」，不會有重複也不會有靜默遺失。
+        //
+        // 併發雙寫（兩個 consumer 同時通過上面的「尚未正規化」檢查）由 claim 的 unique
+        // index 決定勝負：輸的那一邊整個交易回滾，它寫的 Document 不會留下來。
+        let tx = self.store.begin().await?;
+        let db = tx.store();
         for doc in &documents {
-            self.store.put_document(doc).await?;
+            db.put_document(doc).await?;
             let prov = Provenance {
                 id: Uuid::now_v7(),
                 subject_id: doc.id,
@@ -315,12 +316,16 @@ impl Normalizer {
                 timestamp: now,
                 metadata: json!({ "document_id": doc.id }),
             };
-            self.store.put_provenance(&prov).await?;
+            db.put_provenance(&prov).await?;
         }
 
-        match self.claim_normalized(evidence, &documents, now).await {
-            Ok(()) => {}
+        match claim_normalized(db, evidence, &documents, now).await {
+            Ok(()) => tx.commit().await?,
             Err(NormalizerError::Storage(storage_core::StorageError::Conflict { .. })) => {
+                // 別人先佔到 claim。整批回滾——這一輪寫的 Document 不留下來，
+                // 否則就變回「重複 Document 要靠 dedup 收」的舊代價。
+                // PostgreSQL 在錯誤之後交易已經 aborted，本來也只能 rollback。
+                tx.rollback().await?;
                 let again = self
                     .store
                     .list_provenance_by_raw_evidence(raw_evidence_id)
@@ -337,7 +342,11 @@ impl Normalizer {
                     },
                 ));
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // 明確回滾而不是靠 drop：錯誤路徑要看得出意圖。
+                tx.rollback().await?;
+                return Err(err);
+            }
         }
 
         let ids: Vec<Uuid> = documents.iter().map(|d| d.id).collect();
@@ -359,32 +368,36 @@ impl Normalizer {
         }
         Ok(NormalizeOutcome::Created { document_ids: ids })
     }
+}
 
-    async fn claim_normalized(
-        &self,
-        evidence: &RawEvidence,
-        documents: &[Document],
-        now: chrono::DateTime<Utc>,
-    ) -> Result<(), NormalizerError> {
-        let ids: Vec<Uuid> = documents.iter().map(|d| d.id).collect();
-        let subject = ids.first().copied().unwrap_or(evidence.id);
-        let claim = Provenance {
-            id: Uuid::now_v7(),
-            subject_id: subject,
-            action: ACTION_NORMALIZED.into(),
-            parent_id: Some(evidence.id),
-            raw_evidence_id: Some(evidence.id),
-            processor: PROCESSOR.into(),
-            processor_version: env!("CARGO_PKG_VERSION").into(),
-            timestamp: now,
-            metadata: json!({
-                "document_ids": ids,
-                "item_count": ids.len(),
-            }),
-        };
-        self.store.put_provenance(&claim).await?;
-        Ok(())
-    }
+/// 佔下 `action='normalized'` 的 unique claim。
+///
+/// 寫入對象是呼叫端給的 `db`——正常路徑上那是**交易 handle**，claim 與 Document
+/// 必須在同一個交易裡，否則交易就白開了。
+async fn claim_normalized(
+    db: &dyn RelationalStore,
+    evidence: &RawEvidence,
+    documents: &[Document],
+    now: chrono::DateTime<Utc>,
+) -> Result<(), NormalizerError> {
+    let ids: Vec<Uuid> = documents.iter().map(|d| d.id).collect();
+    let subject = ids.first().copied().unwrap_or(evidence.id);
+    let claim = Provenance {
+        id: Uuid::now_v7(),
+        subject_id: subject,
+        action: ACTION_NORMALIZED.into(),
+        parent_id: Some(evidence.id),
+        raw_evidence_id: Some(evidence.id),
+        processor: PROCESSOR.into(),
+        processor_version: env!("CARGO_PKG_VERSION").into(),
+        timestamp: now,
+        metadata: json!({
+            "document_ids": ids,
+            "item_count": ids.len(),
+        }),
+    };
+    db.put_provenance(&claim).await?;
+    Ok(())
 }
 
 /// 從 `RawEvidence.metadata["import"]` 取出上傳當下寫下的 `ImportSpec`。

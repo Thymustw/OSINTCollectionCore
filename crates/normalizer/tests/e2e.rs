@@ -400,15 +400,19 @@ async fn concurrent_normalize_hits_conflict_and_keeps_one_document() {
         1,
         "normalized claim 必須嚴格只有一列"
     );
-    // derived_from 允許 1 或 2：目前是 write-then-claim（見 docs/developer/
-    // collector-normalizer.md「已知代價」），兩個 racer 同時通過「尚未正規化」檢查時，
-    // 輸家會先寫出自己那組 Document、然後才在 claim 時撞到 Conflict。這是刻意接受的
-    // 可回收重複（Phase 4 dedup 會處理），不是要消除的保證——之前斷言 `== 1` 是
-    // claim-first 時代的殘留，在 CI 上（時序跟本機不同）就會偶發失敗。
+    // derived_from **嚴格一列**。
+    //
+    // 這個斷言的歷史值得留著：write-then-claim 時代它必須放寬成「1 或 2」——
+    // 兩個 racer 同時通過「尚未正規化」檢查時，輸家會先寫出自己那組 Document，
+    // 之後才在 claim 撞到 Conflict，留下一組可回收的重複（交給 Phase 4 dedup）。
+    // V0.2 Phase 0e 把 Document + derived_from + claim 包進同一個交易之後，
+    // 輸家的整個交易被回滾，那組重複不再存在，所以收回成 `== 1`。
+    //
+    // 放寬的版本在交易版之下會**通過但驗不到東西**：回滾失效時它照樣是綠的。
     let derived = derived_count(&rows);
-    assert!(
-        derived == 1 || derived == 2,
-        "derived_from 應為 1（未交錯）或 2（write-then-claim race），實際 {derived}"
+    assert_eq!(
+        derived, 1,
+        "derived_from 必須嚴格一列：輸家的交易整個回滾，不留半份 Document"
     );
 }
 

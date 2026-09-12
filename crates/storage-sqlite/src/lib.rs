@@ -4,4 +4,4 @@ mod error;
 mod mapping;
 mod store;
 
-pub use store::SqliteEmbeddedStore;
+pub use store::{SqliteEmbeddedStore, SqliteTransaction};

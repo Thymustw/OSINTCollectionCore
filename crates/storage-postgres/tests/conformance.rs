@@ -1,5 +1,6 @@
 use storage_core::conformance::{
-    assert_canonical_health, assert_relational_round_trip, load_workspace_dotenv, required_env,
+    assert_canonical_health, assert_relational_round_trip, assert_transactional_contract,
+    load_workspace_dotenv, required_env,
 };
 use storage_postgres::PostgresCanonicalStore;
 
@@ -22,4 +23,7 @@ async fn postgres_canonical_conformance() {
     assert_relational_round_trip(&store)
         .await
         .expect("relational round-trip");
+    assert_transactional_contract(&store, "postgres")
+        .await
+        .expect("transactional contract");
 }

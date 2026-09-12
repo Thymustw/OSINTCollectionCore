@@ -17,7 +17,7 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
     CanonicalStore, CapabilityDescriptor, HealthProvider, RelationalStore, SimhashCandidate,
-    StorageAdapter, StorageError, StorageHealth,
+    StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
 };
 
 use crate::error::map_sqlx;
@@ -46,10 +46,37 @@ fn ports_json(ports: Option<&[u16]>) -> Result<Option<Value>, StorageError> {
     }
 }
 
+/// 一次查詢要用的連線。
+///
+/// 兩個變體是 adapter 能同時服務「連線池」與「進行中的交易」的關鍵：
+/// `RelationalStore` 的整份實作只寫一次，執行對象在這裡切換。
+/// 沒有這層的話，交易路徑就得複製一份 80 個方法的 SQL，兩份遲早分岔。
+enum PgConn<'a> {
+    /// 從池子臨時借一條。語意與先前直接把 `&PgPool` 當 executor 相同
+    /// （sqlx 對 `&Pool` 的 `Executor` 實作本來就是「借一條、用完還」）。
+    Pooled(sqlx::pool::PoolConnection<sqlx::Postgres>),
+    /// 這條交易自己的連線。整個交易期間都是同一條。
+    Tx(tokio::sync::MutexGuard<'a, sqlx::Transaction<'static, sqlx::Postgres>>),
+}
+
+impl PgConn<'_> {
+    fn as_mut(&mut self) -> &mut sqlx::PgConnection {
+        match self {
+            PgConn::Pooled(conn) => conn,
+            PgConn::Tx(tx) => tx,
+        }
+    }
+}
+
 /// PostgreSQL canonical + relational store。
 #[derive(Debug, Clone)]
 pub struct PostgresCanonicalStore {
     pool: PgPool,
+    /// `Some` 代表這個 handle 綁在一條進行中的交易上（由
+    /// [`PostgresCanonicalStore::begin`] 產生，外部拿不到這種 handle）。
+    /// 交易是**序列**的，`Mutex` 只是為了在 `&self` 介面下取得 `&mut Transaction`，
+    /// 不是為了讓多個工作同時用同一條交易——那本來就是錯的用法。
+    tx: Option<std::sync::Arc<tokio::sync::Mutex<sqlx::Transaction<'static, sqlx::Postgres>>>>,
 }
 
 impl PostgresCanonicalStore {
@@ -67,7 +94,15 @@ impl PostgresCanonicalStore {
             .connect(dsn)
             .await
             .map_err(map_sqlx)?;
-        Ok(Self { pool })
+        Ok(Self { pool, tx: None })
+    }
+
+    /// 這次查詢要用哪條連線：綁了交易就用交易那條，否則向池子借。
+    async fn conn(&self) -> Result<PgConn<'_>, StorageError> {
+        match &self.tx {
+            Some(tx) => Ok(PgConn::Tx(tx.lock().await)),
+            None => Ok(PgConn::Pooled(self.pool.acquire().await.map_err(map_sqlx)?)),
+        }
     }
 
     /// 跑 `migrations/postgres`。已套用過的版本會被 sqlx 跳過。
@@ -96,7 +131,7 @@ impl PostgresCanonicalStore {
     {
         let row = sqlx::query(sql)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         row.map(|r| map(&r)).transpose()
@@ -105,7 +140,7 @@ impl PostgresCanonicalStore {
     async fn delete_id(&self, sql: &'static str, id: uuid::Uuid) -> Result<bool, StorageError> {
         let result = sqlx::query(sql)
             .bind(id)
-            .execute(&self.pool)
+            .execute(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
@@ -121,7 +156,7 @@ impl PostgresCanonicalStore {
         let rows = sqlx::query(sql)
             .bind(key)
             .bind(clamp_limit(limit))
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity_extraction).collect()
@@ -139,7 +174,7 @@ impl PostgresCanonicalStore {
             .bind(key)
             .bind(before)
             .bind(clamp_limit(limit))
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -154,7 +189,7 @@ impl PostgresCanonicalStore {
         sqlx::query(sql)
             .bind(left)
             .bind(right)
-            .execute(&self.pool)
+            .execute(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(())
@@ -170,7 +205,7 @@ impl PostgresCanonicalStore {
         let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(sql)
             .bind(collection_id)
             .bind(clamp_limit(limit))
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -181,7 +216,7 @@ impl PostgresCanonicalStore {
 impl HealthProvider for PostgresCanonicalStore {
     async fn health(&self) -> Result<StorageHealth, StorageError> {
         let (one,): (i32,) = sqlx::query_as("SELECT 1")
-            .fetch_one(&self.pool)
+            .fetch_one(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         if one != 1 {
@@ -201,11 +236,12 @@ impl StorageAdapter for PostgresCanonicalStore {
         CapabilityDescriptor::new(
             "postgres",
             env!("CARGO_PKG_VERSION"),
-            &["canonical", "relational"],
+            &["canonical", "relational", "transactional"],
         )
         .with_feature("json", Value::Bool(true))
         .with_feature("high_concurrent_write", Value::Bool(true))
         .with_feature("bulk_write", Value::Bool(true))
+        .with_feature("transactions", Value::Bool(true))
     }
 }
 
@@ -213,6 +249,78 @@ impl StorageAdapter for PostgresCanonicalStore {
 impl CanonicalStore for PostgresCanonicalStore {
     fn canonical_backend_id(&self) -> &'static str {
         "postgres"
+    }
+}
+
+#[async_trait]
+impl TransactionalStore for PostgresCanonicalStore {
+    async fn begin(&self) -> Result<Box<dyn Transaction>, StorageError> {
+        if self.tx.is_some() {
+            // sqlx 其實能用 SAVEPOINT 疊，但巢狀交易的語意（內層 rollback 之後外層
+            // 還能不能繼續）需要呼叫端明確決定。V0.2 沒有這種需求，先擋掉——
+            // 讓它「看起來能用」但語意沒定義，比直接不支援危險。
+            return Err(StorageError::UnsupportedCapability {
+                backend: "postgres",
+                capability: "nested_transaction",
+            });
+        }
+        let tx = self.pool.begin().await.map_err(map_sqlx)?;
+        Ok(Box::new(PostgresTransaction {
+            store: PostgresCanonicalStore {
+                pool: self.pool.clone(),
+                tx: Some(std::sync::Arc::new(tokio::sync::Mutex::new(tx))),
+            },
+        }))
+    }
+}
+
+/// 一條進行中的 PostgreSQL 交易。
+///
+/// 內含的 `store` 是一個**綁在這條交易上**的 `PostgresCanonicalStore`：
+/// 交易內的 CRUD 走的是同一份 `RelationalStore` 實作，只是執行對象換成交易的連線。
+///
+/// **沒有 commit 就 drop 會回滾**：drop 時 sqlx 的 `Transaction::drop` 會排一個
+/// ROLLBACK，連線歸還池子前執行。所以「處理到一半 return 了」不會留下半套資料。
+pub struct PostgresTransaction {
+    store: PostgresCanonicalStore,
+}
+
+impl std::fmt::Debug for PostgresTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresTransaction")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresTransaction {
+    /// 取回底層 sqlx 交易。呼叫後這個 handle 就沒了（commit／rollback 各用一次）。
+    fn into_inner(self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, StorageError> {
+        let arc = self.store.tx.ok_or_else(|| StorageError::Unknown {
+            backend: "postgres",
+            message: "交易 handle 沒有帶交易連線。這是 adapter 內部錯誤，請回報".into(),
+        })?;
+        std::sync::Arc::try_unwrap(arc)
+            .map(tokio::sync::Mutex::into_inner)
+            .map_err(|_| StorageError::Unknown {
+                backend: "postgres",
+                message: "交易仍被其他 handle 持有，無法結束。請確認沒有把交易 handle 複製出去"
+                    .into(),
+            })
+    }
+}
+
+#[async_trait]
+impl Transaction for PostgresTransaction {
+    fn store(&self) -> &dyn RelationalStore {
+        &self.store
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), StorageError> {
+        (*self).into_inner()?.commit().await.map_err(map_sqlx)
+    }
+
+    async fn rollback(self: Box<Self>) -> Result<(), StorageError> {
+        (*self).into_inner()?.rollback().await.map_err(map_sqlx)
     }
 }
 
@@ -253,7 +361,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(source.created_at)
         .bind(source.updated_at)
         .bind(source.last_seen)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -284,7 +392,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::source).collect()
@@ -318,7 +426,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(rule.expires_at)
         .bind(rule.created_at)
         .bind(rule.updated_at)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -344,7 +452,7 @@ impl RelationalStore for PostgresCanonicalStore {
             "SELECT * FROM source_network_rules WHERE source_id = $1 ORDER BY created_at, id",
         )
         .bind(source_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::network_rule).collect()
@@ -399,7 +507,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(connector.last_success)
         .bind(&connector.status)
         .bind(connector.error_count)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -421,7 +529,7 @@ impl RelationalStore for PostgresCanonicalStore {
 
     async fn list_enabled_connectors(&self) -> Result<Vec<Connector>, StorageError> {
         let rows = sqlx::query("SELECT * FROM connectors WHERE enabled = TRUE ORDER BY id")
-            .fetch_all(&self.pool)
+            .fetch_all(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
@@ -442,7 +550,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
@@ -466,7 +574,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(after)
         .bind(enabled)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
@@ -496,7 +604,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(collection.priority)
         .bind(collection.created_at)
         .bind(collection.updated_at)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -531,7 +639,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::collection).collect()
@@ -668,7 +776,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(&evidence.http_headers)
         .bind(&evidence.metadata)
         .bind(&evidence.collector_version)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -701,7 +809,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::raw_evidence).collect()
@@ -724,7 +832,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(source_id)
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::raw_evidence).collect()
@@ -788,7 +896,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(&document.external_key)
         .bind(document.simhash)
         .bind(document.duplicate_of)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -823,7 +931,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::document).collect()
@@ -851,7 +959,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(object_type)
         .bind(include_duplicates)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::document).collect()
@@ -884,7 +992,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(entity.first_seen)
         .bind(entity.last_seen)
         .bind(&entity.attributes)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -909,7 +1017,7 @@ impl RelationalStore for PostgresCanonicalStore {
             sqlx::query("SELECT * FROM entities WHERE entity_type = $1 AND normalized_name = $2")
                 .bind(encode_enum(&entity_type)?)
                 .bind(normalized_name)
-                .fetch_optional(&self.pool)
+                .fetch_optional(self.conn().await?.as_mut())
                 .await
                 .map_err(map_sqlx)?;
         row.as_ref().map(mapping::entity).transpose()
@@ -930,7 +1038,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity).collect()
@@ -955,7 +1063,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(after)
         .bind(entity_type)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity).collect()
@@ -990,7 +1098,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(relationship.evidence_count)
         .bind(relationship.created_at)
         .bind(relationship.updated_at)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1028,7 +1136,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(object_id)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship).collect()
@@ -1049,7 +1157,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship).collect()
@@ -1074,7 +1182,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(after)
         .bind(relationship_type)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship).collect()
@@ -1105,7 +1213,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(&evidence.excerpt)
         .bind(evidence.confidence)
         .bind(evidence.created_at)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1138,7 +1246,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(relationship_id)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::relationship_evidence).collect()
@@ -1175,7 +1283,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(&event.attributes)
         .bind(event.created_at)
         .bind(event.updated_at)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1205,7 +1313,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::event).collect()
@@ -1238,7 +1346,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(&provenance.processor_version)
         .bind(provenance.timestamp)
         .bind(&provenance.metadata)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1261,7 +1369,7 @@ impl RelationalStore for PostgresCanonicalStore {
             "SELECT * FROM provenance WHERE raw_evidence_id = $1 ORDER BY timestamp, id",
         )
         .bind(raw_evidence_id)
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::provenance).collect()
@@ -1274,7 +1382,7 @@ impl RelationalStore for PostgresCanonicalStore {
         let rows =
             sqlx::query("SELECT * FROM provenance WHERE subject_id = $1 ORDER BY timestamp, id")
                 .bind(subject_id)
-                .fetch_all(&self.pool)
+                .fetch_all(self.conn().await?.as_mut())
                 .await
                 .map_err(map_sqlx)?;
         rows.iter().map(mapping::provenance).collect()
@@ -1307,7 +1415,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(job.completed_at)
         .bind(job.retry_count)
         .bind(&job.error)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1334,7 +1442,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::job).collect()
@@ -1357,7 +1465,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(encode_enum(&status)?)
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::job).collect()
@@ -1451,7 +1559,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(fingerprint)
         .bind(i64::from(max_distance))
         .bind(clamp_scan_limit(scan_limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::simhash_candidate).collect()
@@ -1480,7 +1588,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(&group.method)
         .bind(group.similarity)
         .bind(group.first_seen)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1525,7 +1633,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(canonical_object_id)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::duplicate_group).collect()
@@ -1559,7 +1667,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(extraction.confidence)
         .bind(extraction.text_offset)
         .bind(&extraction.excerpt)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1629,7 +1737,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(alias.confidence)
         .bind(alias.first_seen)
         .bind(alias.last_seen)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1657,7 +1765,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(entity_id)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity_alias).collect()
@@ -1693,7 +1801,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(identifier.source_id)
         .bind(identifier.first_seen)
         .bind(identifier.last_seen)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1721,7 +1829,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(entity_id)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::entity_identifier).collect()
@@ -1757,7 +1865,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(encode_enum(&candidate.status)?)
         .bind(candidate.created_at)
         .bind(candidate.reviewed_at)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1794,7 +1902,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(after)
         .bind(status)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::resolution_candidate).collect()
@@ -1831,7 +1939,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(history.timestamp)
         .bind(repointed)
         .bind(history.undone_at)
-        .execute(&self.pool)
+        .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         Ok(())
@@ -1866,7 +1974,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(entity_id)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::merge_history).collect()
@@ -1903,7 +2011,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(event.first_seen)
         .bind(event.last_seen)
         .bind(event.replayed_at)
-        .fetch_one(&self.pool)
+        .fetch_one(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         mapping::failed_event(&row)
@@ -1936,7 +2044,7 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(clamp_limit(limit))
-        .fetch_all(&self.pool)
+        .fetch_all(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::failed_event).collect()
@@ -1950,7 +2058,7 @@ impl RelationalStore for PostgresCanonicalStore {
         let result = sqlx::query("UPDATE failed_events SET replayed_at = $2 WHERE id = $1")
             .bind(id)
             .bind(replayed_at)
-            .execute(&self.pool)
+            .execute(self.conn().await?.as_mut())
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)

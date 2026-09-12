@@ -6,4 +6,4 @@ mod security;
 mod store;
 
 pub use security::{PostgresApiTokenStore, PostgresAuditLog};
-pub use store::PostgresCanonicalStore;
+pub use store::{PostgresCanonicalStore, PostgresTransaction};

@@ -2,16 +2,22 @@
 //!
 //! # 這裡在驗的是一條從來沒有被測過的推論鏈
 //!
-//! 三個 consumer 都是 **write-then-claim**（先寫資料，最後才佔 provenance 的
-//! unique claim；理由見 `docs/developer/collector-normalizer.md`）。這個順序刻意
-//! 接受一個 crash window：資料寫完、claim 還沒寫就死掉，重跑會再寫一次。
+//! deduplicator 與 entity-worker 仍是 **write-then-claim**（先寫資料，最後才佔
+//! provenance 的 unique claim；理由見 `docs/developer/collector-normalizer.md`）。
+//! 這個順序刻意接受一個 crash window：資料寫完、claim 還沒寫就死掉，重跑會再寫一次。
+//! 文件裡寫的是「重跑產生的重複由下游收斂」——靠決定性的 v5 id 不產生第二列。
+//! **那整條推論在 Phase 7b 之前沒有任何測試。**
 //!
-//! 文件裡寫的是「重跑產生的重複由下游收斂」——normalizer 的重複 Document 由
-//! deduplicator 收掉，deduplicator 與 entity-worker 的重跑則靠決定性的 v5 id
-//! 不產生第二列。**那整條推論在 Phase 7b 之前沒有任何測試。**
+//! **normalizer 從 V0.2 Phase 0e 起改用交易**（`TransactionalStore`），
+//! 它已經沒有 write-then-claim 的 crash window——所以下面第 1 個測試驗的東西也換了：
+//! 不再是「重複被 dedup 收斂」，而是「上一輪沒 commit 就等於什麼都沒發生」。
 //!
-//! 每個測試都用 SQL 直接刪掉 claim 來模擬 crash window（那是那個狀態的定義），
-//! 然後重送**真正發出去的那一則事件 payload**，不是自己組一個形狀相近的 JSON。
+//! 模擬 crash 的手法依測試而異：
+//! * 交易版（normalizer）→ 真的開一個交易寫進去，然後**不 commit 就 drop**。
+//! * write-then-claim（dedup／entity-worker）→ 用 SQL 直接刪掉 claim，
+//!   那就是「claim 前 crash」這個狀態的定義。
+//!
+//! 兩者都重送**真正發出去的那一則事件 payload**，不是自己組一個形狀相近的 JSON。
 //!
 //! 需要本機 Docker：Postgres／MinIO／Redpanda。不打外網。
 
@@ -22,12 +28,14 @@ use std::time::Duration;
 
 use common::*;
 use core_events::{EventProducer, EventTopic};
-use core_model::{DuplicateGroup, EntityExtraction, Relationship};
+use core_model::{
+    Document, DocumentType, DuplicateGroup, EntityExtraction, Provenance, Relationship,
+};
 use core_observability::MetricsRegistry;
 use deduplicator::{ACTION_DEDUPLICATED, DedupOutcome};
 use entity_worker::{ACTION_ENTITY_EXTRACTED, ExtractOutcome};
 use normalizer::{ACTION_NORMALIZED, NormalizeOutcome};
-use storage_core::RelationalStore;
+use storage_core::{RelationalStore, TransactionalStore};
 use uuid::Uuid;
 
 /// 查關聯資料時一次取幾筆。測試資料遠小於這個數，取滿代表資料有問題。
@@ -40,18 +48,26 @@ const PAGE: u32 = 200;
 const ASSIGN_WAIT: Duration = Duration::from_millis(1_500);
 
 // ---------------------------------------------------------------------------
-// 1. normalizer 的 crash window
+// 1. normalizer：交易化之後的 crash 重送
 // ---------------------------------------------------------------------------
 
-/// collect → normalize（D1）→ 刪掉 `normalized` claim（= claim 前 crash 的狀態）
-/// → 重送同一則 `raw.collected` → normalize（D2）→ deduplicator 對兩份都跑。
+/// collect → 模擬「上一輪的交易沒 commit 就死掉」（真的開一個交易寫 Document +
+/// `derived_from` + `normalized` claim，然後不 commit 直接 drop）→ 重送同一則
+/// `raw.collected` → normalize。
 ///
 /// 斷言：
-/// * D1、D2 是兩份**不同**的 Document（crash window 真的產生了重複）
-/// * 其中 `duplicate_of IS NULL` 的**恰好一筆**，另一筆指向它
+/// * 沒 commit 的那一輪**什麼都沒留下**（Document 與 claim 都不在）
+/// * 重送得到乾淨的 `Created`，這筆 RawEvidence 只衍生出**一份** Document
 /// * RawEvidence **恰好一筆**——重送事件不會讓證據變兩份
+/// * 這份 Document 是 canonical（`duplicate_of IS NULL`），而且沒有東西要 dedup 收
+///
+/// # 為什麼不再測「刪掉 claim 之後重跑會產生兩份」
+///
+/// 那個狀態在交易版之後**不可能出現**。Document 與 claim 現在同進同出，
+/// 用 SQL 刪掉 claim 只是人工製造一個系統自己寫不出來的狀態，
+/// 測它等於在驗一條已經不存在的推論。
 #[tokio::test]
-async fn acceptance_f_normalizer_crash_replay_converges_to_one_canonical() {
+async fn acceptance_f_normalizer_uncommitted_replay_leaves_exactly_one_document() {
     let stack = connect_stack().await;
     let run = Uuid::now_v7();
 
@@ -85,96 +101,92 @@ async fn acceptance_f_normalizer_crash_replay_converges_to_one_canonical() {
     let metrics = MetricsRegistry::new();
     let normalizer = normalizer(&stack, metrics.clone());
 
-    let first = normalizer
-        .handle_payload(&collected.payload)
-        .await
-        .expect("第一次正規化");
-    let NormalizeOutcome::Created { document_ids } = first else {
-        panic!("預期 Created，得到 {first:?}");
-    };
-    assert_eq!(document_ids.len(), 1, "fixture 只有一則 item");
-    let d1 = document_ids[0];
+    // ---- 模擬 crash：上一輪的交易寫完了，但還沒 commit 就整個 process 死掉 ----
+    //
+    // 這裡走的是**真的交易**，不是 SQL 手動製造狀態：normalizer 現在就是這樣寫的
+    // （Document + derived_from + claim 同一個 tx）。不 commit 就 drop，
+    // sqlx 會排一個 ROLLBACK——「crash 之後 DB 剩下什麼」就是這個。
+    let ghost = ghost_document(raw_evidence_id, &guid);
+    let ghost_id = ghost.id;
+    {
+        let tx = stack.pg.begin().await.expect("開交易");
+        let db = tx.store();
+        db.put_document(&ghost).await.expect("交易內寫 Document");
+        db.put_provenance(&ghost_claim(raw_evidence_id, ghost_id))
+            .await
+            .expect("交易內佔 claim");
+        drop(tx); // 沒有 commit
+    }
 
-    // ---- 模擬 crash：Document 已經寫進 DB，claim 還沒寫就死掉 ----
-    let deleted = delete_claim(&stack.pg, d1, ACTION_NORMALIZED).await;
-    assert_eq!(
-        deleted, 1,
-        "應該剛好刪掉一列 normalized claim（subject 是第一份 Document 的 id）。\
-         刪到 0 列代表這個測試根本沒有進入 crash window，後面的斷言全部沒有意義"
+    assert!(
+        stack
+            .pg
+            .get_document(ghost_id)
+            .await
+            .expect("query")
+            .is_none(),
+        "沒 commit 的交易不該留下 Document。留下來的話後面的斷言全部沒有意義"
+    );
+    assert!(
+        documents_of_raw_evidence(&stack.pg, raw_evidence_id)
+            .await
+            .is_empty(),
+        "沒 commit 的交易不該留下任何衍生 Document"
+    );
+    assert!(
+        stack
+            .pg
+            .list_provenance_by_raw_evidence(raw_evidence_id)
+            .await
+            .expect("query provenance")
+            .iter()
+            .all(|p| p.action != ACTION_NORMALIZED),
+        "沒 commit 的交易不該留下 normalized claim"
     );
 
     // ---- 重送同一則 raw.collected ----
     let replayed = normalizer
         .handle_payload(&collected.payload)
         .await
-        .expect("重送後重新正規化");
+        .expect("重送後正規化");
     let NormalizeOutcome::Created {
         document_ids: replay_ids,
     } = replayed
     else {
         panic!(
-            "claim 不在了，normalizer 應該真的重跑一次並產生新的 Document，實際 {replayed:?}。\
-             若這裡是 AlreadyDone，代表 crash window 的前提已經不成立"
+            "上一輪沒 commit 等於沒發生過，重送必須是乾淨的 Created，實際 {replayed:?}。\
+             若這裡是 AlreadyDone，代表回滾沒有把 claim 收掉"
         );
     };
-    assert_eq!(replay_ids.len(), 1);
-    let d2 = replay_ids[0];
-    assert_ne!(
-        d1, d2,
-        "Document id 是 UUID v7，重跑必然產生新的 id——這就是 write-then-claim 的已知代價"
-    );
+    assert_eq!(replay_ids.len(), 1, "fixture 只有一則 item");
+    let doc_id = replay_ids[0];
 
+    // ---- 真正的驗收條件：只有一份 Document，沒有東西要收斂 ----
     let derived = documents_of_raw_evidence(&stack.pg, raw_evidence_id).await;
     assert_eq!(
-        derived.len(),
-        2,
-        "crash window 應該留下兩份 Document（要收斂的就是這個），實際 {derived:?}"
+        derived,
+        vec![doc_id],
+        "交易版之下這筆 RawEvidence 只能衍生出一份 Document。\
+         出現兩份代表回滾沒生效，write-then-claim 的重複代價又回來了"
     );
 
-    // ---- deduplicator 對兩份都跑 ----
     let dedup = deduplicator(&stack, metrics.clone());
-    let o1 = dedup.dedup_document(d1).await.expect("dedup D1");
-    let o2 = dedup.dedup_document(d2).await.expect("dedup D2");
+    let outcome = dedup.dedup_document(doc_id).await.expect("dedup");
     assert!(
-        matches!(o1, DedupOutcome::Canonical { .. }),
-        "先處理的那份應該是 canonical，實際 {o1:?}"
+        matches!(outcome, DedupOutcome::Canonical { .. }),
+        "沒有第二份可比對，這一份就是 canonical，實際 {outcome:?}"
     );
-    match &o2 {
-        DedupOutcome::Duplicate {
-            canonical_object_id,
-            ..
-        } => assert_eq!(
-            *canonical_object_id, d1,
-            "D2 應該指向 D1（同一個 platform + external_id，Stage 1）"
-        ),
-        other => panic!("D2 應該被判成重複，實際 {other:?}"),
-    }
-
-    // ---- 真正的驗收條件 ----
-    let doc1 = stack
+    let doc = stack
         .pg
-        .get_document(d1)
+        .get_document(doc_id)
         .await
         .expect("query")
-        .expect("D1 還在");
-    let doc2 = stack
-        .pg
-        .get_document(d2)
-        .await
-        .expect("query")
-        .expect("D2 還在");
-    let canonicals: Vec<Uuid> = [&doc1, &doc2]
-        .iter()
-        .filter(|d| d.duplicate_of.is_none())
-        .map(|d| d.id)
-        .collect();
+        .expect("Document 還在");
     assert_eq!(
-        canonicals,
-        vec![d1],
-        "crash + 重送之後，duplicate_of IS NULL 的必須恰好是一筆，而且是先到的那一份。\
+        doc.duplicate_of, None,
+        "重送之後 duplicate_of IS NULL 的必須恰好是這一筆。\
          這就是 Acceptance F 的「不建立 duplicate canonical object」"
     );
-    assert_eq!(doc2.duplicate_of, Some(d1), "另一筆必須指向它");
 
     // RawEvidence 不可變且只有一筆：重送事件不會讓證據變兩份。
     assert_eq!(
@@ -183,7 +195,7 @@ async fn acceptance_f_normalizer_crash_replay_converges_to_one_canonical() {
         "重送 raw.collected 不該產生第二筆 RawEvidence——證據是 collector 寫的，不是事件寫的"
     );
 
-    // claim 也回到只有一列（重跑寫了新的那一列）。
+    // claim 恰好一列（unique index 保證；回滾掉的那一列不算）。
     let claims = stack
         .pg
         .list_provenance_by_raw_evidence(raw_evidence_id)
@@ -197,6 +209,52 @@ async fn acceptance_f_normalizer_crash_replay_converges_to_one_canonical() {
         1,
         "normalized claim 只能有一列（unique index 保證），實際 {claims:?}"
     );
+}
+
+/// 「上一輪沒 commit」那個交易裡要寫的 Document。
+///
+/// 欄位刻意跟 normalizer 產出的那一份對齊（`attributes.raw_evidence_id` 是
+/// `documents_of_raw_evidence` 的查詢鍵），這樣「它有沒有留下來」才問得準。
+fn ghost_document(raw_evidence_id: Uuid, guid: &str) -> Document {
+    Document {
+        id: Uuid::now_v7(),
+        object_type: DocumentType::Article,
+        schema_version: "1".into(),
+        title: Some(format!("ghost {guid}")),
+        body: None,
+        summary: None,
+        language: None,
+        author: None,
+        published_at: None,
+        modified_at: None,
+        observed_at: chrono::Utc::now(),
+        collected_at: chrono::Utc::now(),
+        source_url: None,
+        canonical_url: None,
+        normalized_content_hash: None,
+        confidence: 0.8,
+        labels: Vec::new(),
+        attributes: serde_json::json!({ "raw_evidence_id": raw_evidence_id }),
+        external_key: None,
+        simhash: None,
+        duplicate_of: None,
+    }
+}
+
+/// 同一個交易裡的 `normalized` claim。回滾之後它必須跟著消失，
+/// 否則 normalizer 會永遠回報 `AlreadyDone` 卻沒有任何 Document。
+fn ghost_claim(raw_evidence_id: Uuid, document_id: Uuid) -> Provenance {
+    Provenance {
+        id: Uuid::now_v7(),
+        subject_id: document_id,
+        action: ACTION_NORMALIZED.into(),
+        parent_id: Some(raw_evidence_id),
+        raw_evidence_id: Some(raw_evidence_id),
+        processor: "acceptance-f".into(),
+        processor_version: "0".into(),
+        timestamp: chrono::Utc::now(),
+        metadata: serde_json::json!({ "document_ids": [document_id], "item_count": 1 }),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::error::StorageError;
 use crate::traits::{
     CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore, RelationalStore, SearchDocument,
-    SearchQuery, SearchStore, StructuredSearch,
+    SearchQuery, SearchStore, StructuredSearch, TransactionalStore,
 };
 
 /// 從 workspace 根目錄載入 `.env`（若存在）。已設定的環境變數不被覆蓋。
@@ -1553,6 +1553,196 @@ fn assert_cursor_page(
         });
     }
     Ok(())
+}
+
+/// `TransactionalStore` 的契約：commit／rollback／drop 回滾／部分失敗不留半套／隔離性。
+///
+/// 這五條合起來才是 V0.2 Entity Merge 能成立的前提——merge 橫跨五張表，
+/// 只要其中一條不成立，「repoint 到一半」的狀態就會留在 canonical store 裡，
+/// 而且沒有任何錯誤訊息會提到它。
+///
+/// ⚠️ 用的 fixture 都帶 run-specific UUID，不 TRUNCATE 共用表（同 `assert_relational_round_trip`）。
+pub async fn assert_transactional_contract<S: TransactionalStore>(
+    store: &S,
+    backend: &'static str,
+) -> Result<(), StorageError> {
+    let fail = |message: String| StorageError::Unknown {
+        backend: "conformance",
+        message,
+    };
+
+    // --- 1. commit：三張表一起進去 --------------------------------------
+    let committed = tx_entity("commit");
+    let alias = tx_alias(committed.id);
+    let identifier = tx_identifier(committed.id, "commit");
+
+    let tx = store.begin().await?;
+    {
+        let db = tx.store();
+        db.put_entity(&committed).await?;
+        db.put_entity_alias(&alias).await?;
+        db.put_entity_identifier(&identifier).await?;
+
+        // --- 5. 隔離性：commit 之前，交易外讀不到 ---------------------
+        // 這一條在交易還開著的時候檢查，所以必須在 commit 之前。
+        // PostgreSQL 是 READ COMMITTED 預設，SQLite（WAL）讀的是交易開始前的快照，
+        // 兩者對「未提交的資料不可見」的結論一致。
+        if store.get_entity(committed.id).await?.is_some() {
+            return Err(fail(format!(
+                "{backend}：交易尚未 commit，交易外卻讀得到 entity。\
+                 這代表寫入沒有真的進交易（executor 接錯），\
+                 之後 rollback 也不會把它收回去"
+            )));
+        }
+    }
+    tx.commit().await?;
+
+    if store.get_entity(committed.id).await?.is_none() {
+        return Err(fail(format!("{backend}：commit 之後讀不到 entity")));
+    }
+    if store
+        .list_entity_aliases_by_entity(committed.id, 100)
+        .await?
+        .iter()
+        .all(|a| a.id != alias.id)
+    {
+        return Err(fail(format!("{backend}：commit 之後讀不到 entity_alias")));
+    }
+    if store.get_entity_identifier(identifier.id).await?.is_none() {
+        return Err(fail(format!(
+            "{backend}：commit 之後讀不到 entity_identifier"
+        )));
+    }
+
+    // --- 2. rollback：兩張表一起不見 ------------------------------------
+    let rolled_back = tx_entity("rollback");
+    let rolled_back_alias = tx_alias(rolled_back.id);
+    let tx = store.begin().await?;
+    {
+        let db = tx.store();
+        db.put_entity(&rolled_back).await?;
+        db.put_entity_alias(&rolled_back_alias).await?;
+    }
+    tx.rollback().await?;
+    if store.get_entity(rolled_back.id).await?.is_some() {
+        return Err(fail(format!("{backend}：rollback 之後 entity 還在")));
+    }
+    if store
+        .get_entity_alias(rolled_back_alias.id)
+        .await?
+        .is_some()
+    {
+        return Err(fail(format!("{backend}：rollback 之後 entity_alias 還在")));
+    }
+
+    // --- 3. drop 不 commit：一樣要回滾 ----------------------------------
+    //
+    // **這條是防「忘了 commit 卻留下資料」與「連線沒歸還」兩件事。**
+    // 只斷言資料不在是不夠的：交易還開著的話資料本來就看不到，兩種狀態從外面
+    // 長得一模一樣。所以 drop 之後還要再寫一筆——寫得進去才證明那條連線真的
+    // 被 ROLLBACK 後歸還了（SQLite 尤其明顯：交易沒結束的話寫入會卡到 busy_timeout）。
+    let dropped = tx_entity("drop");
+    let tx = store.begin().await?;
+    tx.store().put_entity(&dropped).await?;
+    drop(tx);
+    if store.get_entity(dropped.id).await?.is_some() {
+        return Err(fail(format!(
+            "{backend}：交易被 drop 卻沒有 commit，entity 仍然存在。\
+             sqlx 的 Transaction::drop 應該排一個 ROLLBACK"
+        )));
+    }
+    let after_drop = tx_entity("after-drop");
+    store.put_entity(&after_drop).await?;
+    if store.get_entity(after_drop.id).await?.is_none() {
+        return Err(fail(format!(
+            "{backend}：drop 交易之後連線沒有回到可用狀態（後續寫入讀不到）"
+        )));
+    }
+
+    // --- 4. 交易內部分失敗 → 不留半套 -----------------------------------
+    let partial = tx_entity("partial");
+    let first = tx_identifier(partial.id, "partial");
+    // 同一個 (namespace, normalized_value) 換一個 id：UNIQUE 必須擋下來。
+    let clashing = EntityIdentifier {
+        id: Uuid::now_v7(),
+        ..first.clone()
+    };
+    let tx = store.begin().await?;
+    {
+        let db = tx.store();
+        db.put_entity(&partial).await?;
+        db.put_entity_identifier(&first).await?;
+        match db.put_entity_identifier(&clashing).await {
+            Err(StorageError::Conflict { .. }) => {}
+            other => {
+                return Err(fail(format!(
+                    "{backend}：交易內違反 (namespace, normalized_value) UNIQUE 應回 Conflict，\
+                     實際 {other:?}"
+                )));
+            }
+        }
+    }
+    // PostgreSQL 在錯誤之後整個交易進入 aborted 狀態，只能 rollback；
+    // 這裡本來就要 rollback，不再對同一條交易下任何寫入。
+    tx.rollback().await?;
+    if store.get_entity(partial.id).await?.is_some() {
+        return Err(fail(format!(
+            "{backend}：交易內某一步失敗後回滾，先前寫入的 entity 卻留下來了。\
+             這就是「合併到一半」的狀態，Entity Merge 不能接受"
+        )));
+    }
+    if store.get_entity_identifier(first.id).await?.is_some() {
+        return Err(fail(format!(
+            "{backend}：交易內某一步失敗後回滾，先前寫入的 entity_identifier 卻留下來了"
+        )));
+    }
+
+    Ok(())
+}
+
+/// 交易 conformance 用的 Entity fixture。`normalized_name` 帶 run-specific UUID，
+/// 理由同 `assert_relational_round_trip`：`(entity_type, normalized_name)` 是 UNIQUE。
+fn tx_entity(label: &str) -> Entity {
+    let name = format!("conformance-tx-{label}-{}", Uuid::now_v7().simple());
+    Entity {
+        id: Uuid::now_v7(),
+        entity_type: EntityType::Vulnerability,
+        name: name.clone(),
+        normalized_name: name.to_ascii_lowercase(),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        attributes: json!({}),
+    }
+}
+
+fn tx_alias(entity_id: Uuid) -> EntityAlias {
+    EntityAlias {
+        id: Uuid::now_v7(),
+        entity_id,
+        alias: format!("conformance-tx-alias-{}", Uuid::now_v7().simple()),
+        alias_type: "localized_name".into(),
+        source_id: None,
+        confidence: 0.75,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+    }
+}
+
+fn tx_identifier(entity_id: Uuid, label: &str) -> EntityIdentifier {
+    let value = format!("tx-{label}-{}.example.invalid", Uuid::now_v7().simple());
+    EntityIdentifier {
+        id: Uuid::now_v7(),
+        entity_id,
+        namespace: format!("conformance-tx-ns-{}", Uuid::now_v7().simple()),
+        value: value.to_ascii_uppercase(),
+        normalized_value: value,
+        confidence: 0.95,
+        source_id: None,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+    }
 }
 
 fn assert_eq_debug<T: PartialEq + std::fmt::Debug>(label: &str, expected: &T, actual: &T) {

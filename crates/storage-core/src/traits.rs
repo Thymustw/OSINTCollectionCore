@@ -592,6 +592,60 @@ pub trait EmbeddedStore: RelationalStore {
     fn database_path(&self) -> &Path;
 }
 
+/// 能開啟跨表交易的 relational store（`STORAGE_ARCHITECTURE.md` §11）。
+///
+/// 需要「多張表要嘛全成功要嘛全失敗」的操作（V0.2 Entity Merge：
+/// `entities` + `entity_aliases` + `entity_identifiers` + `relationships` + `merge_history`）
+/// 一律走這裡，不要用「先寫 A 再寫 B，中間 crash 就算了」那種寫法。
+///
+/// # 為什麼回 `Box<dyn Transaction>` 而不是 `type Tx`
+///
+/// 關聯型別會讓 trait 失去 object safety：服務端只能寫
+/// `Arc<dyn TransactionalStore<Tx = PostgresTransaction>>`——一寫下去就綁死後端，
+/// 等於把 §9「不要讓 domain 認得具體 adapter」那條規則從介面層繞過去了。
+/// 動態分派的成本是每次 `begin()` 一次配置，跟一次 `BEGIN` 的 round-trip 相比可以忽略。
+#[async_trait]
+pub trait TransactionalStore: RelationalStore {
+    /// 開一個交易。回傳值被 drop 而沒有 commit 時**必須 rollback**
+    /// （PostgreSQL／SQLite adapter 都由 sqlx 的 `Transaction::drop` 保證，
+    /// conformance 的 `assert_transactional_contract` 會驗）。
+    async fn begin(&self) -> Result<Box<dyn Transaction>, StorageError>;
+}
+
+/// 進行中的交易。
+///
+/// # 為什麼是 `store()` 而不是 `Transaction: RelationalStore`
+///
+/// 讓 `Transaction` 繼承 `RelationalStore` 對呼叫端比較順手（`tx.put_entity(..)`），
+/// 但那會強迫每個 adapter **再寫一份 80 個方法的實作**——兩份 SQL 遲早分岔，
+/// 而且分岔的那一份只在交易路徑上跑，最難被測到。
+///
+/// 現在的做法是交易 handle 內部持有**同一個** store 型別（只是把執行對象從連線池
+/// 換成這條交易的連線），所以交易內外用的是同一份 SQL，結構上不可能分岔。
+/// 代價是呼叫端要多寫一個 `.store()`：
+///
+/// ```ignore
+/// let tx = store.begin().await?;
+/// let db = tx.store();
+/// db.put_entity(&survivor).await?;
+/// db.put_merge_history(&history).await?;
+/// tx.commit().await?;
+/// ```
+#[async_trait]
+pub trait Transaction: Send {
+    /// 交易內的關聯式操作。這個 handle 上的每次寫入都在同一條交易連線上，
+    /// **commit 之前交易外看不到**。
+    fn store(&self) -> &dyn RelationalStore;
+
+    /// 提交。`self: Box<Self>` 是為了保留 object safety
+    /// （by-value `self` 的方法不能出現在 trait object 上）。
+    async fn commit(self: Box<Self>) -> Result<(), StorageError>;
+
+    /// 明確回滾。**不呼叫也會回滾**（drop 時），這個方法是為了讓錯誤路徑
+    /// 看得出意圖，以及讓回滾本身的失敗可以被回報。
+    async fn rollback(self: Box<Self>) -> Result<(), StorageError>;
+}
+
 /// 要寫進 SearchStore 的一筆文件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchDocument {
