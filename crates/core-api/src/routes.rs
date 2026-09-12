@@ -63,6 +63,18 @@ pub fn router(state: AppState) -> Router {
         // 未認證／viewer 應該先拿到 401／403，而不是先看到 501——
         // 否則這條路由會變成一個「不需要權限就能問到伺服器支援什麼」的探測點。
         .route("/api/v1/objects", post(resources::objects::create_object))
+        .route(
+            "/api/v1/entities/{id}/resolve",
+            post(resources::merge::resolve_entity),
+        )
+        .route(
+            "/api/v1/entities/merge",
+            post(resources::merge::merge_entities),
+        )
+        .route(
+            "/api/v1/merge-history/{id}/undo",
+            post(resources::merge::undo_merge),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_mw::require_write,
@@ -106,6 +118,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/entities/{id}",
             get(resources::entities::get_entity),
+        )
+        .route(
+            "/api/v1/entities/{id}/resolution-candidates",
+            get(resources::merge::list_resolution_candidates),
+        )
+        .route(
+            "/api/v1/entities/{id}/merge-history",
+            get(resources::merge::list_merge_history),
         )
         .route(
             "/api/v1/relationships",

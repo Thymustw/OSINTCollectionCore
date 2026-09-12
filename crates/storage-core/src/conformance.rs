@@ -1364,6 +1364,149 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
         });
     }
 
+    // 依 entity 反查：entity_a 或 entity_b 命中都算，不相關的那筆不能出現，
+    // status 過濾要在 SQL 裡生效。
+    let partner_small = Entity {
+        id: Uuid::now_v7(),
+        entity_type: entity.entity_type,
+        name: format!("by-entity-small-{run}"),
+        normalized_name: format!("by-entity-small-{run}"),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        merged_into: None,
+        attributes: json!({}),
+    };
+    let target = Entity {
+        id: Uuid::now_v7(),
+        entity_type: entity.entity_type,
+        name: format!("by-entity-target-{run}"),
+        normalized_name: format!("by-entity-target-{run}"),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        merged_into: None,
+        attributes: json!({}),
+    };
+    let partner_large = Entity {
+        id: Uuid::now_v7(),
+        entity_type: entity.entity_type,
+        name: format!("by-entity-large-{run}"),
+        normalized_name: format!("by-entity-large-{run}"),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        merged_into: None,
+        attributes: json!({}),
+    };
+    let unrelated_a = Entity {
+        id: Uuid::now_v7(),
+        entity_type: entity.entity_type,
+        name: format!("by-entity-unrelated-a-{run}"),
+        normalized_name: format!("by-entity-unrelated-a-{run}"),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        merged_into: None,
+        attributes: json!({}),
+    };
+    let unrelated_b = Entity {
+        id: Uuid::now_v7(),
+        entity_type: entity.entity_type,
+        name: format!("by-entity-unrelated-b-{run}"),
+        normalized_name: format!("by-entity-unrelated-b-{run}"),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        merged_into: None,
+        attributes: json!({}),
+    };
+    store.put_entity(&partner_small).await?;
+    store.put_entity(&target).await?;
+    store.put_entity(&partner_large).await?;
+    store.put_entity(&unrelated_a).await?;
+    store.put_entity(&unrelated_b).await?;
+
+    let hit_as_a = ResolutionCandidate {
+        id: Uuid::now_v7(),
+        entity_a_id: target.id,
+        entity_b_id: partner_large.id,
+        score: 0.4,
+        method: "normalized_name".into(),
+        evidence: json!({"side": "a"}),
+        status: ResolutionStatus::Pending,
+        created_at: fixture_ts(),
+        reviewed_at: None,
+    };
+    let hit_as_b = ResolutionCandidate {
+        id: Uuid::now_v7(),
+        entity_a_id: partner_small.id,
+        entity_b_id: target.id,
+        score: 0.5,
+        method: "alias".into(),
+        evidence: json!({"side": "b"}),
+        status: ResolutionStatus::Rejected,
+        created_at: fixture_ts(),
+        reviewed_at: None,
+    };
+    let unrelated = ResolutionCandidate {
+        id: Uuid::now_v7(),
+        entity_a_id: unrelated_a.id,
+        entity_b_id: unrelated_b.id,
+        score: 0.9,
+        method: "exact_identifier".into(),
+        evidence: json!({"side": "unrelated"}),
+        status: ResolutionStatus::Pending,
+        created_at: fixture_ts(),
+        reviewed_at: None,
+    };
+    store.put_resolution_candidate(&hit_as_a).await?;
+    store.put_resolution_candidate(&hit_as_b).await?;
+    store.put_resolution_candidate(&unrelated).await?;
+
+    let by_entity = store
+        .list_resolution_candidates_by_entity(target.id, None, None, 100)
+        .await?;
+    if !by_entity.iter().any(|c| c.id == hit_as_a.id) {
+        return Err(StorageError::NotFound {
+            message: "list_resolution_candidates_by_entity 從 entity_a_id 這一端查不到候選".into(),
+        });
+    }
+    if !by_entity.iter().any(|c| c.id == hit_as_b.id) {
+        return Err(StorageError::NotFound {
+            message: "list_resolution_candidates_by_entity 從 entity_b_id 這一端查不到候選".into(),
+        });
+    }
+    if by_entity.iter().any(|c| c.id == unrelated.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_resolution_candidates_by_entity 回了完全不相關的候選".into(),
+        });
+    }
+    let pending_only = store
+        .list_resolution_candidates_by_entity(target.id, Some(ResolutionStatus::Pending), None, 100)
+        .await?;
+    if !pending_only.iter().any(|c| c.id == hit_as_a.id) {
+        return Err(StorageError::NotFound {
+            message:
+                "list_resolution_candidates_by_entity(Pending) 應回 entity_a 那筆 pending 候選"
+                    .into(),
+        });
+    }
+    if pending_only.iter().any(|c| c.id == hit_as_b.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message:
+                "list_resolution_candidates_by_entity(Pending) 回了 Rejected 的候選——status 參數沒有生效"
+                    .into(),
+        });
+    }
+
     // --- §7 merge history -------------------------------------------------
     let history = MergeHistory {
         id: Uuid::now_v7(),

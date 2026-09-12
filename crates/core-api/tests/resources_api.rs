@@ -40,6 +40,8 @@ fn read_paths() -> Vec<String> {
         format!("/api/v1/objects/{id}"),
         "/api/v1/entities".into(),
         format!("/api/v1/entities/{id}"),
+        format!("/api/v1/entities/{id}/resolution-candidates"),
+        format!("/api/v1/entities/{id}/merge-history"),
         "/api/v1/relationships".into(),
         format!("/api/v1/relationships/{id}"),
         "/api/v1/events".into(),
@@ -77,6 +79,21 @@ fn write_requests() -> Vec<(&'static str, String, Value)> {
         ("POST", "/api/v1/collections".into(), json!({"name": "col"})),
         ("POST", "/api/v1/objects".into(), json!({})),
         ("POST", format!("/api/v1/jobs/{id}/retry"), json!({})),
+        ("POST", format!("/api/v1/entities/{id}/resolve"), json!({})),
+        (
+            "POST",
+            "/api/v1/entities/merge".into(),
+            json!({
+                "survivor_id": id,
+                "merged_id": id,
+                "reason": "rbac",
+            }),
+        ),
+        (
+            "POST",
+            format!("/api/v1/merge-history/{id}/undo"),
+            json!({}),
+        ),
     ]
 }
 

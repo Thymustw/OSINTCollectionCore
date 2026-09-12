@@ -514,6 +514,20 @@ pub trait RelationalStore: HealthProvider {
         after: Option<ResolutionCandidateId>,
         limit: u32,
     ) -> Result<Vec<ResolutionCandidate>, StorageError>;
+    /// 這個 Entity 參與過的 resolution candidate，`entity_a_id` **或** `entity_b_id`
+    /// 命中都算，可依 `status` 過濾（`None` = 不過濾），依 `id` 遞減、cursor 分頁。
+    ///
+    /// 兩端合成一個方法的理由同 [`RelationalStore::list_relationships_by_object`]：
+    /// Console 的 Entity 頁要問「這個 Entity 跟誰可能是同一個」，拆成兩個方法
+    /// 只會讓每個呼叫端各查一次再自己合併。過濾放在 SQL 裡，理由同
+    /// [`RelationalStore::list_resolution_candidates`]。
+    async fn list_resolution_candidates_by_entity(
+        &self,
+        entity_id: EntityId,
+        status: Option<ResolutionStatus>,
+        after: Option<ResolutionCandidateId>,
+        limit: u32,
+    ) -> Result<Vec<ResolutionCandidate>, StorageError>;
 
     /// 依主鍵 upsert 一筆 merge 紀錄。
     ///

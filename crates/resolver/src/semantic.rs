@@ -805,6 +805,15 @@ mod tests {
         ) -> Result<Vec<ResolutionCandidate>, StorageError> {
             Self::unsupported("list_resolution_candidates")
         }
+        async fn list_resolution_candidates_by_entity(
+            &self,
+            _: EntityId,
+            _: Option<ResolutionStatus>,
+            _: Option<ResolutionCandidateId>,
+            _: u32,
+        ) -> Result<Vec<ResolutionCandidate>, StorageError> {
+            Self::unsupported("list_resolution_candidates_by_entity")
+        }
         async fn put_merge_history(&self, _: &MergeHistory) -> Result<(), StorageError> {
             Self::unsupported("put_merge_history")
         }

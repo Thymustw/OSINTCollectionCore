@@ -45,6 +45,11 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | POST | `/api/v1/objects` | operator | — | **一律 501**（ADR-006） |
 | GET | `/api/v1/entities` | viewer | 200 | `?entity_type=` |
 | GET | `/api/v1/entities/{id}` | viewer | 200 | 含關聯數與抽取紀錄 |
+| GET | `/api/v1/entities/{id}/resolution-candidates` | viewer | 200 | cursor 分頁；`?status=` |
+| GET | `/api/v1/entities/{id}/merge-history` | viewer | 200 | 含已撤銷的 merge |
+| POST | `/api/v1/entities/{id}/resolve` | operator | 200 | 跑掃描方法，回這次新寫入的候選 |
+| POST | `/api/v1/entities/merge` | operator | 200 | body：`survivor_id`／`merged_id`／`reason` |
+| POST | `/api/v1/merge-history/{id}/undo` | operator | 204 | 重複 undo 回 409 |
 | GET | `/api/v1/relationships` | viewer | 200 | `?type=` |
 | GET | `/api/v1/relationships/{id}` | viewer | 200 | 含 evidence（SPEC §12） |
 | GET | `/api/v1/events` | viewer | 200 | V0.1 無寫入者，正常是空的 |
@@ -251,6 +256,33 @@ curl -s -X POST http://127.0.0.1:18080/api/v1/collections \
   `relationships_truncated` 為 true 時代表「至少這麼多」——把它當精確總數顯示，
   熱門 IOC 的關聯數會永遠停在 100
 - `recent_extractions`：這個 Entity 是從哪些 object 抽出來的（SPEC §17）
+
+### Resolve／Merge
+
+```bash
+# 對一個 Entity 跑目前已實作的掃描方法，回這次新寫入的候選
+curl -s -X POST http://127.0.0.1:18080/api/v1/entities/$ID/resolve \
+  -H "Authorization: Bearer $TOKEN"
+
+# 列出這個 Entity 參與過的候選（entity_a 或 entity_b 命中都算）
+curl -s "http://127.0.0.1:18080/api/v1/entities/$ID/resolution-candidates?status=pending" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 把 merged 併進 survivor。reason 不可為空白。
+curl -s -X POST http://127.0.0.1:18080/api/v1/entities/merge \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"survivor_id":"'$SURVIVOR'","merged_id":"'$MERGED'","reason":"人工確認是同一個人"}'
+
+# 撤銷一次 merge。成功 204；已經 undo 過再打一次是 409。
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  http://127.0.0.1:18080/api/v1/merge-history/$HISTORY_ID/undo \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+`POST /entities/{id}/resolve` 目前注入的是 `MockEmbeddingProvider::unsupported()`
+與空的 `MockGraphStore`：`semantic_similarity`／`graph_context` **誠實回空**，
+不是假裝已接上。會真的產生候選的方法只有 `normalized_name`／`alias`／`domain`。
+完整理由見 `docs/developer/resolver.md`。merge 行為見 `docs/developer/merge.md`。
 
 ## Relationships
 

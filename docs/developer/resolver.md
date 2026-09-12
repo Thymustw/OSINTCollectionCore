@@ -3,7 +3,7 @@
 對應內部規格 V0.2 §5（Resolution Candidate）、§6（Resolution Methods）。
 
 ```text
-crates/resolver    函式庫；目前沒有獨立 binary／事件消費者
+crates/resolver    函式庫；HTTP 入口在 osint-api
 ```
 
 給 Entity 跑 resolution method，產出 `ResolutionCandidate` 寫進 canonical store。
@@ -25,6 +25,28 @@ SPEC §6 列了十種方法（`core_model::RESOLUTION_METHODS` 是拼法來源�
 | `graph_context` | **已實作，接進 `resolve_entity` 聚合** | 只依賴 `GraphStore`，不查 Entity 本體；門檻 `GRAPH_CONTEXT_THRESHOLD` |
 
 骨架把聚合點留在 `ResolverService::resolve_entity`，每加一個方法就接進那條呼叫鏈。
+
+## HTTP API
+
+`osint-api` 把 `ResolverService` 放進
+`AppState.resolver: Option<SharedResolverService>`
+（`Arc<ResolverService<PostgresCanonicalStore, MockEmbeddingProvider, MockGraphStore>>`）。
+組裝時注入的是 `MockEmbeddingProvider::unsupported()` 與空的 `MockGraphStore`：
+
+- `check_semantic_similarity` 誠實回空（不是假造相似度）
+- `check_graph_context` 誠實回空（圖上沒有邊，本來就沒有鄰居）
+
+因此 `POST /api/v1/entities/{id}/resolve` **目前只有** `normalized_name`／`alias`／`domain`
+三種方法會真的產生候選。這不是 workaround，是已知限制——等 Phase 2
+（`storage-neo4j`）與 ml-commons adapter 接上才會補齊，不要假裝已經接上。
+
+| 方法 | 路徑 | 角色 | 成功碼 |
+|---|---|---|---|
+| POST | `/api/v1/entities/{id}/resolve` | operator | 200（這次新寫入的候選） |
+| GET | `/api/v1/entities/{id}/resolution-candidates` | viewer | 200（cursor 分頁，`?status=`） |
+
+Entity 不存在回 404。成功與失敗都寫稽核（`entity.resolve`）。
+請求／回應形狀見 `docs/developer/api-skeleton.md`。
 
 ## `ResolverService`
 

@@ -8,6 +8,9 @@ use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::MetricsRegistry;
 use core_security::{ApiTokenStore, AuditLog, JwtService};
+use merge::MergeService;
+use resolver::ResolverService;
+use storage_core::mock::{MockEmbeddingProvider, MockGraphStore};
 use storage_core::{ObjectStore, RelationalStore};
 use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
@@ -17,6 +20,14 @@ use crate::ready::ReadyProbe;
 pub type SharedTokenStore = Arc<dyn ApiTokenStore>;
 pub type SharedAudit = Arc<dyn AuditLog>;
 pub type SharedJobService = Arc<JobService<PostgresCanonicalStore>>;
+/// 理由同 [`SharedJobService`]：`MergeService<S: TransactionalStore>` 的泛型參數
+/// 不能吃 `Arc<dyn RelationalStore>`（沒有 blanket impl）。直接綁生產 adapter。
+pub type SharedMergeService = Arc<MergeService<PostgresCanonicalStore>>;
+/// 目前用 [`MockEmbeddingProvider::unsupported`] 與空的 [`MockGraphStore`]：
+/// `semantic_similarity`／`graph_context` 誠實回空，不是假裝已接上。
+/// Phase 2 接 `storage-neo4j` 與 ml-commons adapter 後才換真的。
+pub type SharedResolverService =
+    Arc<ResolverService<PostgresCanonicalStore, MockEmbeddingProvider, MockGraphStore>>;
 pub type SharedSearchState = Arc<SearchState>;
 
 /// 泛用的 canonical store handle。
@@ -90,6 +101,12 @@ pub struct AppState {
     /// 物件儲存。`None` 代表沒接上 MinIO。
     pub objects: Option<SharedObjects>,
     pub jobs: Option<SharedJobService>,
+    /// Entity merge。`None` 代表沒接上 Postgres，對應 handler 回 503。
+    pub merge: Option<SharedMergeService>,
+    /// Entity resolution。`None` 代表沒接上 Postgres。embedder／graph 目前是 mock
+    /// （見 [`SharedResolverService`]），不要假設 `POST /entities/{id}/resolve`
+    /// 會產出 `semantic_similarity` 或 `graph_context` 候選。
+    pub resolver: Option<SharedResolverService>,
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
     pub ready: ReadyProbe,

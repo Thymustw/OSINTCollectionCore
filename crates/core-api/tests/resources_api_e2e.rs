@@ -24,9 +24,9 @@ use core_config::ImportSection;
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_model::{
-    Connector, Document, DocumentType, DuplicateGroup, Entity, EntityExtraction, EntityType,
-    Provenance, RawEvidence, Relationship, RelationshipEvidence, RelationshipType, Source,
-    SourceType,
+    Connector, Document, DocumentType, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
+    EntityIdentifier, EntityType, Provenance, RawEvidence, Relationship, RelationshipEvidence,
+    RelationshipType, Source, SourceType,
 };
 use core_observability::MetricsRegistry;
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
@@ -116,6 +116,12 @@ fn build_api_with_backends(
         jobs: producer
             .clone()
             .map(|p| Arc::new(JobService::new(stack.pg.clone(), Some(p)))),
+        merge: Some(Arc::new(merge::MergeService::new(stack.pg.clone()))),
+        resolver: Some(Arc::new(resolver::ResolverService::new(
+            stack.pg.clone(),
+            storage_core::mock::MockEmbeddingProvider::unsupported(),
+            storage_core::mock::MockGraphStore::new(),
+        ))),
         import: None,
         search: None,
         ready: ready_always(),
@@ -1489,4 +1495,351 @@ async fn ops_health_reports_a_broken_redis() {
         postgres["healthy"], true,
         "一個壞掉不該讓其他檢查也被標成壞的：{body}"
     );
+}
+
+// ---------------------------------------------------------------- resolve / merge
+
+fn new_entity(entity_type: EntityType, name: &str, normalized_name: &str) -> Entity {
+    let now = Utc::now();
+    Entity {
+        id: Uuid::now_v7(),
+        entity_type,
+        name: name.into(),
+        normalized_name: normalized_name.into(),
+        description: None,
+        confidence: 0.8,
+        first_seen: now,
+        last_seen: now,
+        merged_into: None,
+        attributes: json!({}),
+    }
+}
+
+/// 跨 type 同名 → `POST /entities/{id}/resolve` 產出 `normalized_name` 候選，
+/// `GET /entities/{id}/resolution-candidates` 查得到同一筆。
+#[tokio::test]
+async fn resolve_entity_hits_normalized_name() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+
+    let token = Uuid::now_v7().simple().to_string();
+    let name = format!("acme-{token}");
+    let person = new_entity(EntityType::Person, &name, &name);
+    let org = new_entity(EntityType::Organization, &name, &name);
+    stack.pg.put_entity(&person).await.expect("seed person");
+    stack.pg.put_entity(&org).await.expect("seed org");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/entities/{}/resolve", person.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let candidates = body.as_array().expect("resolve 回陣列");
+    let hit = candidates.iter().find(|c| {
+        c["method"] == "normalized_name"
+            && (c["entity_a_id"] == person.id.to_string()
+                || c["entity_b_id"] == person.id.to_string())
+            && (c["entity_a_id"] == org.id.to_string() || c["entity_b_id"] == org.id.to_string())
+    });
+    assert!(
+        hit.is_some(),
+        "應含跨 type 同名的 normalized_name 候選：{body}"
+    );
+    let candidate_id: Uuid = hit.unwrap()["id"].as_str().unwrap().parse().unwrap();
+
+    let listed = find_by_cursor(
+        &api.app,
+        &api.viewer,
+        &format!("/api/v1/entities/{}/resolution-candidates", person.id),
+        candidate_id,
+    )
+    .await;
+    assert!(
+        listed.is_some(),
+        "GET resolution-candidates 應查得到剛 resolve 寫入的候選"
+    );
+}
+
+/// 同 type merge 成功：survivor 吃到 alias／identifier，merged 被標 `merged_into`。
+#[tokio::test]
+async fn merge_entities_absorbs_alias_and_identifier() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+
+    let run = Uuid::now_v7().simple().to_string();
+    let survivor = new_entity(
+        EntityType::Person,
+        &format!("survivor-{run}"),
+        &format!("survivor-{run}"),
+    );
+    let merged = new_entity(
+        EntityType::Person,
+        &format!("merged-{run}"),
+        &format!("merged-{run}"),
+    );
+    stack.pg.put_entity(&survivor).await.expect("seed survivor");
+    stack.pg.put_entity(&merged).await.expect("seed merged");
+
+    let now = Utc::now();
+    stack
+        .pg
+        .put_entity_alias(&EntityAlias {
+            id: Uuid::now_v7(),
+            entity_id: merged.id,
+            alias: format!("aka-{run}"),
+            alias_type: "aka".into(),
+            source_id: None,
+            confidence: 0.7,
+            first_seen: now,
+            last_seen: now,
+        })
+        .await
+        .expect("seed alias");
+    stack
+        .pg
+        .put_entity_identifier(&EntityIdentifier {
+            id: Uuid::now_v7(),
+            entity_id: merged.id,
+            namespace: format!("e2e-{run}"),
+            value: format!("id-{run}"),
+            normalized_value: format!("id-{run}"),
+            confidence: 0.9,
+            source_id: None,
+            first_seen: now,
+            last_seen: now,
+        })
+        .await
+        .expect("seed identifier");
+
+    let (status, history, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/entities/merge",
+            &api.operator,
+            &json!({
+                "survivor_id": survivor.id,
+                "merged_id": merged.id,
+                "reason": "e2e 確認是同一個人",
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["survivor_id"], survivor.id.to_string());
+    assert_eq!(history["merged_id"], merged.id.to_string());
+    let history_id: Uuid = history["id"].as_str().unwrap().parse().unwrap();
+
+    let aliases = stack
+        .pg
+        .list_entity_aliases_by_entity(survivor.id, 100)
+        .await
+        .expect("list aliases");
+    assert!(
+        aliases.iter().any(|a| a.alias == format!("aka-{run}")),
+        "survivor 應吃到 merged 的 alias：{aliases:?}"
+    );
+    let identifiers = stack
+        .pg
+        .list_entity_identifiers_by_entity(survivor.id, 100)
+        .await
+        .expect("list identifiers");
+    assert!(
+        identifiers
+            .iter()
+            .any(|i| i.normalized_value == format!("id-{run}")),
+        "survivor 應吃到 merged 的 identifier：{identifiers:?}"
+    );
+
+    let (status, detail, _) = send(
+        &api.app,
+        get(&format!("/api/v1/entities/{}", merged.id), &api.viewer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["merged_into"], survivor.id.to_string());
+
+    let (status, listed, _) = send(
+        &api.app,
+        get(
+            &format!("/api/v1/entities/{}/merge-history", survivor.id),
+            &api.viewer,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["id"] == history_id.to_string()),
+        "GET merge-history 應含剛寫入的歷史：{listed}"
+    );
+
+    let entry = api
+        .audit
+        .entries()
+        .into_iter()
+        .find(|e| {
+            e.action == core_api::AUDIT_ENTITY_MERGE
+                && e.resource_id == Some(history_id.to_string())
+        })
+        .expect("entity.merge 稽核");
+    assert_eq!(entry.outcome, "success");
+    assert_eq!(entry.ip.as_deref(), Some("203.0.113.9"));
+}
+
+#[tokio::test]
+async fn merge_rejects_type_mismatch_and_empty_reason() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+
+    let run = Uuid::now_v7().simple().to_string();
+    let person = new_entity(EntityType::Person, &format!("p-{run}"), &format!("p-{run}"));
+    let org = new_entity(
+        EntityType::Organization,
+        &format!("o-{run}"),
+        &format!("o-{run}"),
+    );
+    stack.pg.put_entity(&person).await.expect("seed person");
+    stack.pg.put_entity(&org).await.expect("seed org");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/entities/merge",
+            &api.operator,
+            &json!({
+                "survivor_id": person.id,
+                "merged_id": org.id,
+                "reason": "型別不同不該過",
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/entities/merge",
+            &api.operator,
+            &json!({
+                "survivor_id": person.id,
+                "merged_id": org.id,
+                "reason": "   ",
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("reason"),
+        "空 reason 的訊息要指出是 reason：{body}"
+    );
+}
+
+#[tokio::test]
+async fn undo_merge_twice_is_409() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+
+    let run = Uuid::now_v7().simple().to_string();
+    let survivor = new_entity(
+        EntityType::Domain,
+        &format!("surv-{run}"),
+        &format!("surv-{run}"),
+    );
+    let merged = new_entity(
+        EntityType::Domain,
+        &format!("src-{run}"),
+        &format!("src-{run}"),
+    );
+    stack.pg.put_entity(&survivor).await.expect("seed survivor");
+    stack.pg.put_entity(&merged).await.expect("seed merged");
+
+    let (status, history, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/entities/merge",
+            &api.operator,
+            &json!({
+                "survivor_id": survivor.id,
+                "merged_id": merged.id,
+                "reason": "e2e undo",
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let history_id = history["id"].as_str().unwrap();
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/merge-history/{history_id}/undo"),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/merge-history/{history_id}/undo"),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[tokio::test]
+async fn viewer_cannot_resolve_or_merge() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+    let id = Uuid::now_v7();
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/entities/{id}/resolve"),
+            &api.viewer,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/entities/merge",
+            &api.viewer,
+            &json!({
+                "survivor_id": id,
+                "merged_id": Uuid::now_v7(),
+                "reason": "viewer 不該過",
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 }

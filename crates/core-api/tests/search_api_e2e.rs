@@ -115,6 +115,8 @@ fn build_api(stack: &Stack, index: &str, role: Role) -> TestApi {
         store: None,
         objects: None,
         jobs: None,
+        merge: None,
+        resolver: None,
         import: None,
         search: Some(Arc::new(SearchState {
             store: stack.os.clone(),

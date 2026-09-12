@@ -3,7 +3,7 @@
 對應內部規格 V0.2 §7（Entity Merge）與 Acceptance C（可 undo、不遺失歷史 evidence）。
 
 ```text
-crates/merge    函式庫；目前沒有獨立 binary／事件消費者／HTTP API
+crates/merge    函式庫；HTTP 入口在 osint-api
 ```
 
 這個 crate **執行**一次已經決定的 merge，**不產生候選**——候選是 `crates/resolver` 的事。呼叫端把 survivor／merged 兩個 Entity id 丟進來，這裡在一筆交易裡改寫參照、處理 relationship UNIQUE 撞號、標記 `entities.merged_into`、寫 `MergeHistory`。
@@ -18,6 +18,23 @@ MergeService<S: TransactionalStore>
 ```
 
 用具體型別參數，不包 `Arc<dyn TransactionalStore>`：`TransactionalStore::begin` 已經回 `Box<dyn Transaction>`，再包一層 dyn 沒有 object-safety 收益。
+
+## HTTP API
+
+`osint-api` 用同一份 `PostgresCanonicalStore` 組 `MergeService`，放進
+`AppState.merge: Option<SharedMergeService>`（`Arc<MergeService<PostgresCanonicalStore>>`，
+理由同 `SharedJobService`：泛型服務吃不了 `dyn RelationalStore`）。沒接 Postgres 時是
+`None`，對應 handler 回 503。掛在：
+
+| 方法 | 路徑 | 角色 | 成功碼 |
+|---|---|---|---|
+| POST | `/api/v1/entities/merge` | operator | 200（`MergeHistory`） |
+| POST | `/api/v1/merge-history/{id}/undo` | operator | 204 |
+| GET | `/api/v1/entities/{id}/merge-history` | viewer | 200 |
+
+`reason` 空白回 400。型別不同回 400，已經被併掉／重複 undo 回 409。
+成功與失敗都寫稽核（`entity.merge`／`merge.undo`）。
+請求／回應形狀見 `docs/developer/api-skeleton.md`。
 
 ## 交易邊界
 

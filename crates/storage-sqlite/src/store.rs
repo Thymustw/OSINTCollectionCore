@@ -1969,6 +1969,34 @@ impl RelationalStore for SqliteEmbeddedStore {
         rows.iter().map(mapping::resolution_candidate).collect()
     }
 
+    async fn list_resolution_candidates_by_entity(
+        &self,
+        entity_id: EntityId,
+        status: Option<ResolutionStatus>,
+        after: Option<ResolutionCandidateId>,
+        limit: u32,
+    ) -> Result<Vec<ResolutionCandidate>, StorageError> {
+        let status = status.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM resolution_candidates
+            WHERE (entity_a_id = ?1 OR entity_b_id = ?1)
+              AND (?2 IS NULL OR status = ?2)
+              AND (?3 IS NULL OR id < ?3)
+            ORDER BY id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(uuid_text(entity_id))
+        .bind(status)
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::resolution_candidate).collect()
+    }
+
     async fn put_merge_history(&self, history: &MergeHistory) -> Result<(), StorageError> {
         let repointed = serde_json::to_string(&history.repointed_references).map_err(|err| {
             StorageError::Unknown {

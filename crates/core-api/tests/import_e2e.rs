@@ -108,6 +108,8 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, import_config: ImportS
         store: Some(Arc::new(stack.pg.clone())),
         objects: Some(Arc::new(stack.s3.clone())),
         jobs: None,
+        merge: None,
+        resolver: None,
         import: Some(Arc::new(ImportState {
             store: Arc::new(stack.pg.clone()),
             sink: Arc::new(sink),

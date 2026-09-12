@@ -189,6 +189,7 @@ graph-worker／DLQ 重放仍沒有生產呼叫端。
 | `find_entity_identifier_owner(namespace, normalized_value)` | 自然鍵反查既有 owner，最多一筆。resolver 的 exact identifier／domain／email／external ID 用它找衝突 |
 | `put_resolution_candidate` / `get_resolution_candidate` | 依主鍵 upsert；CHECK `a < b` + UNIQUE `(a, b, method)` |
 | `list_resolution_candidates(status, after, limit)` | `id DESC`，cursor；`status` **在 SQL 裡**過濾，`None` = 不過濾 |
+| `list_resolution_candidates_by_entity(entity_id, status, after, limit)` | `id DESC`，cursor；`entity_a_id` **或** `entity_b_id` 命中都算；`status` 在 SQL 裡過濾 |
 | `put_merge_history` / `get_merge_history` | 依主鍵 upsert |
 | `list_merge_history_by_entity(entity_id, limit)` | `id DESC`；`survivor_id` **或** `merged_id` 命中都算 |
 | `put_failed_event(event) -> FailedEvent` | 自然鍵 `(topic, partition, offset)` upsert，**回傳實際存下來的那一列** |

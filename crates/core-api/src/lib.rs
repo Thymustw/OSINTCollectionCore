@@ -47,8 +47,9 @@ pub use resources::entities::EntityDetail;
 pub use resources::objects::{ExtractedEntity, ObjectDetail};
 pub use resources::relationships::RelationshipDetail;
 pub use resources::{
-    AUDIT_COLLECTION_CREATE, AUDIT_CONNECTOR_CREATE, AUDIT_CONNECTOR_UPDATE, AUDIT_OBJECT_CREATE,
-    AUDIT_SOURCE_CREATE, AUDIT_SOURCE_UPDATE,
+    AUDIT_COLLECTION_CREATE, AUDIT_CONNECTOR_CREATE, AUDIT_CONNECTOR_UPDATE, AUDIT_ENTITY_MERGE,
+    AUDIT_ENTITY_RESOLVE, AUDIT_MERGE_UNDO, AUDIT_OBJECT_CREATE, AUDIT_SOURCE_CREATE,
+    AUDIT_SOURCE_UPDATE,
 };
 pub use routes::router;
 pub use search::{EntitySummary, SearchHitBody, SearchResponse};

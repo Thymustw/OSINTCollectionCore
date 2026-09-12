@@ -15,9 +15,12 @@ use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::{MetricsRegistry, init_tracing};
 use core_security::{AuditLog, JwtService, MemoryApiTokenStore, MemoryAuditLog};
+use merge::MergeService;
+use resolver::ResolverService;
 use storage_core::conformance::{
     assert_opensearch_identity, load_workspace_dotenv, verify_not_opencti_search,
 };
+use storage_core::mock::{MockEmbeddingProvider, MockGraphStore};
 use storage_postgres::{PostgresApiTokenStore, PostgresAuditLog, PostgresCanonicalStore};
 use tokio::net::TcpListener;
 
@@ -77,7 +80,7 @@ async fn run() -> Result<(), String> {
     let mut audit: Arc<dyn AuditLog> = Arc::new(MemoryAuditLog::new());
     let mut tokens: SharedTokenStore = Arc::new(MemoryApiTokenStore::new());
 
-    let (jobs, import, ready) = match connect_postgres(&cfg).await {
+    let (jobs, merge, resolver, import, ready) = match connect_postgres(&cfg).await {
         Ok(store) => {
             let ready = ReadyProbe::new(vec![Arc::new(PostgresReady {
                 store: store.clone(),
@@ -120,8 +123,16 @@ async fn run() -> Result<(), String> {
                     None
                 }
             };
-            let service = JobService::new(store, producer.clone());
-            (Some(Arc::new(service)), import, ready)
+            let jobs = Some(Arc::new(JobService::new(store.clone(), producer.clone())));
+            let merge = Some(Arc::new(MergeService::new(store.clone())));
+            // MockEmbeddingProvider::unsupported() 讓 semantic_similarity 誠實回空；
+            // 空的 MockGraphStore 讓 graph_context 誠實回空。不是假裝已接上。
+            let resolver = Some(Arc::new(ResolverService::new(
+                store,
+                MockEmbeddingProvider::unsupported(),
+                MockGraphStore::new(),
+            )));
+            (jobs, merge, resolver, import, ready)
         }
         Err(err) => {
             tracing::warn!(
@@ -131,7 +142,7 @@ async fn run() -> Result<(), String> {
             );
             missing.push("postgres");
             missing.push("object_store");
-            (None, None, ReadyProbe::always_ready())
+            (None, None, None, None, ReadyProbe::always_ready())
         }
     };
 
@@ -214,6 +225,8 @@ async fn run() -> Result<(), String> {
         store: shared_store,
         objects: shared_objects,
         jobs,
+        merge,
+        resolver,
         import,
         search,
         ready,
