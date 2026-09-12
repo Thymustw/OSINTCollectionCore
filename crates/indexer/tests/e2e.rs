@@ -950,55 +950,48 @@ async fn rebuild_from_postgres_matches_the_canonical_document_count() {
         .await
         .expect("extract");
 
-    // 「重建前後 PostgreSQL 的計數相同」才做精確比對——這個資料庫是共用的，
-    // 其他測試可能正在寫入。不設這道閘門就會得到一個偶發失敗的測試。
-    let mut asserted_exact = false;
-    let mut report = None;
-    for _ in 0..3 {
-        let before = count_canonical_documents(&stack.pg).await;
-        let run = service
-            .rebuild(RebuildOptions {
-                drop_index: true,
-                page_size: 100,
-            })
-            .await
-            .expect("rebuild");
-        let after = count_canonical_documents(&stack.pg).await;
-        let indexed = service.indexed_count().await.expect("count");
+    // 這個資料庫是 workspace 所有 e2e 共用的，CI 上 nextest 同時跑 50+ 個 test
+    // binary，「rebuild 前後全表 canonical 數相同」在那種環境下不是可靠的前提——
+    // 舊版用三次重試等它相同，2026-09-12 在 GitHub runner 上三次都撞到並行寫入
+    // 而失敗。真正要驗的不變量不需要全表數字穩定：
+    //   (a) rebuild 內部一致：scanned == indexed（沒有掃到卻沒寫進去的）
+    //   (b) index 內的文件數 == 本次寫入數（drop_index=true 起手是空的）
+    //   (c) 掃到的數 >= rebuild 開始前的 canonical 數（其他測試只會加、不會刪）
+    //   (d) 本次建的 canonical 在 index、duplicate 不在（下面另外斷言）
+    // 這四條在並行寫入下仍然嚴格成立；「等於全表數」那條只在單獨跑時成立。
+    let before = count_canonical_documents(&stack.pg).await;
+    let report = service
+        .rebuild(RebuildOptions {
+            drop_index: true,
+            page_size: 100,
+        })
+        .await
+        .expect("rebuild");
+    let indexed = service.indexed_count().await.expect("count");
 
-        assert_eq!(
-            run.indexed, indexed,
-            "從空 index 重建後，index 內的文件數必須等於本次寫入數"
-        );
-        assert_eq!(run.failed.len(), 0, "rebuild 不該有失敗：{:?}", run.failed);
-
-        if before == after {
-            assert_eq!(
-                run.scanned, before,
-                "掃過的 canonical Document 數必須等於 PostgreSQL 裡的 canonical 數"
-            );
-            assert_eq!(
-                indexed, before,
-                "重建後 index 的 hit 數必須等於 PostgreSQL 的 canonical Document 數"
-            );
-            asserted_exact = true;
-            report = Some(run);
-            break;
-        }
-        eprintln!(
-            "重建期間 PostgreSQL 的 canonical 數從 {before} 變成 {after}（其他測試在寫入），重試"
-        );
-        report = Some(run);
-    }
-    let report = report.expect("至少跑過一次 rebuild");
+    assert_eq!(
+        report.failed.len(),
+        0,
+        "rebuild 不該有失敗：{:?}",
+        report.failed
+    );
+    assert_eq!(
+        report.scanned, report.indexed,
+        "掃過的 canonical 數必須等於寫進 index 的數（沒有掃到卻沒寫的）"
+    );
+    assert_eq!(
+        report.indexed, indexed,
+        "從空 index 重建後，index 內的文件數必須等於本次寫入數"
+    );
+    assert!(
+        report.scanned >= before,
+        "rebuild 掃到的 canonical 數（{}）不該少於開始前的 PostgreSQL canonical 數（{before}）——\
+         其他測試只會新增，不會刪除",
+        report.scanned
+    );
     assert!(
         report.skipped_duplicates >= 1,
         "至少要跳過本次建立的那一份 duplicate"
-    );
-    assert!(
-        asserted_exact,
-        "連續三次都遇到並行寫入，沒能做精確比對。\
-         請確認沒有其他 e2e 測試同時在跑，再重試一次"
     );
 
     // 本次的 canonical 在 index 裡，duplicate 不在。
