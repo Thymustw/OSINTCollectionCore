@@ -6,10 +6,11 @@
 # Postgres 5432、Redis 6379、Redpanda 9092/8081/8082/9644 主機端目前空閒，維持原埠。
 # Neo4j 7474/7687 同樣空閒（2026-09-12 實測），維持原埠。
 #
-# 基礎建設的記憶體合計（V0.2 Phase 0b 後）：
-#   postgres 1g + opensearch 2g + redpanda 512m + redis 256m + minio 512m + neo4j 1g
-#   = 5.25 GB / 4.5 CPU
-# opensearch 從 1g 升到 2g 的理由見下方該服務的註解（embedding 模型要求）。
+# 基礎建設的記憶體合計（V0.2 Phase 0a-2 後）：
+#   postgres 1g + opensearch 3g + redpanda 512m + redis 256m + minio 512m + neo4j 1g
+#   = 6.25 GB / 4.5 CPU
+# opensearch 從 1g 升到 2g 再升到 3g 的理由見下方該服務的註解
+#（0a：單一 embedding 模型；0a-2：中英雙模型並存）。
 # 明細與宿主預算見 docs/architecture/RESOURCE_BUDGET.md。
 
 services:
@@ -31,11 +32,32 @@ services:
   # 不要只加 mem_limit 不加 heap：擋下來的是 JVM heap 那條斷路器。
   # 也不要靠調高 jvm_heap_memory_threshold 繞過——那是把 GC 壓力換成
   # 整個叢集不穩，ONNX 模型本身要的是 heap 外的 native memory。
+  #
+  # ---- V0.2 Phase 0a-2：再從 2g/1g heap 升到 3g/1536m heap ----
+  # 因為要**同時掛兩個模型**（英文 all-MiniLM-L6-v2 + 多語 e5-small int8，
+  # 「什麼語言就用什麼模型」）。2026-09-12 實測的三個失敗點：
+  #
+  # 1. 2g 容器塞不下第二個模型：kernel cgroup **OOM-kill**（不是斷路器）。
+  #    journalctl -k 有 "Memory cgroup out of memory: Killed process ... (java)
+  #    anon-rss:2080956kB"，剛好等於 2 GiB 上限。
+  #    ⚠️ `docker inspect .State.OOMKilled` 這時回報 **false**，會騙人；
+  #    唯一可靠的證據是 kernel journal 與 RestartCount。
+  # 2. 3g 容器但維持 -Xmx1g：兩個模型都 deploy 得起來（容器才 2.0 GiB／67%），
+  #    但 heap 穩定停在 86–92 %，超過 ml-commons 的
+  #    jvm_heap_memory_threshold（85，這是 2.19 唯一還生效的門檻），
+  #    於是**每一次推論都被擋成 HTTP 429**「Memory Circuit Breaker is open」。
+  #    容器記憶體看起來很閒，真正的瓶頸是 heap——只加 mem_limit 修不好。
+  # 3. e5-small 的 **FP32**（470 MB ONNX）即使在 3g/1536m 也會 OOM-kill
+  #    （anon-rss 3128400kB）。所以用 int8 量化版（118 MB），實測檢索品質
+  #    與 FP32 相同（中英文 top-1 各 5/5）、延遲還快一倍。
+  #
+  # 目前實測值：兩個模型都 DEPLOYED 時容器 2.55 GiB / 3 GiB（85 %）、
+  # heap 1170/1536 MB（76 %）、斷路器觸發 0 次。
   opensearch:
-    mem_limit: 2g
+    mem_limit: 3g
     cpus: "1.0"
     environment:
-      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+      OPENSEARCH_JAVA_OPTS: -Xms1536m -Xmx1536m
     ports: !override
       - "19200:9200"
 

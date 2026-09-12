@@ -26,9 +26,16 @@
 # 離線／封閉網路環境要先把 ml_cache 預先灌進 volume，否則 deploy 會卡住。
 # 完整實測數據與磁碟拆解見 docs/developer/embedding.md。
 #
-# ⚠️ 資源需求：OpenSearch 容器至少 2 GB、JVM heap 至少 1 GB。
+# ⚠️ 資源需求：只跑這一個英文模型的話，OpenSearch 容器至少 2 GB、heap 至少 1 GB。
 #    低於此值 deploy 會失敗在「Memory Circuit Breaker is open」——
 #    那是斷路器擋下來的，容器不會掛、健康檢查全綠，只有模型永遠起不來。
+#
+#    但本專案的 dev override 已經是 **3 GB / -Xmx1536m**，因為還要並存
+#    多語模型（scripts/opensearch-ml-setup-e5.sh）。兩個模型並存時：
+#      * 2 GB 容器 → kernel cgroup OOM-kill（不是斷路器，容器會重啟）
+#      * 3 GB 但 heap 仍 1 GB → 模型起得來，但 heap 卡在 86–92 %，
+#        超過 jvm_heap_memory_threshold(85)，每次推論都被擋成 HTTP 429
+#    數據見 docs/developer/embedding.md。
 
 set -euo pipefail
 
@@ -91,15 +98,19 @@ log "確認為 OpenSearch ${OS_VER}"
 # only_run_on_ml_node 預設 true：單節點開發叢集沒有專用 ml node，
 # 不關掉的話 deploy 會找不到可派工的節點。
 #
-# native_memory_threshold 預設 90，指的是**容器看得到的系統記憶體**使用率
-# （OpenSearch 讀 cgroup limit，不是宿主的 31 GB）。模型 deploy 之後這台
-# 開發機量到 100%，維持 90 會讓「再部署第二個模型」被擋下來。
-# 設 95 而不是 100：100 等於把斷路器關掉，真的吃光記憶體時會變成 OOM-kill。
+# ⚠️ 2026-09-12 更正：這裡原本還會設 native_memory_threshold: 95，**已移除**。
+# 那個設定在 ml-commons 2.19 的原始碼裡已經被 comment out（upstream PR #1015），
+# 設了不生效——PUT 會回 acknowledged，`_cluster/settings` 也讀得回來，
+# 但完全沒有任何程式碼在讀它。留著只會讓人誤以為 native memory 有保護。
+#
+# 實際唯一生效的門檻是 jvm_heap_memory_threshold（預設 85）。
+# 後果：**native memory 沒有任何斷路器保護**，吃爆就是 kernel cgroup OOM-kill
+# 整個 OpenSearch 行程（實測 docker 的 .State.OOMKilled 還會回報 false）。
+# 完整實測見 docs/developer/embedding.md。
 log "設定 plugins.ml_commons.*"
 api PUT /_cluster/settings '{
   "persistent": {
-    "plugins.ml_commons.only_run_on_ml_node": false,
-    "plugins.ml_commons.native_memory_threshold": 95
+    "plugins.ml_commons.only_run_on_ml_node": false
   }
 }' | jq_py "
 import json,sys
@@ -176,8 +187,9 @@ wait_task() {
 
    這是 ml-commons 的記憶體斷路器擋下來的，**不是容器被 OOM-kill**。
    容器仍然是 running、健康檢查仍然全綠，只有模型永遠起不來。
-   下一步：把 OpenSearch 容器提高到至少 2 GB、JVM heap 至少 1 GB
-   （docker/docker-compose.dev.yml 的 mem_limit 與 OPENSEARCH_JAVA_OPTS），
+   下一步：確認 docker/docker-compose.dev.yml 的 opensearch 是
+   mem_limit: 3g 與 OPENSEARCH_JAVA_OPTS: -Xms1536m -Xmx1536m
+   （單獨跑這個英文模型的下限是 2 GB / 1 GB，兩個模型並存才需要 3 GB / 1536m），
    然後重新執行這支腳本。詳細實測數據見 docs/developer/embedding.md。
    不要靠調高 jvm_heap_memory_threshold 繞過——那是把問題換成整個叢集不穩。"
         fi
