@@ -36,5 +36,5 @@ pub use extract::{
 pub use health::serve as serve_health;
 pub use service::{
     ACTION_ENTITY_EXTRACTED, EntityWorker, ExtractOutcome, PROCESSOR, entity_id, extraction_id,
-    rel_evidence_id, relationship_id,
+    identifier_id, identifier_namespace_for, rel_evidence_id, relationship_id,
 };

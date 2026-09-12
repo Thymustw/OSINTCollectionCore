@@ -30,11 +30,13 @@ V0.1 的 schema 慣例（PG vs SQLite 型別對照、cursor 分頁規則）見 `
 「是誰 undo 的」不放 `MergeHistory`，走 V0.1 既有的 `audit_log`（migration 0006）——
 那張表本來就是記「誰對哪個資源做了什麼」的地方。
 
-> ⚠️ **Phase 0 只建 schema。** Phase 1c 的 `crates/resolver` 會寫
-> `resolution_candidates`（目前只有 `normalized_name` 方法會產生列）。
-> `entity_aliases`／`entity_identifiers`／`merge_history`／`failed_events`
-> 仍沒有生產寫入者（graph-worker／DLQ 重放／identifier 寫入都還沒做）。
-> 跑完 migration 看到那四張空表是預期結果。
+> ⚠️ **Phase 0 只建 schema；Phase 1c 起開始有寫入者。**
+> `crates/resolver` 會寫 `resolution_candidates`（`normalized_name` 掃描，以及
+> entity-worker 在 identifier 衝突時寫入的 `exact_identifier` 列）。
+> `entity-worker` 會為 Domain／Ip／Url／Email／Vulnerability 寫
+> `entity_identifiers`（Hash／Person／Organization 刻意不寫，見
+> `docs/developer/entity-worker.md`）。
+> `entity_aliases`／`merge_history`／`failed_events` 仍沒有生產寫入者。
 
 ### 規格沒寫、資料表必須補的欄位
 
@@ -77,7 +79,9 @@ SQLite 比的是 UUID 的**文字**形式，PG 比的是 16 個位元組。兩�
 那不是錯誤處理的邊角，那正是 resolution 要偵測的訊號。寫入端收到 `Conflict`
 應該去建一筆 `resolution_candidate`；**吞掉的話識別碼會少記一筆而且毫無跡象**。
 組候選用 `resolver::resolution_candidate_from_identifier_conflict`（純函式，不寫 store）。
-目前沒有呼叫端——entity-worker 還沒寫識別碼，見 `docs/developer/resolver.md`。
+entity-worker 是第一個呼叫端：`upsert_entity` 收到 `Conflict` 後查 owner、組候選、
+`put_resolution_candidate`。候選本身再撞 `Conflict`（同一對同一方法已存在）視為正常。
+見 `docs/developer/entity-worker.md` 與 `docs/developer/resolver.md`。
 
 ### `namespace` 與 V0.1 報告 T10
 
@@ -85,8 +89,9 @@ T10 是已接受的限制：40 位 hex 分不出 SHA-1 與 git commit，entity-w
 `ambiguous_sha1`（confidence 0.7）。根源是值本身不帶型別資訊。
 
 `namespace` 把型別搬到值外面：`("sha1", <40 hex>)` 與 `("git_commit", <40 hex>)`
-是兩個不同的識別碼。**但 Phase 0c 只把欄位留著**——T10 還沒有因此消失，
-要真的解決，抽取端必須知道自己在抽哪一種雜湊。
+是兩個不同的識別碼。entity-worker **這次明確跳過 Hash**：抽取端還分不出雜湊型別，
+若用同一個 `namespace="hash"` 寫進去，exact_identifier 會把檔案雜湊與 commit id
+誤判成同一個識別碼。T10 因此還沒消失。
 
 ### `merge_history.repointed_references`：undo 的全部依據
 

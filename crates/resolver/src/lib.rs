@@ -10,27 +10,44 @@
 //! `normalized_name`」那一條——資料來源是既有的 `entities` 表，
 //! [`storage_core::RelationalStore::find_entity_by_normalized_name`] 已經能查。
 //!
-//! 其餘九種（`exact_identifier`／`alias`／`domain`／`url`／`account_handle`／
-//! `email`／`external_id`／`semantic_similarity`／`graph_context`）**這次刻意
-//! 不做**：它們依賴 `entity_identifiers`／`entity_aliases` 的寫入者，而
-//! entity-worker 還沒寫那些表。空跑一圈只會得到永遠為空的結果，看起來像
-//! 「這方法沒命中」，其實是「根本沒資料」。那是獨立技術債，不是這個 crate
-//! 該順手補的範圍。
+//! 其餘方法裡，`exact_identifier`、`alias`、`domain`、`url`、
+//! `semantic_similarity` 與 `graph_context` 有**自由函式**（尚未接進
+//! [`ResolverService::resolve_entity`] 聚合）：
 //!
-//! `exact_identifier` 有一個**純函式 helper**
-//! [`resolution_candidate_from_identifier_conflict`]：給未來的 identifier
-//! 寫入者在撞到 `StorageError::Conflict` 時組出候選。目前沒有呼叫端，
-//! 也不在這裡寫入 store。
+//! * [`resolution_candidate_from_identifier_conflict`]：identifier 寫入衝突時組候選。
+//!   entity-worker 的 `upsert_entity` 是第一個生產呼叫端。
+//! * [`check_alias`]／[`check_domain`]／[`check_url`]：查
+//!   `entity_aliases`／`entity_identifiers`。`entity_identifiers` 已由
+//!   entity-worker 為 Domain／Ip／Url／Email／CVE 寫入；`entity_aliases` 仍空。
+//!   空 Vec 是「沒資料」或「沒命中」，兩者要靠表是否有列來分辨。
+//! * [`check_semantic_similarity`]：同 type Entity 用 embedding cosine 比對。
+//! * [`check_graph_context`]：用一跳鄰居的 Jaccard 相似度找 2-hop 候選。
+//!
+//! `account_handle`／`email`／`external_id` 仍未做：同樣依賴 identifier
+//! 寫入者，且 SPEC §6 明文禁止只因同 username 就判定同一真實人物，
+//! 需要額外設計 score 上限，不是照抄 `check_domain` 的形狀就能做。
 //!
 //! [`ResolutionCandidate`]: core_model::ResolutionCandidate
 //! [`EntityId`]: core_model::EntityId
 //! [`resolution_candidate_from_identifier_conflict`]:
 //!     crate::conflict::resolution_candidate_from_identifier_conflict
+//! [`check_alias`]: crate::identifier_methods::check_alias
+//! [`check_domain`]: crate::identifier_methods::check_domain
+//! [`check_url`]: crate::identifier_methods::check_url
+//! [`check_semantic_similarity`]: crate::semantic::check_semantic_similarity
+//! [`check_graph_context`]: crate::graph_context::check_graph_context
+//! [`ResolverService::resolve_entity`]: crate::ResolverService::resolve_entity
 
 mod conflict;
 mod error;
+mod graph_context;
+mod identifier_methods;
+mod semantic;
 mod service;
 
 pub use conflict::resolution_candidate_from_identifier_conflict;
 pub use error::ResolverError;
+pub use graph_context::check_graph_context;
+pub use identifier_methods::{check_alias, check_domain, check_url};
+pub use semantic::check_semantic_similarity;
 pub use service::{ALL_ENTITY_TYPES, ResolverService};

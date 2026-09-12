@@ -23,13 +23,14 @@ use collector::{CollectOutcome, CollectorRunner, RunBounds};
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_model::{
-    Connector, Document, DocumentType, EntityType, NetworkRule, RawEvidence, RelationshipType,
-    Source, SourceType,
+    Connector, Document, DocumentType, Entity, EntityIdentifier, EntityType, NetworkRule,
+    RawEvidence, RelationshipType, ResolutionStatus, Source, SourceType,
 };
 use core_observability::MetricsRegistry;
 use deduplicator::{DedupBounds, DedupOutcome, Deduplicator};
 use entity_worker::{
     ACTION_ENTITY_EXTRACTED, EntityWorker, ExtractOutcome, ExtractionBounds, entity_id,
+    identifier_id,
 };
 use normalizer::{NormalizeOutcome, Normalizer};
 use serde_json::json;
@@ -1230,4 +1231,277 @@ async fn missing_document_is_skipped_not_fatal() {
         .await
         .expect("不存在的 Document 不該讓 consumer 掛掉");
     assert!(matches!(outcome, ExtractOutcome::DocumentMissing { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// V0.2 Phase 1c-0-data：entity_identifiers
+// ---------------------------------------------------------------------------
+
+/// Domain／Ip／Url／Email／CVE 會寫 identifier；Hash／Person／Organization 不會。
+#[tokio::test]
+async fn upsert_writes_identifiers_for_unique_key_types_and_skips_the_rest() {
+    let stack = connect_stack().await;
+    let fixture = Fixture::new();
+    let source = seed_source(&stack.pg, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+    let author = format!("Reporter {}", fixture.run.simple());
+    let publisher = format!("Example Security Lab {}", fixture.run.simple());
+    let document = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        &format!("公告 {}", fixture.cve),
+        &fixture.article(),
+        Some(&author),
+        json!({ "publisher": publisher }),
+        None,
+    )
+    .await;
+
+    worker(&stack)
+        .extract_document(document.id)
+        .await
+        .expect("extract");
+
+    let expected: [(EntityType, &str, String); 5] = [
+        (EntityType::Vulnerability, "cve", fixture.cve.to_uppercase()),
+        (EntityType::Domain, "domain", fixture.domain.clone()),
+        (EntityType::Ip, "ip", fixture.ip.clone()),
+        (EntityType::Email, "email", fixture.email.clone()),
+        (
+            EntityType::Url,
+            "url",
+            core_model::url_norm::canonicalize(&format!(
+                "https://{}/advisory/{}?utm_source=news",
+                fixture.domain, fixture.run
+            ))
+            .expect("fixture URL 必須能正規化"),
+        ),
+    ];
+    for (kind, namespace, normalized) in &expected {
+        let entity = stack
+            .pg
+            .find_entity_by_normalized_name(*kind, normalized)
+            .await
+            .expect("query")
+            .unwrap_or_else(|| panic!("{kind:?} `{normalized}` 必須建立 Entity"));
+        let rows = stack
+            .pg
+            .list_entity_identifiers_by_entity(entity.id, PAGE)
+            .await
+            .expect("identifiers");
+        assert_eq!(
+            rows.len(),
+            1,
+            "{kind:?} 應剛好一筆 identifier，實際 {rows:?}"
+        );
+        assert_eq!(rows[0].namespace, *namespace);
+        assert_eq!(rows[0].normalized_value, *normalized);
+        assert_eq!(rows[0].entity_id, entity.id);
+        assert_eq!(
+            rows[0].id,
+            identifier_id(namespace, entity.id, normalized),
+            "identifier id 必須是 UUID v5，重跑才不會累積重複列"
+        );
+        assert_eq!(
+            rows[0].source_id,
+            Some(source.id),
+            "identifier.source_id 應從 RawEvidence 反查到本次 Source"
+        );
+    }
+
+    let skipped: [(EntityType, String); 3] = [
+        (EntityType::Hash, fixture.sha256.clone()),
+        (EntityType::Person, author.to_lowercase()),
+        (EntityType::Organization, publisher.to_lowercase()),
+    ];
+    for (kind, normalized) in &skipped {
+        let entity = stack
+            .pg
+            .find_entity_by_normalized_name(*kind, normalized)
+            .await
+            .expect("query")
+            .unwrap_or_else(|| panic!("{kind:?} `{normalized}` 必須建立 Entity"));
+        let rows = stack
+            .pg
+            .list_entity_identifiers_by_entity(entity.id, PAGE)
+            .await
+            .expect("identifiers");
+        assert!(
+            rows.is_empty(),
+            "{kind:?} 這次不該寫 identifier（Hash=T10；Person/Organization=名字不是唯一鍵），實際 {rows:?}"
+        );
+    }
+}
+
+/// 同一個 Entity 刪掉 claim 再抽一次，identifier 仍是同一列。
+#[tokio::test]
+async fn rerunning_upsert_does_not_duplicate_identifiers() {
+    let stack = connect_stack().await;
+    let fixture = Fixture::new();
+    let source = seed_source(&stack.pg, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+    let document = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        &format!("公告 {}", fixture.cve),
+        &format!("受影響的網站為 {}。", fixture.domain),
+        None,
+        json!({}),
+        None,
+    )
+    .await;
+
+    let service = worker(&stack);
+    service.extract_document(document.id).await.expect("first");
+    let entity = stack
+        .pg
+        .find_entity_by_normalized_name(EntityType::Domain, &fixture.domain)
+        .await
+        .expect("query")
+        .expect("domain");
+    let before = stack
+        .pg
+        .list_entity_identifiers_by_entity(entity.id, PAGE)
+        .await
+        .expect("identifiers");
+    assert_eq!(before.len(), 1);
+
+    let claim = stack
+        .pg
+        .list_provenance_by_subject(document.id)
+        .await
+        .expect("query")
+        .into_iter()
+        .find(|p| p.action == ACTION_ENTITY_EXTRACTED)
+        .expect("claim");
+    sqlx::query("DELETE FROM provenance WHERE id = $1")
+        .bind(claim.id)
+        .execute(stack.pg.pool())
+        .await
+        .expect("delete claim");
+
+    service.extract_document(document.id).await.expect("second");
+    let after = stack
+        .pg
+        .list_entity_identifiers_by_entity(entity.id, PAGE)
+        .await
+        .expect("identifiers");
+    assert_eq!(
+        after.len(),
+        1,
+        "同一個 Entity 重跑不可累積 identifier；靠的是 UUID v5 主鍵"
+    );
+    assert_eq!(after[0].id, before[0].id);
+}
+
+/// 兩個不同 Entity 宣稱同一個 `(namespace, normalized_value)` 時寫
+/// `method=exact_identifier` 的 resolution candidate。
+///
+/// 同一型別、同一 normalized_name 的 Entity 會被自然鍵合併，不會走到這條路。
+/// 衝突要靠「另一個型別的 Entity 先佔了這個識別碼」才能觸發——這裡用一個
+/// 預先寫入的 Person 去佔 `("domain", <本次 domain>)`。
+#[tokio::test]
+async fn identifier_conflict_writes_exact_identifier_candidate() {
+    let stack = connect_stack().await;
+    let fixture = Fixture::new();
+    let source = seed_source(&stack.pg, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+
+    let now = Utc::now();
+    let occupant_id = entity_id(EntityType::Person, &format!("occupant-{}", fixture.run));
+    let occupant = Entity {
+        id: occupant_id,
+        entity_type: EntityType::Person,
+        name: format!("Occupant {}", fixture.run),
+        normalized_name: format!("occupant-{}", fixture.run),
+        description: None,
+        confidence: 0.5,
+        first_seen: now,
+        last_seen: now,
+        attributes: json!({}),
+    };
+    stack.pg.put_entity(&occupant).await.expect("occupant");
+    let occupant_identifier = EntityIdentifier {
+        id: identifier_id("domain", occupant_id, &fixture.domain),
+        entity_id: occupant_id,
+        namespace: "domain".into(),
+        value: fixture.domain.clone(),
+        normalized_value: fixture.domain.clone(),
+        confidence: 0.5,
+        source_id: Some(source.id),
+        first_seen: now,
+        last_seen: now,
+    };
+    stack
+        .pg
+        .put_entity_identifier(&occupant_identifier)
+        .await
+        .expect("pre-claim identifier");
+
+    let document = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        "衝突文件",
+        &format!("受影響的網站為 {}。", fixture.domain),
+        None,
+        json!({}),
+        None,
+    )
+    .await;
+    worker(&stack)
+        .extract_document(document.id)
+        .await
+        .expect("extract");
+
+    let domain_entity = stack
+        .pg
+        .find_entity_by_normalized_name(EntityType::Domain, &fixture.domain)
+        .await
+        .expect("query")
+        .expect("抽取仍必須建立 Domain Entity；identifier 衝突不該讓抽取失敗");
+
+    let domain_ids = stack
+        .pg
+        .list_entity_identifiers_by_entity(domain_entity.id, PAGE)
+        .await
+        .expect("identifiers");
+    assert!(
+        domain_ids.is_empty(),
+        "衝突時後來者寫不進去，識別碼仍屬於先佔的 Entity，實際 {domain_ids:?}"
+    );
+    let owner = stack
+        .pg
+        .find_entity_identifier_owner("domain", &fixture.domain)
+        .await
+        .expect("owner")
+        .expect("識別碼仍應屬於預先寫入的 Person");
+    assert_eq!(owner.entity_id, occupant_id);
+
+    let candidates = stack
+        .pg
+        .list_resolution_candidates(Some(ResolutionStatus::Pending), None, PAGE)
+        .await
+        .expect("candidates");
+    let hit: Vec<_> = candidates
+        .iter()
+        .filter(|c| c.method == "exact_identifier")
+        .filter(|c| {
+            (c.entity_a_id == occupant_id && c.entity_b_id == domain_entity.id)
+                || (c.entity_a_id == domain_entity.id && c.entity_b_id == occupant_id)
+        })
+        .collect();
+    assert_eq!(
+        hit.len(),
+        1,
+        "必須剛好一筆 exact_identifier 候選，實際 {hit:?}"
+    );
+    assert_eq!(hit[0].score, 0.95);
+    assert_eq!(hit[0].status, ResolutionStatus::Pending);
+    assert!(hit[0].entity_a_id < hit[0].entity_b_id);
+    assert_eq!(hit[0].evidence["namespace"], "domain");
+    assert_eq!(hit[0].evidence["normalized_value"], fixture.domain);
+    assert_eq!(hit[0].evidence["trigger"], "write_conflict");
 }

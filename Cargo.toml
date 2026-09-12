@@ -115,6 +115,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "json",
 ] }
 storage-core = { path = "crates/storage-core" }
+resolver = { path = "crates/resolver" }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal"] }
 tower = { version = "0.5.3", features = ["limit", "util"] }

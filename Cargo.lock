@@ -1349,6 +1349,7 @@ dependencies = [
  "deduplicator",
  "normalizer",
  "regex",
+ "resolver",
  "serde_json",
  "sqlx",
  "storage-core",
@@ -3188,6 +3189,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 

@@ -33,8 +33,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use core_events::{EventProducer, EventTopic};
 use core_model::{
-    Document, Entity, EntityExtraction, EntityType, Provenance, Relationship, RelationshipEvidence,
-    RelationshipType,
+    Document, Entity, EntityExtraction, EntityIdentifier, EntityType, Provenance, Relationship,
+    RelationshipEvidence, RelationshipType, SourceId,
 };
 use core_observability::MetricsRegistry;
 use serde_json::{Value, json};
@@ -61,12 +61,14 @@ pub const ACTION_ENTITY_EXTRACTED: &str = "entity_extracted";
 ///
 /// 固定常數，**不可更動**：改了之後同一個輸入會算出不同 id，舊列不會被 upsert 覆蓋，
 /// 而是多出一列——冪等保證直接失效（且不會報錯）。
-/// 四個 namespace 彼此不同，避免「Entity 的自然鍵」與「Relationship 的自然鍵」
+/// 五個 namespace 彼此不同，避免「Entity 的自然鍵」與「Identifier 的自然鍵」
 /// 剛好算出同一個 UUID。
 const ENTITY_NAMESPACE: Uuid = Uuid::from_u128(0x0199_5c31_7e20_7a55_8b4c_2d3e_6f70_8091);
 const RELATIONSHIP_NAMESPACE: Uuid = Uuid::from_u128(0x0199_5c31_7e20_7a55_8b4c_2d3e_6f70_8092);
 const REL_EVIDENCE_NAMESPACE: Uuid = Uuid::from_u128(0x0199_5c31_7e20_7a55_8b4c_2d3e_6f70_8093);
 const EXTRACTION_NAMESPACE: Uuid = Uuid::from_u128(0x0199_5c31_7e20_7a55_8b4c_2d3e_6f70_8094);
+/// `EntityIdentifier.id` 的 v5 namespace。與上面四個分開，避免自然鍵字串碰巧撞出同一個 UUID。
+const IDENTIFIER_NAMESPACE: Uuid = Uuid::from_u128(0x0199_5c31_7e20_7a55_8b4c_2d3e_6f70_8095);
 
 /// 從 `Document.attributes` 取 Organization 的欄位名（依序找，全部都取）。
 ///
@@ -235,6 +237,10 @@ impl EntityWorker {
 
         let now = Utc::now();
         let raw_evidence_id = raw_evidence_id_of(&document);
+        // identifier.source_id 指「這個識別碼是從哪個 Source 看到的」。
+        // Document 本身沒有 source_id，要從它的 RawEvidence 反查；查不到就留 None，
+        // 不要編一個——空值比假值安全，下游可以用 object_id 再追。
+        let source_id = source_id_of_raw(&self.store, raw_evidence_id).await;
 
         // ---- CPU-bound 的 regex 掃描 ----
         // CLAUDE.md §6：CPU-heavy work must not block Tokio executor threads。
@@ -279,7 +285,7 @@ impl EntityWorker {
             let entity_id = match entity_ids.get(&key) {
                 Some(id) => *id,
                 None => {
-                    let id = self.upsert_entity(item, now).await?;
+                    let id = self.upsert_entity(item, now, source_id).await?;
                     entity_ids.insert(key.clone(), id);
                     id
                 }
@@ -380,10 +386,16 @@ impl EntityWorker {
     /// 先用自然鍵查既有列：查到就只更新 `last_seen`（與可能變動的 attributes），
     /// **保留原本的 `first_seen`**——那個欄位的語意是「第一次看到這個實體」，
     /// 每次重跑都往後推的話它會變成「最後一次處理時間」，失去全部意義。
+    ///
+    /// `put_entity` 成功後會對特定型別再寫一筆 [`EntityIdentifier`]（見
+    /// [`identifier_namespace_for`]）。identifier 寫入失敗**不**讓抽取失敗：
+    /// Entity 已經是 canonical 事實，識別碼與衝突候選是 resolution 的旁支。
+    /// 失敗只記 error log；理由見 [`write_identifier_if_applicable`]。
     async fn upsert_entity(
         &self,
         item: &Extracted,
         now: DateTime<Utc>,
+        source_id: Option<SourceId>,
     ) -> Result<Uuid, EntityWorkerError> {
         let existing = self
             .store
@@ -424,23 +436,160 @@ impl EntityWorker {
             attributes: Value::Object(attributes),
         };
 
-        match self.store.put_entity(&entity).await {
-            Ok(()) => Ok(entity.id),
+        let persisted = match self.store.put_entity(&entity).await {
+            Ok(()) => entity,
             Err(storage_core::StorageError::Conflict { .. }) => {
                 // 並發：另一個 worker 在我們查完之後、寫入之前先建了同一個 Entity，
                 // 而且它用的 id 與我們算的不同（例如資料是舊版程式寫的）。
-                // 重查一次拿它的 id，不要讓整份 Document 失敗。
-                let found = self
-                    .store
+                // 重查一次拿它的列，不要讓整份 Document 失敗。
+                // identifier 要寫在真正落地的那一列上，所以用重查到的 Entity，
+                // 不是我們本來要寫、但被擋下的那份。
+                self.store
                     .find_entity_by_normalized_name(item.entity_type, &item.normalized_name)
                     .await?
                     .ok_or_else(|| EntityWorkerError::EntityConflict {
                         entity_type: format!("{:?}", item.entity_type).to_lowercase(),
                         normalized_name: item.normalized_name.clone(),
-                    })?;
-                Ok(found.id)
+                    })?
             }
-            Err(err) => Err(err.into()),
+            Err(err) => return Err(err.into()),
+        };
+        self.write_identifier_if_applicable(&persisted, source_id)
+            .await;
+        Ok(persisted.id)
+    }
+
+    /// 對特定 `EntityType` 寫一筆 [`EntityIdentifier`]。
+    ///
+    /// 只覆蓋「值本身就是命名空間內唯一鍵」的型別（Domain／Ip／Url／Email／CVE）。
+    /// Hash／Person／Organization 等刻意跳過，理由見 [`identifier_namespace_for`]。
+    ///
+    /// # 錯誤處理：一律 log-only，不回傳失敗
+    ///
+    /// identifier 衝突與候選建立是 resolution 的旁支，**不該讓核心抽取失敗**。
+    /// 一份文件抽到 CVE 與 domain，domain 的識別碼寫不進去，不代表這份文件沒抽過。
+    /// 若這裡回 `Err`，`upsert_entity` 會讓整份 Document 重試——Entity 已經寫進去了，
+    /// 重試只會多一次同樣的衝突，抽取永遠過不了。
+    ///
+    /// * `put_entity_identifier` 成功 → 沒事。
+    /// * `StorageError::Conflict`（另一個 Entity 已佔 `(namespace, normalized_value)`）
+    ///   → 查 owner、組 `exact_identifier` 候選、`put_resolution_candidate`。
+    ///   候選本身再撞 `Conflict`（同一對同一方法已存在）視為正常，info log。
+    ///   查不到 owner 或其他錯誤：error log。
+    /// * 其他 `StorageError`：error log。DB 掛了下一筆 Entity 還是會失敗，
+    ///   不會因為這裡吞掉而讓整次抽取假裝成功。
+    async fn write_identifier_if_applicable(&self, entity: &Entity, source_id: Option<SourceId>) {
+        let Some(namespace) = identifier_namespace_for(entity.entity_type) else {
+            return;
+        };
+        let identifier = EntityIdentifier {
+            id: identifier_id(namespace, entity.id, &entity.normalized_name),
+            entity_id: entity.id,
+            namespace: namespace.to_string(),
+            value: entity.name.clone(),
+            normalized_value: entity.normalized_name.clone(),
+            confidence: entity.confidence,
+            source_id,
+            first_seen: entity.first_seen,
+            last_seen: entity.last_seen,
+        };
+        match self.store.put_entity_identifier(&identifier).await {
+            Ok(()) => {}
+            Err(storage_core::StorageError::Conflict { message }) => {
+                tracing::info!(
+                    entity_id = %entity.id,
+                    namespace,
+                    normalized_value = %entity.normalized_name,
+                    %message,
+                    "entity_identifiers 自然鍵衝突：另一個 Entity 已宣稱這個識別碼，改寫 resolution candidate"
+                );
+                self.record_identifier_conflict(&identifier).await;
+            }
+            Err(err) => {
+                tracing::error!(
+                    entity_id = %entity.id,
+                    namespace,
+                    normalized_value = %entity.normalized_name,
+                    error = %err,
+                    "寫入 entity_identifiers 失敗（非衝突）。Entity 已落地，識別碼這次略過；\
+                     請查 Postgres 連線與 migration 0007 是否已套用"
+                );
+            }
+        }
+    }
+
+    /// `(namespace, normalized_value)` 已被另一個 Entity 佔走時，寫一筆
+    /// `exact_identifier` 的 [`core_model::ResolutionCandidate`]。
+    ///
+    /// 錯誤同樣不往上拋，理由見 [`write_identifier_if_applicable`]。
+    async fn record_identifier_conflict(&self, identifier: &EntityIdentifier) {
+        let owner = match self
+            .store
+            .find_entity_identifier_owner(&identifier.namespace, &identifier.normalized_value)
+            .await
+        {
+            Ok(Some(owner)) => owner,
+            Ok(None) => {
+                tracing::error!(
+                    namespace = %identifier.namespace,
+                    normalized_value = %identifier.normalized_value,
+                    conflicting_entity_id = %identifier.entity_id,
+                    "put_entity_identifier 回 Conflict，但 find_entity_identifier_owner \
+                     查不到既有 owner。請查 `entity_identifiers` 的 UNIQUE 是否還在、\
+                     以及剛才那次寫入是不是撞到別的 constraint"
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::error!(
+                    namespace = %identifier.namespace,
+                    normalized_value = %identifier.normalized_value,
+                    error = %err,
+                    "查 identifier owner 失敗，無法建立 exact_identifier 候選"
+                );
+                return;
+            }
+        };
+        if owner.entity_id == identifier.entity_id {
+            // 同一 Entity 重跑、但 identifier 主鍵與既有列不同（例如舊資料用 v7 id）。
+            // UNIQUE 擋的是自然鍵不是主鍵；這不是兩個 Entity 的衝突，不要開候選。
+            tracing::debug!(
+                entity_id = %identifier.entity_id,
+                namespace = %identifier.namespace,
+                "identifier 衝突的 owner 就是自己（多半是舊列用不同 id），略過候選"
+            );
+            return;
+        }
+        let candidate =
+            resolver::resolution_candidate_from_identifier_conflict(&owner, identifier.entity_id);
+        match self.store.put_resolution_candidate(&candidate).await {
+            Ok(()) => {
+                tracing::info!(
+                    candidate_id = %candidate.id,
+                    entity_a_id = %candidate.entity_a_id,
+                    entity_b_id = %candidate.entity_b_id,
+                    namespace = %identifier.namespace,
+                    "已寫入 exact_identifier resolution candidate"
+                );
+            }
+            Err(storage_core::StorageError::Conflict { message }) => {
+                tracing::info!(
+                    entity_a_id = %candidate.entity_a_id,
+                    entity_b_id = %candidate.entity_b_id,
+                    %message,
+                    "exact_identifier 候選已存在（同一對同一方法），沿用既有列，不中斷抽取"
+                );
+            }
+            Err(err) => {
+                tracing::error!(
+                    entity_a_id = %candidate.entity_a_id,
+                    entity_b_id = %candidate.entity_b_id,
+                    error = %err,
+                    "寫入 exact_identifier resolution candidate 失敗。\
+                     Entity 已落地、識別碼衝突已偵測到，但 Review 畫面暫時看不到這一對；\
+                     請查 `resolution_candidates` 與 migration 0007"
+                );
+            }
         }
     }
 
@@ -722,6 +871,71 @@ pub fn extraction_id(
     Uuid::new_v5(&EXTRACTION_NAMESPACE, key.as_bytes())
 }
 
+/// 這個 EntityType 要不要寫 `entity_identifiers`，以及寫進哪個 namespace。
+///
+/// 只覆蓋「值本身就是命名空間內唯一鍵」的五種。其餘回 `None`：
+///
+/// * **Hash**：40 位 hex 分不出 SHA-1 與 git commit（T10，`extract.rs` 的
+///   `ambiguous_sha1`）。若用同一個 `namespace="hash"` 寫進去，exact_identifier
+///   會把檔案雜湊與 commit id 誤判成同一個識別碼——false merge 比 false negative
+///   危險。等抽取端能明確分辨雜湊型別再處理。
+/// * **Person／Organization**：`name` 是人看的名字，不是命名空間內的唯一鍵。
+/// * **Account／Software／Repository／Location／Hostname**：這次沒有清楚的
+///   namespace 語意，不寫。
+#[must_use]
+pub fn identifier_namespace_for(entity_type: EntityType) -> Option<&'static str> {
+    match entity_type {
+        EntityType::Domain => Some("domain"),
+        EntityType::Ip => Some("ip"),
+        EntityType::Url => Some("url"),
+        EntityType::Email => Some("email"),
+        EntityType::Vulnerability => Some("cve"),
+        _ => None,
+    }
+}
+
+/// `EntityIdentifier.id` = UUID v5(namespace, `namespace|entity_id|normalized_name`)。
+///
+/// seed 含 `entity_id`：同一個 `(namespace, normalized_value)` 被兩個 Entity 宣稱時
+/// 必須算出**不同**的主鍵，UNIQUE `(namespace, normalized_value)` 才會回
+/// `StorageError::Conflict`——那正是 exact_identifier 要偵測的訊號。
+/// 若 seed 只用 `namespace|normalized_value`，兩邊算出同一個 id，
+/// `ON CONFLICT (id) DO UPDATE` 會把既有列的 `entity_id` 覆寫成後來者，
+/// 衝突被靜默吃掉，Review 永遠看不到這一對。
+///
+/// 同一個 Entity 重跑算出同一個 id → upsert 同一列，不會累積重複。
+#[must_use]
+pub fn identifier_id(namespace: &str, entity_id: Uuid, normalized_name: &str) -> Uuid {
+    let key = format!("{namespace}|{entity_id}|{normalized_name}");
+    Uuid::new_v5(&IDENTIFIER_NAMESPACE, key.as_bytes())
+}
+
+/// 從 RawEvidence 反查 `source_id`。查不到或查失敗都回 `None`，不編造。
+async fn source_id_of_raw(
+    store: &PostgresCanonicalStore,
+    raw_evidence_id: Option<Uuid>,
+) -> Option<SourceId> {
+    let id = raw_evidence_id?;
+    match store.get_raw_evidence(id).await {
+        Ok(Some(raw)) => Some(raw.source_id),
+        Ok(None) => {
+            tracing::debug!(
+                raw_evidence_id = %id,
+                "Document 標了 raw_evidence_id 但列不在，identifier 的 source_id 留空"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                raw_evidence_id = %id,
+                error = %err,
+                "查不到 RawEvidence 的 source_id，identifier 的 source_id 留空"
+            );
+            None
+        }
+    }
+}
+
 /// Entity 的自然鍵，用來在單次處理內去重。與 [`entity_id`] 的雜湊輸入同一套字串。
 fn natural_key(entity_type: EntityType, normalized_name: &str) -> (String, String) {
     (entity_type_key(entity_type), normalized_name.to_string())
@@ -850,6 +1064,51 @@ mod tests {
             Some(uuid::Version::Sha1),
             "必須是 v5；換成 v7 就失去冪等性"
         );
+    }
+
+    #[test]
+    fn identifier_namespace_only_covers_unique_key_types() {
+        assert_eq!(identifier_namespace_for(EntityType::Domain), Some("domain"));
+        assert_eq!(identifier_namespace_for(EntityType::Ip), Some("ip"));
+        assert_eq!(identifier_namespace_for(EntityType::Url), Some("url"));
+        assert_eq!(identifier_namespace_for(EntityType::Email), Some("email"));
+        assert_eq!(
+            identifier_namespace_for(EntityType::Vulnerability),
+            Some("cve")
+        );
+        // Hash：T10，40 位 hex 分不出 SHA-1 與 git commit，這次明確跳過。
+        assert_eq!(identifier_namespace_for(EntityType::Hash), None);
+        assert_eq!(identifier_namespace_for(EntityType::Person), None);
+        assert_eq!(identifier_namespace_for(EntityType::Organization), None);
+        assert_eq!(identifier_namespace_for(EntityType::Account), None);
+        assert_eq!(identifier_namespace_for(EntityType::Hostname), None);
+        assert_eq!(identifier_namespace_for(EntityType::Software), None);
+        assert_eq!(identifier_namespace_for(EntityType::Repository), None);
+        assert_eq!(identifier_namespace_for(EntityType::Location), None);
+    }
+
+    #[test]
+    fn identifier_id_is_deterministic_and_owner_sensitive() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let first = identifier_id("domain", a, "example.com");
+        assert_eq!(first, identifier_id("domain", a, "example.com"));
+        assert_eq!(
+            first.get_version(),
+            Some(uuid::Version::Sha1),
+            "必須是 v5；換成 v7 同一個 Entity 重跑會累積出重複 identifier"
+        );
+        assert_ne!(
+            first,
+            identifier_id("domain", b, "example.com"),
+            "兩個 Entity 宣稱同一個識別碼必須算出不同主鍵，UNIQUE 才會回 Conflict"
+        );
+        assert_ne!(
+            first,
+            identifier_id("email", a, "example.com"),
+            "namespace 不同就是不同識別碼"
+        );
+        assert_ne!(first, identifier_id("domain", a, "example.org"));
     }
 
     #[test]

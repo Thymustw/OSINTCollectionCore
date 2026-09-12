@@ -179,6 +179,9 @@ crate 版本跟著整個 workspace 走，規則沒改也會變。
 
 處理方式：照樣抽成 Hash Entity，但在 `attributes` 標
 `ambiguous_sha1 = true` 與 `ambiguity_note`，`confidence` 給 `0.7`。
+**也不寫 `entity_identifiers`**：若用同一個 `namespace="hash"` 寫進去，
+exact_identifier 會把檔案雜湊與 commit id 誤判成同一個識別碼
+（false merge 比 false negative 危險）。等抽取端能明確分辨雜湊型別再處理。
 
 硬判會兩邊都錯：當成 commit 會漏掉真的惡意檔案雜湊，當成 hash 會讓每篇技術文章的
 commit id 都變成 IOC。**把判斷權留給有語境的下游。**
@@ -267,7 +270,7 @@ evidence 是 upsert（不會變多）但計數會每跑一次加一，「邊數�
 
 ### 2. 決定性的 UUID v5（主力）
 
-四種衍生物件的 id 全部由自然鍵推導，所有 `put_*` 都是依主鍵 upsert，
+五種衍生物件的 id 全部由自然鍵推導，所有 `put_*` 都是依主鍵 upsert，
 所以重跑寫的是同一列。
 
 | 物件 | v5 雜湊輸入 |
@@ -276,6 +279,7 @@ evidence 是 upsert（不會變多）但計數會每跑一次加一，「邊數�
 | `Relationship` | `source\|type\|target` |
 | `RelationshipEvidence` | `relationship\|object\|text_offset` |
 | `EntityExtraction` | `object\|entity\|extractor\|text_offset` |
+| `EntityIdentifier` | `namespace\|entity_id\|normalized_name` |
 
 enum 轉字串走 **serde 的 snake_case 名稱**，不是 `Debug`。
 `Debug` 的輸出不是穩定契約，改個 variant 名稱就會讓所有既有 id 算出不同結果。
@@ -306,6 +310,61 @@ write-then-claim 的 crash window 只會造成重跑，而重跑因為第 2 點�
 ⚠️ **normalizer 已經在 V0.2 Phase 0e 改成交易，entity-worker 還沒。**
 `storage-core` 現在有 `TransactionalStore`，這裡也該改，排在 V0.2 Phase 1。
 在那之前 crash window 依然存在，靠的是 v5 id 的冪等，不是原子性。
+
+---
+
+## `entity_identifiers`（V0.2 Phase 1c-0-data）
+
+`upsert_entity` 在 `put_entity` 成功後呼叫 `write_identifier_if_applicable`，
+對特定 `EntityType` 再寫一筆 `EntityIdentifier`。同一個 Entity 重跑不累積重複列
+（UUID v5 主鍵 + `ON CONFLICT (id)`）。
+
+公開函式（`crates/entity-worker/src/service.rs`）：
+
+- `identifier_namespace_for(entity_type)`：五種唯一鍵型別回 namespace 字串，其餘 `None`。
+- `identifier_id(namespace, entity_id, normalized_name)`：UUID v5，namespace 常數是
+  `IDENTIFIER_NAMESPACE`（`0x0199_5c31_7e20_7a55_8b4c_2d3e_6f70_8095`）。
+  seed 含 `entity_id`，這樣兩個 Entity 宣稱同一個識別碼會算出**不同**主鍵，
+  UNIQUE `(namespace, normalized_value)` 才會回 `Conflict` 而不是被 `ON CONFLICT (id)` 覆寫。
+
+| EntityType | namespace | value / normalized_value |
+|---|---|---|
+| Domain | `domain` | `entity.name` / `entity.normalized_name`（抽取時已正規化，不再折一次） |
+| Ip | `ip` | 同上 |
+| Url | `url` | 同上 |
+| Email | `email` | 同上 |
+| Vulnerability | `cve` | 同上 |
+
+其餘型別**不寫**：
+
+- **Hash**：T10，見上一節。
+- **Person／Organization**：`name` 是人看的名字，不是命名空間內的唯一鍵。這次也不寫 `entity_aliases`。
+- **Account／Software／Repository／Location／Hostname**：沒有清楚的 namespace 語意。
+
+`source_id` 從 Document 的 RawEvidence 反查；查不到就留 `None`，不編造。
+
+### 衝突處理（log-only，不讓抽取失敗）
+
+`(namespace, normalized_value)` 是 UNIQUE。另一個 Entity 已佔這個識別碼時，
+`put_entity_identifier` 回 `StorageError::Conflict`。這**不是**錯誤邊角，
+是 SPEC §6 exact identifier 要偵測的訊號：
+
+1. `find_entity_identifier_owner` 拿既有 owner
+2. `resolver::resolution_candidate_from_identifier_conflict` 組候選
+3. `put_resolution_candidate`
+
+identifier 衝突與候選建立是 resolution 的旁支，**不讓核心抽取失敗**。
+`put_resolution_candidate` 自己再撞 `Conflict`（同一對同一方法已存在）視為正常，
+info log。其他錯誤 error log。Entity 已經寫進去了，這裡回 `Err` 只會讓整份
+Document 重試、永遠過不了。
+
+同一型別、同一 `normalized_name` 的兩份文件**不會**走到這條路——Entity 自然鍵
+會把它們合併成同一個 Entity，identifier 是 upsert 同一列。衝突要靠「另一個
+型別的 Entity 先佔了這個識別碼」（例如手動／舊資料把某個 domain 寫在 Person 上）。
+
+e2e：`upsert_writes_identifiers_for_unique_key_types_and_skips_the_rest`、
+`rerunning_upsert_does_not_duplicate_identifiers`、
+`identifier_conflict_writes_exact_identifier_candidate`。
 
 ---
 

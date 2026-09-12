@@ -6,11 +6,11 @@
 //!
 //! **純函式，不寫入 store**——呼叫端自己決定要不要 `put_resolution_candidate`。
 //!
-//! # 目前沒有任何呼叫端
+//! # 呼叫端
 //!
-//! entity-worker 還沒寫 `entity_identifiers`（V0.2 Phase 0 只把欄位留著，
-//! 見 `core_model::EntityIdentifier` 的模組說明）。這個 helper 是刻意留給
-//! 未來的接線點，不要假裝已經接到抽取管線上。
+//! entity-worker 的 `upsert_entity` 在 `put_entity_identifier` 撞到
+//! `StorageError::Conflict` 時呼叫這個 helper，再自己 `put_resolution_candidate`。
+//! 這是第一個生產呼叫端；helper 本身仍是純函式、不寫 store。
 
 use chrono::Utc;
 use core_model::{

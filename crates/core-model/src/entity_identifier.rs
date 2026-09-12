@@ -20,8 +20,10 @@ use crate::ids::{EntityId, EntityIdentifierId, SourceId};
 /// `("sha1", "<40 hex>")` 與 `("git_commit", "<40 hex>")` 是兩個不同的識別碼，
 /// 不會互相誤判成同一個 Entity。
 ///
-/// ⚠️ V0.2 Phase 0 **只把欄位留著**，entity-worker 還沒有寫入者，
-/// T10 的歧義也還沒因此消失——要真的解決，抽取端必須知道自己在抽哪一種雜湊。
+/// ⚠️ entity-worker 目前只為 Domain／Ip／Url／Email／Vulnerability 寫入。
+/// **Hash 刻意不寫**：40 位 hex 分不出 SHA-1 與 git commit（T10），若用同一個
+/// `namespace="hash"` 寫進去，exact_identifier 會把兩種語意不同的雜湊誤判成同一個
+/// 識別碼。等抽取端能明確分辨雜湊型別再處理。T10 的歧義因此還沒消失。
 ///
 /// # `value` vs `normalized_value`
 ///

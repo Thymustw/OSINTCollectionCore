@@ -21,6 +21,7 @@ core-observability = { workspace = true }
 # 確定性抽取規則（SPEC §17）。regex 1.13 已經在相依樹裡（tracing-subscriber 的
 # env-filter 帶進來的），所以這一行不會新增任何 crate 到樹上，授權面也沒有變化。
 regex = { workspace = true }
+resolver = { workspace = true }
 serde_json = { workspace = true }
 storage-core = { workspace = true }
 storage-postgres = { path = "../storage-postgres" }
