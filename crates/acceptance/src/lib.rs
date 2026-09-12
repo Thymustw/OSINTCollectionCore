@@ -18,3 +18,7 @@
 //!
 //! * `tests/acceptance_f.rs` — SPEC §26 Acceptance F：consumer crash 後重送事件，
 //!   不產生重複的 canonical object（normalizer／deduplicator／entity-worker 三段）。
+//! * `tests/failure_recovery.rs` — `TEST_STRATEGY.md` §6 failure/recovery：
+//!   broker redelivery、DB 暫時失效、search unavailable、object storage unavailable。
+//!   **會真的 `docker compose stop` 後端**，所以全部標 `#[ignore]`，
+//!   要單獨跑：`cargo test -p acceptance --test failure_recovery -- --ignored --test-threads=1`。
