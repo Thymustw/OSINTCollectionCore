@@ -14,6 +14,7 @@ use core_model::{Job, JobStatus};
 use core_security::{AuditEntry, Permission, Principal};
 
 use crate::error::ApiError;
+use crate::extractors::ClientIp;
 use crate::pagination::{CursorPage, Pagination};
 use crate::state::AppState;
 
@@ -22,6 +23,8 @@ use crate::state::AppState;
 pub const AUDIT_JOB_CREATE: &str = "job.create";
 pub const AUDIT_JOB_TRANSITION: &str = "job.transition";
 pub const AUDIT_JOB_DISPATCH: &str = "job.dispatch";
+/// SPEC §31「retry action is audited」直接對應這一列。
+pub const AUDIT_JOB_RETRY: &str = "job.retry";
 
 #[derive(Debug, Deserialize)]
 pub struct CreateJobBody {
@@ -53,15 +56,36 @@ fn jobs_or_unavailable(state: &AppState) -> Result<&crate::state::SharedJobServi
     })
 }
 
+/// `GET /api/v1/jobs` 的 query。`status` 是 Operations Center 最常用的過濾條件
+/// （「現在有哪些 job 掛了」）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListJobsQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+    /// `queued`／`running`／`completed`／`retrying`／`failed`／`cancelled`。
+    pub status: Option<JobStatus>,
+}
+
 pub async fn list_jobs(
     State(state): State<AppState>,
     principal: Principal,
-    Query(page): Query<Pagination>,
+    Query(query): Query<ListJobsQuery>,
 ) -> Result<Json<CursorPage<Job>>, ApiError> {
     principal.role.require(Permission::Read)?;
     let jobs = jobs_or_unavailable(&state)?;
-    let (after, limit) = page.decode()?;
-    let items = jobs.list(after, limit).await?;
+    let (after, limit) = Pagination {
+        cursor: query.cursor.clone(),
+        limit: query.limit,
+    }
+    .decode()?;
+    // 有 status 就走 `list_jobs_by_status`——那個方法把過濾放進 SQL。
+    // 先取一頁再在程式端 filter 是錯的：佇列裡有一萬筆 queued 時，
+    // 取回最新 100 筆再濾出 failed 的會得到空頁，而「沒有失敗的 job」與
+    // 「最新 100 筆裡沒有失敗的 job」是完全不同的兩件事。
+    let items = match query.status {
+        Some(status) => jobs.list_by_status(status, after, limit).await?,
+        None => jobs.list(after, limit).await?,
+    };
     Ok(Json(CursorPage::from_items(items, limit, |job| job.id)))
 }
 
@@ -78,6 +102,7 @@ pub async fn get_job(
 pub async fn create_job(
     State(state): State<AppState>,
     principal: Principal,
+    ip: ClientIp,
     Json(body): Json<CreateJobBody>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     principal.role.require(Permission::Write)?;
@@ -89,6 +114,7 @@ pub async fn create_job(
             audit(
                 &state,
                 &principal,
+                &ip,
                 AUDIT_JOB_CREATE,
                 Some(job.id.to_string()),
                 "success",
@@ -100,6 +126,7 @@ pub async fn create_job(
             audit(
                 &state,
                 &principal,
+                &ip,
                 AUDIT_JOB_CREATE,
                 None,
                 "rejected",
@@ -130,6 +157,7 @@ async fn create_job_inner(state: &AppState, body: CreateJobBody) -> Result<Job, 
 pub async fn transition_job(
     State(state): State<AppState>,
     principal: Principal,
+    ip: ClientIp,
     Path(id): Path<Uuid>,
     Json(body): Json<TransitionBody>,
 ) -> Result<Json<Job>, ApiError> {
@@ -145,6 +173,7 @@ pub async fn transition_job(
     audit_outcome(
         &state,
         &principal,
+        &ip,
         AUDIT_JOB_TRANSITION,
         id,
         &result,
@@ -157,6 +186,7 @@ pub async fn transition_job(
 pub async fn dispatch_job(
     State(state): State<AppState>,
     principal: Principal,
+    ip: ClientIp,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Job>, ApiError> {
     principal.role.require(Permission::Write)?;
@@ -168,7 +198,38 @@ pub async fn dispatch_job(
     audit_outcome(
         &state,
         &principal,
+        &ip,
         AUDIT_JOB_DISPATCH,
+        id,
+        &result,
+        json!({}),
+    )
+    .await;
+    result.map(Json)
+}
+
+/// `POST /api/v1/jobs/{id}/retry`（SPEC §31）。operator 以上。
+///
+/// 只對 `failed` 的 job 有效，其他狀態回 409。成功與失敗都寫稽核——
+/// SPEC §31 的驗收條件之一就是「retry action is audited」，
+/// 而「viewer 重試被擋下來」這件事同樣要查得到（那條在 middleware 寫 `authz.denied`）。
+pub async fn retry_job(
+    State(state): State<AppState>,
+    principal: Principal,
+    ip: ClientIp,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Job>, ApiError> {
+    principal.role.require(Permission::Write)?;
+    let result = async {
+        let jobs = jobs_or_unavailable(&state)?;
+        jobs.retry(id).await.map_err(ApiError::from)
+    }
+    .await;
+    audit_outcome(
+        &state,
+        &principal,
+        &ip,
+        AUDIT_JOB_RETRY,
         id,
         &result,
         json!({}),
@@ -181,6 +242,7 @@ pub async fn dispatch_job(
 async fn audit_outcome(
     state: &AppState,
     principal: &Principal,
+    ip: &ClientIp,
     action: &str,
     id: Uuid,
     result: &Result<Job, ApiError>,
@@ -200,6 +262,7 @@ async fn audit_outcome(
     audit(
         state,
         principal,
+        ip,
         action,
         Some(id.to_string()),
         outcome,
@@ -217,6 +280,7 @@ fn merge(target: &mut Value, key: &str, value: Value) {
 async fn audit(
     state: &AppState,
     principal: &Principal,
+    ip: &ClientIp,
     action: &str,
     resource_id: Option<String>,
     outcome: &str,
@@ -229,6 +293,7 @@ async fn audit(
         resource_id,
         outcome,
     )
+    .with_ip(ip.0.clone())
     .with_metadata(metadata);
     if let Err(err) = state.audit.append(entry).await {
         tracing::error!(error = %err, %action, "寫入 Job 稽核紀錄失敗");

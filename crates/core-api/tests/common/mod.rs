@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use core_api::{AppState, AuthState, RateLimiter, ready_always, router};
+use core_api::{AppState, AuthState, RateLimiter, ReadyCheck, ReadyProbe, ready_always, router};
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
 
 /// 測試用 JWT 密鑰。**只在測試 binary 裡**（見模組註解）。
@@ -41,6 +41,27 @@ pub fn test_app(jwt: JwtService) -> axum::Router {
 
 /// 同 [`test_app`]，另外回傳稽核與 token store，讓測試可以驗證「真的有寫」。
 pub fn test_app_parts(jwt: JwtService) -> (axum::Router, MemoryAuditLog, Arc<MemoryApiTokenStore>) {
+    test_app_with_backends(jwt, Vec::new(), DEFAULT_MISSING.to_vec())
+}
+
+/// 預設「什麼後端都沒接」。
+const DEFAULT_MISSING: [&str; 5] = [
+    "postgres",
+    "object_store",
+    "redis",
+    "opensearch",
+    "redpanda",
+];
+
+/// 同 [`test_app_parts`]，但可以指定 `/api/v1/ops/health` 要跑哪些檢查。
+///
+/// 驗「某個後端掛掉時回 503 且指得出是哪一個」時用這個：預設的空清單是
+/// healthy（空集合的 `all()` 是 true），放一個會 down 的檢查進來才測得到那條路徑。
+pub fn test_app_with_backends(
+    jwt: JwtService,
+    checks: Vec<Arc<dyn ReadyCheck>>,
+    missing: Vec<&'static str>,
+) -> (axum::Router, MemoryAuditLog, Arc<MemoryApiTokenStore>) {
     let audit = MemoryAuditLog::new();
     let tokens = Arc::new(MemoryApiTokenStore::new());
     let state = AppState {
@@ -59,8 +80,11 @@ pub fn test_app_parts(jwt: JwtService) -> (axum::Router, MemoryAuditLog, Arc<Mem
         // 不接 OpenSearch：`POST /api/v1/search` 回 503。
         search: None,
         ready: ready_always(),
+        backends: ReadyProbe::new(checks),
+        backends_missing: missing,
         rate_limit_per_second: 100,
         request_body_limit_bytes: 1_048_576,
+        object_bucket: String::new(),
         // 測試用小上限：不需要為了驗證 413 真的傳 10 MiB 進來。
         import_config: core_config::ImportSection {
             max_upload_bytes: 4_096,

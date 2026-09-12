@@ -121,9 +121,13 @@ fn build_api(stack: &Stack, index: &str, role: Role) -> TestApi {
             index: index.to_string(),
         })),
         ready: ready_always(),
+        // 這支 e2e 不驗 ops health，給空清單。
+        backends: core_api::ReadyProbe::new(Vec::new()),
+        backends_missing: Vec::new(),
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,
         import_config: core_config::ImportSection::default(),
+        object_bucket: String::new(),
         rate_limiter: RateLimiter::new(1_000),
     };
     TestApi {

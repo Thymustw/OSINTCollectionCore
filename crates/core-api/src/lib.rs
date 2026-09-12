@@ -20,21 +20,33 @@ mod extractors;
 mod import;
 mod jobs;
 mod middleware;
+mod ops;
 mod pagination;
 mod rate_limit;
 mod ready;
+mod resources;
 mod routes;
 mod search;
 mod state;
 mod tokens;
 
 pub use error::{ApiError, ErrorBody};
+pub use extractors::ClientIp;
 pub use import::{AUDIT_ACTION as IMPORT_AUDIT_ACTION, ImportRequest};
-pub use jobs::{AUDIT_JOB_CREATE, AUDIT_JOB_DISPATCH, AUDIT_JOB_TRANSITION};
+pub use jobs::{AUDIT_JOB_CREATE, AUDIT_JOB_DISPATCH, AUDIT_JOB_RETRY, AUDIT_JOB_TRANSITION};
 pub use middleware::{AUDIT_AUTH_FAILED, AUDIT_AUTHZ_DENIED};
+pub use ops::{BackendCheck, BrokerCheck, OpsHealth, ProcessMetrics};
 pub use pagination::{CursorPage, Pagination};
 pub use rate_limit::RateLimiter;
 pub use ready::{PostgresReady, ReadyCheck, ReadyProbe};
+pub use resources::collections::CollectionDetail;
+pub use resources::entities::EntityDetail;
+pub use resources::objects::{ExtractedEntity, ObjectDetail};
+pub use resources::relationships::RelationshipDetail;
+pub use resources::{
+    AUDIT_COLLECTION_CREATE, AUDIT_CONNECTOR_CREATE, AUDIT_CONNECTOR_UPDATE, AUDIT_OBJECT_CREATE,
+    AUDIT_SOURCE_CREATE, AUDIT_SOURCE_UPDATE,
+};
 pub use routes::router;
 pub use search::{EntitySummary, SearchHitBody, SearchResponse};
 pub use state::{

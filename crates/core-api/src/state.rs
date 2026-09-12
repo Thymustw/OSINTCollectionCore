@@ -93,8 +93,22 @@ pub struct AppState {
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
     pub ready: ReadyProbe,
+    /// `GET /api/v1/ops/health` 要敲的後端。與 [`AppState::ready`] **刻意分開**：
+    /// `/ready` 只檢查 API 自己非有不可的依賴（給 orchestrator 判斷要不要送流量），
+    /// 這裡是整套 pipeline 的後端（含 Redis／Redpanda，API 自己不需要它們）。
+    /// 混在一起會讓「Redis 掛了」變成「API 不接受流量」。
+    pub backends: ReadyProbe,
+    /// 沒接上（因此不在 [`AppState::backends`] 裡）的後端名稱。
+    ///
+    /// 少了這一欄，一個「只接了 Postgres」的部署會回 `healthy: true`，
+    /// 看起來跟五個後端全綠一模一樣——那是最危險的一種假綠燈。
+    pub backends_missing: Vec<&'static str>,
     pub rate_limit_per_second: u32,
     pub request_body_limit_bytes: u32,
     pub import_config: ImportSection,
+    /// 物件儲存的 bucket 名稱。`GET /raw/{id}?body=true` 用它把
+    /// `s3://{bucket}/{key}` 形式的 `storage_path` 還原成物件 key。
+    /// 沒接物件儲存時是空字串（那時 `?body=true` 本來就會回 503）。
+    pub object_bucket: String,
     pub rate_limiter: crate::rate_limit::RateLimiter,
 }

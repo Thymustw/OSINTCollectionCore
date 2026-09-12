@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -20,7 +20,9 @@ use crate::error::ApiError;
 use crate::import;
 use crate::jobs;
 use crate::middleware as auth_mw;
+use crate::ops;
 use crate::rate_limit;
+use crate::resources;
 use crate::search;
 use crate::state::AppState;
 use crate::tokens;
@@ -34,10 +36,33 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics));
 
+    // operator 以上。RBAC 對照表見 docs/developer/api-skeleton.md。
     let write = Router::new()
         .route("/api/v1/jobs", post(jobs::create_job))
         .route("/api/v1/jobs/{id}/transition", post(jobs::transition_job))
         .route("/api/v1/jobs/{id}/dispatch", post(jobs::dispatch_job))
+        .route("/api/v1/jobs/{id}/retry", post(jobs::retry_job))
+        .route("/api/v1/sources", post(resources::sources::create_source))
+        .route(
+            "/api/v1/sources/{id}",
+            patch(resources::sources::patch_source),
+        )
+        .route(
+            "/api/v1/connectors",
+            post(resources::connectors::create_connector),
+        )
+        .route(
+            "/api/v1/connectors/{id}",
+            patch(resources::connectors::patch_connector),
+        )
+        .route(
+            "/api/v1/collections",
+            post(resources::collections::create_collection),
+        )
+        // V0.1 一律回 501（SPEC §14 的可追溯鏈）。仍然掛在 require_write 底下：
+        // 未認證／viewer 應該先拿到 401／403，而不是先看到 501——
+        // 否則這條路由會變成一個「不需要權限就能問到伺服器支援什麼」的探測點。
+        .route("/api/v1/objects", post(resources::objects::create_object))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_mw::require_write,
@@ -55,10 +80,54 @@ pub fn router(state: AppState) -> Router {
             auth_mw::require_admin,
         ));
 
+    // viewer 以上的唯讀路由（SPEC §19 的 GET 全部在這裡）。
+    let read = Router::new()
+        .route("/api/v1/sources", get(resources::sources::list_sources))
+        .route("/api/v1/sources/{id}", get(resources::sources::get_source))
+        .route(
+            "/api/v1/connectors",
+            get(resources::connectors::list_connectors),
+        )
+        .route(
+            "/api/v1/connectors/{id}",
+            get(resources::connectors::get_connector),
+        )
+        .route(
+            "/api/v1/collections",
+            get(resources::collections::list_collections),
+        )
+        .route(
+            "/api/v1/collections/{id}",
+            get(resources::collections::get_collection),
+        )
+        .route("/api/v1/objects", get(resources::objects::list_objects))
+        .route("/api/v1/objects/{id}", get(resources::objects::get_object))
+        .route("/api/v1/entities", get(resources::entities::list_entities))
+        .route(
+            "/api/v1/entities/{id}",
+            get(resources::entities::get_entity),
+        )
+        .route(
+            "/api/v1/relationships",
+            get(resources::relationships::list_relationships),
+        )
+        .route(
+            "/api/v1/relationships/{id}",
+            get(resources::relationships::get_relationship),
+        )
+        .route("/api/v1/events", get(resources::events::list_events))
+        .route("/api/v1/events/{id}", get(resources::events::get_event))
+        .route("/api/v1/raw/{id}", get(resources::raw::get_raw))
+        // Operations Center（SPEC §31）。**需要認證**：後端拓樸與故障點
+        // 對外部觀察者是有價值的情報，不該像 /health 那樣公開。
+        .route("/api/v1/ops/health", get(ops::health))
+        .route("/api/v1/ops/metrics", get(ops::metrics));
+
     let protected = Router::new()
         .route("/api/v1/jobs", get(jobs::list_jobs))
         .route("/api/v1/jobs/{id}", get(jobs::get_job))
         .route("/api/v1/whoami", get(whoami))
+        .merge(read)
         // 搜尋是唯讀的（viewer 以上），但用 POST：查詢條件有巢狀結構
         // （entity 物件、日期、布林語法），塞進 query string 會需要多層編碼，
         // 而且長查詢會撞到 URL 長度上限。這與 SPEC §19 的 `POST /search` 一致。

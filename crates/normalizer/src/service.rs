@@ -182,7 +182,24 @@ impl Normalizer {
                     });
                 }
             },
-            ContentClass::Json | ContentClass::Csv | ContentClass::Unsupported => unreachable!(),
+            // 上面那個 match 已經把這三種擋掉了，所以理論上到不了這裡。
+            //
+            // **但這裡刻意不寫 `unreachable!()`。** 這個函式處理的是外部內容：
+            // 只要之後有人動了上面的分類邏輯（多一個 ContentClass、或把某個
+            // early return 拿掉），panic 會沿著 consumer 迴圈炸掉整個服務——
+            // 一則畸形的來源內容就能讓正規化停擺。回 SkippedUnsupported 的話
+            // 最壞情況只是「這一則沒被處理」，而且 log 裡看得到。
+            ContentClass::Json | ContentClass::Csv | ContentClass::Unsupported => {
+                tracing::error!(
+                    raw_evidence_id = %evidence.id,
+                    ?class,
+                    "分類邏輯不一致：這個 content class 不該走到解析階段。跳過這一則，\
+                     請檢查 normalizer::service 的 ContentClass 判斷"
+                );
+                return Ok(NormalizeOutcome::SkippedUnsupported {
+                    content_type: evidence.content_type.clone(),
+                });
+            }
         };
 
         let mut documents = Vec::new();

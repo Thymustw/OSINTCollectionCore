@@ -28,11 +28,16 @@ import-format = { workspace = true }
 # index mapping、欄位名常數與搜尋語法都在 indexer crate：core-api 與 osint-cli
 # 都只呼叫 indexer::search::build，不自己組查詢（理由見 crates/indexer/src/lib.rs）。
 indexer = { path = "../indexer" }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 storage-core = { workspace = true }
 storage-opensearch = { path = "../storage-opensearch" }
 storage-postgres = { path = "../storage-postgres" }
+# 只給 GET /api/v1/ops/health 用：Redis 是 collector／worker 的節流與去重快取，
+# API 自己不讀它，但運維要看得到它活著。
+storage-redis = { path = "../storage-redis" }
 storage-s3 = { path = "../storage-s3" }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -116,9 +116,13 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, import_config: ImportS
         // 這個 e2e 只驗匯入路徑，不接搜尋投影。
         search: None,
         ready: ready_always(),
+        // 這支 e2e 不驗 ops health，給空清單。
+        backends: core_api::ReadyProbe::new(Vec::new()),
+        backends_missing: Vec::new(),
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,
         import_config,
+        object_bucket: String::new(),
         rate_limiter: RateLimiter::new(1_000),
     };
     TestApi {

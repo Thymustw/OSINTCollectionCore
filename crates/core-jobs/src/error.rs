@@ -17,6 +17,11 @@ pub enum JobError {
         "job 不可從 `{from:?}` 轉成 `{to:?}`。合法轉換：queued→running|cancelled、running→completed|failed|retrying|cancelled、retrying→running|failed|cancelled、failed→retrying。終態 completed/cancelled 不可再轉"
     )]
     InvalidTransition { from: JobStatus, to: JobStatus },
+    #[error(
+        "job `{id}` 目前是 `{status:?}`，不能重試。只有 failed 的 job 可以 retry；\
+             running 的請等它結束，completed／cancelled 是終態（要重跑請建一個新的 job）"
+    )]
+    NotRetryable { id: String, status: JobStatus },
     #[error("job `{id}` 目前是 `{status:?}`，不能派工。只有 queued 或 retrying 可以 dispatch")]
     NotDispatchable { id: String, status: JobStatus },
 }

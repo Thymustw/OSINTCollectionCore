@@ -273,9 +273,3 @@ async fn audit(state: &AppState, entry: AuditEntry) {
         tracing::error!(error = %err, %action, "寫入稽核紀錄失敗");
     }
 }
-
-/// 給 handler 直接呼叫。
-#[allow(dead_code)]
-pub fn check_role(role: Role, permission: Permission) -> Result<(), ApiError> {
-    role.require(permission).map_err(ApiError::from)
-}

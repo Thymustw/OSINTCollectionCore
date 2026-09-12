@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::extractors::ClientIp;
 use crate::state::AppState;
 
 /// 稽核 action。改動要同步改 `docs/developer/security.md` 的動作清單。
@@ -67,6 +68,7 @@ pub struct TokenSummary {
 pub async fn issue_token(
     State(state): State<AppState>,
     principal: Principal,
+    ip: ClientIp,
     Json(body): Json<IssueTokenBody>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // 路由層已經有 require_admin；handler 再擋一次，被搬到別的 router 也不會失去保護。
@@ -79,6 +81,7 @@ pub async fn issue_token(
             audit(
                 &state,
                 &principal,
+                &ip,
                 AUDIT_TOKEN_ISSUE,
                 Some(id.to_string()),
                 "success",
@@ -91,6 +94,7 @@ pub async fn issue_token(
             audit(
                 &state,
                 &principal,
+                &ip,
                 AUDIT_TOKEN_ISSUE,
                 None,
                 "rejected",
@@ -175,6 +179,7 @@ async fn issue(
 pub async fn list_tokens(
     State(state): State<AppState>,
     principal: Principal,
+    ip: ClientIp,
 ) -> Result<Json<Value>, ApiError> {
     principal.role.require(Permission::Admin)?;
     let now = Utc::now();
@@ -201,6 +206,7 @@ pub async fn list_tokens(
     audit(
         &state,
         &principal,
+        &ip,
         AUDIT_TOKEN_LIST,
         None,
         "success",
@@ -217,6 +223,7 @@ pub async fn list_tokens(
 pub async fn revoke_token(
     State(state): State<AppState>,
     principal: Principal,
+    ip: ClientIp,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     principal.role.require(Permission::Admin)?;
@@ -224,6 +231,7 @@ pub async fn revoke_token(
     audit(
         &state,
         &principal,
+        &ip,
         AUDIT_TOKEN_REVOKE,
         Some(id.to_string()),
         if found { "success" } else { "not_found" },
@@ -241,6 +249,7 @@ pub async fn revoke_token(
 async fn audit(
     state: &AppState,
     principal: &Principal,
+    ip: &ClientIp,
     action: &str,
     resource_id: Option<String>,
     outcome: &str,
@@ -253,6 +262,7 @@ async fn audit(
         resource_id,
         outcome,
     )
+    .with_ip(ip.0.clone())
     .with_metadata(metadata);
     if let Err(err) = state.audit.append(entry).await {
         tracing::error!(error = %err, %action, "寫入 API token 稽核紀錄失敗");

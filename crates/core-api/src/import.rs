@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::extractors::ClientIp;
 use crate::state::{AppState, ImportState};
 
 /// 稽核 action。
@@ -93,6 +94,7 @@ struct Upload {
 pub async fn import_upload(
     State(state): State<AppState>,
     principal: Principal,
+    ip: ClientIp,
     multipart: Multipart,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     // 路由層已經有 require_write，這裡再擋一次：handler 被搬到別的 router 時不會失去保護。
@@ -103,6 +105,7 @@ pub async fn import_upload(
             audit(
                 &state,
                 &principal,
+                &ip,
                 Some(response.source_id.to_string()),
                 "success",
                 json!({
@@ -125,6 +128,7 @@ pub async fn import_upload(
             audit(
                 &state,
                 &principal,
+                &ip,
                 None,
                 "rejected",
                 json!({ "status": err.status.as_u16(), "error": err.error }),
@@ -652,6 +656,7 @@ fn storage_error(err: storage_core::StorageError) -> ApiError {
 async fn audit(
     state: &AppState,
     principal: &Principal,
+    ip: &ClientIp,
     source_id: Option<String>,
     outcome: &str,
     metadata: Value,
@@ -663,6 +668,7 @@ async fn audit(
         source_id,
         outcome,
     )
+    .with_ip(ip.0.clone())
     .with_metadata(metadata);
     if let Err(err) = state.audit.append(entry).await {
         tracing::error!(error = %err, "寫入匯入稽核紀錄失敗");

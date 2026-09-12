@@ -4,11 +4,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use core_model::{
-    Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
-    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, EntityType, Event,
-    EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
-    RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
-    RelationshipId, Source, SourceId,
+    Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
+    DuplicateGroup, DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId,
+    EntityType, Event, EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId,
+    Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
+    RelationshipEvidenceId, RelationshipId, RelationshipType, Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -190,6 +190,24 @@ impl SqliteEmbeddedStore {
         let rows = sqlx::query(sql)
             .bind(key)
             .bind(uuid_text(before))
+            .bind(clamp_limit(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| mapping::uuid_column(row, "id"))
+            .collect()
+    }
+
+    /// collection 三個關聯表的反查共用：一個 collection_id + 上限，回一欄 UUID。
+    async fn linked_ids(
+        &self,
+        sql: &'static str,
+        collection_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, StorageError> {
+        let rows = sqlx::query(sql)
+            .bind(uuid_text(collection_id))
             .bind(clamp_limit(limit))
             .fetch_all(&self.pool)
             .await
@@ -478,6 +496,30 @@ impl RelationalStore for SqliteEmbeddedStore {
         rows.iter().map(mapping::connector).collect()
     }
 
+    async fn list_connectors_by_enabled(
+        &self,
+        enabled: Option<bool>,
+        after: Option<ConnectorId>,
+        limit: u32,
+    ) -> Result<Vec<Connector>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM connectors
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR enabled = ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(enabled.map(bool_int))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::connector).collect()
+    }
+
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -578,6 +620,48 @@ impl RelationalStore for SqliteEmbeddedStore {
             "INSERT INTO collection_objects (collection_id, object_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
             collection_id,
             object_id,
+        )
+        .await
+    }
+
+    async fn list_collection_sources(
+        &self,
+        collection_id: CollectionId,
+        limit: u32,
+    ) -> Result<Vec<SourceId>, StorageError> {
+        self.linked_ids(
+            "SELECT source_id AS id FROM collection_sources \
+             WHERE collection_id = ?1 ORDER BY source_id ASC LIMIT ?2",
+            collection_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_collection_connectors(
+        &self,
+        collection_id: CollectionId,
+        limit: u32,
+    ) -> Result<Vec<ConnectorId>, StorageError> {
+        self.linked_ids(
+            "SELECT connector_id AS id FROM collection_connectors \
+             WHERE collection_id = ?1 ORDER BY connector_id ASC LIMIT ?2",
+            collection_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_collection_objects(
+        &self,
+        collection_id: CollectionId,
+        limit: u32,
+    ) -> Result<Vec<ObjectId>, StorageError> {
+        self.linked_ids(
+            "SELECT object_id AS id FROM collection_objects \
+             WHERE collection_id = ?1 ORDER BY object_id ASC LIMIT ?2",
+            collection_id,
+            limit,
         )
         .await
     }
@@ -769,6 +853,34 @@ impl RelationalStore for SqliteEmbeddedStore {
         rows.iter().map(mapping::document).collect()
     }
 
+    async fn list_documents_filtered(
+        &self,
+        object_type: Option<DocumentType>,
+        include_duplicates: bool,
+        after: Option<DocumentId>,
+        limit: u32,
+    ) -> Result<Vec<Document>, StorageError> {
+        let object_type = object_type.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM documents
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR object_type = ?2)
+              AND (?3 = 1 OR duplicate_of IS NULL)
+            ORDER BY id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(object_type)
+        .bind(bool_int(include_duplicates))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::document).collect()
+    }
+
     async fn put_entity(&self, entity: &Entity) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -843,6 +955,31 @@ impl RelationalStore for SqliteEmbeddedStore {
             "#,
         )
         .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity).collect()
+    }
+
+    async fn list_entities_by_type(
+        &self,
+        entity_type: Option<EntityType>,
+        after: Option<EntityId>,
+        limit: u32,
+    ) -> Result<Vec<Entity>, StorageError> {
+        let entity_type = entity_type.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM entities
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR entity_type = ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(entity_type)
         .bind(clamp_limit(limit))
         .fetch_all(&self.pool)
         .await
@@ -937,6 +1074,31 @@ impl RelationalStore for SqliteEmbeddedStore {
             "#,
         )
         .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::relationship).collect()
+    }
+
+    async fn list_relationships_by_type(
+        &self,
+        relationship_type: Option<RelationshipType>,
+        after: Option<RelationshipId>,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let relationship_type = relationship_type.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM relationships
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR relationship_type = ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(relationship_type)
         .bind(clamp_limit(limit))
         .fetch_all(&self.pool)
         .await

@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use core_model::{
-    Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
-    DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, EntityType, Event,
-    EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
-    RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
-    RelationshipId, Source, SourceId,
+    Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
+    DuplicateGroup, DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId,
+    EntityType, Event, EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId,
+    Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
+    RelationshipEvidenceId, RelationshipId, RelationshipType, Source, SourceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,6 +61,18 @@ pub trait RelationalStore: HealthProvider {
         after: Option<ConnectorId>,
         limit: u32,
     ) -> Result<Vec<Connector>, StorageError>;
+    /// 同 [`RelationalStore::list_connectors`]，但可依 `enabled` 過濾。
+    /// `enabled = None` 等同不過濾。
+    ///
+    /// 過濾**必須在 SQL 裡做**，理由同 [`RelationalStore::list_jobs_by_status`]：
+    /// 先取一頁再在程式端 filter，會讓「這個 source 沒有停用的 connector」與
+    /// 「最新一頁裡沒有停用的 connector」變成同一個答案。
+    async fn list_connectors_by_enabled(
+        &self,
+        enabled: Option<bool>,
+        after: Option<ConnectorId>,
+        limit: u32,
+    ) -> Result<Vec<Connector>, StorageError>;
 
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError>;
     async fn get_collection(&self, id: CollectionId) -> Result<Option<Collection>, StorageError>;
@@ -86,6 +98,28 @@ pub trait RelationalStore: HealthProvider {
         collection_id: CollectionId,
         object_id: ObjectId,
     ) -> Result<(), StorageError>;
+    /// 這個 Collection 連到哪些 Source，依 `source_id` 升序，`limit` 夾在 1..=100。
+    ///
+    /// SPEC §7 的 Relations（sources／connectors／objects）在關聯表裡，
+    /// 少了這三個反查就只能寫進去、讀不出來——`GET /api/v1/collections/{id}`
+    /// 會永遠回空清單，而且不會有任何錯誤。
+    async fn list_collection_sources(
+        &self,
+        collection_id: CollectionId,
+        limit: u32,
+    ) -> Result<Vec<SourceId>, StorageError>;
+    /// 同 [`RelationalStore::list_collection_sources`]，回 Connector。
+    async fn list_collection_connectors(
+        &self,
+        collection_id: CollectionId,
+        limit: u32,
+    ) -> Result<Vec<ConnectorId>, StorageError>;
+    /// 同 [`RelationalStore::list_collection_sources`]，回 object（Document 等）。
+    async fn list_collection_objects(
+        &self,
+        collection_id: CollectionId,
+        limit: u32,
+    ) -> Result<Vec<ObjectId>, StorageError>;
 
     /// Raw Evidence 寫入後不可變。重複主鍵回 `Conflict`，不可變成 update。
     async fn insert_raw_evidence(&self, evidence: &RawEvidence) -> Result<(), StorageError>;
@@ -119,6 +153,22 @@ pub trait RelationalStore: HealthProvider {
         after: Option<DocumentId>,
         limit: u32,
     ) -> Result<Vec<Document>, StorageError>;
+    /// 同 [`RelationalStore::list_documents`]，但可依 `object_type` 過濾，
+    /// 並可選擇是否含重複文件（`duplicate_of IS NOT NULL` 的那些）。
+    ///
+    /// `GET /api/v1/objects` 的預設是**排除**重複：一份文章被十個站轉載時，
+    /// 預設列表應該看到一筆而不是十一筆。要看全部就傳 `include_duplicates=true`。
+    ///
+    /// 兩個條件都在 SQL 裡做，理由同 [`RelationalStore::list_jobs_by_status`]：
+    /// 取回一頁再在程式端濾掉重複，會讓「最近 20 筆剛好全是轉載」變成一個空頁，
+    /// 使用者只會以為系統沒有資料。
+    async fn list_documents_filtered(
+        &self,
+        object_type: Option<DocumentType>,
+        include_duplicates: bool,
+        after: Option<DocumentId>,
+        limit: u32,
+    ) -> Result<Vec<Document>, StorageError>;
 
     async fn put_entity(&self, entity: &Entity) -> Result<(), StorageError>;
     async fn get_entity(&self, id: EntityId) -> Result<Option<Entity>, StorageError>;
@@ -144,6 +194,15 @@ pub trait RelationalStore: HealthProvider {
     /// 要按時間看請自己比對 `last_seen`。理由同 [`RelationalStore::list_connectors`]。
     async fn list_entities(
         &self,
+        after: Option<EntityId>,
+        limit: u32,
+    ) -> Result<Vec<Entity>, StorageError>;
+    /// 同 [`RelationalStore::list_entities`]，但可依 `entity_type` 過濾
+    /// （`None` 等同不過濾）。過濾在 SQL 裡做，理由同
+    /// [`RelationalStore::list_documents_filtered`]。
+    async fn list_entities_by_type(
+        &self,
+        entity_type: Option<EntityType>,
         after: Option<EntityId>,
         limit: u32,
     ) -> Result<Vec<Entity>, StorageError>;
@@ -179,6 +238,15 @@ pub trait RelationalStore: HealthProvider {
     /// [`RelationalStore::list_connectors`]；要按時間看請比對 `last_seen`。
     async fn list_relationships(
         &self,
+        after: Option<RelationshipId>,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError>;
+    /// 同 [`RelationalStore::list_relationships`]，但可依 `relationship_type` 過濾
+    /// （`None` 等同不過濾）。過濾在 SQL 裡做，理由同
+    /// [`RelationalStore::list_documents_filtered`]。
+    async fn list_relationships_by_type(
+        &self,
+        relationship_type: Option<RelationshipType>,
         after: Option<RelationshipId>,
         limit: u32,
     ) -> Result<Vec<Relationship>, StorageError>;

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
-    AppState, AuthState, ErrorBody, ImportState, PostgresReady, ReadyProbe, SharedObjects,
-    SharedStore, SharedTokenStore, router,
+    AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, ImportState, PostgresReady,
+    ReadyCheck, ReadyProbe, SharedObjects, SharedStore, SharedTokenStore, router,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -58,6 +58,11 @@ async fn run() -> Result<(), String> {
 
     let mut shared_store: Option<SharedStore> = None;
     let mut shared_objects: Option<SharedObjects> = None;
+    // `/api/v1/ops/health` 要敲的後端。**用具體型別建**：
+    // `Arc<dyn RelationalStore>` 沒辦法直接當成 `Arc<dyn HealthProvider>`
+    // （trait object 之間不能互轉），而這裡手上正好有具體的 store。
+    let mut health_checks: Vec<Arc<dyn ReadyCheck>> = Vec::new();
+    let mut missing: Vec<&'static str> = Vec::new();
     // 預設是記憶體版。Postgres 接上後就換成落地版——**不要**把這裡當成常態：
     // 記憶體 audit 在重啟時整批消失，記憶體 token store 會讓發出去的 token 失效。
     // 沒換成功時下面會發一條 warn，那是唯一的訊號。
@@ -77,12 +82,20 @@ async fn run() -> Result<(), String> {
             // 一份 Arc 給所有 handler 用（AppState.store 與 ImportState.store 是同一個）。
             let shared: SharedStore = Arc::new(store.clone());
             shared_store = Some(shared.clone());
+            health_checks.push(Arc::new(BackendCheck::new(
+                "postgres",
+                Arc::new(store.clone()),
+            )));
 
             // 匯入另外需要物件儲存。MinIO 沒接上時只有 /api/v1/import 回 503，
             // 其他路由照常——沒有理由讓查詢功能陪著一起掛掉。
             let import = match connect_objects(&cfg).await {
                 Ok(objects) => {
                     shared_objects = Some(Arc::new(objects.clone()));
+                    health_checks.push(Arc::new(BackendCheck::new(
+                        "object_store",
+                        Arc::new(objects.clone()),
+                    )));
                     Some(Arc::new(ImportState {
                         store: shared,
                         // sink 用**具體型別**組裝：`StoreEvidenceSink<R, O>` 要求
@@ -95,10 +108,11 @@ async fn run() -> Result<(), String> {
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "MinIO 未連上；POST /api/v1/import 會回 503");
+                    missing.push("object_store");
                     None
                 }
             };
-            let service = JobService::new(store, producer);
+            let service = JobService::new(store, producer.clone());
             (Some(Arc::new(service)), import, ready)
         }
         Err(err) => {
@@ -107,6 +121,8 @@ async fn run() -> Result<(), String> {
                 "Postgres 未連上；/jobs、/api/v1/import 與 /api/v1/tokens 會回 503，\
                  /health 仍可用。稽核與 API token 這次只存在記憶體裡，重啟即遺失"
             );
+            missing.push("postgres");
+            missing.push("object_store");
             (None, None, ReadyProbe::always_ready())
         }
     };
@@ -114,12 +130,34 @@ async fn run() -> Result<(), String> {
     // 搜尋接不上時只有 POST /api/v1/search 回 503，其他路由照常——
     // 沒有理由讓 Job 查詢陪著搜尋投影一起掛掉。
     let search = match connect_search(&cfg).await {
-        Ok(state) => Some(Arc::new(state)),
+        Ok(state) => {
+            health_checks.push(Arc::new(BackendCheck::new(
+                "opensearch",
+                Arc::new(state.store.clone()),
+            )));
+            Some(Arc::new(state))
+        }
         Err(err) => {
             tracing::warn!(error = %err, "OpenSearch 未連上；POST /api/v1/search 會回 503");
+            missing.push("opensearch");
             None
         }
     };
+
+    // Redis 在 V0.1 沒有 API 路由用到它（它是 collector／worker 的節流與去重快取），
+    // 但運維要看得到它活著——pipeline 會因為它掛掉而變慢卻不報錯。
+    match connect_cache(&cfg) {
+        Ok(cache) => health_checks.push(Arc::new(BackendCheck::new("redis", Arc::new(cache)))),
+        Err(err) => {
+            tracing::warn!(error = %err, "Redis 未連上；GET /api/v1/ops/health 會標示為未設定");
+            missing.push("redis");
+        }
+    }
+
+    match &producer {
+        Some(producer) => health_checks.push(Arc::new(BrokerCheck::new(producer.clone()))),
+        None => missing.push("redpanda"),
+    }
 
     let state = AppState {
         metrics: MetricsRegistry::new(),
@@ -134,9 +172,14 @@ async fn run() -> Result<(), String> {
         import,
         search,
         ready,
+        // 沒接上的後端不會變成「壞掉」，而是列進 `backends_missing`——
+        // 「沒設定」與「壞了」的下一步完全不同。
+        backends: ReadyProbe::new(health_checks),
+        backends_missing: missing,
         rate_limit_per_second: cfg.http.rate_limit_per_second,
         request_body_limit_bytes: cfg.http.request_body_limit_bytes,
         import_config: cfg.import.clone(),
+        object_bucket: cfg.storage.object.bucket.clone(),
         rate_limiter: core_api::RateLimiter::new(cfg.http.rate_limit_per_second),
     };
 
@@ -198,6 +241,17 @@ async fn connect_search(cfg: &AppConfig) -> Result<core_api::SearchState, String
     })
 }
 
+/// 連 Redis。只給 `/api/v1/ops/health` 用，連不上不影響其他路由。
+fn connect_cache(cfg: &AppConfig) -> Result<storage_redis::RedisKeyValueStore, String> {
+    let url = cfg
+        .storage
+        .cache
+        .url_secret_ref
+        .resolve()
+        .map_err(|err| err.to_string())?;
+    storage_redis::RedisKeyValueStore::connect(&url).map_err(|err| err.to_string())
+}
+
 async fn connect_objects(cfg: &AppConfig) -> Result<storage_s3::S3ObjectStore, String> {
     let access = cfg
         .storage
@@ -228,7 +282,9 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
         axum::Json(ErrorBody {
             error: "not_found".into(),
             message: "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs、\
-                 /api/v1/tokens（admin）、POST /api/v1/import 與 POST /api/v1/search"
+                 /api/v1/tokens（admin）、/api/v1/ops/health 與 /api/v1/ops/metrics、\
+                 sources／connectors／collections／objects／entities／relationships／events／raw、\
+                 POST /api/v1/import 與 POST /api/v1/search"
                 .into(),
         }),
     )

@@ -100,9 +100,9 @@ impl From<JobError> for ApiError {
     fn from(err: JobError) -> Self {
         match err {
             JobError::NotFound { .. } => Self::not_found(err.to_string()),
-            JobError::InvalidTransition { .. } | JobError::NotDispatchable { .. } => {
-                Self::conflict(err.to_string())
-            }
+            JobError::InvalidTransition { .. }
+            | JobError::NotDispatchable { .. }
+            | JobError::NotRetryable { .. } => Self::conflict(err.to_string()),
             JobError::Storage(storage) => storage.into(),
             JobError::Event(event) => Self::internal(event.to_string()),
         }

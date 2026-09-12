@@ -56,6 +56,41 @@ impl<S: CanonicalStore> JobService<S> {
         Ok(self.store.list_jobs(after, limit).await?)
     }
 
+    /// 只列指定狀態。過濾在 SQL 裡做（見
+    /// `storage_core::RelationalStore::list_jobs_by_status`）。
+    pub async fn list_by_status(
+        &self,
+        status: JobStatus,
+        after: Option<JobId>,
+        limit: u32,
+    ) -> Result<Vec<Job>, JobError> {
+        Ok(self.store.list_jobs_by_status(status, after, limit).await?)
+    }
+
+    /// 重試一個失敗的 job（SPEC §31：operator 可以重試，而且要留稽核）。
+    ///
+    /// # 為什麼是 `failed → retrying` 而不是 `failed → queued`
+    ///
+    /// 狀態機（`transition.rs`）沒有 `failed → queued` 這條邊，而且不該有：
+    /// `retry_count` 是在進入 `retrying` 時累加的。若把失敗的 job 直接丟回
+    /// `queued`，它看起來會跟一個**從沒跑過**的新 job 一模一樣——
+    /// 「這個 job 重試過幾次」這個資訊會在每次重試時被抹掉，
+    /// 無限重試的迴圈也就沒有任何地方看得出來。
+    ///
+    /// 轉成 `retrying` 之後立刻 dispatch（`retrying` 是可派工狀態），
+    /// 所以對呼叫端而言效果就是「它會再跑一次」。
+    pub async fn retry(&self, id: JobId) -> Result<Job, JobError> {
+        let job = self.get(id).await?;
+        if job.status != JobStatus::Failed {
+            return Err(JobError::NotRetryable {
+                id: id.to_string(),
+                status: job.status,
+            });
+        }
+        self.transition(id, JobStatus::Retrying, None).await?;
+        self.dispatch(id).await
+    }
+
     pub async fn transition(
         &self,
         id: JobId,
