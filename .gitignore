@@ -64,7 +64,9 @@ docs/specs/
 docs/governance/
 docs/security/
 docs/operations/
-docs/developer/
 docs/adr/
 docs/claude/
 .claude/CLAUDE.md
+# docs/developer/ removed from this list 2026-09-12: scope was deliberately
+# expanded to publish it (see the private repo's commit fe3a346 and the
+# docs/user/*.md dead-link fix it resolves). Everything above stays private.
