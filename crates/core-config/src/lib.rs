@@ -49,6 +49,10 @@ pub struct StorageSection {
     pub search: SearchStorage,
     pub object: ObjectStorage,
     pub cache: CacheStorage,
+    /// 圖投影（Neo4j）。`#[serde(default)]` 是為了讓既有的設定檔／測試
+    /// 不加這一段也能載入——V0.1 時期的設定檔沒有 `[storage.graph]`。
+    #[serde(default)]
+    pub graph: GraphStorage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +89,37 @@ pub struct ObjectStorage {
 pub struct CacheStorage {
     pub adapter: String,
     pub url_secret_ref: SecretRef,
+}
+
+/// 圖投影（Neo4j）。
+///
+/// # 為什麼這裡只有 HTTP URL，沒有 Bolt URI／帳密
+///
+/// V0.2 Phase 0b **只把 Neo4j 加進 compose 並讓 `/ops/health` 看得到它**。
+/// 真正的圖寫入走 Bolt（7687），那是 Phase 2a `storage-neo4j` adapter 的事，
+/// 連同 driver 相依、憑證 SecretRef 與 capability 介面一起進來
+/// （CLAUDE.md §13：不要在 domain service 裡散落後端專屬細節）。
+///
+/// 現在就把 Bolt 憑證欄位放進設定，等於宣告一個還沒有人讀的契約——
+/// 之後 adapter 落地時十之八九形狀會改，而中間那段時間運維會以為它有在用。
+///
+/// HTTP `GET /`（7474）不需要認證就會回叢集的 discovery JSON，
+/// 拿來探活剛好夠，也不必為此引進 driver。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphStorage {
+    pub adapter: String,
+    /// Neo4j 的 HTTP 埠（7474）。空字串 = 未設定，`/ops/health` 會列進
+    /// `not_configured` 而不是 `unhealthy`。
+    pub http_url: String,
+}
+
+impl Default for GraphStorage {
+    fn default() -> Self {
+        Self {
+            adapter: "neo4j".into(),
+            http_url: "http://127.0.0.1:7474".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

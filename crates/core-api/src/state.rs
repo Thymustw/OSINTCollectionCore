@@ -107,7 +107,7 @@ pub struct AppState {
     /// 沒接上（因此不在 [`AppState::backends`] 裡）的後端名稱。
     ///
     /// 少了這一欄，一個「只接了 Postgres」的部署會回 `healthy: true`，
-    /// 看起來跟五個後端全綠一模一樣——那是最危險的一種假綠燈。
+    /// 看起來跟六個後端全綠一模一樣——那是最危險的一種假綠燈。
     pub backends_missing: Vec<&'static str>,
     pub rate_limit_per_second: u32,
     pub request_body_limit_bytes: u32,

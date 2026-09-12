@@ -1,7 +1,8 @@
 //! `/api/v1/ops/*`：Operations Center 的基礎面板（SPEC §31）。
 //!
-//! * `GET /ops/health`：五個後端（PostgreSQL／物件儲存／Redis／OpenSearch／Redpanda）
-//!   的聚合健康。任一 down → 整體 **503**，回應裡指出是哪一個。
+//! * `GET /ops/health`：六個後端（PostgreSQL／物件儲存／Redis／OpenSearch／Redpanda／
+//!   Neo4j）的聚合健康。任一 down → 整體 **503**，回應裡指出是哪一個。
+//!   Neo4j 是 V0.2 phase 0b 加的，**只做 HTTP 探活**，見 [`GraphCheck`]。
 //! * `GET /ops/metrics`：本行程的資源用量（RSS、CPU 時間、執行緒數、
 //!   以及工作目錄所在檔案系統的容量／剩餘空間）。
 //! * `GET /ops/connectors`：每個 connector 的採集健康（SPEC §31「connector health」）。
@@ -110,6 +111,95 @@ impl ReadyCheck for BrokerCheck {
             Err(err) => CheckResult::down(
                 "redpanda",
                 format!("{err}。請確認 Redpanda 在跑，以及 [broker].brokers 設定正確"),
+            ),
+        }
+    }
+}
+
+/// Neo4j 的 ops 檢查（V0.2 Phase 0b）。
+///
+/// # 為什麼是 HTTP 而不是 Bolt
+///
+/// Neo4j 不是 storage adapter（V0.2 Phase 0b 還沒有 `storage-neo4j`），
+/// 所以沒有 `HealthProvider`，跟 [`BrokerCheck`] 一樣單獨包一個。
+///
+/// 探活只打 HTTP 埠（預設 7474）的 `GET /`：那個端點**不需要認證**就會回
+/// 叢集的 discovery JSON，所以這個檢查不必持有任何憑證，也就不會在
+/// 「還沒有人真的要用 Neo4j」的階段先把密碼灌進 API 行程。
+/// Bolt（7687）連線與 Cypher 查詢是 Phase 2a `storage-neo4j` adapter 的事。
+///
+/// ⚠️ **這只證明 HTTP 埠活著，不證明資料庫可寫。** Neo4j 在還原、
+/// 資料庫處於 `offline`／`failed` 狀態時，7474 仍然會回 200。
+/// Phase 2a 接上 driver 之後要把判定升級成真的跑一次 Cypher——
+/// 在那之前不要把這個檢查當成「圖投影是健康的」。
+pub struct GraphCheck {
+    client: reqwest::Client,
+    url: String,
+}
+
+impl GraphCheck {
+    /// 建立探針。逾時與 [`BrokerCheck`] 同樣刻意設短：health 端點自己被卡住
+    /// 的話，運維看到的會是「這個頁面壞了」而不是「Neo4j 壞了」。
+    ///
+    /// `url` 建不起 client 時回 `None`（呼叫端把它列進 `not_configured`）。
+    #[must_use]
+    pub fn new(url: impl Into<String>) -> Option<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .ok()?;
+        Some(Self {
+            client,
+            url: url.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl ReadyCheck for GraphCheck {
+    fn name(&self) -> &'static str {
+        "neo4j"
+    }
+
+    async fn check(&self) -> CheckResult {
+        match self.client.get(&self.url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                // discovery JSON 有 neo4j_version／neo4j_edition。拿得到就回報，
+                // 拿不到也不算失敗——2xx 已經證明是 Neo4j 的 HTTP 端點。
+                let status = resp.status();
+                let detail = match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        let version = body
+                            .get("neo4j_version")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        let edition = body
+                            .get("neo4j_edition")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown");
+                        format!("HTTP {status}，Neo4j {version} {edition}")
+                    }
+                    Err(_) => format!("HTTP {status}"),
+                };
+                CheckResult::ok("neo4j", detail)
+            }
+            Ok(resp) => CheckResult::down(
+                "neo4j",
+                format!(
+                    "{} 回 HTTP {}。這個端點不需要認證就該回 200，\
+                     非 2xx 多半代表位址指到的不是 Neo4j 的 HTTP 埠（預設 7474）",
+                    self.url,
+                    resp.status()
+                ),
+            ),
+            Err(err) => CheckResult::down(
+                "neo4j",
+                format!(
+                    "連不上 {}：{err}。請確認 Neo4j 在跑（make compose-up），\
+                     以及 [storage.graph].http_url 設定正確\
+                     （本機 dev 是 http://127.0.0.1:7474，容器內是 http://neo4j:7474）",
+                    self.url
+                ),
             ),
         }
     }

@@ -30,6 +30,16 @@ secret_key_ref = "env:MINIO_ROOT_PASSWORD"
 adapter = "redis"
 url_secret_ref = "env:REDIS_URL"
 
+# 圖投影（SPEC_V0.2 §8）。PostgreSQL 仍是 canonical truth，這裡是可重建的投影。
+#
+# V0.2 Phase 0b 只用 HTTP（7474）給 /api/v1/ops/health 探活，**沒有** Bolt 連線。
+# Bolt URI 與憑證要等 Phase 2a 的 storage-neo4j adapter 一起進來；
+# 現在先放欄位等於宣告一個沒有人讀的契約。
+# 留空字串 = 未設定，/ops/health 會列進 not_configured 而不是 unhealthy。
+[storage.graph]
+adapter = "neo4j"
+http_url = "http://127.0.0.1:7474"
+
 [broker]
 brokers = "127.0.0.1:9092"
 

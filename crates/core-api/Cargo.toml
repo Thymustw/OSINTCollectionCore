@@ -31,6 +31,11 @@ indexer = { path = "../indexer" }
 hex = { workspace = true }
 # GET /api/v1/ops/metrics 的 Disk 指標（statvfs）。見 src/ops.rs 的 disk_usage。
 libc = { workspace = true }
+# 只給 GET /api/v1/ops/health 的 Neo4j 探活用（HTTP 7474）。
+# **刻意不引進 Bolt driver（neo4rs）**：V0.2 Phase 0b 只要「它活著嗎」，
+# 而 reqwest 本來就在相依樹裡（connector-sdk、storage-s3）。
+# 真正的圖查詢走 Bolt，那是 Phase 2a storage-neo4j adapter 的事。
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

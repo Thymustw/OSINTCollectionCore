@@ -359,8 +359,8 @@ async fn ops_health_separates_not_configured_from_broken() {
     assert!(body["checks"].as_array().unwrap().is_empty());
     assert_eq!(
         body["not_configured"].as_array().unwrap().len(),
-        5,
-        "五個後端都沒接就要五個都列出來：{body}"
+        6,
+        "六個後端都沒接就要六個都列出來：{body}"
     );
 }
 

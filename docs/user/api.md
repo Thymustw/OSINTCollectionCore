@@ -238,7 +238,7 @@ curl -s "$API/raw/$RAW_ID?body=true" -H "Authorization: Bearer $TOKEN"   # 連�
 ## 7. 出事的時候
 
 ```bash
-# 五個後端服務活著沒有（任一掛掉整體回 503，並指出是哪一個）
+# 六個後端服務活著沒有（任一掛掉整體回 503，並指出是哪一個）
 curl -s -o /dev/null -w '%{http_code}\n' $API/ops/health -H "Authorization: Bearer $TOKEN"
 curl -s $API/ops/health -H "Authorization: Bearer $TOKEN"
 

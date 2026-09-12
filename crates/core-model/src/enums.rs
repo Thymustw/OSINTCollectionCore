@@ -77,3 +77,21 @@ pub enum JobStatus {
     Failed,
     Cancelled,
 }
+
+// ===== V0.2 =====
+
+/// Resolution candidate 的審核狀態（SPEC_V0.2 §5）。
+///
+/// 這是 V0.2 少數**規格有明確列舉值**的欄位，所以做成 enum 而不是 `String`。
+///
+/// `confirmed` 與 `auto_confirmed` 分開是有意義的：前者有人看過，後者是門檻夠高
+/// 由系統自己決定的。混成同一個值之後就再也分不出「哪些合併沒有人類看過」——
+/// 那正是出事時第一個要問的問題。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionStatus {
+    Pending,
+    Confirmed,
+    Rejected,
+    AutoConfirmed,
+}

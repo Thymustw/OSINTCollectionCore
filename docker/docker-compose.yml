@@ -36,6 +36,7 @@ volumes:
   redpanda-data:
   redis-data:
   minio-data:
+  neo4j-data:
 
 # 六個應用服務共用的連線設定。全部指向 compose network 的服務名，不是 127.0.0.1。
 x-osint-env: &osint-env
@@ -45,6 +46,9 @@ x-osint-env: &osint-env
   # OSINT__<區段>__<鍵> 覆寫 config/default.toml。巢狀鍵用雙底線。
   OSINT__STORAGE__SEARCH__URL: http://opensearch:9200
   OSINT__STORAGE__OBJECT__ENDPOINT: http://minio:9000
+  # Neo4j 的 HTTP 埠，只給 /ops/health 探活用（V0.2 Phase 0b）。
+  # Bolt（7687）要等 Phase 2a 的 storage-neo4j adapter。
+  OSINT__STORAGE__GRAPH__HTTP_URL: http://neo4j:7474
   # 29092 是 redpanda 的 internal listener（宣告成 redpanda:29092）。
   # **不要改成 9092**——那個 listener 宣告的是 127.0.0.1，容器連上去會變成
   # 連自己。理由與症狀見下方 redpanda 服務的註解。
@@ -110,6 +114,13 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # ⚠️ 這裡的 512m heap **跑不動 V0.2 的 embedding 模型**。
+  # scripts/opensearch-ml-setup.sh 需要容器 2 GB + heap 1 GB，低於此值
+  # deploy 會失敗在「Memory Circuit Breaker is open」，而且容器不會掛、
+  # healthcheck 全綠（實測數據見 docs/developer/embedding.md §4）。
+  # docker-compose.dev.yml 已經把本機提到 2 GB / 1 GB。
+  # base 這份維持 512m 是因為 CI 目前**沒有**跑 embedding 測試；
+  # 哪天 CI 要跑，這裡要一起調，否則會得到一個很難讀的「綠燈但模型起不來」。
   opensearch:
     image: opensearchproject/opensearch:2.19.6
     hostname: opensearch
@@ -241,6 +252,66 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+    restart: unless-stopped
+
+  # V0.2 的圖投影（SPEC_V0.2 §8 Graph Projection／§9 Graph API）。
+  #
+  # PostgreSQL 仍然是 canonical truth，Neo4j 跟 OpenSearch 一樣是**可重建的
+  # 投影**（CLAUDE.md §5）。所以這個 volume 掉了不是資料遺失，是要重跑投影。
+  #
+  # 授權：Neo4j Community 是 GPLv3。以獨立容器執行、不 link 進本專案的
+  # binary，GPL 的傳染性不及於 Rust code。決策與備案見
+  # docs/adr/ADR-010-neo4j-community-edition.md。
+  #
+  # ⚠️ tag 釘到具體的 5.26.30-community，不是 `5-community`。
+  # 2026-09-12 用 Docker Hub v2 API 確認過這個 tag 存在（2026-09-09 推送，
+  # amd64 347.4 MB）。浮動 tag 會讓「同一份 compose 在兩台機器起出不同版本」
+  # 變成無聲的差異——minio 那次 image 整個從 Docker Hub 消失才被發現，
+  # 就是因為沒有人定期確認 tag 還在。
+  # 5.26 是 Neo4j 5 的 LTS 線。
+  #
+  # ⚠️ **不裝任何 plugin**。V0.2 §8/§9 只要基本的節點/關係投影與查詢，
+  # 用不到 APOC 或 GDS。NEO4J_PLUGINS 設成空陣列是刻意寫出來的：
+  # 留著這行比留空白更能擋下「順手加一個 APOC」——那會多拉數十 MB、
+  # 多一組 GPL 之外的授權要審，還會讓 Cypher 查詢意外依賴非標準函式。
+  neo4j:
+    image: neo4j:5.26.30-community
+    hostname: neo4j
+    environment:
+      # 帳號從 .env 讀。Community 版**初始使用者只能是 `neo4j`**，
+      # NEO4J_USER 設成別的名字不會建立那個帳號，而且不會報錯——
+      # 只會在登入時變成「密碼錯誤」。要改名得登入後用 Cypher 另外建。
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-osint_dev_neo4j}
+      NEO4J_PLUGINS: "[]"
+      # 記憶體上限寫在 base compose（不是只寫在 dev override）：CI 也跑這個檔，
+      # 而 Neo4j 沒設定時會依「看得到的 RAM」自動推算 heap，在 7 GB 的
+      # GitHub runner 上會抓走遠超過需要的量，把其他五個服務擠掉。
+      # dev override 會再疊一層 mem_limit。
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    ports:
+      # 7474 HTTP（探活 + Browser）、7687 Bolt（Phase 2a 的 driver 會用）。
+      # 2026-09-12 `ss -ltn` 實測本工作站這兩個埠都空著，
+      # 不需要像 OpenSearch/MinIO 那樣在 dev override 改埠。
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j-data:/data
+    networks:
+      - osint-core
+    # 用 HTTP `GET /` 而不是 cypher-shell：前者不需要認證，
+    # healthcheck 裡就不必出現密碼（也就不會被寫進 `docker inspect`）。
+    # image 內沒有 curl，但有 wget（實測）。
+    #
+    # ⚠️ 這只證明 HTTP 端口活著，**不證明 Bolt 或資料庫可寫**。
+    # Phase 2a 接上 driver 之後要把健康判定升級成真的跑一次 Cypher。
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7474/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
     restart: unless-stopped
 
   # =========================================================================

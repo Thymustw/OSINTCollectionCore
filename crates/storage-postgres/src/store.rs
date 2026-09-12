@@ -1,12 +1,15 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-    DuplicateGroup, DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId,
-    EntityType, Event, EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId,
-    Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
-    RelationshipEvidenceId, RelationshipId, RelationshipType, Source, SourceId,
+    DuplicateGroup, DuplicateGroupId, Entity, EntityAlias, EntityAliasId, EntityExtraction,
+    EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId, EntityType, Event, EventId,
+    FailedEvent, FailedEventId, Job, JobId, JobStatus, MergeHistory, MergeHistoryId, NetworkRule,
+    NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship,
+    RelationshipEvidence, RelationshipEvidenceId, RelationshipId, RelationshipType,
+    ResolutionCandidate, ResolutionCandidateId, ResolutionStatus, Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::PgPool;
@@ -1598,5 +1601,358 @@ impl RelationalStore for PostgresCanonicalStore {
             limit,
         )
         .await
+    }
+
+    // ===== V0.2 =====
+
+    async fn put_entity_alias(&self, alias: &EntityAlias) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO entity_aliases (
+                id, entity_id, alias, alias_type, source_id, confidence, first_seen, last_seen
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT (id) DO UPDATE SET
+                entity_id = EXCLUDED.entity_id,
+                alias = EXCLUDED.alias,
+                alias_type = EXCLUDED.alias_type,
+                source_id = EXCLUDED.source_id,
+                confidence = EXCLUDED.confidence,
+                first_seen = EXCLUDED.first_seen,
+                last_seen = EXCLUDED.last_seen
+            "#,
+        )
+        .bind(alias.id)
+        .bind(alias.entity_id)
+        .bind(&alias.alias)
+        .bind(&alias.alias_type)
+        .bind(alias.source_id)
+        .bind(alias.confidence)
+        .bind(alias.first_seen)
+        .bind(alias.last_seen)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_entity_alias(
+        &self,
+        id: EntityAliasId,
+    ) -> Result<Option<EntityAlias>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM entity_aliases WHERE id = $1",
+            id,
+            mapping::entity_alias,
+        )
+        .await
+    }
+
+    async fn list_entity_aliases_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityAlias>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM entity_aliases WHERE entity_id = $1 ORDER BY id ASC LIMIT $2",
+        )
+        .bind(entity_id)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_alias).collect()
+    }
+
+    async fn put_entity_identifier(
+        &self,
+        identifier: &EntityIdentifier,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO entity_identifiers (
+                id, entity_id, namespace, value, normalized_value, confidence,
+                source_id, first_seen, last_seen
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ON CONFLICT (id) DO UPDATE SET
+                entity_id = EXCLUDED.entity_id,
+                namespace = EXCLUDED.namespace,
+                value = EXCLUDED.value,
+                normalized_value = EXCLUDED.normalized_value,
+                confidence = EXCLUDED.confidence,
+                source_id = EXCLUDED.source_id,
+                first_seen = EXCLUDED.first_seen,
+                last_seen = EXCLUDED.last_seen
+            "#,
+        )
+        .bind(identifier.id)
+        .bind(identifier.entity_id)
+        .bind(&identifier.namespace)
+        .bind(&identifier.value)
+        .bind(&identifier.normalized_value)
+        .bind(identifier.confidence)
+        .bind(identifier.source_id)
+        .bind(identifier.first_seen)
+        .bind(identifier.last_seen)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_entity_identifier(
+        &self,
+        id: EntityIdentifierId,
+    ) -> Result<Option<EntityIdentifier>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM entity_identifiers WHERE id = $1",
+            id,
+            mapping::entity_identifier,
+        )
+        .await
+    }
+
+    async fn list_entity_identifiers_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityIdentifier>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM entity_identifiers WHERE entity_id = $1 ORDER BY id ASC LIMIT $2",
+        )
+        .bind(entity_id)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_identifier).collect()
+    }
+
+    async fn put_resolution_candidate(
+        &self,
+        candidate: &ResolutionCandidate,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO resolution_candidates (
+                id, entity_a_id, entity_b_id, score, method, evidence, status,
+                created_at, reviewed_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ON CONFLICT (id) DO UPDATE SET
+                entity_a_id = EXCLUDED.entity_a_id,
+                entity_b_id = EXCLUDED.entity_b_id,
+                score = EXCLUDED.score,
+                method = EXCLUDED.method,
+                evidence = EXCLUDED.evidence,
+                status = EXCLUDED.status,
+                created_at = EXCLUDED.created_at,
+                reviewed_at = EXCLUDED.reviewed_at
+            "#,
+        )
+        .bind(candidate.id)
+        .bind(candidate.entity_a_id)
+        .bind(candidate.entity_b_id)
+        .bind(candidate.score)
+        .bind(&candidate.method)
+        .bind(&candidate.evidence)
+        .bind(encode_enum(&candidate.status)?)
+        .bind(candidate.created_at)
+        .bind(candidate.reviewed_at)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_resolution_candidate(
+        &self,
+        id: ResolutionCandidateId,
+    ) -> Result<Option<ResolutionCandidate>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM resolution_candidates WHERE id = $1",
+            id,
+            mapping::resolution_candidate,
+        )
+        .await
+    }
+
+    async fn list_resolution_candidates(
+        &self,
+        status: Option<ResolutionStatus>,
+        after: Option<ResolutionCandidateId>,
+        limit: u32,
+    ) -> Result<Vec<ResolutionCandidate>, StorageError> {
+        let status = status.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM resolution_candidates
+            WHERE ($1::uuid IS NULL OR id < $1)
+              AND ($2::text IS NULL OR status = $2)
+            ORDER BY id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(after)
+        .bind(status)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::resolution_candidate).collect()
+    }
+
+    async fn put_merge_history(&self, history: &MergeHistory) -> Result<(), StorageError> {
+        let repointed = serde_json::to_value(&history.repointed_references).map_err(|err| {
+            StorageError::Unknown {
+                backend: "postgres",
+                message: format!("序列化 merge_history.repointed_references 失敗：{err}"),
+            }
+        })?;
+        sqlx::query(
+            r#"
+            INSERT INTO merge_history (
+                id, survivor_id, merged_id, reason, operator, timestamp,
+                repointed_references, undone_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            ON CONFLICT (id) DO UPDATE SET
+                survivor_id = EXCLUDED.survivor_id,
+                merged_id = EXCLUDED.merged_id,
+                reason = EXCLUDED.reason,
+                operator = EXCLUDED.operator,
+                timestamp = EXCLUDED.timestamp,
+                repointed_references = EXCLUDED.repointed_references,
+                undone_at = EXCLUDED.undone_at
+            "#,
+        )
+        .bind(history.id)
+        .bind(history.survivor_id)
+        .bind(history.merged_id)
+        .bind(&history.reason)
+        .bind(&history.operator)
+        .bind(history.timestamp)
+        .bind(repointed)
+        .bind(history.undone_at)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_merge_history(
+        &self,
+        id: MergeHistoryId,
+    ) -> Result<Option<MergeHistory>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM merge_history WHERE id = $1",
+            id,
+            mapping::merge_history,
+        )
+        .await
+    }
+
+    async fn list_merge_history_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<MergeHistory>, StorageError> {
+        // 兩端都算。idx_merge_history_survivor 與 idx_merge_history_merged 都在，
+        // PostgreSQL 會走 bitmap OR（理由同 list_relationships_by_object）。
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM merge_history
+            WHERE survivor_id = $1 OR merged_id = $1
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(entity_id)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::merge_history).collect()
+    }
+
+    async fn put_failed_event(&self, event: &FailedEvent) -> Result<FailedEvent, StorageError> {
+        // 自然鍵是 (topic, partition, offset)，不是 id。衝突時 attempt_count 由 DB 累加，
+        // id / first_seen 保留既有列的值——所以必須 RETURNING 把實際存下來的列帶回去，
+        // 呼叫端拿自己產生的 id 是查不到東西的。
+        let row = sqlx::query(
+            r#"
+            INSERT INTO failed_events (
+                id, topic, partition, "offset", consumer_group, failure_reason,
+                attempt_count, envelope, first_seen, last_seen, replayed_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ON CONFLICT (topic, partition, "offset") DO UPDATE SET
+                consumer_group = EXCLUDED.consumer_group,
+                failure_reason = EXCLUDED.failure_reason,
+                attempt_count = failed_events.attempt_count + 1,
+                envelope = EXCLUDED.envelope,
+                last_seen = EXCLUDED.last_seen,
+                replayed_at = EXCLUDED.replayed_at
+            RETURNING *
+            "#,
+        )
+        .bind(event.id)
+        .bind(&event.topic)
+        .bind(event.partition)
+        .bind(event.offset)
+        .bind(&event.consumer_group)
+        .bind(&event.failure_reason)
+        .bind(event.attempt_count)
+        .bind(&event.envelope)
+        .bind(event.first_seen)
+        .bind(event.last_seen)
+        .bind(event.replayed_at)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        mapping::failed_event(&row)
+    }
+
+    async fn get_failed_event(
+        &self,
+        id: FailedEventId,
+    ) -> Result<Option<FailedEvent>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM failed_events WHERE id = $1",
+            id,
+            mapping::failed_event,
+        )
+        .await
+    }
+
+    async fn list_failed_events(
+        &self,
+        after: Option<FailedEventId>,
+        limit: u32,
+    ) -> Result<Vec<FailedEvent>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM failed_events
+            WHERE ($1::uuid IS NULL OR id < $1)
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(after)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::failed_event).collect()
+    }
+
+    async fn mark_replayed(
+        &self,
+        id: FailedEventId,
+        replayed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query("UPDATE failed_events SET replayed_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(replayed_at)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
     }
 }

@@ -1,6 +1,7 @@
 use core_model::{
-    Collection, Connector, Document, DuplicateGroup, Entity, EntityExtraction, Event, Job,
-    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, Source,
+    Collection, Connector, Document, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
+    EntityIdentifier, Event, FailedEvent, Job, MergeHistory, NetworkRule, Provenance, RawEvidence,
+    Relationship, RelationshipEvidence, RepointedReference, ResolutionCandidate, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -285,5 +286,101 @@ pub fn entity_extraction(row: &PgRow) -> Result<EntityExtraction, StorageError> 
         confidence: get(row, "confidence")?,
         text_offset: get(row, "text_offset")?,
         excerpt: get(row, "excerpt")?,
+    })
+}
+
+// ===== V0.2 =====
+
+pub fn entity_alias(row: &PgRow) -> Result<EntityAlias, StorageError> {
+    Ok(EntityAlias {
+        id: get(row, "id")?,
+        entity_id: get(row, "entity_id")?,
+        alias: get(row, "alias")?,
+        alias_type: get(row, "alias_type")?,
+        source_id: get(row, "source_id")?,
+        confidence: get(row, "confidence")?,
+        first_seen: get(row, "first_seen")?,
+        last_seen: get(row, "last_seen")?,
+    })
+}
+
+pub fn entity_identifier(row: &PgRow) -> Result<EntityIdentifier, StorageError> {
+    Ok(EntityIdentifier {
+        id: get(row, "id")?,
+        entity_id: get(row, "entity_id")?,
+        namespace: get(row, "namespace")?,
+        value: get(row, "value")?,
+        normalized_value: get(row, "normalized_value")?,
+        confidence: get(row, "confidence")?,
+        source_id: get(row, "source_id")?,
+        first_seen: get(row, "first_seen")?,
+        last_seen: get(row, "last_seen")?,
+    })
+}
+
+pub fn resolution_candidate(row: &PgRow) -> Result<ResolutionCandidate, StorageError> {
+    Ok(ResolutionCandidate {
+        id: get(row, "id")?,
+        entity_a_id: get(row, "entity_a_id")?,
+        entity_b_id: get(row, "entity_b_id")?,
+        score: get(row, "score")?,
+        method: get(row, "method")?,
+        evidence: get(row, "evidence")?,
+        status: decode_enum(&get::<String>(row, "status")?, "status")?,
+        created_at: get(row, "created_at")?,
+        reviewed_at: get(row, "reviewed_at")?,
+    })
+}
+
+pub fn merge_history(row: &PgRow) -> Result<MergeHistory, StorageError> {
+    Ok(MergeHistory {
+        id: get(row, "id")?,
+        survivor_id: get(row, "survivor_id")?,
+        merged_id: get(row, "merged_id")?,
+        reason: get(row, "reason")?,
+        operator: get(row, "operator")?,
+        timestamp: get(row, "timestamp")?,
+        repointed_references: decode_repointed(get(row, "repointed_references")?)?,
+        undone_at: get(row, "undone_at")?,
+    })
+}
+
+/// `merge_history.repointed_references` 必須是 JSON 陣列。
+///
+/// 解不開時回 [`StorageError::CorruptionSuspected`] 而**不是**當成空陣列：
+/// 空陣列的意思是「這次 merge 沒有改過任何參照」，拿它來代表「讀不懂」
+/// 會讓 undo 靜默地少還原一批參照，而且沒有任何錯誤訊息。
+fn decode_repointed(value: Value) -> Result<Vec<RepointedReference>, StorageError> {
+    match value {
+        Value::Array(_) => {
+            serde_json::from_value(value).map_err(|err| StorageError::CorruptionSuspected {
+                message: format!(
+                    "merge_history.repointed_references 不是 RepointedReference 陣列：{err}。\
+                     這筆 merge 無法 undo，請先人工比對"
+                ),
+            })
+        }
+        other => Err(StorageError::CorruptionSuspected {
+            message: format!(
+                "merge_history.repointed_references 應為 JSON 陣列，實際是 {other}。\
+                 這筆 merge 無法 undo，請先人工比對"
+            ),
+        }),
+    }
+}
+
+pub fn failed_event(row: &PgRow) -> Result<FailedEvent, StorageError> {
+    Ok(FailedEvent {
+        id: get(row, "id")?,
+        topic: get(row, "topic")?,
+        partition: get(row, "partition")?,
+        offset: get(row, "offset")?,
+        consumer_group: get(row, "consumer_group")?,
+        failure_reason: get(row, "failure_reason")?,
+        attempt_count: get(row, "attempt_count")?,
+        envelope: get(row, "envelope")?,
+        first_seen: get(row, "first_seen")?,
+        last_seen: get(row, "last_seen")?,
+        replayed_at: get(row, "replayed_at")?,
     })
 }

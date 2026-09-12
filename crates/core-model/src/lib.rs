@@ -9,15 +9,20 @@ pub mod content;
 pub mod document;
 pub mod duplicate;
 pub mod entity;
+pub mod entity_alias;
+pub mod entity_identifier;
 pub mod enums;
 pub mod event;
 pub mod extraction;
+pub mod failed_event;
 pub mod ids;
 pub mod job;
+pub mod merge;
 pub mod network_rule;
 pub mod provenance;
 pub mod raw_evidence;
 pub mod relationship;
+pub mod resolution;
 pub mod source;
 pub mod url_norm;
 
@@ -27,15 +32,22 @@ pub use content::{content_hash, normalize_content};
 pub use document::Document;
 pub use duplicate::DuplicateGroup;
 pub use entity::Entity;
-pub use enums::{DocumentType, EntityType, JobStatus, RelationshipType, SourceType};
+pub use entity_alias::EntityAlias;
+pub use entity_identifier::EntityIdentifier;
+pub use enums::{
+    DocumentType, EntityType, JobStatus, RelationshipType, ResolutionStatus, SourceType,
+};
 pub use event::Event;
 pub use extraction::EntityExtraction;
+pub use failed_event::FailedEvent;
 pub use ids::*;
 pub use job::Job;
+pub use merge::{MergeHistory, RepointedReference};
 pub use network_rule::NetworkRule;
 pub use provenance::Provenance;
 pub use raw_evidence::RawEvidence;
 pub use relationship::{Relationship, RelationshipEvidence};
+pub use resolution::{RESOLUTION_METHODS, ResolutionCandidate};
 pub use source::Source;
 
 #[cfg(test)]
@@ -286,6 +298,151 @@ mod tests {
         assert_eq!(round_trip(&rule), rule);
         assert!(rule.is_expired(ts()));
         assert!(!rule.is_expired(ts() - chrono::Duration::seconds(1)));
+    }
+
+    #[test]
+    fn v0_2_alias_and_identifier_round_trip() {
+        let alias = EntityAlias {
+            id: id(),
+            entity_id: id(),
+            alias: "微軟".into(),
+            alias_type: "localized_name".into(),
+            source_id: Some(id()),
+            confidence: 0.8,
+            first_seen: ts(),
+            last_seen: ts(),
+        };
+        assert_eq!(round_trip(&alias), alias);
+
+        // source_id 可為 None：resolver 自己推導的 alias 沒有來源可指。
+        let derived = EntityAlias {
+            source_id: None,
+            ..alias.clone()
+        };
+        assert_eq!(round_trip(&derived), derived);
+        let v = serde_json::to_value(&derived).unwrap();
+        assert!(v["source_id"].is_null());
+
+        let identifier = EntityIdentifier {
+            id: id(),
+            entity_id: id(),
+            // T10 的歧義就是靠 namespace 分開的：同樣 40 位 hex，
+            // `git_commit` 與 `sha1` 是兩個不同的識別碼。
+            namespace: "git_commit".into(),
+            value: "A".repeat(40),
+            normalized_value: "a".repeat(40),
+            confidence: 0.9,
+            source_id: None,
+            first_seen: ts(),
+            last_seen: ts(),
+        };
+        assert_eq!(round_trip(&identifier), identifier);
+        let v = serde_json::to_value(&identifier).unwrap();
+        assert_eq!(v["namespace"], "git_commit");
+    }
+
+    #[test]
+    fn v0_2_resolution_candidate_round_trip() {
+        let candidate = ResolutionCandidate {
+            id: id(),
+            entity_a_id: Uuid::parse_str("01993c6a-7c3e-7a11-8000-7c3e7a110001").unwrap(),
+            entity_b_id: Uuid::parse_str("01993c6a-7c3e-7a11-8000-7c3e7a110002").unwrap(),
+            score: 0.93,
+            method: "exact_identifier".into(),
+            evidence: json!({"namespace": "domain", "value": "microsoft.com"}),
+            status: ResolutionStatus::Pending,
+            created_at: ts(),
+            reviewed_at: None,
+        };
+        assert_eq!(round_trip(&candidate), candidate);
+        let v = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(v["status"], "pending");
+
+        let reviewed = ResolutionCandidate {
+            status: ResolutionStatus::AutoConfirmed,
+            reviewed_at: Some(ts()),
+            ..candidate.clone()
+        };
+        assert_eq!(round_trip(&reviewed), reviewed);
+        // 四個狀態的線上字串是 schema 的一部分，改名等於改 schema。
+        assert_eq!(
+            serde_json::to_value(reviewed.status).unwrap(),
+            "auto_confirmed"
+        );
+
+        // ordered_pair 必須符合 migration 0007 的 CHECK（entity_a_id < entity_b_id）。
+        let (a, b) =
+            ResolutionCandidate::ordered_pair(candidate.entity_b_id, candidate.entity_a_id);
+        assert_eq!((a, b), (candidate.entity_a_id, candidate.entity_b_id));
+        assert!(a < b);
+    }
+
+    #[test]
+    fn v0_2_merge_history_round_trip_keeps_previous_values() {
+        let history = MergeHistory {
+            id: id(),
+            survivor_id: id(),
+            merged_id: id(),
+            reason: "同一個 microsoft.com 識別碼".into(),
+            operator: "operator@example.invalid".into(),
+            timestamp: ts(),
+            repointed_references: vec![RepointedReference {
+                table: "relationships".into(),
+                row_id: id(),
+                column: "target_object_id".into(),
+                previous_value: id(),
+            }],
+            undone_at: None,
+        };
+        assert_eq!(round_trip(&history), history);
+
+        // Acceptance C：undo 之後這一列還在，只是被標記——歷史不可以消失。
+        let undone = MergeHistory {
+            undone_at: Some(ts()),
+            ..history.clone()
+        };
+        let back = round_trip(&undone);
+        assert_eq!(back, undone);
+        assert_eq!(back.repointed_references, history.repointed_references);
+    }
+
+    #[test]
+    fn v0_2_failed_event_round_trip() {
+        let failed = FailedEvent {
+            id: id(),
+            topic: "object.normalized".into(),
+            partition: 3,
+            // 超過 i32 的 offset：長期執行的 topic 真的會走到這裡，
+            // 欄位若是 i32 會在這一行溢位。
+            offset: 5_000_000_000,
+            consumer_group: "osint-deduplicator".into(),
+            failure_reason: "payload 缺少 document_id，無法定位文件".into(),
+            attempt_count: 2,
+            envelope: json!({"id": "01993c6a-7c3e-7a11-8000-7c3e7a110001"}),
+            first_seen: ts(),
+            last_seen: ts(),
+            replayed_at: None,
+        };
+        assert_eq!(round_trip(&failed), failed);
+        let v = serde_json::to_value(&failed).unwrap();
+        assert_eq!(v["offset"], 5_000_000_000_i64);
+
+        let replayed = FailedEvent {
+            replayed_at: Some(ts()),
+            ..failed
+        };
+        assert_eq!(round_trip(&replayed), replayed);
+    }
+
+    #[test]
+    fn resolution_method_names_are_unique() {
+        let mut sorted = RESOLUTION_METHODS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), before, "RESOLUTION_METHODS 有重複名稱");
+        // SPEC §6 要求「至少」這十種。少一個就代表清單被改壞了。
+        assert_eq!(RESOLUTION_METHODS.len(), 10);
     }
 
     #[test]

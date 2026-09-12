@@ -4,12 +4,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-    DuplicateGroup, DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId,
-    EntityType, Event, EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId,
-    Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
-    RelationshipEvidenceId, RelationshipId, RelationshipType, Source, SourceId,
+    DuplicateGroup, DuplicateGroupId, Entity, EntityAlias, EntityAliasId, EntityExtraction,
+    EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId, EntityType, Event, EventId,
+    FailedEvent, FailedEventId, Job, JobId, JobStatus, MergeHistory, MergeHistoryId, NetworkRule,
+    NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship,
+    RelationshipEvidence, RelationshipEvidenceId, RelationshipId, RelationshipType,
+    ResolutionCandidate, ResolutionCandidateId, ResolutionStatus, Source, SourceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -415,6 +418,151 @@ pub trait RelationalStore: HealthProvider {
         entity_id: EntityId,
         limit: u32,
     ) -> Result<Vec<EntityExtraction>, StorageError>;
+
+    // =========================================================================
+    // ===== V0.2 =====
+    //
+    // Entity Resolution（SPEC_V0.2 §3／§4／§5／§7）與 ADR-008 的 failed_events。
+    // Schema 在 `migrations/*/0007_v0_2_resolution_and_failed_events.sql`。
+    //
+    // ⚠️ V0.2 Phase 0 只有這層介面與 schema，**沒有任何服務會呼叫它們**
+    //    （resolver / graph-worker / DLQ 重放都還沒做）。五張表是空的是預期結果。
+    // =========================================================================
+
+    /// 依主鍵 upsert 一筆 alias。
+    ///
+    /// 沒有唯一鍵擋重複的 `(entity_id, alias)`：同一個別名由兩個來源、
+    /// 兩種信心度分別觀察到是正常的，理由見 migration 0007 的註解。
+    async fn put_entity_alias(&self, alias: &EntityAlias) -> Result<(), StorageError>;
+    async fn get_entity_alias(
+        &self,
+        id: EntityAliasId,
+    ) -> Result<Option<EntityAlias>, StorageError>;
+    /// 這個 Entity 的別名列，依 `id` 升序，`limit` 夾在 1..=100。
+    /// 語意同 [`RelationalStore::list_entity_extractions_by_entity`]。
+    async fn list_entity_aliases_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityAlias>, StorageError>;
+
+    /// 依主鍵 upsert 一筆識別碼。
+    ///
+    /// ⚠️ `(namespace, normalized_value)` 是 UNIQUE。**兩個不同 Entity 宣稱同一個
+    /// 識別碼時，第二次寫入會回 [`StorageError::Conflict`]，不是靜默覆蓋。**
+    /// 那個衝突正是 SPEC §6「exact identifier」要偵測的訊號——呼叫端應該據此
+    /// 建立 resolution candidate，把它當雜訊吞掉的話識別碼會少記一筆而且毫無跡象。
+    async fn put_entity_identifier(
+        &self,
+        identifier: &EntityIdentifier,
+    ) -> Result<(), StorageError>;
+    async fn get_entity_identifier(
+        &self,
+        id: EntityIdentifierId,
+    ) -> Result<Option<EntityIdentifier>, StorageError>;
+    /// 這個 Entity 的識別碼列，依 `id` 升序，`limit` 夾在 1..=100。
+    async fn list_entity_identifiers_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityIdentifier>, StorageError>;
+
+    /// 依主鍵 upsert 一筆合併候選。
+    ///
+    /// ⚠️ 兩個前置條件由**資料庫**強制，兩者的錯誤型別不同：
+    /// * `entity_a_id < entity_b_id`（CHECK constraint）→ 違反回
+    ///   [`StorageError::ConstraintViolation`]。用
+    ///   [`core_model::ResolutionCandidate::ordered_pair`] 排好再寫；候選對是無向的，
+    ///   不排序就會讓同一對存成兩列。
+    /// * `(entity_a_id, entity_b_id, method)` UNIQUE → 違反回
+    ///   [`StorageError::Conflict`]。同一對用同一方法只有一筆；
+    ///   **重跑 resolver 要沿用同一個 `id` 才是 upsert**，換 id 重寫會撞唯一鍵。
+    async fn put_resolution_candidate(
+        &self,
+        candidate: &ResolutionCandidate,
+    ) -> Result<(), StorageError>;
+    async fn get_resolution_candidate(
+        &self,
+        id: ResolutionCandidateId,
+    ) -> Result<Option<ResolutionCandidate>, StorageError>;
+    /// 依 `id` 遞減、cursor 分頁列出候選，可依 `status` 過濾（`None` = 不過濾）。
+    ///
+    /// 過濾**在 SQL 裡做**，理由同 [`RelationalStore::list_jobs_by_status`]：
+    /// Resolution Review 問的是「還有幾筆 pending」，取回最新一頁再在程式端 filter
+    /// 會讓「沒有待審候選」與「最新 100 筆剛好都審完了」變成同一個答案。
+    async fn list_resolution_candidates(
+        &self,
+        status: Option<ResolutionStatus>,
+        after: Option<ResolutionCandidateId>,
+        limit: u32,
+    ) -> Result<Vec<ResolutionCandidate>, StorageError>;
+
+    /// 依主鍵 upsert 一筆 merge 紀錄。
+    ///
+    /// `repointed_references` 空陣列代表「當時沒有任何列需要 repoint」。
+    /// **不要用空陣列表示「沒記錄」**——那是資料遺失，會讓 undo 悄悄少還原一批參照。
+    async fn put_merge_history(&self, history: &MergeHistory) -> Result<(), StorageError>;
+    async fn get_merge_history(
+        &self,
+        id: MergeHistoryId,
+    ) -> Result<Option<MergeHistory>, StorageError>;
+    /// 這個 Entity 參與過的 merge，`survivor_id` **或** `merged_id` 命中都算，
+    /// 依 `id` 遞減，`limit` 夾在 1..=100。
+    ///
+    /// 兩端合成一個方法的理由同 [`RelationalStore::list_relationships_by_object`]：
+    /// Console 的 Entity Merge History 要問「這個 canonical 吃掉了誰」，
+    /// API 收到舊 entity id 時要問「這個 id 被併去哪了」，拆成兩個方法只會讓
+    /// 每個呼叫端各查一次再自己合併。
+    ///
+    /// 已撤銷的 merge（`undone_at` 非 NULL）**照樣回傳**。它是歷史的一部分，
+    /// 過濾掉等於違反 Acceptance C；要不要顯示由呼叫端決定。
+    async fn list_merge_history_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<MergeHistory>, StorageError>;
+
+    /// 記錄一則永久失敗的事件（ADR-008）。回傳**資料庫裡實際存著的那一列**。
+    ///
+    /// 自然鍵是 `(topic, partition, offset)`，不是 `id`。同一則事件再次失敗時：
+    ///
+    /// | 欄位 | 行為 |
+    /// |---|---|
+    /// | `attempt_count` | **由資料庫 +1**，傳入值被忽略 |
+    /// | `last_seen`／`failure_reason`／`consumer_group`／`envelope` | 以傳入值覆寫 |
+    /// | `replayed_at` | 以傳入值覆寫。**傳 `None` 會清掉先前的重放時間**——
+    ///   一則重放後又失敗的事件是「還沒修好」，不是「已重放」 |
+    /// | `id`／`first_seen` | 保留**既有列**的值，傳入值被忽略 |
+    ///
+    /// 所以回傳的 `id` 可能不是你傳進去的那個。回傳整列而不是 `()` 就是為了這件事：
+    /// 呼叫端要記 log 或之後重放時，拿著自己產生的 id 會查不到任何東西。
+    async fn put_failed_event(&self, event: &FailedEvent) -> Result<FailedEvent, StorageError>;
+    async fn get_failed_event(
+        &self,
+        id: FailedEventId,
+    ) -> Result<Option<FailedEvent>, StorageError>;
+    /// 依 UUID v7 由新到舊列出。cursor 語意同 [`RelationalStore::list_jobs`]。
+    ///
+    /// **含已重放的列。** `replayed_at` 非 NULL 的那些是「這則事件修好了」的紀錄，
+    /// 刪掉或藏起來就沒有人能回答「上次那批到底補回去了沒」。
+    async fn list_failed_events(
+        &self,
+        after: Option<FailedEventId>,
+        limit: u32,
+    ) -> Result<Vec<FailedEvent>, StorageError>;
+    /// 標記一則 failed event 已重放成功。回傳是否真的更新到列。
+    ///
+    /// `replayed_at` 由呼叫端傳入而不是 adapter 自己取 `Utc::now()`：
+    /// 重放時間應該是「重放動作發生的時間」，由發起端決定，
+    /// adapter 內部取當下時間會讓測試無法斷言，也讓批次重放的時間戳散開。
+    ///
+    /// 已經標記過的列**照樣覆寫**成新時間並回 `true`——重放兩次是操作事實，
+    /// 不是錯誤。要避免重複重放是呼叫端的冪等責任。
+    async fn mark_replayed(
+        &self,
+        id: FailedEventId,
+        replayed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError>;
 }
 
 /// Dedup Stage 4 的候選列。

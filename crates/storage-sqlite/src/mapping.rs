@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use core_model::{
-    Collection, Connector, Document, DuplicateGroup, Entity, EntityExtraction, Event, Job,
-    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, Source,
+    Collection, Connector, Document, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
+    EntityIdentifier, Event, FailedEvent, Job, MergeHistory, NetworkRule, Provenance, RawEvidence,
+    Relationship, RelationshipEvidence, RepointedReference, ResolutionCandidate, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -345,6 +346,92 @@ pub fn duplicate_group(row: &SqliteRow) -> Result<DuplicateGroup, StorageError> 
         method: get_str(row, "method")?,
         similarity: get_f64(row, "similarity")?,
         first_seen: ts(row, "first_seen")?,
+    })
+}
+
+// ===== V0.2 =====
+
+pub fn entity_alias(row: &SqliteRow) -> Result<EntityAlias, StorageError> {
+    Ok(EntityAlias {
+        id: uuid_from(row, "id")?,
+        entity_id: uuid_from(row, "entity_id")?,
+        alias: get_str(row, "alias")?,
+        alias_type: get_str(row, "alias_type")?,
+        source_id: opt_uuid(row, "source_id")?,
+        confidence: get_f64(row, "confidence")?,
+        first_seen: ts(row, "first_seen")?,
+        last_seen: ts(row, "last_seen")?,
+    })
+}
+
+pub fn entity_identifier(row: &SqliteRow) -> Result<EntityIdentifier, StorageError> {
+    Ok(EntityIdentifier {
+        id: uuid_from(row, "id")?,
+        entity_id: uuid_from(row, "entity_id")?,
+        namespace: get_str(row, "namespace")?,
+        value: get_str(row, "value")?,
+        normalized_value: get_str(row, "normalized_value")?,
+        confidence: get_f64(row, "confidence")?,
+        source_id: opt_uuid(row, "source_id")?,
+        first_seen: ts(row, "first_seen")?,
+        last_seen: ts(row, "last_seen")?,
+    })
+}
+
+pub fn resolution_candidate(row: &SqliteRow) -> Result<ResolutionCandidate, StorageError> {
+    Ok(ResolutionCandidate {
+        id: uuid_from(row, "id")?,
+        entity_a_id: uuid_from(row, "entity_a_id")?,
+        entity_b_id: uuid_from(row, "entity_b_id")?,
+        score: get_f64(row, "score")?,
+        method: get_str(row, "method")?,
+        evidence: json(row, "evidence")?,
+        status: decode_enum(&get_str(row, "status")?, "status")?,
+        created_at: ts(row, "created_at")?,
+        reviewed_at: opt_ts(row, "reviewed_at")?,
+    })
+}
+
+pub fn merge_history(row: &SqliteRow) -> Result<MergeHistory, StorageError> {
+    Ok(MergeHistory {
+        id: uuid_from(row, "id")?,
+        survivor_id: uuid_from(row, "survivor_id")?,
+        merged_id: uuid_from(row, "merged_id")?,
+        reason: get_str(row, "reason")?,
+        operator: get_str(row, "operator")?,
+        timestamp: ts(row, "timestamp")?,
+        repointed_references: decode_repointed(&get_str(row, "repointed_references")?)?,
+        undone_at: opt_ts(row, "undone_at")?,
+    })
+}
+
+/// `merge_history.repointed_references` 必須是 JSON 陣列。
+///
+/// 解不開時回 [`StorageError::CorruptionSuspected`] 而**不是**當成空陣列：
+/// 空陣列的意思是「這次 merge 沒有改過任何參照」，拿它來代表「讀不懂」
+/// 會讓 undo 靜默地少還原一批參照。語意與 PG adapter 相同。
+fn decode_repointed(raw: &str) -> Result<Vec<RepointedReference>, StorageError> {
+    serde_json::from_str(raw).map_err(|err| StorageError::CorruptionSuspected {
+        message: format!(
+            "merge_history.repointed_references 不是 RepointedReference 陣列：{err}。\
+             這筆 merge 無法 undo，請先人工比對"
+        ),
+    })
+}
+
+pub fn failed_event(row: &SqliteRow) -> Result<FailedEvent, StorageError> {
+    Ok(FailedEvent {
+        id: uuid_from(row, "id")?,
+        topic: get_str(row, "topic")?,
+        partition: i32_from(row, "partition")?,
+        offset: get_i64(row, "offset")?,
+        consumer_group: get_str(row, "consumer_group")?,
+        failure_reason: get_str(row, "failure_reason")?,
+        attempt_count: i32_from(row, "attempt_count")?,
+        envelope: json(row, "envelope")?,
+        first_seen: ts(row, "first_seen")?,
+        last_seen: ts(row, "last_seen")?,
+        replayed_at: opt_ts(row, "replayed_at")?,
     })
 }
 

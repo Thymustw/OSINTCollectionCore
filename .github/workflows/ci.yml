@@ -120,6 +120,23 @@ jobs:
     # whether CI runs. A prior doc-sync pass misread that and rewrote this
     # comment to "never executed"; corrected. Observed `--wait` time on the
     # runner is well under the 180s ceiling (typically 60–110s).
+    #
+    # Memory budget (V0.2 phase 0b added Neo4j as a 6th infrastructure
+    # service). Per GitHub's hosted-runner docs (re-checked 2026-09-12),
+    # `ubuntu-latest` on PUBLIC repositories is 4 vCPU / 16 GB RAM / 14 GB SSD
+    # — not the 7 GB an earlier note assumed. Configured ceilings here:
+    #   postgres shared_buffers 256M, opensearch heap 512M,
+    #   redpanda 256M, redis 192M, minio small, neo4j heap 512M + pagecache 256M
+    # ≈ 2 GB of declared limits, leaving ample headroom for the cargo build.
+    # NOTE: docker-compose.yml carries no `mem_limit` (those live in the dev
+    # override), so these are per-process heap settings, not cgroup caps.
+    # Neo4j's heap/pagecache are therefore set in the BASE compose file on
+    # purpose: unset, Neo4j sizes its heap from visible RAM and would take far
+    # more than it needs here.
+    #
+    # `--wait` now covers 6 services. Neo4j's healthcheck has a 40s
+    # start_period (measured ~20-30s to first HTTP 200 locally), still well
+    # inside the 180s ceiling.
     env:
       DATABASE_URL: postgres://osint:osint_dev@localhost:5432/osint_core
       SQLITE_URL: "sqlite:./var/osint-local.sqlite?mode=rwc"
@@ -130,6 +147,15 @@ jobs:
       MINIO_ROOT_PASSWORD: osint_dev_minio
       REDIS_URL: redis://localhost:6379/0
       REDPANDA_BROKERS: localhost:9092
+      # Neo4j (V0.2 phase 0b). Canonical ports; the local-dev override does not
+      # remap them because 7474/7687 are free on the dev workstation too.
+      # NEO4J_USER must stay `neo4j`: Community Edition cannot create a
+      # differently-named initial user via NEO4J_AUTH, and it fails silently
+      # (the container starts, the login just never works).
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: osint_dev_neo4j
+      NEO4J_URI: bolt://localhost:7687
+      OSINT__STORAGE__GRAPH__HTTP_URL: http://localhost:7474
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

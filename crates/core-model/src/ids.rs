@@ -18,3 +18,11 @@ pub type DuplicateGroupId = Uuid;
 pub type RelationshipEvidenceId = Uuid;
 pub type EntityExtractionId = Uuid;
 pub type ObjectId = Uuid;
+
+// ===== V0.2（SPEC_V0.2 §3／§4／§5／§7 + ADR-008）=====
+
+pub type EntityAliasId = Uuid;
+pub type EntityIdentifierId = Uuid;
+pub type ResolutionCandidateId = Uuid;
+pub type MergeHistoryId = Uuid;
+pub type FailedEventId = Uuid;

@@ -5,10 +5,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-    DuplicateGroup, DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId,
-    EntityType, Event, EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId,
-    Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
-    RelationshipEvidenceId, RelationshipId, RelationshipType, Source, SourceId,
+    DuplicateGroup, DuplicateGroupId, Entity, EntityAlias, EntityAliasId, EntityExtraction,
+    EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId, EntityType, Event, EventId,
+    FailedEvent, FailedEventId, Job, JobId, JobStatus, MergeHistory, MergeHistoryId, NetworkRule,
+    NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship,
+    RelationshipEvidence, RelationshipEvidenceId, RelationshipId, RelationshipType,
+    ResolutionCandidate, ResolutionCandidateId, ResolutionStatus, Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -1635,5 +1637,356 @@ impl RelationalStore for SqliteEmbeddedStore {
             limit,
         )
         .await
+    }
+
+    // ===== V0.2 =====
+
+    async fn put_entity_alias(&self, alias: &EntityAlias) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO entity_aliases (
+                id, entity_id, alias, alias_type, source_id, confidence, first_seen, last_seen
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                entity_id = excluded.entity_id,
+                alias = excluded.alias,
+                alias_type = excluded.alias_type,
+                source_id = excluded.source_id,
+                confidence = excluded.confidence,
+                first_seen = excluded.first_seen,
+                last_seen = excluded.last_seen
+            "#,
+        )
+        .bind(uuid_text(alias.id))
+        .bind(uuid_text(alias.entity_id))
+        .bind(&alias.alias)
+        .bind(&alias.alias_type)
+        .bind(opt_uuid_text(alias.source_id))
+        .bind(alias.confidence)
+        .bind(rfc3339(alias.first_seen))
+        .bind(rfc3339(alias.last_seen))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_entity_alias(
+        &self,
+        id: EntityAliasId,
+    ) -> Result<Option<EntityAlias>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM entity_aliases WHERE id = ?",
+            id,
+            mapping::entity_alias,
+        )
+        .await
+    }
+
+    async fn list_entity_aliases_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityAlias>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM entity_aliases WHERE entity_id = ?1 ORDER BY id ASC LIMIT ?2",
+        )
+        .bind(uuid_text(entity_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_alias).collect()
+    }
+
+    async fn put_entity_identifier(
+        &self,
+        identifier: &EntityIdentifier,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO entity_identifiers (
+                id, entity_id, namespace, value, normalized_value, confidence,
+                source_id, first_seen, last_seen
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                entity_id = excluded.entity_id,
+                namespace = excluded.namespace,
+                value = excluded.value,
+                normalized_value = excluded.normalized_value,
+                confidence = excluded.confidence,
+                source_id = excluded.source_id,
+                first_seen = excluded.first_seen,
+                last_seen = excluded.last_seen
+            "#,
+        )
+        .bind(uuid_text(identifier.id))
+        .bind(uuid_text(identifier.entity_id))
+        .bind(&identifier.namespace)
+        .bind(&identifier.value)
+        .bind(&identifier.normalized_value)
+        .bind(identifier.confidence)
+        .bind(opt_uuid_text(identifier.source_id))
+        .bind(rfc3339(identifier.first_seen))
+        .bind(rfc3339(identifier.last_seen))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_entity_identifier(
+        &self,
+        id: EntityIdentifierId,
+    ) -> Result<Option<EntityIdentifier>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM entity_identifiers WHERE id = ?",
+            id,
+            mapping::entity_identifier,
+        )
+        .await
+    }
+
+    async fn list_entity_identifiers_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<EntityIdentifier>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM entity_identifiers WHERE entity_id = ?1 ORDER BY id ASC LIMIT ?2",
+        )
+        .bind(uuid_text(entity_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::entity_identifier).collect()
+    }
+
+    async fn put_resolution_candidate(
+        &self,
+        candidate: &ResolutionCandidate,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO resolution_candidates (
+                id, entity_a_id, entity_b_id, score, method, evidence, status,
+                created_at, reviewed_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                entity_a_id = excluded.entity_a_id,
+                entity_b_id = excluded.entity_b_id,
+                score = excluded.score,
+                method = excluded.method,
+                evidence = excluded.evidence,
+                status = excluded.status,
+                created_at = excluded.created_at,
+                reviewed_at = excluded.reviewed_at
+            "#,
+        )
+        .bind(uuid_text(candidate.id))
+        .bind(uuid_text(candidate.entity_a_id))
+        .bind(uuid_text(candidate.entity_b_id))
+        .bind(candidate.score)
+        .bind(&candidate.method)
+        .bind(json_text(&candidate.evidence))
+        .bind(encode_enum(&candidate.status)?)
+        .bind(rfc3339(candidate.created_at))
+        .bind(opt_rfc3339(candidate.reviewed_at))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_resolution_candidate(
+        &self,
+        id: ResolutionCandidateId,
+    ) -> Result<Option<ResolutionCandidate>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM resolution_candidates WHERE id = ?",
+            id,
+            mapping::resolution_candidate,
+        )
+        .await
+    }
+
+    async fn list_resolution_candidates(
+        &self,
+        status: Option<ResolutionStatus>,
+        after: Option<ResolutionCandidateId>,
+        limit: u32,
+    ) -> Result<Vec<ResolutionCandidate>, StorageError> {
+        let status = status.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM resolution_candidates
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR status = ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(status)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::resolution_candidate).collect()
+    }
+
+    async fn put_merge_history(&self, history: &MergeHistory) -> Result<(), StorageError> {
+        let repointed = serde_json::to_string(&history.repointed_references).map_err(|err| {
+            StorageError::Unknown {
+                backend: "sqlite",
+                message: format!("序列化 merge_history.repointed_references 失敗：{err}"),
+            }
+        })?;
+        sqlx::query(
+            r#"
+            INSERT INTO merge_history (
+                id, survivor_id, merged_id, reason, operator, timestamp,
+                repointed_references, undone_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                survivor_id = excluded.survivor_id,
+                merged_id = excluded.merged_id,
+                reason = excluded.reason,
+                operator = excluded.operator,
+                timestamp = excluded.timestamp,
+                repointed_references = excluded.repointed_references,
+                undone_at = excluded.undone_at
+            "#,
+        )
+        .bind(uuid_text(history.id))
+        .bind(uuid_text(history.survivor_id))
+        .bind(uuid_text(history.merged_id))
+        .bind(&history.reason)
+        .bind(&history.operator)
+        .bind(rfc3339(history.timestamp))
+        .bind(repointed)
+        .bind(opt_rfc3339(history.undone_at))
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_merge_history(
+        &self,
+        id: MergeHistoryId,
+    ) -> Result<Option<MergeHistory>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM merge_history WHERE id = ?",
+            id,
+            mapping::merge_history,
+        )
+        .await
+    }
+
+    async fn list_merge_history_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<MergeHistory>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM merge_history
+            WHERE survivor_id = ?1 OR merged_id = ?1
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(uuid_text(entity_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::merge_history).collect()
+    }
+
+    async fn put_failed_event(&self, event: &FailedEvent) -> Result<FailedEvent, StorageError> {
+        // 契約與 PG 相同：自然鍵是 (topic, partition, offset)，衝突時 attempt_count 累加，
+        // id / first_seen 保留既有列，回傳實際存下來的那一列。
+        // SQLite 從 3.35 起支援 RETURNING，sqlx 內建的版本高於這個門檻。
+        let row = sqlx::query(
+            r#"
+            INSERT INTO failed_events (
+                id, topic, partition, "offset", consumer_group, failure_reason,
+                attempt_count, envelope, first_seen, last_seen, replayed_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (topic, partition, "offset") DO UPDATE SET
+                consumer_group = excluded.consumer_group,
+                failure_reason = excluded.failure_reason,
+                attempt_count = failed_events.attempt_count + 1,
+                envelope = excluded.envelope,
+                last_seen = excluded.last_seen,
+                replayed_at = excluded.replayed_at
+            RETURNING *
+            "#,
+        )
+        .bind(uuid_text(event.id))
+        .bind(&event.topic)
+        .bind(i64::from(event.partition))
+        .bind(event.offset)
+        .bind(&event.consumer_group)
+        .bind(&event.failure_reason)
+        .bind(i64::from(event.attempt_count))
+        .bind(json_text(&event.envelope))
+        .bind(rfc3339(event.first_seen))
+        .bind(rfc3339(event.last_seen))
+        .bind(opt_rfc3339(event.replayed_at))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        mapping::failed_event(&row)
+    }
+
+    async fn get_failed_event(
+        &self,
+        id: FailedEventId,
+    ) -> Result<Option<FailedEvent>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM failed_events WHERE id = ?",
+            id,
+            mapping::failed_event,
+        )
+        .await
+    }
+
+    async fn list_failed_events(
+        &self,
+        after: Option<FailedEventId>,
+        limit: u32,
+    ) -> Result<Vec<FailedEvent>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM failed_events
+            WHERE (?1 IS NULL OR id < ?1)
+            ORDER BY id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::failed_event).collect()
+    }
+
+    async fn mark_replayed(
+        &self,
+        id: FailedEventId,
+        replayed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query("UPDATE failed_events SET replayed_at = ?2 WHERE id = ?1")
+            .bind(uuid_text(id))
+            .bind(rfc3339(replayed_at))
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
     }
 }

@@ -167,6 +167,30 @@ async fn run() -> Result<(), String> {
         None => missing.push("redpanda"),
     }
 
+    // Neo4j（V0.2 Phase 0b）。與 Redis 同樣的定位：V0.2 Phase 0b 還沒有任何
+    // API 路由讀它，但運維要看得到圖投影的後端活著。
+    //
+    // 空字串 = 刻意未設定（例如還沒起 Neo4j 的環境），列進 not_configured
+    // 而不是每次 health 都去連一個不存在的位址然後報 down。
+    // 這裡**不建立 Bolt 連線**，只有 HTTP 探活，理由見 GraphCheck 的文件註解。
+    let graph_url = cfg.storage.graph.http_url.trim();
+    if graph_url.is_empty() {
+        tracing::info!("[storage.graph].http_url 未設定；GET /api/v1/ops/health 會標示為未設定");
+        missing.push("neo4j");
+    } else {
+        match core_api::GraphCheck::new(graph_url) {
+            Some(check) => health_checks.push(Arc::new(check)),
+            None => {
+                tracing::warn!(
+                    url = graph_url,
+                    "Neo4j 探針建立失敗（HTTP client 無法建立）；\
+                     GET /api/v1/ops/health 會標示為未設定"
+                );
+                missing.push("neo4j");
+            }
+        }
+    }
+
     // `GET /api/v1/ops/queues`。與 producer 分開建：producer 連不上時 lag 探針
     // 仍然值得建起來（它自己會回報查不到），但 broker 位址設定錯誤要在這裡就講清楚。
     let queues = match core_events::GroupLagProbe::new(&cfg.broker.brokers, LAG_PROBE_TIMEOUT) {

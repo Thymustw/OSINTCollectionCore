@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use core_model::{
-    Collection, Connector, Document, DocumentType, DuplicateGroup, Entity, EntityExtraction,
-    EntityType, Event, Job, JobStatus, NetworkRule, Provenance, RawEvidence, Relationship,
-    RelationshipEvidence, RelationshipType, Source, SourceType,
+    Collection, Connector, Document, DocumentType, DuplicateGroup, Entity, EntityAlias,
+    EntityExtraction, EntityIdentifier, EntityType, Event, FailedEvent, Job, JobStatus,
+    MergeHistory, NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence,
+    RelationshipType, RepointedReference, ResolutionCandidate, ResolutionStatus, Source,
+    SourceType,
 };
 use serde_json::json;
 use url::Url;
@@ -621,6 +623,9 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
     );
     assert_extraction_queries(store, &extraction).await?;
 
+    assert_v0_2_resolution_queries(store, &entity, source.id).await?;
+    assert_v0_2_failed_events(store).await?;
+
     let missing = Uuid::now_v7();
     if store.get_document(missing).await?.is_some() {
         return Err(StorageError::Unknown {
@@ -984,6 +989,511 @@ async fn assert_dedup_queries<S: RelationalStore>(
                 "list_duplicate_groups_by_canonical 應回 1 筆相符 group，實際 {} 筆",
                 by_canonical.len()
             ),
+        });
+    }
+    Ok(())
+}
+
+/// V0.2 §3／§4／§5／§7：alias／identifier／resolution candidate／merge history。
+///
+/// 這裡驗的重點不是「寫得進去讀得回來」，而是**四個做錯了不會報錯的地方**：
+///
+/// 1. `(namespace, normalized_value)` 的唯一鍵真的存在——沒有它，兩個 Entity
+///    可以各自宣稱同一個 domain，「exact identifier」就不再是合併依據。
+/// 2. `entity_a_id < entity_b_id` 的 CHECK 真的擋得住——沒有它，同一對候選
+///    會存成兩列，Review 畫面出現重複項目而且不會有任何錯誤。
+/// 3. `(a, b, method)` 的唯一鍵真的存在——沒有它，每跑一次 resolver 就長一批新列。
+/// 4. `repointed_references` 原樣讀得回來——它是 undo 的**全部**依據，
+///    少一筆就少還原一個參照（SPEC Acceptance C）。
+async fn assert_v0_2_resolution_queries<S: RelationalStore>(
+    store: &S,
+    entity: &Entity,
+    source_id: Uuid,
+) -> Result<(), StorageError> {
+    let run = Uuid::now_v7();
+
+    // --- §3 alias ---------------------------------------------------------
+    let alias = EntityAlias {
+        id: Uuid::now_v7(),
+        entity_id: entity.id,
+        alias: format!("conformance-alias-{run}"),
+        alias_type: "localized_name".into(),
+        source_id: Some(source_id),
+        confidence: 0.75,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+    };
+    store.put_entity_alias(&alias).await?;
+    assert_eq_debug(
+        "entity_alias",
+        &alias,
+        &store
+            .get_entity_alias(alias.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 entity_alias 讀不到".into(),
+            })?,
+    );
+    // source_id 可為 NULL——resolver 自己推導的 alias 沒有來源可指。
+    let derived = EntityAlias {
+        id: Uuid::now_v7(),
+        source_id: None,
+        ..alias.clone()
+    };
+    store.put_entity_alias(&derived).await?;
+    assert_eq_debug(
+        "entity_alias_without_source",
+        &derived,
+        &store.get_entity_alias(derived.id).await?.expect("alias"),
+    );
+
+    let listed = store.list_entity_aliases_by_entity(entity.id, 100).await?;
+    if !listed.iter().any(|a| a.id == alias.id) {
+        return Err(StorageError::NotFound {
+            message: "list_entity_aliases_by_entity 查不到剛寫入的 alias".into(),
+        });
+    }
+    if listed.iter().any(|a| a.entity_id != entity.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_entity_aliases_by_entity 回了不屬於該 entity 的列".into(),
+        });
+    }
+    if !store
+        .list_entity_aliases_by_entity(Uuid::now_v7(), 100)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_entity_aliases_by_entity 對不存在的 entity_id 回了資料".into(),
+        });
+    }
+
+    // --- §4 identifier ----------------------------------------------------
+    let namespace = format!("conformance-ns-{run}");
+    let identifier = EntityIdentifier {
+        id: Uuid::now_v7(),
+        entity_id: entity.id,
+        namespace: namespace.clone(),
+        value: "Example.COM".into(),
+        normalized_value: "example.com".into(),
+        confidence: 0.95,
+        source_id: None,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+    };
+    store.put_entity_identifier(&identifier).await?;
+    assert_eq_debug(
+        "entity_identifier",
+        &identifier,
+        &store
+            .get_entity_identifier(identifier.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 entity_identifier 讀不到".into(),
+            })?,
+    );
+    let listed = store
+        .list_entity_identifiers_by_entity(entity.id, 100)
+        .await?;
+    if !listed.iter().any(|i| i.id == identifier.id) {
+        return Err(StorageError::NotFound {
+            message: "list_entity_identifiers_by_entity 查不到剛寫入的識別碼".into(),
+        });
+    }
+
+    // 同一個 (namespace, normalized_value) 換一個 id 再寫 → 必須是 Conflict。
+    // 這個衝突是 resolution 的訊號，不是可以忽略的雜訊（見 trait 說明）。
+    let clashing = EntityIdentifier {
+        id: Uuid::now_v7(),
+        ..identifier.clone()
+    };
+    match store.put_entity_identifier(&clashing).await {
+        Err(StorageError::Conflict { .. }) => {}
+        other => {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "(namespace, normalized_value) 應為 UNIQUE，重複寫入卻得到 {other:?}。\
+                     少了這個唯一鍵，兩個 Entity 可以各自宣稱同一個識別碼，\
+                     SPEC §6 的 exact identifier 就不再是合併依據"
+                ),
+            });
+        }
+    }
+    // 同一個值換 namespace 必須寫得進去——namespace 存在的意義就是把
+    // 「40 位 hex 是 SHA-1 還是 git commit」這種歧義分開（V0.1 報告 T10）。
+    let other_namespace = EntityIdentifier {
+        id: Uuid::now_v7(),
+        namespace: format!("{namespace}-other"),
+        ..identifier.clone()
+    };
+    store.put_entity_identifier(&other_namespace).await?;
+
+    // --- §5 resolution candidate -----------------------------------------
+    // 需要第二個 Entity。normalized_name 必須含 run-specific UUID，理由同上面
+    // 的 entity fixture：(entity_type, normalized_name) 是 UNIQUE。
+    let other_name = format!("conformance-entity-{run}");
+    let other_entity = Entity {
+        id: Uuid::now_v7(),
+        entity_type: entity.entity_type,
+        name: other_name.clone(),
+        normalized_name: other_name.to_ascii_lowercase(),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        attributes: json!({}),
+    };
+    store.put_entity(&other_entity).await?;
+
+    let (a, b) = ResolutionCandidate::ordered_pair(entity.id, other_entity.id);
+    let candidate = ResolutionCandidate {
+        id: Uuid::now_v7(),
+        entity_a_id: a,
+        entity_b_id: b,
+        score: 0.91,
+        method: "exact_identifier".into(),
+        evidence: json!({"namespace": namespace, "normalized_value": "example.com"}),
+        status: ResolutionStatus::Pending,
+        created_at: fixture_ts(),
+        reviewed_at: None,
+    };
+    store.put_resolution_candidate(&candidate).await?;
+    assert_eq_debug(
+        "resolution_candidate",
+        &candidate,
+        &store
+            .get_resolution_candidate(candidate.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 resolution_candidate 讀不到".into(),
+            })?,
+    );
+
+    // CHECK constraint：反過來寫必須被擋下。擋不住的話同一對會有兩列。
+    let reversed = ResolutionCandidate {
+        id: Uuid::now_v7(),
+        entity_a_id: b,
+        entity_b_id: a,
+        ..candidate.clone()
+    };
+    match store.put_resolution_candidate(&reversed).await {
+        Err(StorageError::ConstraintViolation { .. }) => {}
+        other => {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "entity_a_id < entity_b_id 的 CHECK 應擋下反向的候選對，實際得到 {other:?}。\
+                     候選對是無向的，(A,B) 與 (B,A) 存成兩列會讓 Review 出現重複項目"
+                ),
+            });
+        }
+    }
+
+    // UNIQUE (entity_a_id, entity_b_id, method)：換 id 重寫同一組必須是 Conflict。
+    // 少了它，每跑一次 resolver 就長一批新列。
+    let duplicate_method = ResolutionCandidate {
+        id: Uuid::now_v7(),
+        ..candidate.clone()
+    };
+    match store.put_resolution_candidate(&duplicate_method).await {
+        Err(StorageError::Conflict { .. }) => {}
+        other => {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "(entity_a_id, entity_b_id, method) 應為 UNIQUE，實際得到 {other:?}"
+                ),
+            });
+        }
+    }
+    // 換一個 method 則是不同的候選，必須寫得進去。
+    let other_method = ResolutionCandidate {
+        id: Uuid::now_v7(),
+        method: "normalized_name".into(),
+        ..candidate.clone()
+    };
+    store.put_resolution_candidate(&other_method).await?;
+
+    // cursor + status 過濾。
+    let page = store
+        .list_resolution_candidates(None, Some(next_uuid(other_method.id)), 10)
+        .await?;
+    assert_cursor_page(
+        "list_resolution_candidates",
+        other_method.id,
+        page.iter().map(|i| i.id),
+    )?;
+    let pending = store
+        .list_resolution_candidates(
+            Some(ResolutionStatus::Pending),
+            Some(next_uuid(other_method.id)),
+            10,
+        )
+        .await?;
+    assert_cursor_page(
+        "list_resolution_candidates(pending)",
+        other_method.id,
+        pending.iter().map(|i| i.id),
+    )?;
+    if pending
+        .iter()
+        .any(|c| c.status != ResolutionStatus::Pending)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_resolution_candidates 回了其他狀態的候選".into(),
+        });
+    }
+    // 反向斷言：少了它，一個完全忽略 status 參數的實作也會通過上面那一條。
+    if store
+        .list_resolution_candidates(
+            Some(ResolutionStatus::Rejected),
+            Some(next_uuid(other_method.id)),
+            10,
+        )
+        .await?
+        .iter()
+        .any(|c| c.id == other_method.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message:
+                "list_resolution_candidates(Rejected) 回了 pending 的候選——status 參數沒有生效"
+                    .into(),
+        });
+    }
+    if store.list_resolution_candidates(None, None, 0).await?.len() != 1 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_resolution_candidates(limit=0) 應夾成 1 筆，limit 沒被夾住等於無界查詢"
+                .into(),
+        });
+    }
+
+    // --- §7 merge history -------------------------------------------------
+    let history = MergeHistory {
+        id: Uuid::now_v7(),
+        survivor_id: entity.id,
+        merged_id: other_entity.id,
+        reason: format!("conformance merge {run}"),
+        operator: "conformance@example.invalid".into(),
+        timestamp: fixture_ts(),
+        repointed_references: vec![
+            RepointedReference {
+                table: "relationships".into(),
+                row_id: Uuid::now_v7(),
+                column: "target_object_id".into(),
+                previous_value: other_entity.id,
+            },
+            RepointedReference {
+                table: "entity_extractions".into(),
+                row_id: Uuid::now_v7(),
+                column: "entity_id".into(),
+                previous_value: other_entity.id,
+            },
+        ],
+        undone_at: None,
+    };
+    store.put_merge_history(&history).await?;
+    // repointed_references 是 undo 的全部依據：少一筆或順序錯掉都會少還原一個參照。
+    assert_eq_debug(
+        "merge_history",
+        &history,
+        &store
+            .get_merge_history(history.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 merge_history 讀不到".into(),
+            })?,
+    );
+
+    // 兩端都要查得到：「這個 canonical 吃掉了誰」與「這個 id 被併去哪了」。
+    for (label, entity_id) in [
+        ("survivor_id", history.survivor_id),
+        ("merged_id", history.merged_id),
+    ] {
+        let rows = store.list_merge_history_by_entity(entity_id, 100).await?;
+        if !rows.iter().any(|h| h.id == history.id) {
+            return Err(StorageError::NotFound {
+                message: format!(
+                    "list_merge_history_by_entity 從 {label} 這一端查不到剛寫入的 merge。\
+                     只支援單邊等於「舊 entity id 被併去哪了」查不到"
+                ),
+            });
+        }
+    }
+
+    // Acceptance C：undo 之後這一列還在，只是多了 undone_at，
+    // repointed_references 必須原封不動——否則歷史 evidence 就遺失了。
+    let undone = MergeHistory {
+        undone_at: Some(fixture_ts()),
+        ..history.clone()
+    };
+    store.put_merge_history(&undone).await?;
+    let after_undo =
+        store
+            .get_merge_history(history.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "標記 undone 之後 merge_history 讀不到了——歷史不可以消失".into(),
+            })?;
+    assert_eq_debug("merge_history_undone", &undone, &after_undo);
+    if !store
+        .list_merge_history_by_entity(history.survivor_id, 100)
+        .await?
+        .iter()
+        .any(|h| h.id == history.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "已撤銷的 merge 不該從 list_merge_history_by_entity 消失（Acceptance C）"
+                .into(),
+        });
+    }
+
+    if !store
+        .list_merge_history_by_entity(Uuid::now_v7(), 100)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_merge_history_by_entity 對不存在的 entity_id 回了資料".into(),
+        });
+    }
+    Ok(())
+}
+
+/// ADR-008 的 `failed_events`：自然鍵 upsert、`attempt_count` 累加、重放標記。
+///
+/// 這裡最關鍵的一條是**回傳列的 `id` 是既有列的 id，不是傳進去那個**。
+/// 若 adapter 只回 `()`，呼叫端會拿著自己產生的 id 去查而永遠查不到，
+/// 表面上看起來就只是「DLQ 裡沒有這筆」——正是 ADR-008 想避免的靜默損失。
+async fn assert_v0_2_failed_events<S: RelationalStore>(store: &S) -> Result<(), StorageError> {
+    let run = Uuid::now_v7();
+    // topic 帶 run id：共用的 Postgres 上有其他測試的殘留列，
+    // (topic, partition, offset) 撞到的話測的就不是自己寫的那一筆。
+    let topic = format!("conformance.failed.{run}");
+    let first = FailedEvent {
+        id: Uuid::now_v7(),
+        topic: topic.clone(),
+        partition: 2,
+        // 超過 i32 的 offset：欄位若是 32 位會在這裡溢位。
+        offset: 4_294_967_400,
+        consumer_group: "conformance-group".into(),
+        failure_reason: "payload 缺少 document_id".into(),
+        attempt_count: 1,
+        envelope: json!({"id": run.to_string(), "event_type": "object.normalized"}),
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        replayed_at: None,
+    };
+    let stored = store.put_failed_event(&first).await?;
+    assert_eq_debug("failed_event", &first, &stored);
+
+    // 同一則事件再次失敗：換一個 id、換 last_seen、attempt_count 故意傳 1。
+    let again = FailedEvent {
+        id: Uuid::now_v7(),
+        failure_reason: "第二次仍然缺少 document_id".into(),
+        attempt_count: 1,
+        first_seen: fixture_ts() + chrono::Duration::seconds(60),
+        last_seen: fixture_ts() + chrono::Duration::seconds(60),
+        ..first.clone()
+    };
+    let merged = store.put_failed_event(&again).await?;
+    if merged.id != first.id {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "put_failed_event 應以 (topic, partition, offset) 為自然鍵沿用既有列，\
+                 實際回了新 id {}（原本是 {}）",
+                merged.id, first.id
+            ),
+        });
+    }
+    if merged.attempt_count != 2 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "attempt_count 應由資料庫 +1（1 → 2），實際是 {}。\
+                 用傳入值覆寫的話「試了幾次」永遠停在 1",
+                merged.attempt_count
+            ),
+        });
+    }
+    if merged.first_seen != first.first_seen {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "first_seen 應保留既有列的值（第一次失敗的時間），不可被覆寫".into(),
+        });
+    }
+    if merged.last_seen != again.last_seen || merged.failure_reason != again.failure_reason {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "last_seen／failure_reason 應以本次傳入值覆寫".into(),
+        });
+    }
+    // 只有一列，不是兩列。
+    let stored_row =
+        store
+            .get_failed_event(first.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "get_failed_event 讀不到既有列".into(),
+            })?;
+    assert_eq_debug("failed_event_merged", &merged, &stored_row);
+    if store.get_failed_event(again.id).await?.is_some() {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "同一則事件不該產生第二列——DLQ 的筆數會失去意義".into(),
+        });
+    }
+
+    let page = store
+        .list_failed_events(Some(next_uuid(first.id)), 10)
+        .await?;
+    assert_cursor_page("list_failed_events", first.id, page.iter().map(|i| i.id))?;
+
+    // 重放標記。
+    let replayed_at = fixture_ts() + chrono::Duration::seconds(120);
+    if !store.mark_replayed(first.id, replayed_at).await? {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "mark_replayed 對既有列應回 true".into(),
+        });
+    }
+    let after = store
+        .get_failed_event(first.id)
+        .await?
+        .expect("failed_event");
+    if after.replayed_at != Some(replayed_at) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "mark_replayed 之後 replayed_at 應為呼叫端傳入的時間，實際是 {:?}",
+                after.replayed_at
+            ),
+        });
+    }
+    // 已重放的列仍要列得出來——「上次那批補回去了沒」只能靠它回答。
+    if !store
+        .list_failed_events(Some(next_uuid(first.id)), 10)
+        .await?
+        .iter()
+        .any(|e| e.id == first.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "已重放的 failed event 不該從 list_failed_events 消失".into(),
+        });
+    }
+    if store.mark_replayed(Uuid::now_v7(), replayed_at).await? {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "mark_replayed 對不存在的 id 應回 false".into(),
         });
     }
     Ok(())
