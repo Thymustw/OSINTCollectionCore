@@ -212,6 +212,65 @@ impl EventConsumer {
         }
     }
 
+    /// 這個 consumer group 在已指派 partition 上的總 lag（high watermark − 目前位置）。
+    ///
+    /// # 給誰用
+    ///
+    /// 高吞吐 consumer 的 backpressure 判斷（CLAUDE.md §6）。也寫進
+    /// `osint_queue_depth` gauge，讓上游採集端知道下游追不上。
+    ///
+    /// # 為什麼要處理 runtime flavor
+    ///
+    /// librdkafka 的 `fetch_watermarks` 是**同步阻塞**呼叫（會發一次網路請求）。
+    /// 直接在 Tokio executor thread 上跑會擋住同一條 thread 上的所有 task，
+    /// 包含 health endpoint。`block_in_place` 可以把當前 thread 交還給 runtime，
+    /// 但它在 current-thread runtime 上會 **panic**——`#[tokio::test]` 預設就是
+    /// current-thread，所以必須先問 runtime 是哪一種。
+    ///
+    /// 尚未指派到任何 partition（剛啟動、還在 rebalance）時回 `Ok(0)`：
+    /// 那不是錯誤，而是「還沒有東西可以落後」。
+    pub fn consumer_lag(&self, timeout: Duration) -> Result<u64, EventError> {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        let compute = || self.consumer_lag_blocking(timeout);
+        match Handle::try_current().map(|handle| handle.runtime_flavor()) {
+            Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(compute),
+            _ => compute(),
+        }
+    }
+
+    fn consumer_lag_blocking(&self, timeout: Duration) -> Result<u64, EventError> {
+        let assignment = self.inner.assignment().map_err(|err| EventError::Commit {
+            message: format!("查詢 partition 指派失敗：{err}"),
+        })?;
+        let positions = self.inner.position().map_err(|err| EventError::Commit {
+            message: format!("查詢 consumer 位置失敗：{err}"),
+        })?;
+        let mut lag = 0_u64;
+        for element in assignment.elements() {
+            let (_, high) = self
+                .inner
+                .fetch_watermarks(element.topic(), element.partition(), timeout)
+                .map_err(|err| EventError::Commit {
+                    message: format!(
+                        "查詢 {}[{}] 的 watermark 失敗：{err}",
+                        element.topic(),
+                        element.partition()
+                    ),
+                })?;
+            let current = positions
+                .find_partition(element.topic(), element.partition())
+                .and_then(|p| match p.offset() {
+                    Offset::Offset(value) => Some(value),
+                    // Invalid／Beginning／Stored 都代表「還沒讀過任何東西」，
+                    // 這時 lag 就是整個 partition 的長度。用 0 當起點。
+                    _ => None,
+                })
+                .unwrap_or(0);
+            lag = lag.saturating_add(high.saturating_sub(current).max(0) as u64);
+        }
+        Ok(lag)
+    }
+
     /// 提交上一則成功解析的 envelope 的 offset（offset+1）。沒有上一則時是 no-op。
     pub fn commit_last(&self) -> Result<(), EventError> {
         let stored = self

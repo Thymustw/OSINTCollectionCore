@@ -58,6 +58,7 @@ async fn run(cli: Cli) -> Result<bool, CliError> {
         Command::Documents { action } => commands::documents::run(&ctx, action).await?,
         Command::Entities { action } => commands::entities::run(&ctx, action).await?,
         Command::Jobs { action } => commands::jobs::run(&ctx, action).await?,
+        Command::Search(args) => commands::search::run(&ctx, args).await?,
         Command::Health => return commands::health::run(&ctx).await,
     }
     Ok(true)

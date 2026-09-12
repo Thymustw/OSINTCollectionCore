@@ -67,6 +67,11 @@ pub enum Command {
         #[command(subcommand)]
         action: JobAction,
     },
+    /// 搜尋已索引的 Document（SPEC §18）
+    ///
+    /// 直接查 OpenSearch，不經 core-api——與其他子命令一致。
+    /// 查詢語法（片語、AND/OR/NOT、括號）見 `docs/user/search.md`。
+    Search(SearchArgs),
     /// 對 PostgreSQL／MinIO／Redis／OpenSearch／Redpanda 各做一次 health check
     Health,
 }
@@ -166,6 +171,59 @@ pub enum EntityAction {
 pub enum JobAction {
     /// 列出 Job
     List(ListArgs),
+}
+
+/// `osint-cli search` 的參數。八種搜尋（SPEC §18）各對應一個。
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// 查詢字串。支援 `"片語"`、`AND`／`OR`／`NOT`（必須全大寫）與括號。
+    ///
+    /// 留空時只用下面的過濾條件（例如只給 --source 就是列出該來源的文件）。
+    #[arg(default_value = "")]
+    pub query: String,
+
+    /// 只找這個 Source 底下的文件
+    #[arg(long, value_name = "SOURCE_ID")]
+    pub source: Option<Uuid>,
+
+    /// 只找這個 Connector 產生的文件
+    #[arg(long, value_name = "CONNECTOR_ID")]
+    pub connector: Option<Uuid>,
+
+    /// 只找提到這個實體的文件。格式 `型別:名稱`（例如 `vulnerability:CVE-2026-0001`）
+    /// 或只給名稱（例如 `example.com`）。名稱大小寫不敏感。
+    #[arg(long, value_name = "TYPE:NAME")]
+    pub entity: Option<String>,
+
+    /// 起始時間。`YYYY-MM-DD` 或完整 RFC3339（`2026-09-10T12:00:00Z`）
+    #[arg(long, value_name = "DATE")]
+    pub from: Option<String>,
+
+    /// 結束時間。格式同 --from
+    #[arg(long, value_name = "DATE")]
+    pub to: Option<String>,
+
+    /// --from/--to 比對哪個時間欄位。
+    /// `effective`（預設，published 有值就用它、否則用 observed）／`published`／`observed`
+    #[arg(long, value_name = "FIELD", default_value = "effective")]
+    pub date_field: String,
+
+    /// 只找這個語言（例如 `en`／`zh`）
+    #[arg(long, value_name = "LANG")]
+    pub lang: Option<String>,
+
+    /// 只找這個物件型別（`article`／`web_page`／`post`／`report`／`advisory`…）
+    #[arg(long = "type", value_name = "OBJECT_TYPE")]
+    pub object_type: Option<String>,
+
+    /// 連重複文件也列出來。預設不列——偵錯用：正常情況下 index 裡沒有 duplicate，
+    /// 真的查到東西代表有 duplicate 漏進索引。
+    #[arg(long)]
+    pub include_duplicates: bool,
+
+    /// 最多列出幾筆（上限 100）
+    #[arg(long, short = 'n', default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=100))]
+    pub limit: u32,
 }
 
 #[cfg(test)]

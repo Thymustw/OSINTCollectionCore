@@ -14,6 +14,7 @@ pub use capability::{CapabilityDescriptor, StorageAdapter};
 pub use error::StorageError;
 pub use health::{HealthProvider, StorageHealth};
 pub use traits::{
-    BulkIndexResult, CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore, RelationalStore,
-    SearchDocument, SearchHit, SearchHits, SearchQuery, SearchStore, SimhashCandidate,
+    BulkFailure, BulkIndexResult, CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore,
+    QueryExpr, RelationalStore, SearchDocument, SearchField, SearchFilter, SearchHit, SearchHits,
+    SearchQuery, SearchStore, SimhashCandidate, SortField, StructuredSearch,
 };

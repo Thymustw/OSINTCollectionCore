@@ -341,7 +341,12 @@ pub struct SearchDocument {
     pub body: Value,
 }
 
-/// 簡易全文查詢。V0.1 只支援 `query_string`；語法細節留給 adapter。
+/// 簡易全文查詢。語法細節留給 adapter，只給 conformance 與臨時查詢用。
+///
+/// ⚠️ **不要拿這個型別接使用者輸入**。`query_string` 會被 adapter 原樣交給後端的
+/// 查詢語言（OpenSearch 是 `query_string`），使用者可以用 `欄位名:值`、`*`、`~`
+/// 存取任意欄位或做 wildcard DoS。面向使用者的搜尋一律走 [`StructuredSearch`]——
+/// 那條路徑沒有任何字串會進到查詢語言裡。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub index: String,
@@ -367,6 +372,16 @@ pub struct SearchHit {
     pub id: String,
     pub score: Option<f64>,
     pub source: Value,
+    /// 後端回傳的排序鍵。cursor pagination（OpenSearch 的 `search_after`）要原樣送回去。
+    ///
+    /// **不能用 hit 的順序或 `from` 偏移量代替。** `from/size` 深分頁在每個 shard 上都要
+    /// 取回 `from + size` 筆再丟掉前面的，翻到第 1000 頁時等於每個 shard 排序 20000 筆；
+    /// `search_after` 是「從這個排序鍵之後繼續」，成本與頁碼無關。
+    #[serde(default)]
+    pub sort: Vec<Value>,
+    /// 命中片段（欄位名 → 片段列）。查詢沒要求 highlight 時是空的。
+    #[serde(default)]
+    pub highlights: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -375,10 +390,142 @@ pub struct SearchHits {
     pub hits: Vec<SearchHit>,
 }
 
+/// Bulk 寫入中單筆失敗的細節。
+///
+/// **存在的理由是「不要靜默丟資料」。** 只回一個 `errors: 3` 沒辦法重試，也沒辦法判斷
+/// 是暫時性（429 佇列滿）還是永久性（mapping 衝突）——呼叫端只能整批重送或整批放棄。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BulkFailure {
+    /// 失敗那筆的 document id。
+    pub id: String,
+    /// 後端回的 HTTP 狀態碼（OpenSearch bulk 每筆 item 都有）。
+    pub status: u16,
+    /// 後端回的原因字串（已經過 [`StorageError::sanitize`]）。
+    pub reason: String,
+}
+
+impl BulkFailure {
+    /// 這筆失敗值不值得重試。
+    ///
+    /// 429（佇列滿）／503（暫時不可用）／502／504 是暫時性的，退避後重送有意義。
+    /// 400（mapping 衝突、欄位型別不符）重送一百次還是同樣的結果——那要進 DLQ 讓人看，
+    /// 不是在迴圈裡一直重試。
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self.status, 429 | 502 | 503 | 504)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BulkIndexResult {
     pub indexed: u32,
     pub errors: u32,
+    /// 每一筆失敗的細節。長度應等於 `errors`。
+    #[serde(default)]
+    pub failures: Vec<BulkFailure>,
+}
+
+impl BulkIndexResult {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            indexed: 0,
+            errors: 0,
+            failures: Vec::new(),
+        }
+    }
+}
+
+/// 全文條件的後端中立語法樹。
+///
+/// # 為什麼是 AST 而不是字串
+///
+/// 使用者輸入的字串**永遠不會**被交給後端的查詢語言。呼叫端先把它 parse 成這棵樹，
+/// adapter 再把樹翻成後端查詢。這讓 injection 在結構上不可能發生：
+/// `title:*` 只會變成一個 [`QueryExpr::Term`]，被當作要比對的文字，
+/// 而不是「欄位 title 的萬用字元查詢」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum QueryExpr {
+    /// 單一詞彙。由 analyzer 斷詞後比對。
+    Term(String),
+    /// 片語。詞序必須相符。
+    Phrase(String),
+    /// 全部都要命中。
+    And(Vec<QueryExpr>),
+    /// 至少命中一個。
+    Or(Vec<QueryExpr>),
+    /// 不可命中。
+    Not(Box<QueryExpr>),
+}
+
+/// 要查的全文欄位與權重。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchField {
+    pub name: String,
+    pub boost: f32,
+}
+
+impl SearchField {
+    #[must_use]
+    pub fn new(name: impl Into<String>, boost: f32) -> Self {
+        Self {
+            name: name.into(),
+            boost,
+        }
+    }
+}
+
+/// 結構化過濾條件。不計分，只縮小候選集合。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchFilter {
+    /// `field` 精確等於 `value`（keyword 欄位）。
+    Term { field: String, value: String },
+    /// `field` 落在 `[from, to]`（含端點）。兩端都可省略。
+    DateRange {
+        field: String,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// 巢狀物件過濾：`path` 底下**同一個元素**要同時滿足 `terms` 的全部條件。
+    ///
+    /// 「同一個元素」是重點。entities 若用扁平的 keyword 陣列存，
+    /// 查「type=vulnerability 且 name=example.com」會命中「有漏洞、也有網域」的文件——
+    /// 兩個條件落在不同元素上。nested 才能保證是同一個 entity。
+    Nested {
+        path: String,
+        terms: Vec<(String, String)>,
+    },
+    /// `field` 必須不存在（或為 null）。搜尋結果排除 duplicate 用。
+    Missing { field: String },
+}
+
+/// 排序欄位。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortField {
+    pub field: String,
+    pub ascending: bool,
+}
+
+/// 後端中立的結構化搜尋請求。面向使用者的搜尋一律走這條路徑。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StructuredSearch {
+    pub index: String,
+    /// 全文條件。`None` 代表只靠 `filters`（例如「列出這個 source 的全部文件」）。
+    pub expression: Option<QueryExpr>,
+    /// 全文條件要查哪些欄位。`expression` 是 `None` 時忽略。
+    pub fields: Vec<SearchField>,
+    pub filters: Vec<SearchFilter>,
+    /// 要回幾筆。呼叫端負責夾上限，adapter 會再夾一次。
+    pub size: u32,
+    /// 上一頁最後一筆的 [`SearchHit::sort`]。`None` 代表第一頁。
+    pub search_after: Option<Vec<Value>>,
+    /// 排序鍵。**必須以一個唯一欄位收尾**（例如 document id），
+    /// 否則排序值相同的文件在翻頁時會漏掉或重複。
+    pub sort: Vec<SortField>,
+    /// 要產生命中片段的欄位。空的代表不做 highlight。
+    pub highlight_fields: Vec<String>,
 }
 
 /// 搜尋投影。V0.1 不包含 rebuild/checkpoint（那是 V0.2 `ProjectionStore`）。
@@ -389,7 +536,11 @@ pub trait SearchStore: HealthProvider {
         &self,
         documents: Vec<SearchDocument>,
     ) -> Result<BulkIndexResult, StorageError>;
+    /// 原始查詢字串。**只給 conformance 與運維臨時查詢用**，不要接使用者輸入
+    /// （理由見 [`SearchQuery`]）。
     async fn query(&self, query: SearchQuery) -> Result<SearchHits, StorageError>;
+    /// 結構化搜尋。面向使用者的路徑走這個。
+    async fn search(&self, query: StructuredSearch) -> Result<SearchHits, StorageError>;
     async fn delete(&self, index: &str, id: &str) -> Result<bool, StorageError>;
 }
 

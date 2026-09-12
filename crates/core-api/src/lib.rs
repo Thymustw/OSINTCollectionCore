@@ -9,6 +9,7 @@ mod pagination;
 mod rate_limit;
 mod ready;
 mod routes;
+mod search;
 mod state;
 
 pub use error::{ApiError, ErrorBody};
@@ -17,7 +18,8 @@ pub use pagination::{CursorPage, Pagination};
 pub use rate_limit::RateLimiter;
 pub use ready::{PostgresReady, ReadyCheck, ReadyProbe};
 pub use routes::router;
-pub use state::{AppState, AuthState, ImportState};
+pub use search::{EntitySummary, SearchHitBody, SearchResponse};
+pub use state::{AppState, AuthState, ImportState, SearchState};
 
 /// 不接下游的 readiness（測試／Postgres 掛掉時仍讓行程活著）。
 #[must_use]
@@ -47,6 +49,9 @@ pub fn test_app_parts(jwt: JwtService) -> (Router, MemoryAuditLog) {
         audit: Arc::new(audit.clone()),
         jobs: None,
         import: None,
+        // 測試 app 不接 OpenSearch：`POST /api/v1/search` 回 503。
+        // 認證／RBAC 的測試仍然有效——middleware 在 handler 之前就擋下來了。
+        search: None,
         ready: ready::ReadyProbe::always_ready(),
         rate_limit_per_second: 100,
         request_body_limit_bytes: 1_048_576,

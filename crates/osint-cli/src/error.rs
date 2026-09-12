@@ -20,6 +20,11 @@ pub enum CliError {
     )]
     ObjectStoreUnavailable { message: String },
 
+    #[error(
+        "連不上搜尋投影（OpenSearch）：{message}\n下一步：\n  1. 確認 `.env` 的 OPENSEARCH_URL（本機 dev 是 http://127.0.0.1:19200，不是 9200——那是別的堆疊）\n  2. 用 `make compose-ps` 確認 osint-core-opensearch-1 是 healthy\n  3. 若從沒跑過索引，先 `make run-indexer` 或 `make rebuild-index`"
+    )]
+    SearchUnavailable { message: String },
+
     #[error("查詢失敗：{message}")]
     Storage { message: String },
 

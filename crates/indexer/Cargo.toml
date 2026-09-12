@@ -1,54 +1,38 @@
 [package]
-name = "core-api"
+name = "indexer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "Axum API skeleton：health／ready／metrics、auth、RBAC、pagination"
+description = "entity.extracted → OpenSearch documents 投影（SPEC §18）＋搜尋查詢語法解析；可從 PostgreSQL 全量重建"
 
 [[bin]]
-name = "osint-api"
+name = "osint-indexer"
 path = "src/main.rs"
 
 [dependencies]
-async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
-connector-sdk = { workspace = true }
 core-config = { workspace = true }
 core-events = { workspace = true }
-core-jobs = { workspace = true }
 core-model = { workspace = true }
 core-observability = { workspace = true }
-core-security = { workspace = true }
-dotenvy = { workspace = true }
-import-format = { workspace = true }
-# index mapping、欄位名常數與搜尋語法都在 indexer crate：core-api 與 osint-cli
-# 都只呼叫 indexer::search::build，不自己組查詢（理由見 crates/indexer/src/lib.rs）。
-indexer = { path = "../indexer" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 storage-core = { workspace = true }
 storage-opensearch = { path = "../storage-opensearch" }
 storage-postgres = { path = "../storage-postgres" }
-storage-s3 = { path = "../storage-s3" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-# Acceptance A/E 的完整版要真的跑一次採集→正規化→去重→抽取→索引，
-# 才驗得到「真實流程產生的資料可搜尋、可回溯」（見 tests/search_api_e2e.rs）。
 collector = { path = "../collector" }
+core-jobs = { workspace = true }
 deduplicator = { path = "../deduplicator" }
 entity-worker = { path = "../entity-worker" }
-http-body-util = "0.1.3"
 normalizer = { path = "../normalizer" }
 storage-s3 = { path = "../storage-s3" }
-tower = { workspace = true, features = ["util"] }
-uuid = { workspace = true }

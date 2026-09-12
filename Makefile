@@ -4,7 +4,9 @@
 
 .PHONY: help check build test lint fmt audit secret-scan docker-scan \
 	compose-up compose-down compose-ps migrate-postgres migrate-sqlite \
-	run-api run-collector run-normalizer run-deduplicator run-entity-worker run-cli
+	run-api run-collector run-normalizer run-deduplicator run-entity-worker \
+	run-indexer rebuild-index rebuild-index-drop run-cli \
+	disk clean
 
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 CARGO ?= cargo
@@ -33,7 +35,25 @@ help:
 	@echo "  make run-normalizer    啟動 osint-normalizer（需 compose 與 .env）"
 	@echo "  make run-deduplicator  啟動 osint-deduplicator（需 compose 與 .env）"
 	@echo "  make run-entity-worker 啟動 osint-entity-worker（需 compose 與 .env）"
+	@echo "  make run-indexer       啟動 osint-indexer（需 compose 與 .env）"
+	@echo "  make rebuild-index     從 PostgreSQL 補齊 OpenSearch 投影後結束"
+	@echo "  make rebuild-index-drop 先刪 index 再從零重建（mapping 有破壞性變更時用）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
+	@echo "  make disk              顯示 target/、.git、docker volume 的磁碟用量"
+	@echo "  make clean             cargo clean（target/ 會長到數十 GB，定期清）"
+
+# 2026-09-12 實測 target/ 曾長到 67 GB 把磁碟推到 90%。.cargo/config.toml 已關掉
+# incremental 並降 debuginfo，全量 debug+test 建置約 2 GB；但每次 Cargo.toml 變動
+# 仍會留下舊產物，超過 10 GB 就該 make clean。
+disk:
+	@echo "target/:"; du -sh target 2>/dev/null || echo "  (無)"
+	@echo ".git:"; du -sh .git
+	@echo "docker volumes（本專案）:"; docker volume ls --format '{{.Name}}' | grep '^osint-core_' | while read v; do \
+		printf "  %s  %s\n" "$$(docker run --rm -v $$v:/v alpine du -sh /v 2>/dev/null | cut -f1)" "$$v"; done
+	@echo "磁碟:"; df -h / | tail -1
+
+clean:
+	$(CARGO) clean
 
 check:
 	$(CARGO) check --workspace --all-targets
@@ -95,6 +115,23 @@ run-deduplicator:
 # 抽取規則、public suffix 取捨與已知誤判見 docs/developer/entity-worker.md。
 run-entity-worker:
 	$(CARGO) run -p entity-worker --bin osint-entity-worker
+
+# SPEC §18 搜尋投影。訂閱 entity.extracted，bulk 寫進 OpenSearch `osint-documents`。
+# index mapping、analyzer 取捨、backpressure 與已知限制見 docs/developer/indexer.md。
+run-indexer:
+	$(CARGO) run -p indexer --bin osint-indexer
+
+# 從 PostgreSQL 補齊投影（既有文件覆寫，**不刪**已經不該存在的文件）。
+# PostgreSQL 是 truth，OpenSearch 是可重建的 projection（CLAUDE.md §5）。
+rebuild-index:
+	$(CARGO) run -p indexer --bin osint-indexer -- --rebuild
+
+# 先刪掉 index 再從零重建。mapping 有破壞性變更（欄位改型別、analyzer 換掉）時
+# **必須**用這個——OpenSearch 的 _mapping 只能新增欄位，不能改既有欄位的型別，
+# 只跑 rebuild-index 的話舊欄位會繼續用舊型別而且完全不會報錯。
+# ⚠️ 重建完成前搜尋會回較少的結果（或空結果）。
+rebuild-index-drop:
+	$(CARGO) run -p indexer --bin osint-indexer -- --rebuild --drop
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。

@@ -1,6 +1,6 @@
 use storage_core::conformance::{
-    assert_opensearch_identity, assert_search_round_trip, load_workspace_dotenv, required_env,
-    verify_not_opencti_search,
+    assert_opensearch_identity, assert_search_round_trip, assert_structured_search,
+    load_workspace_dotenv, required_env, verify_not_opencti_search,
 };
 use storage_opensearch::OpenSearchStore;
 
@@ -32,4 +32,35 @@ async fn opensearch_search_conformance() {
     assert_search_round_trip(&store, &index)
         .await
         .expect("search round-trip");
+    // StructuredSearch 是面向使用者的那條路徑（過濾、NOT、search_after）。
+    // 未來新增的 SearchStore adapter 也要通過這一支。
+    //
+    // 用**明確 mapping** 的另一個 index：dynamic mapping 會把 `doc_id` 猜成 text，
+    // 而 text 欄位不能排序（400 illegal_argument_exception），search_after 就驗不到。
+    // 這正是 indexer 關掉 dynamic mapping 的理由之一。
+    let structured_index = format!("osint-core-conformance-structured-{}", uuid::Uuid::now_v7());
+    store
+        .ensure_index_with(
+            &structured_index,
+            &serde_json::json!({ "number_of_shards": 1, "number_of_replicas": 0 }),
+            &serde_json::json!({
+                "properties": {
+                    "doc_id": { "type": "keyword" },
+                    "title": { "type": "text" },
+                    "kind": { "type": "keyword" },
+                }
+            }),
+        )
+        .await
+        .expect("建立 structured conformance index");
+    assert_structured_search(&store, &structured_index)
+        .await
+        .expect("structured search");
+    store
+        .delete_index(&structured_index)
+        .await
+        .expect("刪除 structured 測試 index");
+
+    // 一次性 index 用完刪掉，免得叢集慢慢長出幾百個 conformance index。
+    store.delete_index(&index).await.expect("刪除測試 index");
 }

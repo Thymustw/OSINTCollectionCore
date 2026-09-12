@@ -645,6 +645,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
+ "collector",
  "connector-sdk",
  "core-config",
  "core-events",
@@ -652,13 +653,17 @@ dependencies = [
  "core-model",
  "core-observability",
  "core-security",
+ "deduplicator",
  "dotenvy",
+ "entity-worker",
  "http-body-util",
  "import-format",
+ "indexer",
  "normalizer",
  "serde",
  "serde_json",
  "storage-core",
+ "storage-opensearch",
  "storage-postgres",
  "storage-s3",
  "thiserror",
@@ -1983,6 +1988,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexer"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "collector",
+ "core-config",
+ "core-events",
+ "core-jobs",
+ "core-model",
+ "core-observability",
+ "deduplicator",
+ "entity-worker",
+ "normalizer",
+ "serde",
+ "serde_json",
+ "storage-core",
+ "storage-opensearch",
+ "storage-postgres",
+ "storage-s3",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2519,6 +2552,7 @@ dependencies = [
  "core-model",
  "dotenvy",
  "hex",
+ "indexer",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3888,6 +3922,7 @@ name = "storage-opensearch"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "opensearch",
  "serde_json",
  "storage-core",

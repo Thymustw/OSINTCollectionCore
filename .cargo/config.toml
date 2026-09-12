@@ -2,6 +2,26 @@
 [build]
 jobs = 4
 
+# 磁碟控制。2026-09-12 實測 target/ 長到 67 GB（磁碟 90%）：主因是每次
+# Cargo.toml／相依變動都會留下一整組舊的 debug 產物，incremental 快取又把每個
+# crate 的中間檔都存下來。三個措施：
+#   1. incremental=false：本專案的開發節奏是「agent 寫一批 → 全量驗證」，不是
+#      「改一行按存檔」，incremental 帶來的加速在這裡幾乎沒有，但空間代價是數倍。
+#   2. debug=1：只保留行號表（panic backtrace 仍看得懂），不保留完整 DWARF。
+#      full debuginfo 是 debug 產物體積的最大來源。
+#   3. split-debuginfo=unpacked：debuginfo 不塞進每個 .rlib，避免每次連結都複製一份。
+# cargo clean 之後重建一次實測 4.9 GB（含上述設定前的完整重建）。
+# 若哪天真的需要在 gdb 裡逐行 step，用 `CARGO_PROFILE_DEV_DEBUG=2 cargo build` 臨時覆蓋。
+[profile.dev]
+incremental = false
+debug = 1
+split-debuginfo = "unpacked"
+
+[profile.test]
+incremental = false
+debug = 1
+split-debuginfo = "unpacked"
+
 [term]
 color = "auto"
 quiet = false

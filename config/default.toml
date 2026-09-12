@@ -77,6 +77,30 @@ max_extractions = 500
 # 只掃描 title + summary + body 的前 N 個 byte（256 KiB）。
 max_scan_bytes = 262144
 
+[indexer]
+bind = "127.0.0.1:18085"
+consumer_group = "osint-indexer"
+# OpenSearch index 名稱。前綴是刻意的：OPENSEARCH_URL 有可能被指到共用叢集，
+# 叫 "documents" 太通用，撞名時是直接寫進別人的資料。
+# 改名等於換一個空 index，改完要跑 `make rebuild-index`。
+index = "osint-documents"
+# SPEC §18 投影的上限。四個都是硬上限，沒有「不限」：
+# indexer 是高吞吐消費者（CLAUDE.md §6），少了批次上限等於把整個 partition
+# 的內容塞進一次 bulk 請求。
+batch_size = 200
+# 累積不到 batch_size 時最久等多久（毫秒）。設成 0 會讓低流量時最後幾筆
+# **永遠不進 index**——看起來像「搜尋少了最新的文件」。
+batch_timeout_ms = 1000
+# 單一文字欄位（title／summary／body）寫進 index 的 byte 上限（256 KiB），
+# 與 [entity_worker].max_scan_bytes 對齊。
+max_field_bytes = 262144
+# 暫時性 bulk 失敗（429／503）的重試次數。永久性失敗（400 mapping 不符）不重試。
+bulk_max_retries = 3
+# consumer lag 超過此值就在批次之間插入延遲，並把 lag 寫進 osint_queue_depth
+# 讓上游採集端降速。設計理由見 crates/indexer/src/batch.rs。
+lag_threshold = 5000
+backpressure_sleep_ms = 200
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

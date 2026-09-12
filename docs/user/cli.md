@@ -365,6 +365,40 @@ Entity → Relationship → RelationshipEvidence → RawEvidence → Source / Co
 抽取規則與已知誤判（版本號會被當成 IPv4、40 位 hex 分不出 SHA1 與 git commit）
 見 `docs/developer/entity-worker.md`。
 
+### `search "<查詢>"`
+
+在**搜尋投影**（OpenSearch）裡找文件，SPEC §18 的八種搜尋：
+
+```bash
+osint-cli search "ransomware"
+osint-cli search '"lockbit ransomware" NOT decryptor'
+osint-cli search "勒索軟體" --lang zh
+osint-cli search --source <SOURCE_ID> -n 50            # 不給查詢字串＝只用篩選條件
+osint-cli search --entity vulnerability:CVE-2026-0001
+osint-cli search --from 2026-01-01 --to 2026-09-10 --type article
+osint-cli search "ransomware" --json | jq '.hits[].raw_evidence_id'
+```
+
+| 選項 | 說明 |
+|---|---|
+| `--source` / `--connector` | 限定來源／連接器（UUID） |
+| `--entity TYPE:NAME` | 找提到該實體的文件。型別可省略；大小寫不敏感 |
+| `--from` / `--to` | `YYYY-MM-DD` 或 RFC3339。`--to` 的純日期會包含當天一整天 |
+| `--date-field` | `effective`（預設）／`published`／`observed` |
+| `--lang` / `--type` | 語言、物件型別 |
+| `--include-duplicates` | 偵錯用。正常情況下 index 裡沒有 duplicate，查到東西代表有漏進去 |
+| `-n` | 筆數，上限 100 |
+
+語法（片語、`AND`／`OR`／`NOT`、括號）與注意事項見 **`docs/user/search.md`**。
+`*`、`欄位名:值`、`/regex/` 都只是普通文字，不是查詢語法。
+
+表格輸出只有 document_id／分數／標題／片段／發布時間；
+**要 `raw_evidence_id` 與 entities 請加 `--json`**。
+
+> 這個子命令查的是 OpenSearch，**不是 PostgreSQL**。`osint-indexer` 沒跑過的話
+> 投影是空的，會看到「沒有符合的文件」但資料其實在資料庫裡。
+> 用 `make run-indexer`（常駐）或 `make rebuild-index`（一次性補齊）建立投影。
+
 ### `jobs list`
 
 ```bash
@@ -435,6 +469,8 @@ until osint-cli health --json | jq -e 'all(.healthy)' >/dev/null; do sleep 2; do
 | `讀取設定失敗` | 不在 repo 根目錄執行（它會往上找 `config/default.toml`），或 `OSINT_CONFIG_FILE` 指到不存在的檔。 |
 | `找不到 Document ...` | id 打錯或被截斷。訊息會告訴你用哪個 list 子命令查。 |
 | `health` 顯示 OpenSearch/MinIO 連到奇怪的東西 | 本機若同時跑 OpenCTI，9200/9000 是它的。`.env` 要用 19200/19000，並設 `OSINT_STRICT_PORT_ISOLATION=1`。 |
+| `search` 查不到東西，但 `documents list` 有資料 | 搜尋查的是 OpenSearch 投影。跑 `make rebuild-index` 從 PostgreSQL 補齊，或 `make run-indexer` 常駐索引。 |
+| `連不上搜尋投影（OpenSearch）` | `.env` 的 `OPENSEARCH_URL` 要是 19200（9200 是 OpenCTI 的 Elasticsearch）。CLI 會做叢集身分驗證，連錯會直接拒絕而不是查到錯的資料。 |
 
 ---
 
@@ -444,4 +480,7 @@ until osint-cli health --json | jq -e 'all(.healthy)' >/dev/null; do sleep 2; do
 - `docs/developer/import-api.md` — 要**寫入**資料時走的路徑
 - `docs/developer/collector-normalizer.md` — RawEvidence 與 Document 是怎麼產生的
 - `docs/developer/entity-worker.md` — Entity／Relationship 是怎麼抽出來的，以及已知誤判
+- `docs/user/search.md` — 搜尋語法完整說明
+- `docs/developer/indexer.md` — 搜尋投影怎麼建立、mapping 與 analyzer 取捨
+- `docs/developer/search-api.md` — 走 API 搜尋（有 RBAC）的 request/response schema
 - `docs/operations/OPERATIONS.md` — 服務層級的運維程序

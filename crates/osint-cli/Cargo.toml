@@ -20,6 +20,9 @@ core-events = { workspace = true }
 core-model = { workspace = true }
 dotenvy = { workspace = true }
 hex = { workspace = true }
+# 搜尋語法與 index 欄位常數。CLI 與 core-api 用同一支 build()，
+# 兩邊各寫一份會出現「CLI 查得到、API 查不到」且不會報錯。
+indexer = { path = "../indexer" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

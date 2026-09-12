@@ -6,7 +6,9 @@
 //! 否則同一台機器上 CLI 與服務會看到不同的設定。
 
 use core_config::AppConfig;
-use storage_core::conformance::verify_not_opencti_s3;
+use storage_core::conformance::{
+    assert_opensearch_identity, verify_not_opencti_s3, verify_not_opencti_search,
+};
 use storage_postgres::PostgresCanonicalStore;
 use storage_s3::S3ObjectStore;
 
@@ -45,6 +47,34 @@ impl Context {
             .map_err(|err| CliError::PostgresUnavailable {
                 message: err.to_string(),
             })
+    }
+
+    /// 連搜尋投影並確認它真的是 OpenSearch。
+    ///
+    /// **身分驗證不是形式。** 本工作站的 9200 是 OpenCTI 的 Elasticsearch；
+    /// 少了它，`OPENSEARCH_URL` 少打一個 1 就會去查別人的叢集，
+    /// 使用者看到的是「查不到東西」而不是「連錯地方」。
+    ///
+    /// 刻意不呼叫 `ensure_index`——建 index 是寫入動作，CLI 是唯讀工具。
+    pub async fn search(&self) -> Result<storage_opensearch::OpenSearchStore, CliError> {
+        let url = &self.cfg.storage.search.url;
+        verify_not_opencti_search(url).map_err(|err| CliError::Config {
+            message: err.to_string(),
+        })?;
+        let store =
+            storage_opensearch::OpenSearchStore::connect(url).map_err(|err| CliError::Config {
+                message: err.to_string(),
+            })?;
+        let info = store
+            .cluster_info()
+            .await
+            .map_err(|err| CliError::SearchUnavailable {
+                message: err.to_string(),
+            })?;
+        assert_opensearch_identity(&info).map_err(|err| CliError::Config {
+            message: err.to_string(),
+        })?;
+        Ok(store)
     }
 
     /// 連物件儲存。不呼叫 `ensure_bucket()`——建 bucket 是寫入動作。

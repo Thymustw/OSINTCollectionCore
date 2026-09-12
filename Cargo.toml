@@ -23,6 +23,7 @@ members = [
     "crates/normalizer",
     "crates/deduplicator",
     "crates/entity-worker",
+    "crates/indexer",
     "crates/osint-cli",
 ]
 

@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::error::StorageError;
 use crate::traits::{
     CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore, RelationalStore, SearchDocument,
-    SearchQuery, SearchStore,
+    SearchQuery, SearchStore, StructuredSearch,
 };
 
 /// 從 workspace 根目錄載入 `.env`（若存在）。已設定的環境變數不被覆蓋。
@@ -1095,6 +1095,177 @@ pub async fn assert_search_round_trip<S: SearchStore>(
         });
     }
     Ok(())
+}
+
+/// `SearchStore::search`（[`StructuredSearch`]）的後端契約。
+///
+/// **未來新增任何 SearchStore adapter 都必須通過這一支。** 這裡驗的四件事全部都是
+/// 「做錯了不會報錯，只會讓搜尋悄悄變得不對」的那一類：
+///
+/// 1. 過濾條件真的過濾（不是被忽略）；
+/// 2. `Not` 真的排除（只有 `must_not` 的 bool 在某些後端等於不篩選）；
+/// 3. hit 帶得回 `sort`（沒有它就翻不了頁）；
+/// 4. `search_after` 真的接續（不是每次都從頭回同一頁）。
+///
+/// # 呼叫端要先準備好 index
+///
+/// `index` 必須已經存在且宣告了三個欄位：
+///
+/// | 欄位 | 需要的能力 |
+/// |---|---|
+/// | `doc_id` | **可排序的精確值**（OpenSearch 是 `keyword`） |
+/// | `title` | 全文檢索 |
+/// | `kind` | 精確比對過濾 |
+///
+/// 刻意不由這裡建立：建 index 的語法是後端專屬的，寫進 conformance 就等於
+/// 把 OpenSearch 的 mapping DSL 塞進後端中立的介面。
+/// 靠 dynamic mapping 也不行——OpenSearch 會把 `doc_id` 猜成 `text`，
+/// 排序會直接 400（text 欄位沒有 fielddata）。
+pub async fn assert_structured_search<S: SearchStore>(
+    store: &S,
+    index: &str,
+) -> Result<(), StorageError> {
+    use crate::traits::{QueryExpr, SearchField, SearchFilter, SortField};
+
+    let token = format!("osintconf{}", Uuid::now_v7().simple());
+    let docs: Vec<SearchDocument> = (0..3)
+        .map(|i| SearchDocument {
+            index: index.to_string(),
+            id: format!("{token}-{i}"),
+            body: json!({
+                "doc_id": format!("{token}-{i}"),
+                "title": format!("{token} item {i}"),
+                "kind": if i == 0 { "special" } else { "ordinary" },
+            }),
+        })
+        .collect();
+    let bulk = store.bulk_index(docs).await?;
+    if bulk.errors > 0 {
+        return Err(StorageError::Unknown {
+            backend: "search",
+            message: format!("conformance 資料寫入失敗：{:?}", bulk.failures),
+        });
+    }
+
+    let base = |expr: Option<QueryExpr>, filters: Vec<SearchFilter>| StructuredSearch {
+        index: index.to_string(),
+        expression: expr,
+        fields: vec![SearchField::new("title", 1.0)],
+        filters,
+        size: 10,
+        search_after: None,
+        sort: vec![SortField {
+            field: "doc_id".into(),
+            ascending: true,
+        }],
+        highlight_fields: vec!["title".into()],
+    };
+
+    // 1) 全文條件命中三筆。
+    let all = retry_search(
+        store,
+        base(Some(QueryExpr::Term(token.clone())), Vec::new()),
+        3,
+    )
+    .await?;
+    if all.total != 3 {
+        return Err(StorageError::Unknown {
+            backend: "search",
+            message: format!("預期 3 筆，實際 {}", all.total),
+        });
+    }
+
+    // 2) term 過濾要真的過濾。
+    let filtered = store
+        .search(base(
+            Some(QueryExpr::Term(token.clone())),
+            vec![SearchFilter::Term {
+                field: "kind".into(),
+                value: "special".into(),
+            }],
+        ))
+        .await?;
+    if filtered.total != 1 {
+        return Err(StorageError::Unknown {
+            backend: "search",
+            message: format!(
+                "term 過濾後預期 1 筆，實際 {}——過濾條件被忽略了",
+                filtered.total
+            ),
+        });
+    }
+
+    // 3) Not 要真的排除。
+    let negated = store
+        .search(base(
+            Some(QueryExpr::And(vec![
+                QueryExpr::Term(token.clone()),
+                QueryExpr::Not(Box::new(QueryExpr::Term("0".into()))),
+            ])),
+            Vec::new(),
+        ))
+        .await?;
+    if negated.total != 2 {
+        return Err(StorageError::Unknown {
+            backend: "search",
+            message: format!(
+                "NOT 之後預期 2 筆，實際 {}——排除條件沒有生效",
+                negated.total
+            ),
+        });
+    }
+
+    // 4) sort 值與 search_after 接續。
+    let mut first = base(Some(QueryExpr::Term(token.clone())), Vec::new());
+    first.size = 2;
+    let page1 = store.search(first.clone()).await?;
+    let cursor = page1
+        .hits
+        .last()
+        .map(|hit| hit.sort.clone())
+        .filter(|sort| !sort.is_empty())
+        .ok_or_else(|| StorageError::Unknown {
+            backend: "search",
+            message: "hit 沒有帶 sort 值，cursor pagination 無法運作".into(),
+        })?;
+    let mut second = first;
+    second.search_after = Some(cursor);
+    let page2 = store.search(second).await?;
+    if page2.hits.len() != 1 {
+        return Err(StorageError::Unknown {
+            backend: "search",
+            message: format!("第二頁預期 1 筆，實際 {}", page2.hits.len()),
+        });
+    }
+    let page1_ids: Vec<&str> = page1.hits.iter().map(|h| h.id.as_str()).collect();
+    if page1_ids.contains(&page2.hits[0].id.as_str()) {
+        return Err(StorageError::Unknown {
+            backend: "search",
+            message: "search_after 沒有接續，第二頁又回了第一頁的文件".into(),
+        });
+    }
+
+    for hit in &all.hits {
+        store.delete(index, &hit.id).await?;
+    }
+    Ok(())
+}
+
+/// 寫入後可能還沒 refresh，重試幾次再放棄。
+async fn retry_search<S: SearchStore>(
+    store: &S,
+    query: StructuredSearch,
+    expected: u64,
+) -> Result<crate::traits::SearchHits, StorageError> {
+    let mut last = store.search(query.clone()).await?;
+    for _ in 0..20 {
+        if last.total >= expected {
+            return Ok(last);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        last = store.search(query.clone()).await?;
+    }
+    Ok(last)
 }
 
 /// KeyValueStore：get/set/del/expire。

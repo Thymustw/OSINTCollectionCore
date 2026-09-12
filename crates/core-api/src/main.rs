@@ -11,7 +11,9 @@ use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::{MetricsRegistry, init_tracing};
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog};
-use storage_core::conformance::load_workspace_dotenv;
+use storage_core::conformance::{
+    assert_opensearch_identity, load_workspace_dotenv, verify_not_opencti_search,
+};
 use storage_postgres::PostgresCanonicalStore;
 use tokio::net::TcpListener;
 
@@ -81,6 +83,16 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    // 搜尋接不上時只有 POST /api/v1/search 回 503，其他路由照常——
+    // 沒有理由讓 Job 查詢陪著搜尋投影一起掛掉。
+    let search = match connect_search(&cfg).await {
+        Ok(state) => Some(Arc::new(state)),
+        Err(err) => {
+            tracing::warn!(error = %err, "OpenSearch 未連上；POST /api/v1/search 會回 503");
+            None
+        }
+    };
+
     let state = AppState {
         metrics: MetricsRegistry::new(),
         auth: AuthState {
@@ -90,6 +102,7 @@ async fn run() -> Result<(), String> {
         audit: Arc::new(MemoryAuditLog::new()),
         jobs,
         import,
+        search,
         ready,
         rate_limit_per_second: cfg.http.rate_limit_per_second,
         request_body_limit_bytes: cfg.http.request_body_limit_bytes,
@@ -127,6 +140,28 @@ async fn connect_postgres(cfg: &AppConfig) -> Result<PostgresCanonicalStore, Str
     Ok(store)
 }
 
+/// 連 OpenSearch 並驗證它真的是 OpenSearch。
+///
+/// **身分驗證不是形式。** 本工作站的 9200 是 OpenCTI 的 Elasticsearch；
+/// 少了這一步，設定寫錯一個埠號就會去查別人的叢集，而且一路都不會報錯——
+/// 使用者只會覺得「搜尋結果怪怪的」。
+async fn connect_search(cfg: &AppConfig) -> Result<core_api::SearchState, String> {
+    let url = &cfg.storage.search.url;
+    verify_not_opencti_search(url).map_err(|err| err.to_string())?;
+    let store = storage_opensearch::OpenSearchStore::connect(url).map_err(|err| err.to_string())?;
+    let info = store
+        .cluster_info()
+        .await
+        .map_err(|err| format!("連不上 OpenSearch（{url}）：{err}"))?;
+    assert_opensearch_identity(&info).map_err(|err| err.to_string())?;
+    Ok(core_api::SearchState {
+        store,
+        // 與 osint-indexer 讀同一個設定鍵。兩邊不一致的話搜尋會查到空 index，
+        // 而且不會有任何錯誤訊息。
+        index: cfg.indexer.index.clone(),
+    })
+}
+
 async fn connect_objects(cfg: &AppConfig) -> Result<storage_s3::S3ObjectStore, String> {
     let access = cfg
         .storage
@@ -156,9 +191,9 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
         axum::http::StatusCode::NOT_FOUND,
         axum::Json(ErrorBody {
             error: "not_found".into(),
-            message:
-                "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs 與 POST /api/v1/import"
-                    .into(),
+            message: "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs、\
+                 POST /api/v1/import 與 POST /api/v1/search"
+                .into(),
         }),
     )
 }

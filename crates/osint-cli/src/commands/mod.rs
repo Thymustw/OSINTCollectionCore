@@ -6,6 +6,7 @@ pub mod entities;
 pub mod health;
 pub mod jobs;
 pub mod raw;
+pub mod search;
 pub mod sources;
 
 /// 用 cursor 連續翻頁，直到湊滿 `limit` 筆或後端回了不滿一頁。

@@ -8,6 +8,7 @@ use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::MetricsRegistry;
 use core_security::{ApiTokenStore, AuditLog, JwtService};
+use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
 
 use crate::ready::ReadyProbe;
@@ -15,6 +16,18 @@ use crate::ready::ReadyProbe;
 pub type SharedTokenStore = Arc<dyn ApiTokenStore>;
 pub type SharedAudit = Arc<dyn AuditLog>;
 pub type SharedJobService = Arc<JobService<PostgresCanonicalStore>>;
+pub type SharedSearchState = Arc<SearchState>;
+
+/// `POST /api/v1/search` 要用到的下游。沒接上時只有這條路由回 503。
+///
+/// `index` 必須與 `osint-indexer` 用的是同一個名字（兩邊都讀 `[indexer].index`）。
+/// 不一致的話搜尋會查一個空的（或別人的）index，而且完全不會報錯——
+/// 使用者看到的是「都沒有資料」。
+#[derive(Clone)]
+pub struct SearchState {
+    pub store: OpenSearchStore,
+    pub index: String,
+}
 
 /// 匯入路徑要用到的下游。沒接上時 `POST /api/v1/import` 回 503，其他路由不受影響。
 ///
@@ -43,6 +56,7 @@ pub struct AppState {
     pub audit: SharedAudit,
     pub jobs: Option<SharedJobService>,
     pub import: Option<Arc<ImportState>>,
+    pub search: Option<SharedSearchState>,
     pub ready: ReadyProbe,
     pub rate_limit_per_second: u32,
     pub request_body_limit_bytes: u32,

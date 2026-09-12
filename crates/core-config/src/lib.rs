@@ -32,6 +32,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub entity_worker: EntityWorkerSection,
     #[serde(default)]
+    pub indexer: IndexerSection,
+    #[serde(default)]
     pub import: ImportSection,
 }
 
@@ -217,6 +219,48 @@ impl Default for EntityWorkerSection {
     }
 }
 
+/// indexer consumer 與 SPEC §18 搜尋投影的上限設定。
+///
+/// 每一項都必須有值，沒有「不限」這個選項：indexer 是高吞吐消費者
+/// （CLAUDE.md §6），少了批次上限就是把整個 partition 的內容塞進一次 bulk 請求。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexerSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// OpenSearch index 名稱。改名等於換一個空 index，要跑 `osint-indexer --rebuild`。
+    pub index: String,
+    /// 一次 bulk 最多送幾筆。預設值的取捨見 `crates/indexer/src/service.rs`。
+    pub batch_size: u32,
+    /// 累積不到 `batch_size` 時，最久等多久就強制送出（毫秒）。
+    /// 設成 0 會讓低流量時最後幾筆永遠不進 index。
+    pub batch_timeout_ms: u64,
+    /// 單一文字欄位（title／summary／body）寫進 index 的 byte 上限。
+    pub max_field_bytes: usize,
+    /// 暫時性 bulk 失敗最多重試幾次。
+    pub bulk_max_retries: u32,
+    /// consumer lag 超過這個值就在批次之間插入延遲，並把 lag 寫進
+    /// `osint_queue_depth` 讓上游降速。
+    pub lag_threshold: u64,
+    /// 降速時的基礎延遲（毫秒）。實際延遲會依超出門檻的倍數放大，最多 8 倍。
+    pub backpressure_sleep_ms: u64,
+}
+
+impl Default for IndexerSection {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:18085".into(),
+            consumer_group: "osint-indexer".into(),
+            index: "osint-documents".into(),
+            batch_size: 200,
+            batch_timeout_ms: 1_000,
+            max_field_bytes: 256 * 1024,
+            bulk_max_retries: 3,
+            lag_threshold: 5_000,
+            backpressure_sleep_ms: 200,
+        }
+    }
+}
+
 /// `POST /api/v1/import` 的上傳與解析上限。每一項都必須有值，沒有「不限」這個選項。
 ///
 /// `max_upload_bytes` 與 `[http].request_body_limit_bytes` 是兩條獨立的界線：
@@ -366,6 +410,15 @@ mod tests {
         assert_eq!(cfg.entity_worker.consumer_group, "osint-entity-worker");
         assert_eq!(cfg.entity_worker.max_extractions, 500);
         assert_eq!(cfg.entity_worker.max_scan_bytes, 262_144);
+        assert_eq!(cfg.indexer.bind, "127.0.0.1:18085");
+        assert_eq!(cfg.indexer.consumer_group, "osint-indexer");
+        assert_eq!(cfg.indexer.index, "osint-documents");
+        assert_eq!(cfg.indexer.batch_size, 200);
+        assert_eq!(cfg.indexer.batch_timeout_ms, 1_000);
+        assert_eq!(cfg.indexer.max_field_bytes, 262_144);
+        assert_eq!(cfg.indexer.bulk_max_retries, 3);
+        assert_eq!(cfg.indexer.lag_threshold, 5_000);
+        assert_eq!(cfg.indexer.backpressure_sleep_ms, 200);
         assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.import.max_records, 10_000);
         assert_eq!(cfg.import.max_record_bytes, 262_144);

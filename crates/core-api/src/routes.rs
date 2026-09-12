@@ -21,6 +21,7 @@ use crate::import;
 use crate::jobs;
 use crate::middleware as auth_mw;
 use crate::rate_limit;
+use crate::search;
 use crate::state::AppState;
 
 /// 組出完整 router。
@@ -40,6 +41,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs", get(jobs::list_jobs))
         .route("/api/v1/jobs/{id}", get(jobs::get_job))
         .route("/api/v1/whoami", get(whoami))
+        // 搜尋是唯讀的（viewer 以上），但用 POST：查詢條件有巢狀結構
+        // （entity 物件、日期、布林語法），塞進 query string 會需要多層編碼，
+        // 而且長查詢會撞到 URL 長度上限。這與 SPEC §19 的 `POST /search` 一致。
+        .route("/api/v1/search", post(search::search))
         .merge(write)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

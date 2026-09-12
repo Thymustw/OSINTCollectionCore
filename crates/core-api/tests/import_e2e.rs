@@ -111,6 +111,8 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, import_config: ImportS
             sink: Arc::new(sink),
             producer: Some(producer),
         })),
+        // 這個 e2e 只驗匯入路徑，不接搜尋投影。
+        search: None,
         ready: ready_always(),
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,
