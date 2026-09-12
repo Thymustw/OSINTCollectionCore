@@ -19,6 +19,8 @@ pub enum SecurityError {
     TokenNotFound { id: String },
     #[error("API token 已撤銷。請改用新 token")]
     TokenRevoked,
+    #[error("API token 已過期。請用 POST /api/v1/tokens 重新發行一把")]
+    TokenExpired,
     #[error("沒有通過認證。請在 Authorization 放 Bearer JWT 或 API token")]
     Unauthenticated,
     #[error("角色 `{role}` 沒有 `{permission}` 權限。請改用 operator／admin，或請管理員調整角色")]

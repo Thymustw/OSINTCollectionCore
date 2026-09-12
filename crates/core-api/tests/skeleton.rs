@@ -2,7 +2,9 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use core_api::{issue_test_jwt, test_app};
+mod common;
+
+use common::{issue_test_jwt, test_app};
 use core_security::Role;
 use http_body_util::BodyExt;
 use tower::ServiceExt;

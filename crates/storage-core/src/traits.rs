@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
     DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, EntityType, Event,
-    EventId, Job, JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
+    EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
     RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
     RelationshipId, Source, SourceId,
 };
@@ -65,6 +65,12 @@ pub trait RelationalStore: HealthProvider {
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError>;
     async fn get_collection(&self, id: CollectionId) -> Result<Option<Collection>, StorageError>;
     async fn delete_collection(&self, id: CollectionId) -> Result<bool, StorageError>;
+    /// 依 UUID v7 由新到舊列出。cursor 語意同 [`RelationalStore::list_jobs`]。
+    async fn list_collections(
+        &self,
+        after: Option<CollectionId>,
+        limit: u32,
+    ) -> Result<Vec<Collection>, StorageError>;
     async fn link_collection_source(
         &self,
         collection_id: CollectionId,
@@ -161,6 +167,21 @@ pub trait RelationalStore: HealthProvider {
         object_id: ObjectId,
         limit: u32,
     ) -> Result<Vec<Relationship>, StorageError>;
+    /// 全部 Relationship，依 `id` 遞減、cursor 分頁。cursor 語意同
+    /// [`RelationalStore::list_jobs`]。
+    ///
+    /// 與 [`RelationalStore::list_relationships_by_object`] 的差別是**不綁任何一端**：
+    /// 那個方法回答「這個物件牽涉到什麼」，這個回答「系統裡有哪些邊」
+    /// （Operations Center 的瀏覽、圖投影重建的來源）。
+    ///
+    /// ⚠️ 這裡**不能**說「最新的在前」。entity-worker 寫的 Relationship id 是 UUID v5
+    /// （由 `(source, type, target)` 推導，為了冪等），沒有時間序。理由同
+    /// [`RelationalStore::list_connectors`]；要按時間看請比對 `last_seen`。
+    async fn list_relationships(
+        &self,
+        after: Option<RelationshipId>,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError>;
 
     async fn put_relationship_evidence(
         &self,
@@ -184,6 +205,15 @@ pub trait RelationalStore: HealthProvider {
     async fn put_event(&self, event: &Event) -> Result<(), StorageError>;
     async fn get_event(&self, id: EventId) -> Result<Option<Event>, StorageError>;
     async fn delete_event(&self, id: EventId) -> Result<bool, StorageError>;
+    /// 依 UUID v7 由新到舊列出。cursor 語意同 [`RelationalStore::list_jobs`]。
+    ///
+    /// ⚠️ 這裡的 `Event` 是 SPEC §13 的**領域事件物件**（存在 `events` 表裡的
+    /// 情報事件），不是 Redpanda 上的 `EventEnvelope`。兩者只是名字撞在一起。
+    async fn list_events(
+        &self,
+        after: Option<EventId>,
+        limit: u32,
+    ) -> Result<Vec<Event>, StorageError>;
 
     async fn put_provenance(&self, provenance: &Provenance) -> Result<(), StorageError>;
     async fn get_provenance(&self, id: ProvenanceId) -> Result<Option<Provenance>, StorageError>;
@@ -205,6 +235,19 @@ pub trait RelationalStore: HealthProvider {
     /// 依 UUID v7 由新到舊列出。`after` 為上一頁最後一筆 id（嚴格小於）。
     /// `limit` 由呼叫端夾在 1..=100。
     async fn list_jobs(&self, after: Option<JobId>, limit: u32) -> Result<Vec<Job>, StorageError>;
+    /// 同 [`RelationalStore::list_jobs`]，但只含指定 `status`。
+    ///
+    /// 過濾**必須在 SQL 裡做**。先 `list_jobs` 再在程式端 filter 是錯的：
+    /// 一頁只有 100 筆，佇列裡有一萬筆 queued 時，取回最新 100 筆再過濾出
+    /// running 的，得到的可能是空頁——而「沒有 running 的 job」與
+    /// 「最新 100 筆裡沒有 running 的 job」是完全不同的兩件事，
+    /// 前者會讓運維以為佇列空了。
+    async fn list_jobs_by_status(
+        &self,
+        status: JobStatus,
+        after: Option<JobId>,
+        limit: u32,
+    ) -> Result<Vec<Job>, StorageError>;
 
     /// Dedup Stage 1 候選：`documents.external_key` 完全相同、且 `id` **嚴格小於 `before`**
     /// 的 Document，依 `id` 升序（最舊在前）。`limit` 由 adapter 夾在 1..=100，不可無界。

@@ -34,7 +34,6 @@ use core_security::{AuditEntry, Permission, Principal};
 use import_format::{FieldMapping, ImportKind, ImportLimits, ImportSpec};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use storage_core::RelationalStore;
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -104,7 +103,7 @@ pub async fn import_upload(
             audit(
                 &state,
                 &principal,
-                &format!("source/{}", response.source_id),
+                Some(response.source_id.to_string()),
                 "success",
                 json!({
                     "raw_evidence_id": response.raw_evidence_id,
@@ -121,10 +120,12 @@ pub async fn import_upload(
             Ok((StatusCode::CREATED, Json(response.into_json())))
         }
         Err(err) => {
+            // 失敗時 source_id 不一定解析得出來（request 欄位就可能是壞的），
+            // 所以 resource_id 留 None——而不是塞一個假的 "unknown" 字串進索引欄位。
             audit(
                 &state,
                 &principal,
-                "source/unknown",
+                None,
                 "rejected",
                 json!({ "status": err.status.as_u16(), "error": err.error }),
             )
@@ -651,12 +652,18 @@ fn storage_error(err: storage_core::StorageError) -> ApiError {
 async fn audit(
     state: &AppState,
     principal: &Principal,
-    resource: &str,
+    source_id: Option<String>,
     outcome: &str,
     metadata: Value,
 ) {
-    let entry = AuditEntry::new(principal.subject.clone(), AUDIT_ACTION, resource, outcome)
-        .with_metadata(metadata);
+    let entry = AuditEntry::new(
+        principal.subject.clone(),
+        AUDIT_ACTION,
+        "source",
+        source_id,
+        outcome,
+    )
+    .with_metadata(metadata);
     if let Err(err) = state.audit.append(entry).await {
         tracing::error!(error = %err, "寫入匯入稽核紀錄失敗");
     }

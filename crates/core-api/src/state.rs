@@ -8,6 +8,7 @@ use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::MetricsRegistry;
 use core_security::{ApiTokenStore, AuditLog, JwtService};
+use storage_core::{ObjectStore, RelationalStore};
 use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
 
@@ -17,6 +18,30 @@ pub type SharedTokenStore = Arc<dyn ApiTokenStore>;
 pub type SharedAudit = Arc<dyn AuditLog>;
 pub type SharedJobService = Arc<JobService<PostgresCanonicalStore>>;
 pub type SharedSearchState = Arc<SearchState>;
+
+/// 泛用的 canonical store handle。
+///
+/// # 為什麼是 `dyn RelationalStore` 而不是 `PostgresCanonicalStore`
+///
+/// Phase 6b 要加的 REST handler（objects／sources／collections／relationships…）
+/// 需要的全部是 `RelationalStore` 上的方法。用具體型別會讓每一個 handler 都
+/// 硬編在 PostgreSQL 上，違反 CLAUDE.md §13
+/// 「Domain Service → storage-core capability interface → concrete adapter」；
+/// 換言之，之後要讓某個 App 走 SQLite projection 就得改二十幾個 handler 的簽名。
+///
+/// 代價是拿不到 `pool()`（那是 PG 專屬的）。需要 pool 的兩個地方
+/// （`PostgresAuditLog`、`PostgresApiTokenStore`）在 `main.rs` 連線時就從具體型別
+/// 建好再放進 `AppState`，不經過這個 handle。
+///
+/// ⚠️ `+ Send + Sync` 不能省。`RelationalStore` 沒有把它們寫成 supertrait，
+/// 所以 `Arc<dyn RelationalStore>` 預設**不是** `Send + Sync`，
+/// `AppState` 會因此無法當 axum 的 state——而編譯器報的是
+/// 「`FromFn<…>: Service<…>` 不滿足」這種完全指不到真因的訊息。
+pub type SharedStore = Arc<dyn RelationalStore + Send + Sync>;
+
+/// 物件儲存（Raw Evidence blob）handle。理由同 [`SharedStore`]：
+/// handler 只需要 `ObjectStore` 的四個方法，不需要知道後面是 MinIO 還是別的 S3。
+pub type SharedObjects = Arc<dyn ObjectStore + Send + Sync>;
 
 /// `POST /api/v1/search` 要用到的下游。沒接上時只有這條路由回 503。
 ///
@@ -36,7 +61,9 @@ pub struct SearchState {
 /// 不能各寫各的。
 #[derive(Clone)]
 pub struct ImportState {
-    pub store: PostgresCanonicalStore,
+    /// 與 [`AppState::store`] 是同一個 `Arc`（`main.rs` 只建一次）。
+    /// 這裡只用到 `RelationalStore` 上的 `get_source`／`get_connector`／`put_connector`。
+    pub store: SharedStore,
     pub sink: Arc<dyn EvidenceSink>,
     pub producer: Option<Arc<EventProducer>>,
 }
@@ -49,11 +76,19 @@ pub struct AuthState {
 }
 
 /// 整個 API 的狀態。
+///
+/// `store` 與 `objects` 是**通用** handle：Phase 6b 之後每個資源 handler 都從這裡拿，
+/// 不要再各自持有一份連線。`import`／`jobs`／`search` 是有額外組裝需求的子狀態
+/// （分別要 EvidenceSink、JobService、index 名稱），才維持獨立欄位。
 #[derive(Clone)]
 pub struct AppState {
     pub metrics: MetricsRegistry,
     pub auth: AuthState,
     pub audit: SharedAudit,
+    /// canonical store。`None` 代表沒接上 Postgres，資源類 handler 應回 503。
+    pub store: Option<SharedStore>,
+    /// 物件儲存。`None` 代表沒接上 MinIO。
+    pub objects: Option<SharedObjects>,
     pub jobs: Option<SharedJobService>,
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,

@@ -2,6 +2,8 @@
 
 mod error;
 mod mapping;
+mod security;
 mod store;
 
+pub use security::{PostgresApiTokenStore, PostgresAuditLog};
 pub use store::PostgresCanonicalStore;

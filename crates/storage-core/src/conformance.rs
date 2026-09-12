@@ -305,6 +305,14 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         updated_at: fixture_ts(),
     };
     store.put_collection(&collection).await?;
+    let listed = store
+        .list_collections(Some(next_uuid(collection.id)), 10)
+        .await?;
+    assert_cursor_page(
+        "list_collections",
+        collection.id,
+        listed.iter().map(|i| i.id),
+    )?;
     store
         .link_collection_source(collection.id, source.id)
         .await?;
@@ -516,6 +524,8 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         &event,
         &store.get_event(event.id).await?.expect("event"),
     );
+    let listed = store.list_events(Some(next_uuid(event.id)), 10).await?;
+    assert_cursor_page("list_events", event.id, listed.iter().map(|i| i.id))?;
 
     let provenance = Provenance {
         id: Uuid::now_v7(),
@@ -572,6 +582,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入的 job 沒有出現在 list_jobs 結果".into(),
         });
     }
+    assert_job_status_filter(store, &job).await?;
 
     let dup = DuplicateGroup {
         id: Uuid::now_v7(),
@@ -686,6 +697,46 @@ async fn assert_entity_queries<S: RelationalStore>(
     assert_cursor_page("list_entities", entity.id, page.iter().map(|i| i.id))
 }
 
+/// `list_jobs_by_status` 必須在 SQL 裡過濾，而且要維持 cursor 契約。
+///
+/// 兩個斷言缺一不可：
+/// * 用**自己的** status 查得到 → 過濾條件沒有把對的列擋掉。
+/// * 用**別的** status 查不到 → 過濾條件真的有生效。少了這一條，
+///   一個完全忽略 `status` 參數的實作（等同 `list_jobs`）也會通過測試。
+async fn assert_job_status_filter<S: RelationalStore>(
+    store: &S,
+    job: &Job,
+) -> Result<(), StorageError> {
+    let page = store
+        .list_jobs_by_status(job.status, Some(next_uuid(job.id)), 10)
+        .await?;
+    assert_cursor_page("list_jobs_by_status", job.id, page.iter().map(|i| i.id))?;
+    if page.iter().any(|item| item.status != job.status) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_jobs_by_status 回了其他狀態的 job".into(),
+        });
+    }
+
+    // fixture 的 job 是 Queued，所以 Cancelled 這一頁不該有它。
+    let other = JobStatus::Cancelled;
+    if store
+        .list_jobs_by_status(other, Some(next_uuid(job.id)), 10)
+        .await?
+        .iter()
+        .any(|item| item.id == job.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_jobs_by_status({other:?}) 回了 status={:?} 的 job——status 參數沒有生效",
+                job.status
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// SPEC §11／§12：Relationship 的物件反查，以及「任何 relationship 必須能回查 evidence」。
 async fn assert_relationship_queries<S: RelationalStore>(
     store: &S,
@@ -707,6 +758,22 @@ async fn assert_relationship_queries<S: RelationalStore>(
                 ),
             });
         }
+    }
+
+    // 不綁任何一端的全表列出，cursor 契約與其他 list_* 相同。
+    let page = store
+        .list_relationships(Some(next_uuid(relationship.id)), 10)
+        .await?;
+    assert_cursor_page(
+        "list_relationships",
+        relationship.id,
+        page.iter().map(|i| i.id),
+    )?;
+    if store.list_relationships(None, 0).await?.len() != 1 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_relationships(limit=0) 應夾成 1 筆，limit 沒被夾住等於無界查詢".into(),
+        });
     }
 
     let rows = store

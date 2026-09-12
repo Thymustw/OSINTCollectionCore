@@ -5,7 +5,10 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use core_api::{IMPORT_AUDIT_ACTION, issue_test_jwt, test_app, test_app_parts};
+mod common;
+
+use common::{issue_test_jwt, test_app, test_app_parts};
+use core_api::IMPORT_AUDIT_ACTION;
 use core_security::Role;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -207,7 +210,7 @@ async fn typo_in_mapping_key_fails_fast() {
 #[tokio::test]
 async fn audit_entry_is_written_even_when_rejected() {
     let (jwt, token) = issue_test_jwt(Role::Operator);
-    let (app, audit) = test_app_parts(jwt);
+    let (app, audit, _tokens) = test_app_parts(jwt);
     let body = multipart_body(&json_request_field(), "a.json", br#"[{"title":"a"}]"#);
     let response = app
         .oneshot(import_request(Some(&token), body))

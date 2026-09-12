@@ -111,6 +111,9 @@ fn build_api(stack: &Stack, index: &str, role: Role) -> TestApi {
             tokens: Arc::new(MemoryApiTokenStore::new()),
         },
         audit: Arc::new(MemoryAuditLog::new()),
+        // 這個 e2e 只驗搜尋路徑，不接 canonical store 與物件儲存。
+        store: None,
+        objects: None,
         jobs: None,
         import: None,
         search: Some(Arc::new(SearchState {

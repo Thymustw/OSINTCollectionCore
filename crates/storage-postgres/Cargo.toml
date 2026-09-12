@@ -11,6 +11,10 @@ description = "PostgreSQL CanonicalStore + RelationalStore adapter"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 core-model = { workspace = true }
+# AuditLog／ApiTokenStore 是 core-security 定義的能力介面，PG 實作在 src/security.rs。
+# 相依方向只有這一個：core-security **不可以**反過來相依任何 storage crate
+# （理由與取捨見 src/security.rs 的模組註解）。
+core-security = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, default-features = false, features = ["postgres"] }
 storage-core = { workspace = true }

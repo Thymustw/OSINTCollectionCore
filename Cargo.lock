@@ -3937,6 +3937,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "core-model",
+ "core-security",
  "serde_json",
  "sqlx",
  "storage-core",

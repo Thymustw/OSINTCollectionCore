@@ -86,7 +86,8 @@ impl From<SecurityError> for ApiError {
             SecurityError::Unauthenticated
             | SecurityError::JwtInvalid { .. }
             | SecurityError::MalformedApiToken
-            | SecurityError::TokenRevoked => Self::unauthorized(err.to_string()),
+            | SecurityError::TokenRevoked
+            | SecurityError::TokenExpired => Self::unauthorized(err.to_string()),
             SecurityError::Forbidden { .. } => Self::forbidden(err.to_string()),
             SecurityError::TokenNotFound { .. } => Self::not_found(err.to_string()),
             SecurityError::JwtSecretTooShort { .. } => Self::internal(err.to_string()),

@@ -136,7 +136,8 @@ impl SsrfGuard {
                     AuditEntry::new(
                         matched.approved_by.clone(),
                         "connector.ssrf.allowlist",
-                        format!("source/{}", self.source_id),
+                        "source",
+                        Some(self.source_id.to_string()),
                         "allowed",
                     )
                     .with_metadata(json!({

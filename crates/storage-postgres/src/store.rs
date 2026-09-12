@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DuplicateGroup,
     DuplicateGroupId, Entity, EntityExtraction, EntityExtractionId, EntityId, EntityType, Event,
-    EventId, Job, JobId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
+    EventId, Job, JobId, JobStatus, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
     RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
     RelationshipId, Source, SourceId,
 };
@@ -473,6 +473,27 @@ impl RelationalStore for PostgresCanonicalStore {
             .await
     }
 
+    async fn list_collections(
+        &self,
+        after: Option<CollectionId>,
+        limit: u32,
+    ) -> Result<Vec<Collection>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM collections
+            WHERE ($1::uuid IS NULL OR id < $1)
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(after)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::collection).collect()
+    }
+
     async fn link_collection_source(
         &self,
         collection_id: CollectionId,
@@ -863,6 +884,27 @@ impl RelationalStore for PostgresCanonicalStore {
         rows.iter().map(mapping::relationship).collect()
     }
 
+    async fn list_relationships(
+        &self,
+        after: Option<RelationshipId>,
+        limit: u32,
+    ) -> Result<Vec<Relationship>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM relationships
+            WHERE ($1::uuid IS NULL OR id < $1)
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(after)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::relationship).collect()
+    }
+
     async fn put_relationship_evidence(
         &self,
         evidence: &RelationshipEvidence,
@@ -971,6 +1013,27 @@ impl RelationalStore for PostgresCanonicalStore {
 
     async fn delete_event(&self, id: EventId) -> Result<bool, StorageError> {
         self.delete_id("DELETE FROM events WHERE id = $1", id).await
+    }
+
+    async fn list_events(
+        &self,
+        after: Option<EventId>,
+        limit: u32,
+    ) -> Result<Vec<Event>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM events
+            WHERE ($1::uuid IS NULL OR id < $1)
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(after)
+        .bind(clamp_limit(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::event).collect()
     }
 
     async fn put_provenance(&self, provenance: &Provenance) -> Result<(), StorageError> {
@@ -1096,6 +1159,29 @@ impl RelationalStore for PostgresCanonicalStore {
         )
         .bind(after)
         .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::job).collect()
+    }
+
+    async fn list_jobs_by_status(
+        &self,
+        status: JobStatus,
+        after: Option<JobId>,
+        limit: u32,
+    ) -> Result<Vec<Job>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM jobs
+            WHERE status = $1 AND ($2::uuid IS NULL OR id < $2)
+            ORDER BY id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(encode_enum(&status)?)
+        .bind(after)
+        .bind(clamp_limit(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;

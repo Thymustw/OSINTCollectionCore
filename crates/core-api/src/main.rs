@@ -5,16 +5,19 @@ use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
-use core_api::{AppState, AuthState, ErrorBody, ImportState, PostgresReady, ReadyProbe, router};
+use core_api::{
+    AppState, AuthState, ErrorBody, ImportState, PostgresReady, ReadyProbe, SharedObjects,
+    SharedStore, SharedTokenStore, router,
+};
 use core_config::AppConfig;
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::{MetricsRegistry, init_tracing};
-use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog};
+use core_security::{AuditLog, JwtService, MemoryApiTokenStore, MemoryAuditLog};
 use storage_core::conformance::{
     assert_opensearch_identity, load_workspace_dotenv, verify_not_opencti_search,
 };
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresApiTokenStore, PostgresAuditLog, PostgresCanonicalStore};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -53,19 +56,43 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    let mut shared_store: Option<SharedStore> = None;
+    let mut shared_objects: Option<SharedObjects> = None;
+    // 預設是記憶體版。Postgres 接上後就換成落地版——**不要**把這裡當成常態：
+    // 記憶體 audit 在重啟時整批消失，記憶體 token store 會讓發出去的 token 失效。
+    // 沒換成功時下面會發一條 warn，那是唯一的訊號。
+    let mut audit: Arc<dyn AuditLog> = Arc::new(MemoryAuditLog::new());
+    let mut tokens: SharedTokenStore = Arc::new(MemoryApiTokenStore::new());
+
     let (jobs, import, ready) = match connect_postgres(&cfg).await {
         Ok(store) => {
             let ready = ReadyProbe::new(vec![Arc::new(PostgresReady {
                 store: store.clone(),
             })]);
+            // 稽核與 token 落到 `audit_log` / `api_tokens`（migration 0006）。
+            // 兩者共用 canonical store 的連線池，不另開池。
+            audit = Arc::new(PostgresAuditLog::new(&store));
+            tokens = Arc::new(PostgresApiTokenStore::new(&store));
+
+            // 一份 Arc 給所有 handler 用（AppState.store 與 ImportState.store 是同一個）。
+            let shared: SharedStore = Arc::new(store.clone());
+            shared_store = Some(shared.clone());
+
             // 匯入另外需要物件儲存。MinIO 沒接上時只有 /api/v1/import 回 503，
             // 其他路由照常——沒有理由讓查詢功能陪著一起掛掉。
             let import = match connect_objects(&cfg).await {
-                Ok(objects) => Some(Arc::new(ImportState {
-                    store: store.clone(),
-                    sink: Arc::new(StoreEvidenceSink::new(store.clone(), objects)),
-                    producer: producer.clone(),
-                })),
+                Ok(objects) => {
+                    shared_objects = Some(Arc::new(objects.clone()));
+                    Some(Arc::new(ImportState {
+                        store: shared,
+                        // sink 用**具體型別**組裝：`StoreEvidenceSink<R, O>` 要求
+                        // `R: RelationalStore`，而 `Arc<dyn RelationalStore>` 本身
+                        // 沒有實作那個 trait（沒有 blanket impl）。這裡手上正好有
+                        // 具體的 store，不需要為此加一層 wrapper。
+                        sink: Arc::new(StoreEvidenceSink::new(store.clone(), objects)),
+                        producer: producer.clone(),
+                    }))
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, "MinIO 未連上；POST /api/v1/import 會回 503");
                     None
@@ -77,7 +104,8 @@ async fn run() -> Result<(), String> {
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "Postgres 未連上；/jobs 與 /api/v1/import 會回 503，/health 仍可用"
+                "Postgres 未連上；/jobs、/api/v1/import 與 /api/v1/tokens 會回 503，\
+                 /health 仍可用。稽核與 API token 這次只存在記憶體裡，重啟即遺失"
             );
             (None, None, ReadyProbe::always_ready())
         }
@@ -97,9 +125,11 @@ async fn run() -> Result<(), String> {
         metrics: MetricsRegistry::new(),
         auth: AuthState {
             jwt: Arc::new(jwt),
-            tokens: Arc::new(MemoryApiTokenStore::new()),
+            tokens,
         },
-        audit: Arc::new(MemoryAuditLog::new()),
+        audit,
+        store: shared_store,
+        objects: shared_objects,
         jobs,
         import,
         search,
@@ -120,10 +150,16 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|err| format!("綁定 {addr} 失敗：{err}。請改 config [http].bind 或釋放該埠"))?;
     tracing::info!(%addr, "osint-api 開始聽");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|err| format!("伺服器結束：{err}"))
+    // `into_make_service_with_connect_info` 是為了讓 auth middleware 拿得到 TCP peer IP
+    // 寫進稽核。少了它 `audit_log.ip` 會全部是 NULL，而且完全不會報錯——
+    // 查「那些 401 是從哪裡來的」時才會發現沒有資料。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .map_err(|err| format!("伺服器結束：{err}"))
 }
 
 async fn connect_postgres(cfg: &AppConfig) -> Result<PostgresCanonicalStore, String> {
@@ -192,7 +228,7 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
         axum::Json(ErrorBody {
             error: "not_found".into(),
             message: "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs、\
-                 POST /api/v1/import 與 POST /api/v1/search"
+                 /api/v1/tokens（admin）、POST /api/v1/import 與 POST /api/v1/search"
                 .into(),
         }),
     )

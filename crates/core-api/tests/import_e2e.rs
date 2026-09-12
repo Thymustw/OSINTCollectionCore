@@ -105,9 +105,11 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, import_config: ImportS
             tokens: Arc::new(MemoryApiTokenStore::new()),
         },
         audit: Arc::new(audit.clone()),
+        store: Some(Arc::new(stack.pg.clone())),
+        objects: Some(Arc::new(stack.s3.clone())),
         jobs: None,
         import: Some(Arc::new(ImportState {
-            store: stack.pg.clone(),
+            store: Arc::new(stack.pg.clone()),
             sink: Arc::new(sink),
             producer: Some(producer),
         })),

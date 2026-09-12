@@ -1,4 +1,19 @@
 //! Axum API skeleton。
+//!
+//! # 這裡沒有測試用的 app 與密鑰
+//!
+//! Phase 6a 之前 `test_jwt()` / `test_app()` / `issue_test_jwt()` 就放在這個檔，
+//! 用一個「32 個相同位元組」的字面量當 JWT 密鑰，而且**沒有 `#[cfg(test)]`**——
+//! 也就是說那段硬編碼密鑰會被編進 `libcore_api` 與 `osint-api` 的 release binary。
+//! 它們已經搬到 `tests/common/mod.rs`（整合測試的 crate 裡，不會進生產產物）。
+//!
+//! `tests/no_test_secret_in_src.rs` 會掃這個目錄，防止同樣的東西被放回來。
+//! （那支測試是純字串比對，所以這裡連舉例都不能寫出那個字面量。）
+//!
+//! 沒有改用 `#[cfg(feature = "test-util")]` 的理由：那需要 crate 自己
+//! dev-depend 自己才能在整合測試裡打開 feature，會出現「同一個 crate 兩份」
+//! 的型別不相容問題。搬到 `tests/common/` 沒有這個風險，
+//! 而且讓「生產 build 不含測試密鑰」變成結構上必然，不是靠設定正確。
 
 mod error;
 mod extractors;
@@ -11,68 +26,26 @@ mod ready;
 mod routes;
 mod search;
 mod state;
+mod tokens;
 
 pub use error::{ApiError, ErrorBody};
 pub use import::{AUDIT_ACTION as IMPORT_AUDIT_ACTION, ImportRequest};
+pub use jobs::{AUDIT_JOB_CREATE, AUDIT_JOB_DISPATCH, AUDIT_JOB_TRANSITION};
+pub use middleware::{AUDIT_AUTH_FAILED, AUDIT_AUTHZ_DENIED};
 pub use pagination::{CursorPage, Pagination};
 pub use rate_limit::RateLimiter;
 pub use ready::{PostgresReady, ReadyCheck, ReadyProbe};
 pub use routes::router;
 pub use search::{EntitySummary, SearchHitBody, SearchResponse};
-pub use state::{AppState, AuthState, ImportState, SearchState};
+pub use state::{
+    AppState, AuthState, ImportState, SearchState, SharedObjects, SharedStore, SharedTokenStore,
+};
+pub use tokens::{
+    AUDIT_TOKEN_ISSUE, AUDIT_TOKEN_LIST, AUDIT_TOKEN_REVOKE, IssueTokenBody, TokenSummary,
+};
 
 /// 不接下游的 readiness（測試／Postgres 掛掉時仍讓行程活著）。
 #[must_use]
 pub fn ready_always() -> ReadyProbe {
     ReadyProbe::always_ready()
-}
-
-use axum::Router;
-use core_observability::MetricsRegistry;
-use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
-use std::sync::Arc;
-
-/// 測試與本機不接 DB 時的最小 app（記憶體 token store）。
-pub fn test_app(jwt: JwtService) -> Router {
-    test_app_parts(jwt).0
-}
-
-/// 同 `test_app`，另外回傳稽核紀錄，讓測試可以驗證「真的有寫」。
-pub fn test_app_parts(jwt: JwtService) -> (Router, MemoryAuditLog) {
-    let audit = MemoryAuditLog::new();
-    let state = AppState {
-        metrics: MetricsRegistry::new(),
-        auth: AuthState {
-            jwt: Arc::new(jwt),
-            tokens: Arc::new(MemoryApiTokenStore::new()),
-        },
-        audit: Arc::new(audit.clone()),
-        jobs: None,
-        import: None,
-        // 測試 app 不接 OpenSearch：`POST /api/v1/search` 回 503。
-        // 認證／RBAC 的測試仍然有效——middleware 在 handler 之前就擋下來了。
-        search: None,
-        ready: ready::ReadyProbe::always_ready(),
-        rate_limit_per_second: 100,
-        request_body_limit_bytes: 1_048_576,
-        // 測試用小上限：不需要為了驗證 413 真的傳 10 MiB 進來。
-        import_config: core_config::ImportSection {
-            max_upload_bytes: 4_096,
-            ..core_config::ImportSection::default()
-        },
-        rate_limiter: rate_limit::RateLimiter::new(100),
-    };
-    (router(state), audit)
-}
-
-/// 從 secret bytes 建測試 JWT。
-pub fn test_jwt() -> JwtService {
-    JwtService::new(&[b't'; 32], "osint-core", chrono::Duration::hours(1)).expect("test jwt")
-}
-
-/// 測試用 admin token。
-pub fn issue_test_jwt(role: Role) -> (JwtService, String) {
-    let jwt = test_jwt();
-    let token = jwt.issue("test-user", role).expect("issue");
-    (jwt, token)
 }
