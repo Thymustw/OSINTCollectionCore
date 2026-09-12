@@ -1,5 +1,29 @@
-# 本機／共用工作站基礎建設。正式資源上限在 docker-compose.dev.yml。
-# 使用：docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up -d
+# 本機／共用工作站基礎建設 + 六個應用服務。正式資源上限在 docker-compose.dev.yml。
+#
+# 只起基礎建設（本機用 cargo run 跑服務）：
+#   make compose-up
+# 連應用服務一起起（全容器化）：
+#   make compose-up-full
+#
+# 六個應用服務放在 `profiles: ["app"]` 底下，**預設不啟動**。這是刻意的：
+# CI 的 integration-test job 與 `make compose-up` 都只要基礎建設，若應用服務
+# 是預設啟動，那兩條路徑都會被迫先跑一次十幾分鐘的 image build。
+# 要啟動它們必須明確加 `--profile app`。
+#
+# ---------------------------------------------------------------------------
+# 容器內的連線設定跟本機 .env **不一樣**，不要混用
+# ---------------------------------------------------------------------------
+# 本機 .env 寫的是 127.0.0.1:19200 / 127.0.0.1:19000，而且設了
+# OSINT_STRICT_PORT_ISOLATION=1 —— 那是為了避開這台工作站上 OpenCTI 佔用的
+# 9200/9000，是**宿主端**的規避手段。
+#
+# 容器是走 compose network 的 DNS：opensearch:9200 / minio:9000 / postgres:5432。
+# 那些埠在 network 內是本專案自己的服務，沒有任何衝突。所以應用服務：
+#   1. **絕對不要**設 OSINT_STRICT_PORT_ISOLATION（設了會被
+#      storage-core 的 verify_not_opencti_search 擋下來，錯誤訊息還會叫你改成
+#      19200，那在容器內是錯的建議）。
+#   2. **絕對不要** env_file: ../.env（同上，會把宿主專屬設定灌進來）。
+# 對照表寫在 docs/developer/local-dev.md。
 name: osint-core
 
 networks:
@@ -12,6 +36,49 @@ volumes:
   redpanda-data:
   redis-data:
   minio-data:
+
+# 六個應用服務共用的連線設定。全部指向 compose network 的服務名，不是 127.0.0.1。
+x-osint-env: &osint-env
+  # core-config 的 SecretRef `env:DATABASE_URL`（config/default.toml
+  # [storage.canonical].dsn_secret_ref）。
+  DATABASE_URL: postgres://${POSTGRES_USER:-osint}:${POSTGRES_PASSWORD:-osint_dev}@postgres:5432/${POSTGRES_DB:-osint_core}
+  # OSINT__<區段>__<鍵> 覆寫 config/default.toml。巢狀鍵用雙底線。
+  OSINT__STORAGE__SEARCH__URL: http://opensearch:9200
+  OSINT__STORAGE__OBJECT__ENDPOINT: http://minio:9000
+  # 29092 是 redpanda 的 internal listener（宣告成 redpanda:29092）。
+  # **不要改成 9092**——那個 listener 宣告的是 127.0.0.1，容器連上去會變成
+  # 連自己。理由與症狀見下方 redpanda 服務的註解。
+  OSINT__BROKER__BROKERS: redpanda:29092
+  REDIS_URL: redis://redis:6379/0
+  MINIO_ROOT_USER: ${MINIO_ROOT_USER:-osint}
+  MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-osint_dev_minio}
+  # JwtService 要求至少 32 個 ASCII byte，短了會直接啟動失敗。
+  # ⚠️ 這個預設值只適用於本機／CI。正式佈署必須從 secret 管理機制帶入。
+  JWT_SECRET: ${JWT_SECRET:-osint-dev-only-jwt-secret-32bytes-min}
+  OSINT__APP__ENVIRONMENT: ${OSINT_ENVIRONMENT:-dev}
+  RUST_LOG: ${RUST_LOG:-info,rdkafka=warn,librdkafka=warn}
+  # 刻意**不設** OSINT_STRICT_PORT_ISOLATION：容器內的 opensearch:9200 /
+  # minio:9000 是本專案自己的服務，不是宿主上的 OpenCTI。理由見檔頭。
+
+# 全部依賴基礎建設就緒。六個服務啟動時都會各自跑一次 store.migrate()；
+# 已確認 sqlx-core 0.9.0 的 Migrator 預設 `locking: true`
+# （sqlx-core-0.9.0/src/migrate/migrator.rs:39），Postgres 端是 advisory lock，
+# 所以同時啟動會序列化而不是互相踩踏——不需要額外的 one-shot migrate 服務。
+x-osint-depends: &osint-depends
+  postgres:
+    condition: service_healthy
+  opensearch:
+    condition: service_healthy
+  redpanda:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+
+x-osint-build: &osint-build
+  context: ..
+  dockerfile: docker/Dockerfile
 
 services:
   postgres:
@@ -76,11 +143,33 @@ services:
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
     hostname: redpanda
+    # 兩個 Kafka listener。**這不是可選的美化，少了它容器內的服務會靜默壞掉。**
+    #
+    # 2026-09-12 實測：`--mode dev-container` 單一 listener 時，broker 對外
+    # 宣告的位址是 `127.0.0.1:9092`。宿主上的 `cargo run` 沒問題（127.0.0.1
+    # 真的就是 broker），但容器內的服務拿到這個 metadata 之後會去連**自己**的
+    # 127.0.0.1，得到 `AllBrokersDown ... MessageTimedOut`。
+    #
+    # 陰險的地方在於**這不會讓健康檢查變紅**：bootstrap 位址 `redpanda:9092`
+    # 連得上，metadata 查得到（`/api/v1/ops/health` 回「1 個 broker、57 個
+    # topic」一切正常），只有實際 produce/consume 會逾時。表現出來是
+    # 「匯入回 201 但文件永遠不會出現在搜尋結果裡」。
+    #
+    #   external → 0.0.0.0:9092，宣告 127.0.0.1:9092  → 給宿主（cargo run、CI）
+    #   internal → 0.0.0.0:29092，宣告 redpanda:29092 → 給 compose network 內的容器
+    #
+    # external 維持 9092 是刻意的：本機 .env、config/default.toml、CI 的
+    # REDPANDA_BROKERS 全都指著 9092，換掉會波及整個測試套件。29092 不對宿主
+    # 開放（沒有寫進 ports），只在 network 內用。
     command:
       - redpanda
       - start
       - --mode
       - dev-container
+      - --kafka-addr
+      - internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - internal://redpanda:29092,external://127.0.0.1:9092
       - --smp
       - "1"
       - --memory
@@ -152,4 +241,119 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+    restart: unless-stopped
+
+  # =========================================================================
+  # 應用服務（SPEC §27 exit criteria：docker compose 可啟動整套）
+  # =========================================================================
+  #
+  # healthcheck 由 image 的 HEALTHCHECK 指令提供（docker/Dockerfile），
+  # compose 直接沿用，不在這裡重複定義一份會慢慢跟 Dockerfile 走鐘的副本。
+  #
+  # 每個服務都必須把 bind 覆寫成 0.0.0.0：config/default.toml 的預設
+  # 127.0.0.1 在容器內等於「只有容器自己連得到」，宿主與其他容器都打不到。
+  #
+  # 宿主埠沿用本機開發同一組 18080–18085，方便在容器版與 `cargo run` 版之間
+  # 直接切換（兩者不能同時跑，會搶埠）。
+
+  osint-api:
+    build:
+      <<: *osint-build
+      target: osint-api
+    image: osint-core/osint-api:0.1.0
+    hostname: osint-api
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__HTTP__BIND: 0.0.0.0:18080
+    ports:
+      - "18080:18080"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+
+  osint-collector:
+    build:
+      <<: *osint-build
+      target: osint-collector
+    image: osint-core/osint-collector:0.1.0
+    hostname: osint-collector
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__COLLECTOR__BIND: 0.0.0.0:18081
+    ports:
+      - "18081:18081"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+
+  osint-normalizer:
+    build:
+      <<: *osint-build
+      target: osint-normalizer
+    image: osint-core/osint-normalizer:0.1.0
+    hostname: osint-normalizer
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__NORMALIZER__BIND: 0.0.0.0:18082
+    ports:
+      - "18082:18082"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+
+  osint-deduplicator:
+    build:
+      <<: *osint-build
+      target: osint-deduplicator
+    image: osint-core/osint-deduplicator:0.1.0
+    hostname: osint-deduplicator
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__DEDUPLICATOR__BIND: 0.0.0.0:18083
+    ports:
+      - "18083:18083"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+
+  osint-entity-worker:
+    build:
+      <<: *osint-build
+      target: osint-entity-worker
+    image: osint-core/osint-entity-worker:0.1.0
+    hostname: osint-entity-worker
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__ENTITY_WORKER__BIND: 0.0.0.0:18084
+    ports:
+      - "18084:18084"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+
+  osint-indexer:
+    build:
+      <<: *osint-build
+      target: osint-indexer
+    image: osint-core/osint-indexer:0.1.0
+    hostname: osint-indexer
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__INDEXER__BIND: 0.0.0.0:18085
+    ports:
+      - "18085:18085"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
     restart: unless-stopped

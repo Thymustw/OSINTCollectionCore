@@ -13,7 +13,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Gate order: lint -> secret scan -> SCA -> IaC scan -> unit -> integration -> build.
+# Gate order: lint -> secret scan -> SCA -> IaC scan -> unit -> integration ->
+#             build -> image-build -> sbom + image-scan.
+#
+# 對應 docs/security/SECURITY_CI.md 的 "Build Candidate" 段
+# （container build → SBOM generation → image scan）與 DEVSECOPS.md §12。
 #
 # No continue-on-error anywhere: a green run must mean the gate actually
 # passed. This file is intentionally NOT pushed to the remote until the
@@ -135,3 +139,142 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
+
+  # ==========================================================================
+  # Build Candidate 段（SECURITY_CI.md）：container build -> SBOM -> image scan
+  # ==========================================================================
+
+  image-build:
+    name: Container build (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - osint-api
+          - osint-collector
+          - osint-normalizer
+          - osint-deduplicator
+          - osint-entity-worker
+          - osint-indexer
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v3
+      # 六個 target 共用同一個 builder stage。GHA cache 讓第二個之後的
+      # service 直接命中，不會把同一份 workspace 編六次。
+      #
+      # 產出存成 tar 給 sbom / image-scan job 用。分成不同 job 是為了讓
+      # DEVSECOPS §12 的 gate 在 CI 上各自可見（哪一關擋下來一目了然），
+      # 不是為了讓它們各自重編一次。
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: ${{ matrix.service }}
+          tags: osint-core/${{ matrix.service }}:ci
+          push: false
+          load: false
+          outputs: type=docker,dest=/tmp/${{ matrix.service }}.tar
+          cache-from: type=gha,scope=osint-core-builder
+          cache-to: type=gha,mode=max,scope=osint-core-builder
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.service }}
+          path: /tmp/${{ matrix.service }}.tar
+          retention-days: 1
+
+  sbom:
+    name: SBOM (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [image-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - osint-api
+          - osint-collector
+          - osint-normalizer
+          - osint-deduplicator
+          - osint-entity-worker
+          - osint-indexer
+    steps:
+      # V0.1 只要求「有產生路徑」（DEVSECOPS.md §25：正式 SBOM 是 V1.0 的
+      # release gate）。這裡用 trivy 而不是 syft，理由是 SECURITY_CI.md 的
+      # 「Avoid unnecessary tool sprawl」——image scan 已經需要 trivy，
+      # 同一支工具就能出 CycloneDX，不必為此再引進第二個掃描器。
+      #
+      # 這個 job **不擋**任何東西：它只產生 artifact。真正的 gate 是 image-scan。
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.service }}
+          path: /tmp
+      - run: docker load --input /tmp/${{ matrix.service }}.tar
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: osint-core/${{ matrix.service }}:ci
+          format: cyclonedx
+          output: sbom-${{ matrix.service }}.cdx.json
+          exit-code: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.cdx.json
+          retention-days: 30
+
+  image-scan:
+    name: Image scan (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [image-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - osint-api
+          - osint-collector
+          - osint-normalizer
+          - osint-deduplicator
+          - osint-entity-worker
+          - osint-indexer
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.service }}
+          path: /tmp
+      - run: docker load --input /tmp/${{ matrix.service }}.tar
+      # 兩段式，對齊 DEVSECOPS.md §13：
+      #   Critical → 擋（"unresolved Critical security finding ... blocks"）
+      #   High     → 列出來分流（"High findings require explicit triage"），不擋
+      #
+      # ⚠️ 這與「HIGH,CRITICAL 一律 exit-code 1」不同，是刻意的。runtime base
+      # 是 debian:bookworm-slim，distro 套件常年帶著上游沒修的 HIGH；一律擋的
+      # 結果是所有人把它們塞進 .trivyignore，gate 就退化成裝飾品。
+      #
+      # --ignore-unfixed：上游還沒出修補版的，擋了也沒有下一步動作可做。
+      #
+      # 若真的需要 .trivyignore，每一個 ID **必須**在
+      # docs/security/VULNERABILITY_TRIAGE.md 有對應條目（跟 deny.toml 的
+      # advisories ignore 同一套規矩），沒有對應條目就是流程違規。
+      - name: HIGH findings (triage list, non-blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: osint-core/${{ matrix.service }}:ci
+          scanners: vuln
+          severity: HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "0"
+      - name: CRITICAL gate (blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: osint-core/${{ matrix.service }}:ci
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"

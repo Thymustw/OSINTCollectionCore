@@ -6,6 +6,8 @@
 	compose-up compose-down compose-ps migrate-postgres migrate-sqlite \
 	run-api run-collector run-normalizer run-deduplicator run-entity-worker \
 	run-indexer rebuild-index rebuild-index-drop run-cli \
+	image-build image-scan image-prune image-ls \
+	compose-up-full compose-down-full compose-ps-full \
 	disk clean
 
 export PATH := $(HOME)/.cargo/bin:$(PATH)
@@ -39,6 +41,13 @@ help:
 	@echo "  make rebuild-index     從 PostgreSQL 補齊 OpenSearch 投影後結束"
 	@echo "  make rebuild-index-drop 先刪 index 再從零重建（mapping 有破壞性變更時用）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
+	@echo "  make image-build       建六個服務的容器 image（不 push）"
+	@echo "  make image-scan        trivy image 掃六個 image（需已安裝 trivy）"
+	@echo "  make image-ls          列出本專案的 image 與大小"
+	@echo "  make image-prune       清掉 dangling layer 與 builder 快取"
+	@echo "  make compose-up-full   基礎建設 + 六個應用服務（會先 build）"
+	@echo "  make compose-down-full 停掉含應用服務的整套"
+	@echo "  make compose-ps-full   含應用服務的狀態"
 	@echo "  make disk              顯示 target/、.git、docker volume 的磁碟用量"
 	@echo "  make clean             cargo clean（target/ 會長到數十 GB，定期清）"
 
@@ -88,6 +97,70 @@ compose-down:
 
 compose-ps:
 	$(COMPOSE) $(COMPOSE_FILES) ps
+
+# --- 容器化（Phase 7a）--------------------------------------------------
+# 六個應用服務在 compose 的 `app` profile 底下，預設不啟動。
+# 沒有 --profile app 的目標（compose-up / compose-down / compose-ps）行為不變。
+
+IMAGE_TAG ?= 0.1.0
+IMAGE_PREFIX ?= osint-core
+SERVICES := osint-api osint-collector osint-normalizer \
+	osint-deduplicator osint-entity-worker osint-indexer
+
+# 只 build，不啟動。image 名稱固定成 $(IMAGE_PREFIX)/<服務>:$(IMAGE_TAG)，
+# 所以重 build 會覆蓋同一個 tag（舊的變成 dangling，用 image-prune 清）。
+# **不 push 任何 registry**：V0.1 只需要本機 build + CI build + scan。
+image-build:
+	$(COMPOSE) $(COMPOSE_FILES) --profile app build
+
+image-ls:
+	@docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}' \
+		| grep -E 'REPOSITORY|^$(IMAGE_PREFIX)/' || echo "（還沒有 $(IMAGE_PREFIX)/ 的 image，先跑 make image-build）"
+
+# trivy 沒安裝就明確失敗，不要靜默跳過——「掃描通過」跟「根本沒掃」
+# 在 CI log 裡長得一模一樣才是真正的風險。
+#
+# 兩段式，對齊 DEVSECOPS.md §13/§14：
+#   1. CRITICAL（且有修補版本）→ exit 1，擋下。
+#   2. HIGH → 只列出來供分流（§13：「High findings require explicit triage」），
+#      不擋。分流結果寫進 docs/security/VULNERABILITY_TRIAGE.md。
+# --ignore-unfixed：上游還沒出修補的 distro 套件擋了也沒有下一步可做，
+# 那只會訓練大家去加 .trivyignore。
+image-scan:
+	@command -v trivy >/dev/null 2>&1 || { \
+		echo "找不到 trivy。請先安裝（https://trivy.dev/latest/getting-started/installation/），"; \
+		echo "或在 CI 上跑 image-scan job。這個目標不會在沒有掃描器的情況下假裝通過。"; \
+		exit 1; }
+	@for svc in $(SERVICES); do \
+		echo "=== HIGH 分流清單（不擋）：$(IMAGE_PREFIX)/$$svc:$(IMAGE_TAG) ==="; \
+		trivy image --scanners vuln --severity HIGH --ignore-unfixed \
+			--exit-code 0 "$(IMAGE_PREFIX)/$$svc:$(IMAGE_TAG)" || exit 1; \
+	done
+	@for svc in $(SERVICES); do \
+		echo "=== CRITICAL gate（會擋）：$(IMAGE_PREFIX)/$$svc:$(IMAGE_TAG) ==="; \
+		trivy image --scanners vuln --severity CRITICAL --ignore-unfixed \
+			--exit-code 1 "$(IMAGE_PREFIX)/$$svc:$(IMAGE_TAG)" || exit 1; \
+	done
+
+# build 完一定要跑。multi-stage 的 builder stage 是 buildpack-deps 底的
+# rust image（>1.5 GB），加上 BuildKit 的 cargo/target cache mount，
+# 不清的話每 build 一輪磁碟就往上跳好幾 GB（CLAUDE.md §15）。
+#
+# ⚠️ `docker image prune -f` 清的是**全機**的 dangling image。這台工作站上
+# 還有 OpenCTI 那套，先確認那邊沒有正在依賴未 tag 的 image 再跑。
+image-prune:
+	docker image prune -f
+	docker builder prune -f
+	@df -h / | tail -1
+
+compose-up-full:
+	$(COMPOSE) $(COMPOSE_FILES) --profile app up -d --build --wait --wait-timeout 300
+
+compose-down-full:
+	$(COMPOSE) $(COMPOSE_FILES) --profile app down
+
+compose-ps-full:
+	$(COMPOSE) $(COMPOSE_FILES) --profile app ps
 
 migrate-postgres:
 	$(SQLX) migrate run --source migrations/postgres --database-url "$(DATABASE_URL)"

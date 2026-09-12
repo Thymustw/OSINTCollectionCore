@@ -32,3 +32,43 @@ services:
     ports: !override
       - "19000:9000"
       - "19001:9001"
+
+  # --- 應用服務（profiles: app，只有 `make compose-up-full` 會起）---
+  #
+  # RESOURCE_BUDGET.md §2/§3 的原則（Core 不擁有全部 CPU/RAM，要留給 VM 與
+  # 宿主）套到這台開發機的實際規格：約 31 GB RAM / 8 核心，而且同時跑著
+  # 一整套 OpenCTI。上面的基礎建設已經佔掉 3.25 GB / 4.0 CPU，
+  # 這六個服務再加 1.9 GB / 2.5 CPU，合計 5.15 GB / 6.5 CPU。
+  #
+  # 分配依據：osint-api 同時是 HTTP 入口與匯入解析點，拿最多；indexer 要做
+  # bulk 批次與 OpenSearch 投影，次之；其餘四個消費者是輕量常駐。
+  #
+  # ⚠️ 這些是**本機開發**的天花板，不是容量規劃。正式佈署要依
+  # RESOURCE_BUDGET.md 的 OSINT_RAM_SOFT_LIMIT_GB / OSINT_CPU_SOFT_PERCENT 重算。
+  #
+  # 宿主埠**不覆寫**：18080–18085 在這台機器上是空的（`ss -ltn` 實測），
+  # 沒有像 9200/9000 那樣的 OpenCTI 衝突要規避。
+
+  osint-api:
+    mem_limit: 512m
+    cpus: "1.0"
+
+  osint-collector:
+    mem_limit: 256m
+    cpus: "0.25"
+
+  osint-normalizer:
+    mem_limit: 256m
+    cpus: "0.25"
+
+  osint-deduplicator:
+    mem_limit: 256m
+    cpus: "0.25"
+
+  osint-entity-worker:
+    mem_limit: 256m
+    cpus: "0.25"
+
+  osint-indexer:
+    mem_limit: 384m
+    cpus: "0.50"
