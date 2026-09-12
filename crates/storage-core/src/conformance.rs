@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use core_model::{
-    Collection, Connector, Document, DocumentType, DuplicateGroup, Entity, EntityAlias,
-    EntityExtraction, EntityIdentifier, EntityType, Event, FailedEvent, Job, JobStatus,
-    MergeHistory, NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence,
-    RelationshipType, RepointedReference, ResolutionCandidate, ResolutionStatus, Source,
-    SourceType,
+    AbsorberSnapshot, Collection, Connector, Document, DocumentType, DuplicateGroup, Entity,
+    EntityAlias, EntityExtraction, EntityIdentifier, EntityType, Event, FailedEvent, Job,
+    JobStatus, MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence,
+    Relationship, RelationshipEvidence, RelationshipType, RepointedReference, ResolutionCandidate,
+    ResolutionStatus, Source, SourceType,
 };
 use serde_json::json;
 use url::Url;
@@ -456,6 +456,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         confidence: 1.0,
         first_seen: fixture_ts(),
         last_seen: fixture_ts(),
+        merged_into: None,
         attributes: json!({}),
     };
     store.put_entity(&entity).await?;
@@ -1006,6 +1007,8 @@ async fn assert_dedup_queries<S: RelationalStore>(
 /// 3. `(a, b, method)` 的唯一鍵真的存在——沒有它，每跑一次 resolver 就長一批新列。
 /// 4. `repointed_references` 原樣讀得回來——它是 undo 的**全部**依據，
 ///    少一筆就少還原一個參照（SPEC Acceptance C）。
+/// 5. `merged_into` 與 `merged_relationships` 原樣讀得回來（Phase 1e）。
+///    漏掉的話下一棒 merge 實作寫進去、讀出來卻永遠是空，而且不會報錯。
 async fn assert_v0_2_resolution_queries<S: RelationalStore>(
     store: &S,
     entity: &Entity,
@@ -1176,6 +1179,7 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
         confidence: 1.0,
         first_seen: fixture_ts(),
         last_seen: fixture_ts(),
+        merged_into: None,
         attributes: json!({}),
     };
     store.put_entity(&other_entity).await?;
@@ -1382,6 +1386,7 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
                 previous_value: other_entity.id,
             },
         ],
+        merged_relationships: Vec::new(),
         undone_at: None,
     };
     store.put_merge_history(&history).await?;
@@ -1451,6 +1456,65 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
             message: "list_merge_history_by_entity 對不存在的 entity_id 回了資料".into(),
         });
     }
+
+    // Phase 1e：merged_into 與 merged_relationships 必須原樣讀回來。
+    // 不驗證 merge 業務邏輯——只證明欄位能寫進去讀出來。漏掉的話下一棒
+    // 的 merge 實作會把標記寫進去、讀出來卻永遠是 None／空陣列，而且不會報錯。
+    let marked = Entity {
+        merged_into: Some(entity.id),
+        ..other_entity.clone()
+    };
+    store.put_entity(&marked).await?;
+    assert_eq_debug(
+        "entity_merged_into",
+        &marked,
+        &store
+            .get_entity(marked.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入 merged_into 的 Entity 讀不到".into(),
+            })?,
+    );
+
+    let absorbed = Relationship {
+        id: Uuid::now_v7(),
+        source_object_id: other_entity.id,
+        relationship_type: RelationshipType::Affects,
+        target_object_id: Uuid::now_v7(),
+        confidence: 0.6,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        evidence_count: 1,
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+    };
+    let with_merged_rels = MergeHistory {
+        merged_relationships: vec![MergedRelationship {
+            absorbed_relationship_id: absorbed.id,
+            absorber_relationship_id: Some(Uuid::now_v7()),
+            absorbed_snapshot: absorbed,
+            absorber_pre_merge: Some(AbsorberSnapshot {
+                evidence_count: 3,
+                confidence: 0.9,
+                first_seen: fixture_ts(),
+                last_seen: fixture_ts(),
+            }),
+            moved_evidence_ids: vec![Uuid::now_v7()],
+        }],
+        ..undone.clone()
+    };
+    store.put_merge_history(&with_merged_rels).await?;
+    assert_eq_debug(
+        "merge_history_merged_relationships",
+        &with_merged_rels,
+        &store
+            .get_merge_history(history.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入 merged_relationships 的 merge_history 讀不到".into(),
+            })?,
+    );
+
     Ok(())
 }
 
@@ -1800,6 +1864,7 @@ fn tx_entity(label: &str) -> Entity {
         confidence: 1.0,
         first_seen: fixture_ts(),
         last_seen: fixture_ts(),
+        merged_into: None,
         attributes: json!({}),
     }
 }

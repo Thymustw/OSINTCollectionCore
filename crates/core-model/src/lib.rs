@@ -42,7 +42,7 @@ pub use extraction::EntityExtraction;
 pub use failed_event::FailedEvent;
 pub use ids::*;
 pub use job::Job;
-pub use merge::{MergeHistory, RepointedReference};
+pub use merge::{AbsorberSnapshot, MergeHistory, MergedRelationship, RepointedReference};
 pub use network_rule::NetworkRule;
 pub use provenance::Provenance;
 pub use raw_evidence::RawEvidence;
@@ -184,6 +184,7 @@ mod tests {
             confidence: 1.0,
             first_seen: ts(),
             last_seen: ts(),
+            merged_into: None,
             attributes: json!({}),
         };
         assert_eq!(round_trip(&entity), entity);
@@ -379,6 +380,18 @@ mod tests {
 
     #[test]
     fn v0_2_merge_history_round_trip_keeps_previous_values() {
+        let rel = Relationship {
+            id: id(),
+            source_object_id: id(),
+            relationship_type: RelationshipType::Affects,
+            target_object_id: id(),
+            confidence: 0.8,
+            first_seen: ts(),
+            last_seen: ts(),
+            evidence_count: 2,
+            created_at: ts(),
+            updated_at: ts(),
+        };
         let history = MergeHistory {
             id: id(),
             survivor_id: id(),
@@ -391,6 +404,18 @@ mod tests {
                 row_id: id(),
                 column: "target_object_id".into(),
                 previous_value: id(),
+            }],
+            merged_relationships: vec![MergedRelationship {
+                absorbed_relationship_id: id(),
+                absorber_relationship_id: Some(id()),
+                absorbed_snapshot: rel.clone(),
+                absorber_pre_merge: Some(AbsorberSnapshot {
+                    evidence_count: 2,
+                    confidence: 0.8,
+                    first_seen: ts(),
+                    last_seen: ts(),
+                }),
+                moved_evidence_ids: vec![id()],
             }],
             undone_at: None,
         };

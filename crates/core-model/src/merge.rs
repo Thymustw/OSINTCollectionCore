@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ids::{EntityId, MergeHistoryId};
+use crate::ids::{EntityId, MergeHistoryId, RelationshipEvidenceId, RelationshipId};
+use crate::relationship::Relationship;
 
 /// merge 時被改寫的一個 canonical reference。
 ///
@@ -67,6 +68,50 @@ pub struct MergeHistory {
     /// merge 改寫過的參照。空陣列代表當時沒有任何列需要 repoint，
     /// **不代表沒記錄**——沒記錄是資料遺失，要當成錯誤處理，不是空陣列。
     pub repointed_references: Vec<RepointedReference>,
+    /// merge 時因 relationship UNIQUE 撞號而被吸收合併或自迴圈刪除的 relationship。
+    /// 空陣列代表「這次 merge 沒有任何 relationship 撞號」，不是沒記錄。
+    ///
+    /// `RepointedReference` 只能表達「單欄位從 A 改成 B」。撞號時整列被刪、
+    /// evidence 搬去別的列，那個模型寫不進去；不另記的話 undo 無法重建被刪的
+    /// relationship，而且**不會報錯**，圖上只是少幾條邊。
+    pub merged_relationships: Vec<MergedRelationship>,
     /// 這次 merge 被撤銷的時間。`None` = 仍然生效。
     pub undone_at: Option<DateTime<Utc>>,
+}
+
+/// merge 時因 relationship 的 `(source, type, target)` UNIQUE 撞號而被吸收合併時，
+/// absorber（留下來那條）在合併前的可變欄位快照。undo 時用來還原。
+///
+/// 不記的話 undo 只能看到合併後的 `evidence_count`／`confidence`／時間窗，
+/// 分不出哪些是吸收進來的、哪些本來就在 absorber 上。把吸收後的值留著不還原，
+/// 等於同一批 evidence 被算兩次。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AbsorberSnapshot {
+    pub evidence_count: i32,
+    pub confidence: f64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+/// merge 時因撞號被刪除的一條 relationship（`RepointedReference` 的「單欄位還原」
+/// 模型無法表達「整列被刪除」，所以用這個型別另外記）。
+///
+/// `absorber_relationship_id` 為 `None` 代表**自迴圈刪除**（merged 與 survivor
+/// 之間原本就有直接關聯，repoint 後兩端會變成同一個 Entity，語意無效，直接刪除，
+/// 不吸收進任何一條——這種情況下 `relationship_evidence` 會被 `ON DELETE CASCADE`
+/// 一併刪除，undo 只能重建 relationship 本身，evidence 無法復原，這是已知限制）。
+/// 為 `Some(id)` 代表**吸收合併**：`absorbed_relationship_id` 這條被刪除，
+/// 它的 evidence 全部搬到 `absorber_relationship_id` 這條、`absorber_pre_merge`
+/// 記錄 absorber 合併前的欄位供 undo 還原。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MergedRelationship {
+    pub absorbed_relationship_id: RelationshipId,
+    pub absorber_relationship_id: Option<RelationshipId>,
+    /// 被刪除前的完整快照，undo 時用它 `put_relationship` 重建。
+    pub absorbed_snapshot: Relationship,
+    /// `absorber_relationship_id` 為 `Some` 時才有值。
+    pub absorber_pre_merge: Option<AbsorberSnapshot>,
+    /// 從 `absorbed_relationship_id` 搬到 `absorber_relationship_id` 的 evidence id
+    /// 列表。`absorber_relationship_id` 為 `None`（自迴圈）時這裡是空陣列。
+    pub moved_evidence_ids: Vec<RelationshipEvidenceId>,
 }

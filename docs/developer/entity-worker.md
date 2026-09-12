@@ -311,6 +311,9 @@ write-then-claim 的 crash window 只會造成重跑，而重跑因為第 2 點�
 `storage-core` 現在有 `TransactionalStore`，這裡也該改，排在 V0.2 Phase 1。
 在那之前 crash window 依然存在，靠的是 v5 id 的冪等，不是原子性。
 
+`upsert_entity` 重建 `Entity` 時會保留既有的 `merged_into`（Phase 1e）。抽取路徑
+不該清掉 merge 標記——寫成 `None` 會把已併掉的 Entity 靜默復活。
+
 ---
 
 ## `entity_identifiers`（V0.2 Phase 1c-0-data）

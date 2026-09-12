@@ -433,6 +433,8 @@ impl EntityWorker {
                 .map_or(item.confidence, |e| e.confidence.max(item.confidence)),
             first_seen: existing.as_ref().map_or(now, |e| e.first_seen),
             last_seen: now,
+            // 抽取路徑不碰 merge 標記。寫成 `None` 會把已併掉的 Entity 靜默復活。
+            merged_into: existing.as_ref().and_then(|e| e.merged_into),
             attributes: Value::Object(attributes),
         };
 

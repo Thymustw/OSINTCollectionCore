@@ -906,6 +906,7 @@ async fn object_detail_carries_the_provenance_chain() {
         confidence: 0.9,
         first_seen: Utc::now(),
         last_seen: Utc::now(),
+        merged_into: None,
         attributes: json!({}),
     };
     stack.pg.put_entity(&entity).await.expect("seed entity");
@@ -989,6 +990,7 @@ async fn entity_and_relationship_detail() {
         confidence: 0.7,
         first_seen: Utc::now(),
         last_seen: Utc::now(),
+        merged_into: None,
         attributes: json!({}),
     };
     stack.pg.put_entity(&entity).await.expect("seed entity");

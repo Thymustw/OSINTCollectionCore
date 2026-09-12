@@ -44,7 +44,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `CanonicalStore` | `storage-postgres` | PostgreSQL 17（Core 真實來源） |
 | `EmbeddedStore` | `storage-sqlite` | SQLite（本機／App／投影，不是高併發 canonical） |
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
-| `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表（見下方「`RelationalStore` 的 V0.2 方法」） |
+| `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`，見 `schema-v0.2.md`） |
 | `SearchStore` | `storage-opensearch` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`query`／`search`／`delete`） |
 | `ProjectionStore` | `storage-opensearch` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
 | `GraphStore` | **尚未**（Phase 2 `storage-neo4j`）；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g）。見下方「`GraphStore`」 |
@@ -164,11 +164,11 @@ migrations/postgres/   Core canonical（sqlx migrate；adapter 也可 `PostgresC
 migrations/sqlite/     Embedded / App / projection（`SqliteEmbeddedStore::migrate`）
 ```
 
-SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / TIMESTAMPTZ）。見 `docs/developer/schema-v0.1.md`；V0.2 的 `0007`（Entity Resolution + `failed_events`）見 `docs/developer/schema-v0.2.md`。
+SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / TIMESTAMPTZ）。見 `docs/developer/schema-v0.1.md`；V0.2 的 `0007`（Entity Resolution + `failed_events`）與 `0008`（Entity Merge 欄位）見 `docs/developer/schema-v0.2.md`。
 
 ## `RelationalStore` 的 V0.2 方法（Phase 0c）
 
-`traits.rs` 裡以 `// ===== V0.2 =====` 分隔。表在 migration `0007`。
+`traits.rs` 裡以 `// ===== V0.2 =====` 分隔。表在 migration `0007`；`entities.merged_into` 與 `merge_history.merged_relationships` 在 `0008`。
 `crates/resolver`（Phase 1c）掃描式聚合會呼叫 `get_entity`、
 `find_entity_by_normalized_name`、`list_entity_aliases_by_entity`、
 `find_entity_aliases_by_text`、`list_relationships_by_object`、

@@ -1,7 +1,8 @@
 use core_model::{
     Collection, Connector, Document, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
-    EntityIdentifier, Event, FailedEvent, Job, MergeHistory, NetworkRule, Provenance, RawEvidence,
-    Relationship, RelationshipEvidence, RepointedReference, ResolutionCandidate, Source,
+    EntityIdentifier, Event, FailedEvent, Job, MergeHistory, MergedRelationship, NetworkRule,
+    Provenance, RawEvidence, Relationship, RelationshipEvidence, RepointedReference,
+    ResolutionCandidate, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -186,6 +187,7 @@ pub fn entity(row: &PgRow) -> Result<Entity, StorageError> {
         confidence: get(row, "confidence")?,
         first_seen: get(row, "first_seen")?,
         last_seen: get(row, "last_seen")?,
+        merged_into: get(row, "merged_into")?,
         attributes: get(row, "attributes")?,
     })
 }
@@ -341,6 +343,7 @@ pub fn merge_history(row: &PgRow) -> Result<MergeHistory, StorageError> {
         operator: get(row, "operator")?,
         timestamp: get(row, "timestamp")?,
         repointed_references: decode_repointed(get(row, "repointed_references")?)?,
+        merged_relationships: decode_merged_relationships(get(row, "merged_relationships")?)?,
         undone_at: get(row, "undone_at")?,
     })
 }
@@ -363,6 +366,30 @@ fn decode_repointed(value: Value) -> Result<Vec<RepointedReference>, StorageErro
         other => Err(StorageError::CorruptionSuspected {
             message: format!(
                 "merge_history.repointed_references 應為 JSON 陣列，實際是 {other}。\
+                 這筆 merge 無法 undo，請先人工比對"
+            ),
+        }),
+    }
+}
+
+/// `merge_history.merged_relationships` 必須是 JSON 陣列。
+///
+/// 解不開時回 [`StorageError::CorruptionSuspected`] 而**不是**當成空陣列：
+/// 空陣列的意思是「這次 merge 沒有任何 relationship 撞號」，拿它來代表「讀不懂」
+/// 會讓 undo 靜默地少重建一批被吸收／自迴圈刪除的 relationship。
+fn decode_merged_relationships(value: Value) -> Result<Vec<MergedRelationship>, StorageError> {
+    match value {
+        Value::Array(_) => {
+            serde_json::from_value(value).map_err(|err| StorageError::CorruptionSuspected {
+                message: format!(
+                    "merge_history.merged_relationships 不是 MergedRelationship 陣列：{err}。\
+                     這筆 merge 無法 undo，請先人工比對"
+                ),
+            })
+        }
+        other => Err(StorageError::CorruptionSuspected {
+            message: format!(
+                "merge_history.merged_relationships 應為 JSON 陣列，實際是 {other}。\
                  這筆 merge 無法 undo，請先人工比對"
             ),
         }),

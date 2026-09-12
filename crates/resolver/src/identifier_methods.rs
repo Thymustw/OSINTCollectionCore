@@ -257,6 +257,7 @@ mod tests {
             confidence: 1.0,
             first_seen: ts(),
             last_seen: ts(),
+            merged_into: None,
             attributes: json!({}),
         }
     }

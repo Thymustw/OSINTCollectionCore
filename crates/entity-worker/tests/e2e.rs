@@ -1420,6 +1420,7 @@ async fn identifier_conflict_writes_exact_identifier_candidate() {
         confidence: 0.5,
         first_seen: now,
         last_seen: now,
+        merged_into: None,
         attributes: json!({}),
     };
     stack.pg.put_entity(&occupant).await.expect("occupant");

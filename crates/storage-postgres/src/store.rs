@@ -970,8 +970,8 @@ impl RelationalStore for PostgresCanonicalStore {
             r#"
             INSERT INTO entities (
                 id, entity_type, name, normalized_name, description, confidence,
-                first_seen, last_seen, attributes
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                first_seen, last_seen, merged_into, attributes
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (id) DO UPDATE SET
                 entity_type = EXCLUDED.entity_type,
                 name = EXCLUDED.name,
@@ -980,6 +980,7 @@ impl RelationalStore for PostgresCanonicalStore {
                 confidence = EXCLUDED.confidence,
                 first_seen = EXCLUDED.first_seen,
                 last_seen = EXCLUDED.last_seen,
+                merged_into = EXCLUDED.merged_into,
                 attributes = EXCLUDED.attributes
             "#,
         )
@@ -991,6 +992,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(entity.confidence)
         .bind(entity.first_seen)
         .bind(entity.last_seen)
+        .bind(entity.merged_into)
         .bind(&entity.attributes)
         .execute(self.conn().await?.as_mut())
         .await
@@ -1948,12 +1950,19 @@ impl RelationalStore for PostgresCanonicalStore {
                 message: format!("序列化 merge_history.repointed_references 失敗：{err}"),
             }
         })?;
+        let merged_relationships =
+            serde_json::to_value(&history.merged_relationships).map_err(|err| {
+                StorageError::Unknown {
+                    backend: "postgres",
+                    message: format!("序列化 merge_history.merged_relationships 失敗：{err}"),
+                }
+            })?;
         sqlx::query(
             r#"
             INSERT INTO merge_history (
                 id, survivor_id, merged_id, reason, operator, timestamp,
-                repointed_references, undone_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                repointed_references, merged_relationships, undone_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
             ON CONFLICT (id) DO UPDATE SET
                 survivor_id = EXCLUDED.survivor_id,
                 merged_id = EXCLUDED.merged_id,
@@ -1961,6 +1970,7 @@ impl RelationalStore for PostgresCanonicalStore {
                 operator = EXCLUDED.operator,
                 timestamp = EXCLUDED.timestamp,
                 repointed_references = EXCLUDED.repointed_references,
+                merged_relationships = EXCLUDED.merged_relationships,
                 undone_at = EXCLUDED.undone_at
             "#,
         )
@@ -1971,6 +1981,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(&history.operator)
         .bind(history.timestamp)
         .bind(repointed)
+        .bind(merged_relationships)
         .bind(history.undone_at)
         .execute(self.conn().await?.as_mut())
         .await

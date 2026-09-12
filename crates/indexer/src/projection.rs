@@ -256,6 +256,7 @@ mod tests {
             confidence: 1.0,
             first_seen: Utc::now(),
             last_seen: Utc::now(),
+            merged_into: None,
             attributes: json!({}),
         }
     }

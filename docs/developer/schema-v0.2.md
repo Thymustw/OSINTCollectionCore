@@ -24,7 +24,7 @@ V0.1 的 schema 慣例（PG vs SQLite 型別對照、cursor 分頁規則）見 `
 | `EntityIdentifier` | `crates/core-model/src/entity_identifier.rs` | `namespace` 見下文與 T10 |
 | `ResolutionCandidate` + `RESOLUTION_METHODS` | `crates/core-model/src/resolution.rs` | `RESOLUTION_METHODS` 是 §6 那十個名字的**參考清單，不是白名單**（§6 原文是「至少」），欄位仍是自由字串；`ordered_pair()` 負責排序 |
 | `ResolutionStatus` | `crates/core-model/src/enums.rs` | V0.2 少數規格有列舉值的欄位，所以做成 enum。`confirmed` 與 `auto_confirmed` **刻意分開**——混成同一個值之後就再也分不出「哪些合併沒有人類看過」 |
-| `MergeHistory` + `RepointedReference` | `crates/core-model/src/merge.rs` | `RepointedReference` = `{table, row_id, column, previous_value}` |
+| `MergeHistory` + `RepointedReference` + `MergedRelationship` + `AbsorberSnapshot` | `crates/core-model/src/merge.rs` | `RepointedReference` = `{table, row_id, column, previous_value}`；`MergedRelationship` 見 migration 0008 |
 | `FailedEvent` | `crates/core-model/src/failed_event.rs` | `offset` 是 `i64` |
 
 「是誰 undo 的」不放 `MergeHistory`，走 V0.1 既有的 `audit_log`（migration 0006）——
@@ -124,6 +124,56 @@ ADR-008 指定 V0.2 用 canonical 表而不是 Redpanda DLQ topic（topic 會過
 
 `"offset"` 在 PG 與 SQLite 都是保留字，DDL 與所有 SQL 都要加雙引號。
 型別是 64 位（PG `BIGINT`）：長期執行的 topic 真的會超過 `i32`。
+
+## Migration 0008：Entity Merge 欄位（Phase 1e）
+
+`migrations/postgres/0008_v0_2_entity_merge_columns.sql` 與
+`migrations/sqlite/0008_v0_2_entity_merge_columns.sql`。
+
+這次**只擴欄位**，沒有 merge 執行邏輯（那是下一棒）。兩個欄位都是為了讓 merge
+可以 undo，而且不違反既有外鍵。
+
+| 欄位 | 型別（PG / SQLite） | 用途 |
+|---|---|---|
+| `entities.merged_into` | `UUID NULL REFERENCES entities(id)` / `TEXT REFERENCES entities(id)` | 被併掉的 Entity **不刪列**，改指向 survivor |
+| `merge_history.merged_relationships` | `JSONB NOT NULL DEFAULT '[]'` / `TEXT NOT NULL DEFAULT '[]'` | 因 relationship UNIQUE 撞號而被吸收或自迴圈刪除的列 |
+
+### 為什麼不刪被併掉的 Entity
+
+`resolution_candidates.entity_a_id`／`entity_b_id`、`entity_extractions.entity_id`
+都有 FK 指向 `entities(id)`，且**沒有 `ON DELETE CASCADE`**（預設 `NO ACTION`）。
+刪列會直接違反外鍵。undo 也需要這一列還在，才能把參照寫回去。
+
+查詢一般 Entity 列表時應過濾 `merged_into IS NOT NULL`——那是 API 層的責任，
+adapter 的 `list_entities` **不過濾**，與 `list_merge_history_by_entity` 回已撤銷
+merge 的理由相同：過濾是呼叫端的決定，adapter 靜默丟掉會讓歷史查不到。
+
+`entity-worker` 的 upsert 會**保留**既有的 `merged_into`。寫成 `None` 會把已併掉的
+Entity 靜默復活。
+
+0007 對 `merge_history.merged_id` 刻意不加外鍵，是因為當時還沒決定 merge 要不要
+刪列。0008 決定了「不刪」，所以 `entities.merged_into` **有**自參照外鍵——指向的
+survivor 必須真的存在。
+
+### 為什麼 `RepointedReference` 不夠，要另開 `merged_relationships`
+
+`RepointedReference` 只能表達「單欄位從 A 改成 B」。relationship 表有
+`(source_object_id, relationship_type, target_object_id)` UNIQUE（migration 0005）。
+merge 把指向 merged Entity 的端點改成 survivor 時，可能撞到 survivor 那邊已經
+存在的同一條邊：
+
+- **吸收合併**：撞號那條被刪，它的 evidence 搬到留下來那條；undo 需要 absorber
+  合併前的 `evidence_count`／`confidence`／時間窗（`AbsorberSnapshot`），以及
+  被刪那條的完整 `Relationship` 快照。
+- **自迴圈刪除**：merged 與 survivor 之間原本就有直接關聯，repoint 後兩端變成
+  同一個 Entity，語意無效，直接刪除、不吸收。`relationship_evidence` 會被
+  `ON DELETE CASCADE` 一併刪掉，undo 只能重建 relationship 本身，evidence
+  無法復原——這是已知限制，記在 `MergedRelationship` 的 doc comment。
+
+空陣列代表「這次 merge 沒有任何 relationship 撞號」，**不是沒記錄**。adapter
+讀到解不開的內容時回 `CorruptionSuspected`，與 `repointed_references` 同一套理由。
+
+對應型別：`MergedRelationship`、`AbsorberSnapshot`（`crates/core-model/src/merge.rs`）。
 
 ## 對照 V0.1 的 `/ops/dlq`
 

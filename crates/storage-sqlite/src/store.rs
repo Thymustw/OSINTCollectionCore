@@ -986,8 +986,8 @@ impl RelationalStore for SqliteEmbeddedStore {
             r#"
             INSERT INTO entities (
                 id, entity_type, name, normalized_name, description, confidence,
-                first_seen, last_seen, attributes
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+                first_seen, last_seen, merged_into, attributes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (id) DO UPDATE SET
                 entity_type = excluded.entity_type,
                 name = excluded.name,
@@ -996,6 +996,7 @@ impl RelationalStore for SqliteEmbeddedStore {
                 confidence = excluded.confidence,
                 first_seen = excluded.first_seen,
                 last_seen = excluded.last_seen,
+                merged_into = excluded.merged_into,
                 attributes = excluded.attributes
             "#,
         )
@@ -1007,6 +1008,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(entity.confidence)
         .bind(rfc3339(entity.first_seen))
         .bind(rfc3339(entity.last_seen))
+        .bind(opt_uuid_text(entity.merged_into))
         .bind(json_text(&entity.attributes))
         .execute(self.conn().await?.as_mut())
         .await
@@ -1974,12 +1976,19 @@ impl RelationalStore for SqliteEmbeddedStore {
                 message: format!("序列化 merge_history.repointed_references 失敗：{err}"),
             }
         })?;
+        let merged_relationships =
+            serde_json::to_string(&history.merged_relationships).map_err(|err| {
+                StorageError::Unknown {
+                    backend: "sqlite",
+                    message: format!("序列化 merge_history.merged_relationships 失敗：{err}"),
+                }
+            })?;
         sqlx::query(
             r#"
             INSERT INTO merge_history (
                 id, survivor_id, merged_id, reason, operator, timestamp,
-                repointed_references, undone_at
-            ) VALUES (?,?,?,?,?,?,?,?)
+                repointed_references, merged_relationships, undone_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
             ON CONFLICT (id) DO UPDATE SET
                 survivor_id = excluded.survivor_id,
                 merged_id = excluded.merged_id,
@@ -1987,6 +1996,7 @@ impl RelationalStore for SqliteEmbeddedStore {
                 operator = excluded.operator,
                 timestamp = excluded.timestamp,
                 repointed_references = excluded.repointed_references,
+                merged_relationships = excluded.merged_relationships,
                 undone_at = excluded.undone_at
             "#,
         )
@@ -1997,6 +2007,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(&history.operator)
         .bind(rfc3339(history.timestamp))
         .bind(repointed)
+        .bind(merged_relationships)
         .bind(opt_rfc3339(history.undone_at))
         .execute(self.conn().await?.as_mut())
         .await
