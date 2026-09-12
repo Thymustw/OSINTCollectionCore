@@ -120,6 +120,20 @@ fn build_api_with_backends(
         search: None,
         ready: ready_always(),
         backends: ReadyProbe::new(checks),
+        // 真的接本機 Redpanda：`/ops/queues` 要驗的正是「查得到 group lag」，
+        // 給 None 只會驗到 503 那條路徑。
+        queues: core_events::GroupLagProbe::new(&stack.brokers, std::time::Duration::from_secs(3))
+            .ok()
+            .map(|probe| {
+                Arc::new(core_api::QueueInspector {
+                    probe,
+                    bindings: vec![core_api::QueueBinding {
+                        service: "normalizer",
+                        group: "osint-normalizer".into(),
+                        topic: core_events::EventTopic::RawCollected.as_str(),
+                    }],
+                })
+            }),
         backends_missing: missing,
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,

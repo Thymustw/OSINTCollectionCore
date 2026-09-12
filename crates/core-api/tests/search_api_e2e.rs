@@ -123,6 +123,8 @@ fn build_api(stack: &Stack, index: &str, role: Role) -> TestApi {
         ready: ready_always(),
         // 這支 e2e 不驗 ops health，給空清單。
         backends: core_api::ReadyProbe::new(Vec::new()),
+        // 這支測試不驗 /ops/queues。
+        queues: None,
         backends_missing: Vec::new(),
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,

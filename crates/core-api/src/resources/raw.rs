@@ -103,8 +103,10 @@ async fn fetch_body(state: &AppState, evidence: &RawEvidence) -> Result<RawBody,
         .await
         .map_err(|err| {
             tracing::error!(error = %err, storage_path = %evidence.storage_path, "讀取 RawEvidence body 失敗");
+            // 503 而不是 502，理由同 `import::persist` 的註解：後端沒有回應，
+            // 不是回了壞東西，而且「後端不可用」全 API 只用一個狀態碼。
             ApiError::new(
-                StatusCode::BAD_GATEWAY,
+                StatusCode::SERVICE_UNAVAILABLE,
                 "storage_unavailable",
                 "物件儲存讀取失敗。metadata 仍可取得（去掉 ?body=true），\
                  請確認 MinIO 在跑後重試",

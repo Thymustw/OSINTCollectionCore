@@ -14,4 +14,6 @@ mod service;
 pub use content::{ContentClass, classify_content};
 pub use error::NormalizerError;
 pub use health::serve as serve_health;
-pub use service::{NormalizeOutcome, Normalizer};
+pub use service::{
+    ACTION_DERIVED, ACTION_NORMALIZED, NormalizeOutcome, Normalizer, PROCESSOR, SCHEMA_VERSION,
+};

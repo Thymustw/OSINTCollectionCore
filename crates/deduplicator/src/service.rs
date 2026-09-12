@@ -202,7 +202,26 @@ impl Deduplicator {
     /// 單一 Document 失敗不會中止整批——一則事件可能帶十幾份 Document，
     /// 讓其中一份的錯誤吃掉其他份的處理機會沒有意義。失敗的那份會記 error log
     /// 並留在結果外，重新消費該事件時會再試一次（claim 還沒寫，不會被當成已處理）。
+    ///
+    /// SPEC §24 的 `processing latency` 與 `failed jobs` 量在這一層：
+    /// 一則事件的耗時（含它帶的每一份 Document），以及「整則事件處理失敗」的次數。
+    /// 單一 Document 失敗不算 failed job——那一則事件的其他 Document 還是處理完了，
+    /// 把它算成失敗會讓這個計數器變成「有東西出過錯」而不是「有事件沒被處理」。
     pub async fn handle_payload(
+        &self,
+        payload: &Value,
+    ) -> Result<Vec<DedupOutcome>, DeduplicatorError> {
+        let started = std::time::Instant::now();
+        let result = self.handle_payload_inner(payload).await;
+        self.metrics
+            .observe_processing_latency_ms(started.elapsed().as_millis() as u64);
+        if result.is_err() {
+            self.metrics.inc_failed_jobs(1);
+        }
+        result
+    }
+
+    async fn handle_payload_inner(
         &self,
         payload: &Value,
     ) -> Result<Vec<DedupOutcome>, DeduplicatorError> {
@@ -250,6 +269,11 @@ impl Deduplicator {
             );
             return Ok(DedupOutcome::DocumentMissing { document_id });
         };
+
+        // SPEC §24 `duplicate rate` 的分母。在這裡加而不是在 handle_payload：
+        // 已經 claim 過（AlreadyDone）與找不到 Document 的那些不是「這次檢查的」，
+        // 算進去會把重複率稀釋掉。
+        self.metrics.inc_documents_examined(1);
 
         let now = Utc::now();
         let keys = self.derive_keys(&document).await?;

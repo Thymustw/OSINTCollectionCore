@@ -81,6 +81,8 @@ pub fn test_app_with_backends(
         search: None,
         ready: ready_always(),
         backends: ReadyProbe::new(checks),
+        // 這支測試不驗 /ops/queues。
+        queues: None,
         backends_missing: missing,
         rate_limit_per_second: 100,
         request_body_limit_bytes: 1_048_576,

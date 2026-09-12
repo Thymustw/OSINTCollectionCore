@@ -25,6 +25,8 @@ members = [
     "crates/entity-worker",
     "crates/indexer",
     "crates/osint-cli",
+    # 跨服務驗收測試（SPEC §26 Acceptance F、TEST_STRATEGY §6）。沒有生產程式碼。
+    "crates/acceptance",
 ]
 
 [workspace.package]

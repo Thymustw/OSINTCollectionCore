@@ -3,6 +3,37 @@
 version = 4
 
 [[package]]
+name = "acceptance"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "collector",
+ "connector-sdk",
+ "core-api",
+ "core-config",
+ "core-events",
+ "core-jobs",
+ "core-model",
+ "core-observability",
+ "core-security",
+ "deduplicator",
+ "entity-worker",
+ "http-body-util",
+ "indexer",
+ "normalizer",
+ "serde_json",
+ "sqlx",
+ "storage-core",
+ "storage-opensearch",
+ "storage-postgres",
+ "storage-s3",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

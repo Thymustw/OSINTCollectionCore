@@ -121,7 +121,10 @@ pub fn router(state: AppState) -> Router {
         // Operations Center（SPEC §31）。**需要認證**：後端拓樸與故障點
         // 對外部觀察者是有價值的情報，不該像 /health 那樣公開。
         .route("/api/v1/ops/health", get(ops::health))
-        .route("/api/v1/ops/metrics", get(ops::metrics));
+        .route("/api/v1/ops/metrics", get(ops::metrics))
+        .route("/api/v1/ops/connectors", get(ops::connectors))
+        .route("/api/v1/ops/queues", get(ops::queues))
+        .route("/api/v1/ops/dlq", get(ops::dlq));
 
     let protected = Router::new()
         .route("/api/v1/jobs", get(jobs::list_jobs))

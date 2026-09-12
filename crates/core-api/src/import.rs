@@ -248,8 +248,11 @@ async fn handle(
     let stored = import.sink.persist(evidence).await.map_err(|err| {
         // 底層訊息可能含 bucket／路徑，只寫進 log，不回給呼叫端。
         tracing::error!(error = %err, "匯入落地失敗");
+        // 503 而不是 502：後端**沒有回應**（連不上／寫不進去），不是回了壞東西。
+        // 也讓「後端不可用」在整個 API 裡只有一個狀態碼（見 api-skeleton.md 的錯誤表），
+        // 呼叫端才有辦法寫「503 就退避重試」這種規則而不必逐路由查。
         ApiError::new(
-            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
             "storage_unavailable",
             "證據落地失敗（物件儲存或資料庫寫入沒有成功）。上傳未被接受，請稍後重試；\
              持續失敗請看 osint-api 記錄檔",

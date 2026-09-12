@@ -15,6 +15,7 @@ struct Inner {
     collected_total: AtomicU64,
     raw_bytes: AtomicU64,
     duplicate_total: AtomicU64,
+    documents_examined: AtomicU64,
     failed_jobs: AtomicU64,
     connector_errors: AtomicU64,
     queue_depth: AtomicU64,
@@ -41,6 +42,17 @@ impl MetricsRegistry {
 
     pub fn inc_duplicate(&self, n: u64) {
         self.inner.duplicate_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// 去重階段實際檢查過幾份 Document。[`Self::duplicate_rate`] 的分母。
+    ///
+    /// **不要用 `collected_total` 當分母**：那是採集端的計數，跟 deduplicator
+    /// 不在同一個行程裡，在 deduplicator 的 registry 裡永遠是 0——
+    /// 重複率會靜默變成恆等於 0，看起來就像「完全沒有重複」。
+    pub fn inc_documents_examined(&self, n: u64) {
+        self.inner
+            .documents_examined
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn inc_failed_jobs(&self, n: u64) {
@@ -106,6 +118,14 @@ impl MetricsRegistry {
         );
         push_counter(
             &mut out,
+            "osint_documents_examined_total",
+            self.inner.documents_examined.load(Ordering::Relaxed),
+        );
+        // SPEC §24 的 `duplicate rate`。算好再輸出而不是叫看板自己相除：
+        // 分母是哪一個計數器是**這裡**的定義，散到每個儀表板去各算各的遲早分岔。
+        push_gauge_f64(&mut out, "osint_duplicate_rate", self.duplicate_rate());
+        push_counter(
+            &mut out,
             "osint_failed_jobs_total",
             self.inner.failed_jobs.load(Ordering::Relaxed),
         );
@@ -135,14 +155,17 @@ impl MetricsRegistry {
         out
     }
 
-    /// duplicate_rate = duplicate_total / collected_total。沒有 collected 時為 0。
+    /// SPEC §24 的 duplicate rate = `duplicate_total / documents_examined`。
+    ///
+    /// 還沒檢查過任何 Document 時回 0——那是「沒有資料可以算」，不是「重複率是 0」。
+    /// 分母刻意**不是** `collected_total`：見 [`Self::inc_documents_examined`]。
     #[must_use]
     pub fn duplicate_rate(&self) -> f64 {
-        let collected = self.inner.collected_total.load(Ordering::Relaxed);
-        if collected == 0 {
+        let examined = self.inner.documents_examined.load(Ordering::Relaxed);
+        if examined == 0 {
             0.0
         } else {
-            self.inner.duplicate_total.load(Ordering::Relaxed) as f64 / collected as f64
+            self.inner.duplicate_total.load(Ordering::Relaxed) as f64 / examined as f64
         }
     }
 }
@@ -164,6 +187,17 @@ fn push_counter(out: &mut String, name: &str, value: u64) {
     out.push('\n');
 }
 
+/// 浮點 gauge。Prometheus 的 text format 接受一般十進位表示法。
+fn push_gauge_f64(out: &mut String, name: &str, value: f64) {
+    out.push_str("# TYPE ");
+    out.push_str(name);
+    out.push_str(" gauge\n");
+    out.push_str(name);
+    out.push(' ');
+    out.push_str(&format!("{value}"));
+    out.push('\n');
+}
+
 fn push_gauge(out: &mut String, name: &str, value: u64) {
     out.push_str("# TYPE ");
     out.push_str(name);
@@ -182,6 +216,7 @@ mod tests {
     fn counters_and_rate() {
         let m = MetricsRegistry::new();
         m.inc_collected(10);
+        m.inc_documents_examined(10);
         m.inc_duplicate(2);
         m.add_raw_bytes(100);
         m.inc_failed_jobs(1);
@@ -192,6 +227,21 @@ mod tests {
         assert!(text.contains("osint_collected_total 10"), "{text}");
         assert!(text.contains("osint_queue_depth 4"), "{text}");
         assert!(text.contains("osint_processing_latency_count 1"), "{text}");
+        assert!(text.contains("osint_duplicate_rate 0.2"), "{text}");
+    }
+
+    #[test]
+    fn duplicate_rate_denominator_is_examined_not_collected() {
+        // 這是實際踩過的形狀：deduplicator 的 registry 裡 collected_total 永遠是 0
+        // （那是 collector 行程的計數），用它當分母會讓重複率恆為 0。
+        let m = MetricsRegistry::new();
+        m.inc_duplicate(3);
+        assert!(
+            (m.duplicate_rate() - 0.0).abs() < f64::EPSILON,
+            "還沒檢查過任何 Document 時應該是 0"
+        );
+        m.inc_documents_examined(6);
+        assert!((m.duplicate_rate() - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]

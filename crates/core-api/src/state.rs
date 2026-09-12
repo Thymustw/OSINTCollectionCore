@@ -98,6 +98,12 @@ pub struct AppState {
     /// 這裡是整套 pipeline 的後端（含 Redis／Redpanda，API 自己不需要它們）。
     /// 混在一起會讓「Redis 掛了」變成「API 不接受流量」。
     pub backends: ReadyProbe,
+    /// `GET /api/v1/ops/queues` 的 consumer group lag 探針。
+    ///
+    /// `None` = 沒接上 Redpanda，**只有那條路由**回 503。刻意與 [`AppState::backends`]
+    /// 分開：health 檢查用的是 producer（發得出去嗎），這裡用的是不加入 group 的
+    /// 唯讀探針（見 `core_events::GroupLagProbe` 的模組說明）。
+    pub queues: Option<Arc<crate::ops::QueueInspector>>,
     /// 沒接上（因此不在 [`AppState::backends`] 裡）的後端名稱。
     ///
     /// 少了這一欄，一個「只接了 Postgres」的部署會回 `healthy: true`，

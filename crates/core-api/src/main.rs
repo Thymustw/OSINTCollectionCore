@@ -7,7 +7,8 @@ use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
     AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, ImportState, PostgresReady,
-    ReadyCheck, ReadyProbe, SharedObjects, SharedStore, SharedTokenStore, router,
+    QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SharedObjects, SharedStore,
+    SharedTokenStore, router,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -19,6 +20,13 @@ use storage_core::conformance::{
 };
 use storage_postgres::{PostgresApiTokenStore, PostgresAuditLog, PostgresCanonicalStore};
 use tokio::net::TcpListener;
+
+/// 查一個 consumer group lag 的逾時。
+///
+/// 短是刻意的：`/ops/queues` 要查四個 group，每個都可能要打好幾次 broker。
+/// 逾時設長的話 Redpanda 掛掉時運維看到的會是「這個頁面沒反應」
+/// 而不是「Redpanda 連不上」，而且會撞到 router 的 30 秒請求逾時（回 408）。
+const LAG_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() {
@@ -159,6 +167,19 @@ async fn run() -> Result<(), String> {
         None => missing.push("redpanda"),
     }
 
+    // `GET /api/v1/ops/queues`。與 producer 分開建：producer 連不上時 lag 探針
+    // 仍然值得建起來（它自己會回報查不到），但 broker 位址設定錯誤要在這裡就講清楚。
+    let queues = match core_events::GroupLagProbe::new(&cfg.broker.brokers, LAG_PROBE_TIMEOUT) {
+        Ok(probe) => Some(Arc::new(QueueInspector {
+            probe,
+            bindings: queue_bindings(&cfg),
+        })),
+        Err(err) => {
+            tracing::warn!(error = %err, "consumer group lag 探針未建立；GET /api/v1/ops/queues 會回 503");
+            None
+        }
+    };
+
     let state = AppState {
         metrics: MetricsRegistry::new(),
         auth: AuthState {
@@ -175,6 +196,7 @@ async fn run() -> Result<(), String> {
         // 沒接上的後端不會變成「壞掉」，而是列進 `backends_missing`——
         // 「沒設定」與「壞了」的下一步完全不同。
         backends: ReadyProbe::new(health_checks),
+        queues,
         backends_missing: missing,
         rate_limit_per_second: cfg.http.rate_limit_per_second,
         request_body_limit_bytes: cfg.http.request_body_limit_bytes,
@@ -203,6 +225,39 @@ async fn run() -> Result<(), String> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .map_err(|err| format!("伺服器結束：{err}"))
+}
+
+/// `GET /api/v1/ops/queues` 要查哪幾個 (service, group, topic)。
+///
+/// **group 名稱一律從設定讀**，不要在這裡寫死字串：運維改了
+/// `[normalizer].consumer_group` 卻沒改這裡的話，面板會去查一個不存在的 group
+/// 並永遠回 lag 0——看起來完全正常的假綠燈。
+///
+/// topic 則是寫死的：那是每個服務訂閱哪個 topic 的事實（見各服務的 main.rs），
+/// 不是設定項。
+fn queue_bindings(cfg: &AppConfig) -> Vec<QueueBinding> {
+    vec![
+        QueueBinding {
+            service: "normalizer",
+            group: cfg.normalizer.consumer_group.clone(),
+            topic: core_events::EventTopic::RawCollected.as_str(),
+        },
+        QueueBinding {
+            service: "deduplicator",
+            group: cfg.deduplicator.consumer_group.clone(),
+            topic: core_events::EventTopic::ObjectNormalized.as_str(),
+        },
+        QueueBinding {
+            service: "entity-worker",
+            group: cfg.entity_worker.consumer_group.clone(),
+            topic: core_events::EventTopic::DedupCompleted.as_str(),
+        },
+        QueueBinding {
+            service: "indexer",
+            group: cfg.indexer.consumer_group.clone(),
+            topic: core_events::EventTopic::EntityExtracted.as_str(),
+        },
+    ]
 }
 
 async fn connect_postgres(cfg: &AppConfig) -> Result<PostgresCanonicalStore, String> {
@@ -282,7 +337,8 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
         axum::Json(ErrorBody {
             error: "not_found".into(),
             message: "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs、\
-                 /api/v1/tokens（admin）、/api/v1/ops/health 與 /api/v1/ops/metrics、\
+                 /api/v1/tokens（admin）、/api/v1/ops/health、/api/v1/ops/metrics、\
+                 /api/v1/ops/connectors、/api/v1/ops/queues 與 /api/v1/ops/dlq、\
                  sources／connectors／collections／objects／entities／relationships／events／raw、\
                  POST /api/v1/import 與 POST /api/v1/search"
                 .into(),

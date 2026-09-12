@@ -61,7 +61,26 @@ impl Normalizer {
     }
 
     /// 從 envelope payload 取出 raw_evidence_id。
+    ///
+    /// 這一層負責 SPEC §24 的兩個 metric：`processing latency`（處理一則事件的耗時）
+    /// 與 `failed jobs`（處理失敗數）。**量在這裡而不是 `normalize_raw`**，
+    /// 因為 §24 要的是「一則事件從拿到到處理完多久」，而 payload 解析失敗
+    /// 同樣是一次失敗的處理，必須被算進去。
     pub async fn handle_payload(
+        &self,
+        payload: &Value,
+    ) -> Result<NormalizeOutcome, NormalizerError> {
+        let started = std::time::Instant::now();
+        let result = self.handle_payload_inner(payload).await;
+        self.metrics
+            .observe_processing_latency_ms(started.elapsed().as_millis() as u64);
+        if result.is_err() {
+            self.metrics.inc_failed_jobs(1);
+        }
+        result
+    }
+
+    async fn handle_payload_inner(
         &self,
         payload: &Value,
     ) -> Result<NormalizeOutcome, NormalizerError> {

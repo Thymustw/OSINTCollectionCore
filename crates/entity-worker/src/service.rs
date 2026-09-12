@@ -154,7 +154,24 @@ impl EntityWorker {
     ///
     /// payload 形狀由 `deduplicator::Deduplicator::publish` 決定：
     /// `{ document_id, is_duplicate, stage, canonical_object_id, ... }`。
+    ///
+    /// SPEC §24 的 `processing latency` 與 `failed jobs` 量在這一層：
+    /// 一則事件從拿到到處理完的耗時，以及處理失敗的次數（payload 缺欄位也算）。
     pub async fn handle_payload(
+        &self,
+        payload: &Value,
+    ) -> Result<ExtractOutcome, EntityWorkerError> {
+        let started = std::time::Instant::now();
+        let result = self.handle_payload_inner(payload).await;
+        self.metrics
+            .observe_processing_latency_ms(started.elapsed().as_millis() as u64);
+        if result.is_err() {
+            self.metrics.inc_failed_jobs(1);
+        }
+        result
+    }
+
+    async fn handle_payload_inner(
         &self,
         payload: &Value,
     ) -> Result<ExtractOutcome, EntityWorkerError> {
