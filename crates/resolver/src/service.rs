@@ -5,11 +5,14 @@ use core_model::{
     Entity, EntityId, EntityType, RESOLUTION_METHODS, ResolutionCandidate, ResolutionStatus,
 };
 use serde_json::json;
-use storage_core::{RelationalStore, StorageError};
+use storage_core::{EmbeddingProvider, GraphStore, RelationalStore, StorageError};
 use tracing::info;
 use uuid::Uuid;
 
 use crate::error::ResolverError;
+use crate::graph_context::check_graph_context;
+use crate::identifier_methods::{check_alias, check_domain};
+use crate::semantic::check_semantic_similarity;
 
 /// SPEC §10 的 13 種 EntityType。新增變體時下面的 match 會編譯失敗，
 /// 強迫 resolver 決定要不要把新型別納入 `normalized_name` 掃描。
@@ -55,24 +58,41 @@ const fn assert_entity_type_known(t: EntityType) {
 /// 0.40 夠進 Review，遠不到自動合併。
 pub const NORMALIZED_NAME_CROSS_TYPE_SCORE: f64 = 0.40;
 
+/// `check_semantic_similarity` 的 cosine 門檻。
+///
+/// 先給合理預設，之後應該可設定，不是最終定案。
+pub const SEMANTIC_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// `check_graph_context` 的 Jaccard 門檻。
+///
+/// 先給合理預設，之後應該可設定，不是最終定案。
+pub const GRAPH_CONTEXT_THRESHOLD: f64 = 0.5;
+
 const METHOD_NORMALIZED_NAME: &str = RESOLUTION_METHODS[1];
 
 /// 對 Entity 跑 resolution method、把新候選寫進 store。
-pub struct ResolverService<S: RelationalStore> {
+pub struct ResolverService<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> {
     store: S,
+    embedder: E,
+    graph: G,
 }
 
-impl<S: RelationalStore> ResolverService<S> {
+impl<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> ResolverService<S, E, G> {
     #[must_use]
-    pub fn new(store: S) -> Self {
-        Self { store }
+    pub fn new(store: S, embedder: E, graph: G) -> Self {
+        Self {
+            store,
+            embedder,
+            graph,
+        }
     }
 
-    /// 依序跑所有目前已實作的方法，回傳**這次新寫入**的 candidate。
+    /// 依序跑所有目前已實作的掃描方法，回傳**這次新寫入**的 candidate。
     ///
-    /// 目前只跑 [`Self::check_normalized_name`]；之後每加一個方法就加進這條
-    /// 聚合呼叫。某一筆候選已經存在（`StorageError::Conflict`）視為已處理，
-    /// 記一行 log 後繼續，不讓整次 resolve 失敗。
+    /// 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity`
+    /// → `graph_context`。某一筆候選已經存在（`StorageError::Conflict`）視為
+    /// 已處理，記一行 log 後繼續，不讓整次 resolve 失敗。底層 storage 錯誤
+    /// （含 semantic／graph 路徑）用 `?` 往上傳播，只有 persist 那一層吞 Conflict。
     pub async fn resolve_entity(
         &self,
         entity_id: EntityId,
@@ -83,8 +103,23 @@ impl<S: RelationalStore> ResolverService<S> {
             .await?
             .ok_or(ResolverError::EntityNotFound { entity_id })?;
 
+        let mut candidates = self.check_normalized_name(&entity).await?;
+        candidates.extend(check_alias(&self.store, &entity).await?);
+        candidates.extend(check_domain(&self.store, &entity).await?);
+        candidates.extend(
+            check_semantic_similarity(
+                &self.store,
+                &self.embedder,
+                &entity,
+                SEMANTIC_SIMILARITY_THRESHOLD,
+            )
+            .await?,
+        );
+        candidates
+            .extend(check_graph_context(&self.graph, entity_id, GRAPH_CONTEXT_THRESHOLD).await?);
+
         let mut written = Vec::new();
-        for candidate in self.check_normalized_name(&entity).await? {
+        for candidate in candidates {
             if let Some(kept) = self.persist_candidate(candidate).await? {
                 written.push(kept);
             }
@@ -194,6 +229,7 @@ mod tests {
     };
     use serde_json::json;
     use storage_core::health::{HealthProvider, StorageHealth};
+    use storage_core::mock::{MockEmbeddingProvider, MockGraphStore};
     use storage_core::traits::SimhashCandidate;
 
     fn ts() -> chrono::DateTime<Utc> {
@@ -216,9 +252,9 @@ mod tests {
 
     /// resolver 單元測試用的最小 RelationalStore。
     ///
-    /// 只實作 `get_entity`／`find_entity_by_normalized_name`／
-    /// `put_resolution_candidate`；其餘方法回 `UnsupportedCapability`。
-    /// **不要**把這個當生產 adapter。
+    /// 實作 `get_entity`／`find_entity_by_normalized_name`／
+    /// `put_resolution_candidate`／alias 查詢／`list_relationships_by_object`；
+    /// 其餘方法回 `UnsupportedCapability`。**不要**把這個當生產 adapter。
     struct MemoryStore {
         inner: Mutex<Inner>,
     }
@@ -228,6 +264,8 @@ mod tests {
         /// `(entity_type, normalized_name)` → Entity。同鍵後寫覆蓋。
         by_name: HashMap<(EntityType, String), Entity>,
         candidates: HashMap<(EntityId, EntityId, String), ResolutionCandidate>,
+        aliases: Vec<EntityAlias>,
+        relationships: Vec<Relationship>,
         queried_types: Vec<EntityType>,
         /// 下一次 `put_resolution_candidate` 強制回 Conflict，測完自動清掉。
         force_conflict: bool,
@@ -240,6 +278,8 @@ mod tests {
                     entities: HashMap::new(),
                     by_name: HashMap::new(),
                     candidates: HashMap::new(),
+                    aliases: Vec::new(),
+                    relationships: Vec::new(),
                     queried_types: Vec::new(),
                     force_conflict: false,
                 }),
@@ -254,8 +294,16 @@ mod tests {
             inner.entities.insert(e.id, e);
         }
 
+        fn seed_alias(&self, row: EntityAlias) {
+            self.inner.lock().expect("mutex").aliases.push(row);
+        }
+
         fn force_next_put_conflict(&self) {
             self.inner.lock().expect("mutex").force_conflict = true;
+        }
+
+        fn skip_semantic_and_graph() -> (MockEmbeddingProvider, MockGraphStore) {
+            (MockEmbeddingProvider::unsupported(), MockGraphStore::new())
         }
 
         fn queried_types(&self) -> Vec<EntityType> {
@@ -268,6 +316,26 @@ mod tests {
                 capability,
             })
         }
+    }
+
+    fn alias(entity_id: EntityId, text: &str, confidence: f64) -> EntityAlias {
+        EntityAlias {
+            id: Uuid::now_v7(),
+            entity_id,
+            alias: text.into(),
+            alias_type: "name".into(),
+            source_id: None,
+            confidence,
+            first_seen: ts(),
+            last_seen: ts(),
+        }
+    }
+
+    fn svc(
+        store: MemoryStore,
+    ) -> ResolverService<MemoryStore, MockEmbeddingProvider, MockGraphStore> {
+        let (embedder, graph) = MemoryStore::skip_semantic_and_graph();
+        ResolverService::new(store, embedder, graph)
     }
 
     #[async_trait]
@@ -532,10 +600,19 @@ mod tests {
         }
         async fn list_relationships_by_object(
             &self,
-            _: ObjectId,
-            _: u32,
+            object_id: ObjectId,
+            limit: u32,
         ) -> Result<Vec<Relationship>, StorageError> {
-            Self::unsupported("list_relationships_by_object")
+            let inner = self.inner.lock().expect("mutex");
+            let mut items: Vec<Relationship> = inner
+                .relationships
+                .iter()
+                .filter(|r| r.source_object_id == object_id || r.target_object_id == object_id)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| std::cmp::Reverse(a.id));
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn list_relationships(
             &self,
@@ -717,17 +794,35 @@ mod tests {
         }
         async fn list_entity_aliases_by_entity(
             &self,
-            _: EntityId,
-            _: u32,
+            entity_id: EntityId,
+            limit: u32,
         ) -> Result<Vec<EntityAlias>, StorageError> {
-            Self::unsupported("list_entity_aliases_by_entity")
+            let inner = self.inner.lock().expect("mutex");
+            let mut items: Vec<EntityAlias> = inner
+                .aliases
+                .iter()
+                .filter(|a| a.entity_id == entity_id)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| a.id);
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn find_entity_aliases_by_text(
             &self,
-            _: &str,
-            _: u32,
+            alias: &str,
+            limit: u32,
         ) -> Result<Vec<EntityAlias>, StorageError> {
-            Self::unsupported("find_entity_aliases_by_text")
+            let inner = self.inner.lock().expect("mutex");
+            let mut items: Vec<EntityAlias> = inner
+                .aliases
+                .iter()
+                .filter(|a| a.alias == alias)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| a.id);
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn put_entity_identifier(&self, _: &EntityIdentifier) -> Result<(), StorageError> {
             Self::unsupported("put_entity_identifier")
@@ -816,7 +911,7 @@ mod tests {
         let org = entity(org_id, EntityType::Organization, "acme");
         store.seed(person.clone());
         store.seed(org);
-        let svc = ResolverService::new(store);
+        let svc = svc(store);
         let hits = svc.check_normalized_name(&person).await.expect("check");
         assert_eq!(hits.len(), 1);
         let c = &hits[0];
@@ -839,7 +934,7 @@ mod tests {
         let store = MemoryStore::new();
         let person = entity(Uuid::from_u128(1), EntityType::Person, "lonely");
         store.seed(person.clone());
-        let svc = ResolverService::new(store);
+        let svc = svc(store);
         let hits = svc.check_normalized_name(&person).await.expect("check");
         assert!(hits.is_empty(), "{hits:?}");
     }
@@ -855,7 +950,7 @@ mod tests {
         let twin = entity(twin_id, EntityType::Person, "acme");
         store.seed(person.clone());
         store.seed(twin);
-        let svc = ResolverService::new(store);
+        let svc = svc(store);
         let hits = svc.check_normalized_name(&person).await.expect("check");
         assert!(hits.is_empty(), "同 type 不該產生 candidate，得到 {hits:?}");
         let queried = svc.store.queried_types();
@@ -882,7 +977,7 @@ mod tests {
         store.seed(entity(loc_id, EntityType::Location, "acme"));
         // ALL_ENTITY_TYPES 裡 Organization 在 Location 前面，第一筆會 Conflict。
         store.force_next_put_conflict();
-        let svc = ResolverService::new(store);
+        let svc = svc(store);
         let written = svc.resolve_entity(person_id).await.expect("resolve");
         assert_eq!(
             written.len(),
@@ -896,12 +991,49 @@ mod tests {
     #[tokio::test]
     async fn resolve_entity_missing_is_error() {
         let store = MemoryStore::new();
-        let svc = ResolverService::new(store);
+        let svc = svc(store);
         let missing = Uuid::from_u128(0xdead);
         let err = svc.resolve_entity(missing).await.expect_err("missing");
         match err {
             ResolverError::EntityNotFound { entity_id } => assert_eq!(entity_id, missing),
             other => panic!("預期 EntityNotFound，得到 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_entity_aggregates_normalized_name_and_alias() {
+        let store = MemoryStore::new();
+        let person_id = Uuid::from_u128(0x1111);
+        let org_id = Uuid::from_u128(0x2222);
+        let person = entity(person_id, EntityType::Person, "acme");
+        let org = entity(org_id, EntityType::Organization, "acme");
+        store.seed(person);
+        store.seed(org);
+        store.seed_alias(alias(person_id, "微軟", 0.9));
+        store.seed_alias(alias(org_id, "微軟", 0.7));
+        let svc = svc(store);
+        let written = svc.resolve_entity(person_id).await.expect("resolve");
+        let methods: Vec<&str> = written.iter().map(|c| c.method.as_str()).collect();
+        assert!(
+            methods.contains(&"normalized_name"),
+            "跨 type 同名應命中 normalized_name，實際 {written:?}"
+        );
+        assert!(
+            methods.contains(&"alias"),
+            "共用別名應命中 alias，實際 {written:?}"
+        );
+        assert_eq!(
+            written
+                .iter()
+                .filter(|c| c.method == "normalized_name" || c.method == "alias")
+                .count(),
+            2,
+            "兩種方法各應寫入一筆，實際 {written:?}"
+        );
+        for c in &written {
+            assert_eq!(c.entity_a_id, person_id);
+            assert_eq!(c.entity_b_id, org_id);
+            assert_eq!(c.status, ResolutionStatus::Pending);
         }
     }
 }

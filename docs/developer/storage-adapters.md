@@ -169,9 +169,13 @@ SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / 
 ## `RelationalStore` 的 V0.2 方法（Phase 0c）
 
 `traits.rs` 裡以 `// ===== V0.2 =====` 分隔。表在 migration `0007`。
-`crates/resolver`（Phase 1c）會呼叫 `get_entity`、`find_entity_by_normalized_name`、
-`put_resolution_candidate`。其餘 V0.2 方法（alias／identifier／merge_history／failed_events）
-以及 graph-worker／DLQ 重放仍沒有生產呼叫端。
+`crates/resolver`（Phase 1c）掃描式聚合會呼叫 `get_entity`、
+`find_entity_by_normalized_name`、`list_entity_aliases_by_entity`、
+`find_entity_aliases_by_text`、`list_relationships_by_object`、
+`put_resolution_candidate`，以及 `EmbeddingProvider`／`GraphStore`。
+`entity_identifiers` 的寫入衝突路徑仍由 entity-worker 呼叫
+`find_entity_identifier_owner`／`put_resolution_candidate`。
+graph-worker／DLQ 重放仍沒有生產呼叫端。
 
 | 方法 | 排序／契約 |
 |---|---|

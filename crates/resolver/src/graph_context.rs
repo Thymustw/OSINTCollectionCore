@@ -1,12 +1,8 @@
 //! SPEC §6「graph context」：用一跳鄰居集合的 Jaccard 相似度找合併候選。
 //!
 //! **純圖結構、不查 Entity 本體。** 不依賴 [`storage_core::RelationalStore`]，
-//! 也不寫入 candidate 表——呼叫端自己決定要不要 `put_resolution_candidate`。
-//!
-//! # 還沒接到 `resolve_entity`
-//!
-//! 這是自由函式，**沒有**掛進 [`crate::ResolverService::resolve_entity`]。
-//! 聚合點仍只跑 `normalized_name`。接線是之後的獨立交付。
+//! 也不寫入 candidate 表——寫入由 [`crate::ResolverService::resolve_entity`]
+//! 的 persist 負責。聚合門檻是 [`crate::GRAPH_CONTEXT_THRESHOLD`]。
 //!
 //! # 候選集合（2-hop）與效能上限
 //!

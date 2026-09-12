@@ -1,19 +1,39 @@
-//! SPEC §6 的 `alias`／`domain`／`url` 三條 resolution method。
+//! SPEC §6 的 `alias`／`domain` resolution method。
 //!
-//! **自由函式，不寫入 store、不接進 [`crate::ResolverService::resolve_entity`]。**
-//! 呼叫端自己決定要不要 `put_resolution_candidate`。之後的整合任務才會把它們
-//! 接進聚合呼叫。
+//! 兩個函式都由 [`crate::ResolverService::resolve_entity`] 聚合呼叫；也仍以
+//! 自由函式公開，方便單測直接斷言組出來的候選。**不寫 candidate 表**——
+//! 寫入由 `resolve_entity` 的 `persist_candidate` 負責。
 //!
-//! # 資料可能是空的——這是預期，不是沒命中
+//! # `alias` 的空表是預期
 //!
-//! 這三個函式都讀 `entity_aliases`／`entity_identifiers`。entity-worker 的
-//! 寫入者是平行交付（Phase 1c-0-data）；在那完成之前，真實 store 通常是空表，
-//! 這裡會回空 `Vec`。空結果代表「這次沒資料可比」，不要讀成「確定沒有同一實體」。
+//! `check_alias` 讀 `entity_aliases`。V0.2 還沒有生產寫入者，真實 store
+//! 通常是空表，會回空 `Vec`。空結果代表「這次沒資料可比」，不要讀成
+//! 「確定沒有同一實體」。
+//!
+//! # `domain` 為什麼不走 `entity_identifiers`
+//!
+//! 舊版對自己列上的 `namespace="domain"` identifier 做
+//! `find_entity_identifier_owner`。`(namespace, normalized_value)` UNIQUE
+//! 保證一個值只有一個 owner，而這個 owner 一定就是查詢者自己——
+//! **已用真實 PostgreSQL 驗證為結構性死碼**，不是測試 double 種不出資料。
+//!
+//! 真正該比的訊號已經在 `relationships` 表：entity-worker 抽到 Email／URL
+//! 時會衍生 Domain Entity，並寫 `Email --AssociatedWith--> Domain` 或
+//! `URL --BelongsTo--> Domain`。兩份文件抽到指向同一個網域的 Email／URL
+//! 會因 UUID v5 自然鍵收斂到同一個 Domain Entity，所以「共享網域」這件事
+//! 已經完整記錄，resolver 只要走 Relationship 即可。
+//!
+//! `AssociatedWith`／`BelongsTo` 目前**不是**專屬於 domain 衍生
+//! （`RelationshipType` 是共用列舉）。V0.2 只有 entity-worker 會寫這兩種
+//! type；之後有其他寫入者要再檢視，否則會把非 domain 的關聯誤當成共用網域。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
-use core_model::{Entity, RESOLUTION_METHODS, ResolutionCandidate, ResolutionStatus};
+use core_model::{
+    Entity, EntityId, RESOLUTION_METHODS, Relationship, RelationshipType, ResolutionCandidate,
+    ResolutionStatus,
+};
 use serde_json::json;
 use storage_core::RelationalStore;
 use uuid::Uuid;
@@ -24,20 +44,12 @@ use crate::error::ResolverError;
 /// 0.55 夠進 Review，不到自動合併。
 pub const ALIAS_SCORE: f64 = 0.55;
 
-/// 共用 domain identifier 的分數。同一個網域被兩個 Entity 宣稱是弱訊號
+/// 共用衍生 Domain Entity 的分數。共用網域基礎設施不代表同一實體
 /// （共用主機、轉售、資料髒了都常見），0.30 只夠進 Review。
-///
-/// 目前 `entity_identifiers` 通常是空的（寫入者是另一個平行任務），
-/// 這個函式邏輯要對，但實測可能永遠拿到空結果。
 pub const DOMAIN_SCORE: f64 = 0.30;
-
-/// 共用 URL identifier 的分數。正規化後同一個 URL 比 domain 硬一點，
-/// 0.60 夠進 Review，仍不到自動合併。
-pub const URL_SCORE: f64 = 0.60;
 
 const METHOD_ALIAS: &str = RESOLUTION_METHODS[2];
 const METHOD_DOMAIN: &str = RESOLUTION_METHODS[3];
-const METHOD_URL: &str = RESOLUTION_METHODS[4];
 const LIST_LIMIT: u32 = 100;
 
 /// SPEC §6「alias」：這個 Entity 的 alias 文字，有沒有被別的 Entity 用過。
@@ -92,140 +104,128 @@ pub async fn check_alias<S: RelationalStore>(
     Ok(out)
 }
 
-/// SPEC §6「domain」：這個 Entity 的 `namespace="domain"` identifier，
-/// 目前的 owner 是不是別人。
+/// SPEC §6「domain」：兩個 Entity 是否都連到同一個衍生 Domain Entity。
 ///
-/// # 空表是預期
+/// 走 `list_relationships_by_object`，**不碰** `entity_identifiers`。
+/// 舊版 identifier 反查在 UNIQUE 限制下結構性永遠回空（已用真實 PostgreSQL
+/// 驗證）；URL 共用也由同一條衍生 Domain 邊表達，所以 `check_url` 已退場。
 ///
-/// entity-worker 還沒寫 `entity_identifiers` 時，這個函式會回空 `Vec`。
-/// 那是「沒資料」，不是「沒有共用網域」。
+/// 同一對因多個共用 Domain 命中多次時只留第一筆（同 `check_alias`）。
 pub async fn check_domain<S: RelationalStore>(
     store: &S,
     entity: &Entity,
 ) -> Result<Vec<ResolutionCandidate>, ResolverError> {
-    let identifiers = store
-        .list_entity_identifiers_by_entity(entity.id, LIST_LIMIT)
+    let own_rels = store
+        .list_relationships_by_object(entity.id, LIST_LIMIT)
         .await?;
-    let mut seen: HashSet<(core_model::EntityId, core_model::EntityId)> = HashSet::new();
+    // 同一個 Domain 被兩種 type 連兩次時，後寫入的 type 覆蓋——V0.2 不會發生，
+    // 且只影響 evidence 裡「自己那一段」記哪種 type，不影響是否命中。
+    let domain_links: HashMap<EntityId, RelationshipType> = own_rels
+        .iter()
+        .filter(|r| is_domain_link(r.relationship_type))
+        .filter_map(|r| other_end(r, entity.id).map(|id| (id, r.relationship_type)))
+        .collect();
+
+    let mut seen: HashSet<(EntityId, EntityId)> = HashSet::new();
     let mut out = Vec::new();
-    for ident in identifiers {
-        if ident.namespace != "domain" {
-            continue;
+    for (domain_id, own_rel_type) in domain_links {
+        let domain_rels = store
+            .list_relationships_by_object(domain_id, LIST_LIMIT)
+            .await?;
+        for r in domain_rels {
+            if !is_domain_link(r.relationship_type) {
+                continue;
+            }
+            let Some(other_id) = other_end(&r, domain_id) else {
+                continue;
+            };
+            if other_id == entity.id {
+                continue;
+            }
+            let (entity_a_id, entity_b_id) = ResolutionCandidate::ordered_pair(entity.id, other_id);
+            if !seen.insert((entity_a_id, entity_b_id)) {
+                continue;
+            }
+            out.push(domain_candidate(
+                entity.id,
+                other_id,
+                domain_id,
+                own_rel_type,
+                r.relationship_type,
+            ));
         }
-        let Some(owner) = store
-            .find_entity_identifier_owner("domain", &ident.normalized_value)
-            .await?
-        else {
-            continue;
-        };
-        if owner.entity_id == entity.id {
-            continue;
-        }
-        let (entity_a_id, entity_b_id) =
-            ResolutionCandidate::ordered_pair(entity.id, owner.entity_id);
-        if !seen.insert((entity_a_id, entity_b_id)) {
-            continue;
-        }
-        out.push(ResolutionCandidate {
-            id: Uuid::now_v7(),
-            entity_a_id,
-            entity_b_id,
-            score: DOMAIN_SCORE,
-            method: METHOD_DOMAIN.to_string(),
-            evidence: json!({
-                "method": METHOD_DOMAIN,
-                "domain": ident.normalized_value,
-            }),
-            status: ResolutionStatus::Pending,
-            created_at: Utc::now(),
-            reviewed_at: None,
-        });
     }
     Ok(out)
 }
 
-/// SPEC §6「url」：這個 Entity 的 `namespace="url"` identifier，正規化後
-/// 查目前 owner 是不是別人。
-///
-/// 正規化規則見 [`normalize_url_for_resolution`]：只做 scheme／host 小寫、
-/// 去掉 fragment、去掉結尾多餘的 `/`。**不是** [`core_model::url_norm::canonicalize`]——
-/// 那套還會刪追蹤參數、排序 query，是 Stage 2 文件去重用的，語意不同。
-pub async fn check_url<S: RelationalStore>(
-    store: &S,
-    entity: &Entity,
-) -> Result<Vec<ResolutionCandidate>, ResolverError> {
-    let identifiers = store
-        .list_entity_identifiers_by_entity(entity.id, LIST_LIMIT)
-        .await?;
-    let mut seen: HashSet<(core_model::EntityId, core_model::EntityId)> = HashSet::new();
-    let mut out = Vec::new();
-    for ident in identifiers {
-        if ident.namespace != "url" {
-            continue;
-        }
-        let Some(normalized) = normalize_url_for_resolution(&ident.value)
-            .or_else(|| normalize_url_for_resolution(&ident.normalized_value))
-        else {
-            continue;
-        };
-        let Some(owner) = store
-            .find_entity_identifier_owner("url", &normalized)
-            .await?
-        else {
-            continue;
-        };
-        if owner.entity_id == entity.id {
-            continue;
-        }
-        let (entity_a_id, entity_b_id) =
-            ResolutionCandidate::ordered_pair(entity.id, owner.entity_id);
-        if !seen.insert((entity_a_id, entity_b_id)) {
-            continue;
-        }
-        out.push(ResolutionCandidate {
-            id: Uuid::now_v7(),
-            entity_a_id,
-            entity_b_id,
-            score: URL_SCORE,
-            method: METHOD_URL.to_string(),
-            evidence: json!({
-                "method": METHOD_URL,
-                "matched_url": normalized,
-            }),
-            status: ResolutionStatus::Pending,
-            created_at: Utc::now(),
-            reviewed_at: None,
-        });
-    }
-    Ok(out)
+fn is_domain_link(t: RelationshipType) -> bool {
+    matches!(
+        t,
+        RelationshipType::AssociatedWith | RelationshipType::BelongsTo
+    )
 }
 
-/// 給 resolution 用的輕量 URL 正規化。
-///
-/// - scheme 小寫、host 小寫（`url` crate 解析時就會做）
-/// - 去掉 fragment `#...`
-/// - 去掉路徑結尾多餘的 `/`（根路徑 `/` 保留，否則會變成非法 URL）
-///
-/// 解析失敗回 `None`，呼叫端跳過該筆 identifier，不把原字串拿去比——
-/// 那會讓「正規化過的 URL」與「沒正規化的字串」混在同一個鍵裡。
-#[must_use]
-pub fn normalize_url_for_resolution(raw: &str) -> Option<String> {
-    let mut parsed = url::Url::parse(raw.trim()).ok()?;
-    parsed.set_fragment(None);
-    let path = parsed.path().to_string();
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        parsed.set_path("/");
-    } else if trimmed != path {
-        parsed.set_path(trimmed);
+/// relationship 的兩端，回傳不是 `id` 的那一端；兩端都不是 `id`（不該發生）回 `None`。
+fn other_end(r: &Relationship, id: EntityId) -> Option<EntityId> {
+    if r.source_object_id == id {
+        Some(r.target_object_id)
+    } else if r.target_object_id == id {
+        Some(r.source_object_id)
+    } else {
+        None
     }
-    Some(parsed.to_string())
+}
+
+/// 新增 [`RelationshipType`] 變體時這個 match 會編譯失敗。
+const fn relationship_type_str(t: RelationshipType) -> &'static str {
+    match t {
+        RelationshipType::Mentions => "mentions",
+        RelationshipType::References => "references",
+        RelationshipType::PublishedBy => "published_by",
+        RelationshipType::AuthoredBy => "authored_by",
+        RelationshipType::LinksTo => "links_to",
+        RelationshipType::Affects => "affects",
+        RelationshipType::BelongsTo => "belongs_to",
+        RelationshipType::MemberOf => "member_of",
+        RelationshipType::Owns => "owns",
+        RelationshipType::Uses => "uses",
+        RelationshipType::LocatedAt => "located_at",
+        RelationshipType::AssociatedWith => "associated_with",
+        RelationshipType::DerivedFrom => "derived_from",
+    }
+}
+
+fn domain_candidate(
+    entity_id: EntityId,
+    other_id: EntityId,
+    domain_id: EntityId,
+    own_rel_type: RelationshipType,
+    other_rel_type: RelationshipType,
+) -> ResolutionCandidate {
+    let (entity_a_id, entity_b_id) = ResolutionCandidate::ordered_pair(entity_id, other_id);
+    ResolutionCandidate {
+        id: Uuid::now_v7(),
+        entity_a_id,
+        entity_b_id,
+        score: DOMAIN_SCORE,
+        method: METHOD_DOMAIN.to_string(),
+        evidence: json!({
+            "method": METHOD_DOMAIN,
+            "shared_domain_entity_id": domain_id,
+            "relationship_types": [
+                relationship_type_str(own_rel_type),
+                relationship_type_str(other_rel_type),
+            ],
+        }),
+        status: ResolutionStatus::Pending,
+        created_at: Utc::now(),
+        reviewed_at: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -274,39 +274,36 @@ mod tests {
         }
     }
 
-    fn identifier(
-        owner: EntityId,
-        namespace: &str,
-        value: &str,
-        normalized_value: &str,
-    ) -> EntityIdentifier {
-        EntityIdentifier {
+    fn relationship(
+        source: EntityId,
+        rel_type: RelationshipType,
+        target: EntityId,
+    ) -> Relationship {
+        Relationship {
             id: Uuid::now_v7(),
-            entity_id: owner,
-            namespace: namespace.into(),
-            value: value.into(),
-            normalized_value: normalized_value.into(),
+            source_object_id: source,
+            relationship_type: rel_type,
+            target_object_id: target,
             confidence: 1.0,
-            source_id: None,
             first_seen: ts(),
             last_seen: ts(),
+            evidence_count: 1,
+            created_at: ts(),
+            updated_at: ts(),
         }
     }
 
-    /// identifier／alias 單元測試用的最小 RelationalStore。
+    /// alias／domain 單元測試用的最小 RelationalStore。
     ///
     /// 只實作 `list_entity_aliases_by_entity`／`find_entity_aliases_by_text`／
-    /// `list_entity_identifiers_by_entity`／`find_entity_identifier_owner`。
-    /// listed identifier 與 owner 索引分開種，才能測「自己列上看得到、
-    /// owner 卻是別人」——真實 UNIQUE 不允許這種列，測試必須能種。
+    /// `list_relationships_by_object`。其餘方法回 `UnsupportedCapability`。
     struct MemoryStore {
         inner: Mutex<Inner>,
     }
 
     struct Inner {
         aliases: Vec<EntityAlias>,
-        listed_identifiers: Vec<EntityIdentifier>,
-        owners: HashMap<(String, String), EntityIdentifier>,
+        relationships: Vec<Relationship>,
     }
 
     impl MemoryStore {
@@ -314,8 +311,7 @@ mod tests {
             Self {
                 inner: Mutex::new(Inner {
                     aliases: Vec::new(),
-                    listed_identifiers: Vec::new(),
-                    owners: HashMap::new(),
+                    relationships: Vec::new(),
                 }),
             }
         }
@@ -324,19 +320,8 @@ mod tests {
             self.inner.lock().expect("mutex").aliases.push(row);
         }
 
-        fn seed_listed_identifier(&self, row: EntityIdentifier) {
-            self.inner
-                .lock()
-                .expect("mutex")
-                .listed_identifiers
-                .push(row);
-        }
-
-        fn seed_owner(&self, row: EntityIdentifier) {
-            let mut inner = self.inner.lock().expect("mutex");
-            inner
-                .owners
-                .insert((row.namespace.clone(), row.normalized_value.clone()), row);
+        fn seed_relationship(&self, row: Relationship) {
+            self.inner.lock().expect("mutex").relationships.push(row);
         }
 
         fn unsupported<T>(capability: &'static str) -> Result<T, StorageError> {
@@ -572,10 +557,19 @@ mod tests {
         }
         async fn list_relationships_by_object(
             &self,
-            _: ObjectId,
-            _: u32,
+            object_id: ObjectId,
+            limit: u32,
         ) -> Result<Vec<Relationship>, StorageError> {
-            Self::unsupported("list_relationships_by_object")
+            let inner = self.inner.lock().expect("mutex");
+            let mut items: Vec<Relationship> = inner
+                .relationships
+                .iter()
+                .filter(|r| r.source_object_id == object_id || r.target_object_id == object_id)
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| std::cmp::Reverse(a.id));
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn list_relationships(
             &self,
@@ -798,30 +792,17 @@ mod tests {
         }
         async fn list_entity_identifiers_by_entity(
             &self,
-            entity_id: EntityId,
-            limit: u32,
+            _: EntityId,
+            _: u32,
         ) -> Result<Vec<EntityIdentifier>, StorageError> {
-            let inner = self.inner.lock().expect("mutex");
-            let mut items: Vec<EntityIdentifier> = inner
-                .listed_identifiers
-                .iter()
-                .filter(|i| i.entity_id == entity_id)
-                .cloned()
-                .collect();
-            items.sort_by_key(|a| a.id);
-            items.truncate(limit as usize);
-            Ok(items)
+            Self::unsupported("list_entity_identifiers_by_entity")
         }
         async fn find_entity_identifier_owner(
             &self,
-            namespace: &str,
-            normalized_value: &str,
+            _: &str,
+            _: &str,
         ) -> Result<Option<EntityIdentifier>, StorageError> {
-            let inner = self.inner.lock().expect("mutex");
-            Ok(inner
-                .owners
-                .get(&(namespace.to_string(), normalized_value.to_string()))
-                .cloned())
+            Self::unsupported("find_entity_identifier_owner")
         }
         async fn put_resolution_candidate(
             &self,
@@ -884,27 +865,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn normalize_url_lowercases_scheme_host_strips_fragment_and_trailing_slash() {
-        assert_eq!(
-            normalize_url_for_resolution("HTTPS://Example.INVALID/a/#section"),
-            normalize_url_for_resolution("https://example.invalid/a"),
-        );
-        assert_eq!(
-            normalize_url_for_resolution("https://example.invalid/a/"),
-            Some("https://example.invalid/a".into()),
-        );
-        assert_eq!(
-            normalize_url_for_resolution("https://example.invalid/"),
-            Some("https://example.invalid/".into()),
-            "根路徑的 `/` 不是多餘的，拿掉會變成非法 URL"
-        );
-        assert!(
-            normalize_url_for_resolution("not a url").is_none(),
-            "解析失敗應回 None，不要退回原字串"
-        );
-    }
-
     #[tokio::test]
     async fn check_alias_shared_alias_yields_one_candidate() {
         let store = MemoryStore::new();
@@ -965,130 +925,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_domain_owner_is_other_yields_candidate() {
+    async fn check_domain_two_emails_sharing_domain_yields_candidate() {
         let store = MemoryStore::new();
         let a_id = Uuid::from_u128(0x1111);
         let b_id = Uuid::from_u128(0x2222);
-        let a = entity(a_id, EntityType::Organization, "acme");
-        store.seed_listed_identifier(identifier(a_id, "domain", "Example.COM", "example.com"));
-        store.seed_owner(identifier(b_id, "domain", "example.com", "example.com"));
+        let domain_id = Uuid::from_u128(0xdddd);
+        let a = entity(a_id, EntityType::Email, "alice@example.com");
+        store.seed_relationship(relationship(
+            a_id,
+            RelationshipType::AssociatedWith,
+            domain_id,
+        ));
+        store.seed_relationship(relationship(
+            b_id,
+            RelationshipType::AssociatedWith,
+            domain_id,
+        ));
         let hits = check_domain(&store, &a).await.expect("check");
         assert_eq!(hits.len(), 1, "{hits:?}");
         let c = &hits[0];
         assert_eq!(c.entity_a_id, a_id);
         assert_eq!(c.entity_b_id, b_id);
+        assert!(c.entity_a_id < c.entity_b_id);
         assert_eq!(c.score, DOMAIN_SCORE);
         assert_eq!(c.method, "domain");
         assert_eq!(c.status, ResolutionStatus::Pending);
         assert!(c.reviewed_at.is_none());
         assert_eq!(c.evidence["method"], "domain");
-        assert_eq!(c.evidence["domain"], "example.com");
-    }
-
-    #[tokio::test]
-    async fn check_domain_owner_is_self_returns_empty() {
-        let store = MemoryStore::new();
-        let a_id = Uuid::from_u128(0x1111);
-        let a = entity(a_id, EntityType::Domain, "example.com");
-        let row = identifier(a_id, "domain", "example.com", "example.com");
-        store.seed_listed_identifier(row.clone());
-        store.seed_owner(row);
-        let hits = check_domain(&store, &a).await.expect("check");
-        assert!(hits.is_empty(), "owner 是自己不該產生候選，得到 {hits:?}");
-    }
-
-    #[tokio::test]
-    async fn check_domain_no_identifier_returns_empty() {
-        let store = MemoryStore::new();
-        let a = entity(Uuid::from_u128(0x1111), EntityType::Person, "alice");
-        store.seed_listed_identifier(identifier(
-            a.id,
-            "email",
-            "alice@example.com",
-            "alice@example.com",
-        ));
-        let hits = check_domain(&store, &a).await.expect("check");
-        assert!(
-            hits.is_empty(),
-            "沒有 domain identifier 應回空，email 不該被當成 domain：{hits:?}"
+        assert_eq!(c.evidence["shared_domain_entity_id"], domain_id.to_string());
+        assert_eq!(
+            c.evidence["relationship_types"],
+            json!(["associated_with", "associated_with"])
         );
     }
 
     #[tokio::test]
-    async fn check_url_equivalent_after_normalization_hits() {
+    async fn check_domain_only_self_linked_returns_empty() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let domain_id = Uuid::from_u128(0xdddd);
+        let a = entity(a_id, EntityType::Email, "lonely@example.com");
+        store.seed_relationship(relationship(
+            a_id,
+            RelationshipType::AssociatedWith,
+            domain_id,
+        ));
+        let hits = check_domain(&store, &a).await.expect("check");
+        assert!(
+            hits.is_empty(),
+            "只有自己連到 Domain 不該產生候選，得到 {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_domain_mentions_is_not_a_domain_link() {
         let store = MemoryStore::new();
         let a_id = Uuid::from_u128(0x1111);
         let b_id = Uuid::from_u128(0x2222);
-        let a = entity(a_id, EntityType::Url, "https://example.invalid/a/");
-        store.seed_listed_identifier(identifier(
-            a_id,
-            "url",
-            "HTTPS://Example.INVALID/a/#section",
-            "HTTPS://Example.INVALID/a/#section",
+        let domain_id = Uuid::from_u128(0xdddd);
+        let a = entity(a_id, EntityType::Email, "alice@example.com");
+        store.seed_relationship(relationship(a_id, RelationshipType::Mentions, domain_id));
+        store.seed_relationship(relationship(b_id, RelationshipType::Mentions, domain_id));
+        let hits = check_domain(&store, &a).await.expect("check");
+        assert!(
+            hits.is_empty(),
+            "Mentions 不該被當成 domain 衍生邊，得到 {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_domain_email_and_url_sharing_domain_records_both_types() {
+        let store = MemoryStore::new();
+        let email_id = Uuid::from_u128(0x1111);
+        let url_id = Uuid::from_u128(0x2222);
+        let domain_id = Uuid::from_u128(0xdddd);
+        let email = entity(email_id, EntityType::Email, "alice@example.com");
+        store.seed_relationship(relationship(
+            email_id,
+            RelationshipType::AssociatedWith,
+            domain_id,
         ));
-        let matched =
-            normalize_url_for_resolution("https://example.invalid/a/").expect("正規化應成功");
-        store.seed_owner(identifier(
-            b_id,
-            "url",
-            "https://example.invalid/a",
-            &matched,
-        ));
-        let hits = check_url(&store, &a).await.expect("check");
+        store.seed_relationship(relationship(url_id, RelationshipType::BelongsTo, domain_id));
+        let hits = check_domain(&store, &email).await.expect("check");
         assert_eq!(hits.len(), 1, "{hits:?}");
-        let c = &hits[0];
-        assert_eq!(c.entity_a_id, a_id);
-        assert_eq!(c.entity_b_id, b_id);
-        assert_eq!(c.score, URL_SCORE);
-        assert_eq!(c.method, "url");
-        assert_eq!(c.status, ResolutionStatus::Pending);
-        assert!(c.reviewed_at.is_none());
-        assert_eq!(c.evidence["method"], "url");
-        assert_eq!(c.evidence["matched_url"], matched);
-    }
-
-    #[tokio::test]
-    async fn check_url_different_after_normalization_does_not_hit() {
-        let store = MemoryStore::new();
-        let a_id = Uuid::from_u128(0x1111);
-        let b_id = Uuid::from_u128(0x2222);
-        let a = entity(a_id, EntityType::Url, "https://example.invalid/a");
-        store.seed_listed_identifier(identifier(
-            a_id,
-            "url",
-            "https://example.invalid/a",
-            "https://example.invalid/a",
-        ));
-        let other =
-            normalize_url_for_resolution("https://example.invalid/b").expect("正規化應成功");
-        store.seed_owner(identifier(b_id, "url", "https://example.invalid/b", &other));
-        let hits = check_url(&store, &a).await.expect("check");
-        assert!(
-            hits.is_empty(),
-            "正規化後仍不同的 URL 不該命中，得到 {hits:?}"
+        assert_eq!(
+            hits[0].evidence["relationship_types"],
+            json!(["associated_with", "belongs_to"]),
+            "第一段是查詢端（Email），第二段是另一端（URL）"
         );
-    }
-
-    #[tokio::test]
-    async fn check_url_owner_is_self_returns_empty() {
-        let store = MemoryStore::new();
-        let a_id = Uuid::from_u128(0x1111);
-        let a = entity(a_id, EntityType::Url, "https://example.invalid/a");
-        let matched =
-            normalize_url_for_resolution("https://example.invalid/a").expect("正規化應成功");
-        store.seed_listed_identifier(identifier(
-            a_id,
-            "url",
-            "https://example.invalid/a/",
-            "https://example.invalid/a/",
-        ));
-        store.seed_owner(identifier(
-            a_id,
-            "url",
-            "https://example.invalid/a",
-            &matched,
-        ));
-        let hits = check_url(&store, &a).await.expect("check");
-        assert!(hits.is_empty(), "owner 是自己不該產生候選，得到 {hits:?}");
     }
 }

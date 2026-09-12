@@ -1,9 +1,9 @@
 //! SPEC §6「semantic similarity」：同 type 的 Entity 用 embedding cosine 比對。
 //!
-//! **自由函式，不寫入 store、不接進 [`crate::ResolverService::resolve_entity`]。**
-//! 呼叫端自己決定要不要 `put_resolution_candidate`。還沒接真實
-//! ml-commons adapter 時，注入 [`storage_core::mock::MockEmbeddingProvider`]
-//! 或 `unsupported()` 即可測 plumbing。
+//! 由 [`crate::ResolverService::resolve_entity`] 聚合呼叫（門檻
+//! [`crate::SEMANTIC_SIMILARITY_THRESHOLD`]）；也仍以自由函式公開。
+//! **不寫 candidate 表**。還沒接真實 ml-commons adapter 時，注入
+//! [`storage_core::mock::MockEmbeddingProvider`] 或 `unsupported()` 即可測 plumbing。
 
 use chrono::Utc;
 use core_model::{Entity, EntityType, RESOLUTION_METHODS, ResolutionCandidate, ResolutionStatus};

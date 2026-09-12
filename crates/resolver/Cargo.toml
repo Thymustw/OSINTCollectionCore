@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "給 Entity 跑 resolution method，產出 ResolutionCandidate（SPEC_V0.2 §5／§6；目前只實作 normalized_name）"
+description = "給 Entity 跑 resolution method，產出 ResolutionCandidate（SPEC_V0.2 §5／§6）"
 
 [dependencies]
 async-trait = { workspace = true }
@@ -15,7 +15,6 @@ serde_json = { workspace = true }
 storage-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

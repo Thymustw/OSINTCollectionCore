@@ -9,39 +9,41 @@ crates/resolver    函式庫；目前沒有獨立 binary／事件消費者
 給 Entity 跑 resolution method，產出 `ResolutionCandidate` 寫進 canonical store。
 **不做事件消費／發布**——`entity.resolution.requested`／`completed` 是之後 Phase 1h。
 
-## 目前只實作 `normalized_name`
+## 方法狀態
 
 SPEC §6 列了十種方法（`core_model::RESOLUTION_METHODS` 是拼法來源，不是白名單）。
-這個 crate 現在真正去查資料的只有「跨 `EntityType`、相同 `normalized_name`」。
 
 | 方法 | 狀態 | 為什麼現在做／不做 |
 |---|---|---|
-| `normalized_name` | **已實作** | 資料在既有 `entities` 表，`find_entity_by_normalized_name` 就能查 |
-| `exact_identifier` | 純函式 helper + entity-worker 呼叫端 | 見下文；entity-worker 在 identifier 寫入衝突時組候選 |
-| `alias` | **已實作（自由函式，未接進 resolve_entity 聚合）** | 見下文；讀 `entity_aliases`，真實表可能仍空 |
-| `domain` | **已實作（自由函式，未接進 resolve_entity 聚合）** | 見下文；讀 `namespace="domain"`，entity-worker 已寫入 |
-| `url` | **已實作（自由函式，未接進 resolve_entity 聚合）** | 見下文；讀 `namespace="url"`，entity-worker 已寫入 |
-| `account_handle`／`email`／`external_id` | 不做 | `email` namespace 已有寫入者，但這三條掃描方法還沒接到聚合 |
-| `semantic_similarity` | **已實作（自由函式，未接進 resolve_entity 聚合）** | 見下文；暴力 cosine，只適合驗證 plumbing |
-| `graph_context` | **已實作（自由函式，未接進 resolve_entity 聚合）** | 見下文；只依賴 `GraphStore`，不查 Entity 本體 |
+| `normalized_name` | **已實作，接進 `resolve_entity` 聚合** | 資料在既有 `entities` 表，`find_entity_by_normalized_name` 就能查 |
+| `exact_identifier` | 純函式 helper + entity-worker 呼叫端 | 見下文；寫入衝突時組候選，不是掃描式方法 |
+| `alias` | **已實作，接進 `resolve_entity` 聚合** | 讀 `entity_aliases`；V0.2 還沒有生產寫入者，真實表可能仍空 |
+| `domain` | **已實作（走 Relationship，接進 `resolve_entity` 聚合）** | 見下文；舊版 identifier 反查是結構性死碼 |
+| `url` | **已併入 `domain`，函式退場** | URL／Email 共用網域都由 entity-worker 寫成 Relationship |
+| `account_handle`／`email`／`external_id` | 不做 | 同一個 UNIQUE 限制，需要各自的跨欄位設計，不是抄舊版 `check_domain` 的形狀 |
+| `semantic_similarity` | **已實作，接進 `resolve_entity` 聚合** | 暴力 cosine，只適合驗證 plumbing；門檻 `SEMANTIC_SIMILARITY_THRESHOLD` |
+| `graph_context` | **已實作，接進 `resolve_entity` 聚合** | 只依賴 `GraphStore`，不查 Entity 本體；門檻 `GRAPH_CONTEXT_THRESHOLD` |
 
-其餘方法是獨立交付項目，**不要**在這個 crate 裡順手加——骨架已經把聚合點留在
-`ResolverService::resolve_entity`，每加一個方法就接進那條呼叫鏈。
+骨架把聚合點留在 `ResolverService::resolve_entity`，每加一個方法就接進那條呼叫鏈。
 
 ## `ResolverService`
 
 ```text
-ResolverService<S: RelationalStore>
-  new(store)
+ResolverService<S: RelationalStore, E: EmbeddingProvider, G: GraphStore>
+  new(store, embedder, graph)
   resolve_entity(entity_id) -> Result<Vec<ResolutionCandidate>, ResolverError>
   check_normalized_name(entity) -> Result<Vec<ResolutionCandidate>, ResolverError>
 ```
 
 - `resolve_entity` 先 `get_entity`。找不到回 `ResolverError::EntityNotFound`，不 panic。
-- 目前聚合呼叫只跑 `check_normalized_name`。
+- 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity` → `graph_context`。
 - 組好的 candidate 經 `put_resolution_candidate` 寫入。`StorageError::Conflict`
   （同一對同一方法已存在）視為已處理：記一行 log、continue，不讓整次 resolve 失敗。
-- `check_normalized_name` **不寫 store**，只組候選，方便單測直接斷言內容。
+  其他 storage 錯誤（含 semantic／graph 路徑）用 `?` 往上傳播。
+- `check_normalized_name`／`check_alias`／`check_domain`／`check_semantic_similarity`／
+  `check_graph_context` **不寫 store**，只組候選；寫入由 `resolve_entity` 負責。
+- `SEMANTIC_SIMILARITY_THRESHOLD = 0.85`、`GRAPH_CONTEXT_THRESHOLD = 0.5` 是合理預設，
+  之後應該可設定，不是最終定案。
 
 ### `normalized_name` 規則
 
@@ -71,23 +73,15 @@ ResolverService<S: RelationalStore>
 0.40 是弱訊號：Person「acme」與 Organization「acme」同名不代表同一實體，
 只夠進 Review，遠不到 `auto_confirmed`。
 
-## `alias`／`domain`／`url`（自由函式）
+## `alias`／`domain`
 
 ```text
 check_alias(store, entity)  -> Result<Vec<ResolutionCandidate>, ResolverError>
 check_domain(store, entity) -> Result<Vec<ResolutionCandidate>, ResolverError>
-check_url(store, entity)    -> Result<Vec<ResolutionCandidate>, ResolverError>
 ```
 
-三個都是自由函式，**不寫 candidate 表、不接進 `ResolverService::resolve_entity`。**
-那條聚合仍只跑 `normalized_name`。呼叫端自己決定要不要 `put_resolution_candidate`。
-
-`entity_identifiers` 已由 entity-worker 為 Domain／Ip／Url／Email／CVE 寫入
-（Hash／Person／Organization 刻意不寫）。`entity_aliases` 仍沒有生產寫入者。
-空 `Vec` 對 alias 多半是「沒資料」；對 domain／url 則可能是「沒命中」。
-不要把空結果一律讀成「確定沒有同一實體」。
-
-三條都用 `ResolutionCandidate::ordered_pair` 排序 pair，`status = pending`、
+兩個都是自由函式，**不寫 candidate 表**；`resolve_entity` 會呼叫它們再 persist。
+pair 用 `ResolutionCandidate::ordered_pair` 排序，`status = pending`、
 `id = Uuid::now_v7()`、`reviewed_at = None`。
 
 ### `alias` 規則
@@ -113,57 +107,63 @@ evidence：
 取自兩邊各自 alias 列的 `confidence`。
 
 0.55 是中等訊號：同一個顯示名稱出現在兩個 Entity 上夠進 Review，不到自動合併。
+V0.2 還沒有 `entity_aliases` 的生產寫入者，真實表可能仍空——空 `Vec` 多半是「沒資料」，
+不要讀成「確定沒有同一實體」。
 
-### `domain` 規則
+### `domain` 規則（走 Relationship）
 
-1. `list_entity_identifiers_by_entity(entity.id, 100)`，過濾 `namespace == "domain"`。
-2. 對每個 `normalized_value` 呼叫 `find_entity_identifier_owner("domain", ...)`。
-3. owner 是別人 → `score = 0.30`、`method = "domain"`；owner 是自己或沒有 owner → 跳過。
+舊版對自己列上的 `namespace="domain"` identifier 做 `find_entity_identifier_owner`。
+`(namespace, normalized_value)` UNIQUE 保證一個值只有一個 owner，而這個 owner
+一定就是查詢者自己——**已用真實 PostgreSQL 驗證為結構性死碼**，不是測試 double
+種不出資料。舊版 `check_url` 唯一會命中的路徑是正規化不一致的意外邊緣案例
+（結尾斜線），不是設計要抓的訊號。
+
+真正該比的訊號已經在 `relationships` 表：entity-worker 抽到 Email／URL 時會衍生
+Domain Entity，並寫 `Email --AssociatedWith--> Domain` 或 `URL --BelongsTo--> Domain`
+（`source` 是 Email／URL，`target` 是 Domain）。兩份文件抽到指向同一個網域的
+Email／URL 會因 UUID v5 自然鍵收斂到同一個 Domain Entity，所以「共享網域」
+這件事已經完整記錄。
+
+新版步驟：
+
+1. `list_relationships_by_object(entity.id, 100)`，留下 `AssociatedWith`／`BelongsTo`，
+   另一端視為衍生 Domain Entity。
+2. 對每個 Domain 再 `list_relationships_by_object(domain_id, 100)`，找其他一端。
+3. 跳過自己；同一對因多個共用 Domain 命中多次時只留第一筆。
+4. 命中：`score = 0.30`、`method = "domain"`。
 
 evidence：
 
 ```json
 {
   "method": "domain",
-  "domain": "example.com"
+  "shared_domain_entity_id": "<domain entity uuid>",
+  "relationship_types": ["associated_with", "belongs_to"]
 }
 ```
 
-`domain` 用 identifier 列上既有的 `normalized_value`，不再做一次正規化。
-0.30 是弱訊號（共用主機、轉售、資料髒了都常見）。
+`relationship_types` 是兩段邊各自的 type 字串：第一段是查詢 Entity 連到 Domain 的
+那條，第二段是另一端連到同一個 Domain 的那條。方便 Review 判斷是 email 還是 url
+牽的線；不合併所有可能路徑。
 
-### `url` 規則
+0.30 是弱訊號（共用網域基礎設施不代表同一實體）。
 
-1. 同樣列出 identifier，過濾 `namespace == "url"`。
-2. 用本 crate 的輕量正規化（scheme／host 小寫、去掉 fragment、去掉路徑結尾多餘的 `/`；
-   根路徑 `/` 保留）。**不是** `core_model::url_norm::canonicalize`——那套還會刪
-   追蹤參數、排序 query，是 Stage 2 文件去重用的，語意不同。
-3. 解析失敗就跳過該筆，不把原字串拿去比。
-4. 用正規化後的值 `find_entity_identifier_owner("url", ...)`。命中且不是自己 →
-   `score = 0.60`、`method = "url"`。
+`AssociatedWith`／`BelongsTo` 目前**不是**專屬於 domain 衍生（`RelationshipType`
+是共用列舉）。V0.2 只有 entity-worker 會寫這兩種 type；之後有其他寫入者要再檢視，
+否則會把非 domain 的關聯誤當成共用網域。
 
-evidence：
+`url` 方法已併入這條路徑，函式本體退場。SPEC §6 清單仍保留 `"url"` 這個名字，
+只是 crate 不再實作獨立掃描。
 
-```json
-{
-  "method": "url",
-  "matched_url": "https://example.invalid/a"
-}
-```
-
-單元測試用 crate 內記憶體 `RelationalStore` double，不打真實 PostgreSQL／SQLite。
-listed identifier 與 owner 索引分開種，才能測「自己列上看得到、owner 卻是別人」——
-真實 UNIQUE 不允許這種列。
-
-## `semantic_similarity`（自由函式）
+## `semantic_similarity`
 
 ```text
 check_semantic_similarity(store, embedder, entity, threshold)
   -> Result<Vec<ResolutionCandidate>, ResolverError>
 ```
 
-同 type 的 Entity 用 embedding cosine 比對。**不寫 candidate 表、不接進
-`ResolverService::resolve_entity`。** 那條聚合仍只跑 `normalized_name`。
+同 type 的 Entity 用 embedding cosine 比對。**不寫 candidate 表**；
+`resolve_entity` 用 `SEMANTIC_SIMILARITY_THRESHOLD`（0.85）呼叫。
 
 ### 跳過 identity-type
 
@@ -211,14 +211,14 @@ check_semantic_similarity(store, embedder, entity, threshold)
 的 cosine 是偽隨機的，不要斷言「一定不命中」。真實語意品質要接上
 ml-commons adapter 才能驗證。
 
-## `graph_context`（自由函式）
+## `graph_context`
 
 ```text
 check_graph_context(graph, entity_id, threshold) -> Result<Vec<ResolutionCandidate>, ResolverError>
 ```
 
 純圖結構比對，**不吃 `RelationalStore`、不寫 candidate 表、不查 Entity 本體**。
-還沒接到 `ResolverService::resolve_entity`；那條聚合仍只跑 `normalized_name`。
+`resolve_entity` 用 `GRAPH_CONTEXT_THRESHOLD`（0.5）呼叫。
 
 ### 候選集合怎麼產生
 
@@ -298,16 +298,21 @@ helper 再 `put_resolution_candidate`。這**不是** `ResolverService::resolve_
 
 ## 測試策略
 
-單元測試用 crate 內的記憶體 `RelationalStore` double（只實作
-`get_entity`／`find_entity_by_normalized_name`／`put_resolution_candidate`），
-不打真實 PostgreSQL／SQLite。理由：
+單元測試用 crate 內的記憶體 `RelationalStore` double，不打真實 PostgreSQL／SQLite。
+理由：
 
 - `normalized_name` 的比對、skip-self、Conflict 不中斷，都是這個 crate 的邏輯，
   不是 adapter 的 SQL。
 - skip-self 必須能種「同 type 同名的第二個 Entity」來證明是程式跳過、
   不是碰巧查不到——真實 DB 的自然鍵 unique index 不允許這種列存在。
-- adapter 對 `find_entity_by_normalized_name` 與 `put_resolution_candidate`
-  的契約已由 `storage-core::conformance` 覆蓋。
+- `check_domain` 用 Relationship 種子模擬「Email A → Domain X」「Email B → Domain X」，
+  不需要 identifier UNIQUE 的假衝突。
+- adapter 對 `find_entity_by_normalized_name`、`put_resolution_candidate`、
+  `list_relationships_by_object` 的契約已由 `storage-core::conformance` 覆蓋。
+- `resolve_entity` 聚合測試注入 `MockEmbeddingProvider::unsupported()` 與空的
+  `MockGraphStore`，讓 semantic／graph 回空，不干擾 normalized_name／alias 斷言。
 
-未覆蓋：對真實 Docker Postgres 跑一次 end-to-end 的跨 type 同名。那要等
-Phase 1h 接上事件之後，用 entity-worker 抽出的真實 Entity 再補。
+未覆蓋：對真實 Docker Postgres 跑一次 end-to-end 的 Relationship-based `check_domain`。
+那要等 Phase 1h 接上事件之後，用 entity-worker 抽出的真實 Entity 再補。
+這次 Relationship 設計沒有打過真實 Postgres，靠既有 conformance 保證
+`list_relationships_by_object` 的契約。
