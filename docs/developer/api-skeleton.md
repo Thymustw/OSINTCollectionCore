@@ -47,7 +47,8 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/entities/{id}` | viewer | 200 | 含關聯數與抽取紀錄 |
 | GET | `/api/v1/entities/{id}/resolution-candidates` | viewer | 200 | cursor 分頁；`?status=` |
 | GET | `/api/v1/entities/{id}/merge-history` | viewer | 200 | 含已撤銷的 merge |
-| POST | `/api/v1/entities/{id}/resolve` | operator | 200 | 跑掃描方法，回這次新寫入的候選 |
+| POST | `/api/v1/entities/{id}/resolve` | operator | 200 | 跑只需要 Postgres 的掃描方法，回這次新寫入的候選 |
+| POST | `/api/v1/entities/{id}/resolve/graph-context` | operator | 200 | graph_context；Neo4j 沒接上回 503，不影響上一條 |
 | POST | `/api/v1/entities/merge` | operator | 200 | body：`survivor_id`／`merged_id`／`reason` |
 | POST | `/api/v1/merge-history/{id}/undo` | operator | 204 | 重複 undo 回 409 |
 | GET | `/api/v1/relationships` | viewer | 200 | `?type=` |
@@ -260,8 +261,12 @@ curl -s -X POST http://127.0.0.1:18080/api/v1/collections \
 ### Resolve／Merge
 
 ```bash
-# 對一個 Entity 跑目前已實作的掃描方法，回這次新寫入的候選
+# 對一個 Entity 跑只需要 Postgres 的掃描方法，回這次新寫入的候選
 curl -s -X POST http://127.0.0.1:18080/api/v1/entities/$ID/resolve \
+  -H "Authorization: Bearer $TOKEN"
+
+# graph_context（獨立 endpoint）。Neo4j 沒接上回 503，不影響上一條
+curl -s -X POST http://127.0.0.1:18080/api/v1/entities/$ID/resolve/graph-context \
   -H "Authorization: Bearer $TOKEN"
 
 # 列出這個 Entity 參與過的候選（entity_a 或 entity_b 命中都算）
@@ -279,10 +284,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-`POST /entities/{id}/resolve` 目前注入的是 `MockEmbeddingProvider::unsupported()`
-與空的 `MockGraphStore`：`semantic_similarity`／`graph_context` **誠實回空**，
-不是假裝已接上。會真的產生候選的方法只有 `normalized_name`／`alias`／`domain`。
-完整理由見 `docs/developer/resolver.md`。merge 行為見 `docs/developer/merge.md`。
+`POST /entities/{id}/resolve` 目前注入的是 `MockEmbeddingProvider::unsupported()`：
+`semantic_similarity` **誠實回空**，不是假裝已接上。會真的產生候選的方法是
+`normalized_name`／`alias`／`domain`／`account_handle`。`graph_context` 走獨立
+路由 `POST /entities/{id}/resolve/graph-context`（接 `storage-neo4j`；沒接上
+回 503，不影響上一條）。完整理由見 `docs/developer/resolver.md`。
+merge 行為見 `docs/developer/merge.md`。
 
 ## Relationships
 

@@ -68,6 +68,10 @@ pub fn router(state: AppState) -> Router {
             post(resources::merge::resolve_entity),
         )
         .route(
+            "/api/v1/entities/{id}/resolve/graph-context",
+            post(resources::merge::resolve_graph_context),
+        )
+        .route(
             "/api/v1/entities/merge",
             post(resources::merge::merge_entities),
         )

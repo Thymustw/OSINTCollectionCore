@@ -739,6 +739,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "storage-core",
+ "storage-neo4j",
  "storage-opensearch",
  "storage-postgres",
  "storage-redis",

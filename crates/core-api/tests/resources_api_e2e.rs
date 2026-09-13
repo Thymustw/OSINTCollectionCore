@@ -123,8 +123,8 @@ fn build_api_with_backends(
         resolver: Some(Arc::new(resolver::ResolverService::new(
             stack.pg.clone(),
             storage_core::mock::MockEmbeddingProvider::unsupported(),
-            storage_core::mock::MockGraphStore::new(),
         ))),
+        graph_resolver: None,
         import: None,
         search: None,
         ready: ready_always(),

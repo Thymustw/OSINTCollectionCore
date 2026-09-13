@@ -120,18 +120,15 @@ impl ReadyCheck for BrokerCheck {
 ///
 /// # 為什麼是 HTTP 而不是 Bolt
 ///
-/// Neo4j 不是 storage adapter（V0.2 Phase 0b 還沒有 `storage-neo4j`），
-/// 所以沒有 `HealthProvider`，跟 [`BrokerCheck`] 一樣單獨包一個。
-///
 /// 探活只打 HTTP 埠（預設 7474）的 `GET /`：那個端點**不需要認證**就會回
-/// 叢集的 discovery JSON，所以這個檢查不必持有任何憑證，也就不會在
-/// 「還沒有人真的要用 Neo4j」的階段先把密碼灌進 API 行程。
-/// Bolt（7687）連線與 Cypher 查詢是 Phase 2a `storage-neo4j` adapter 的事。
+/// 叢集的 discovery JSON，所以這個檢查不必持有任何憑證。
+/// Bolt（7687）連線與 Cypher 查詢走 `storage-neo4j` 的 `Neo4jStore`，
+/// 由 `POST /entities/{id}/resolve/graph-context` 使用。
 ///
 /// ⚠️ **這只證明 HTTP 埠活著，不證明資料庫可寫。** Neo4j 在還原、
 /// 資料庫處於 `offline`／`failed` 狀態時，7474 仍然會回 200。
-/// Phase 2a 接上 driver 之後要把判定升級成真的跑一次 Cypher——
-/// 在那之前不要把這個檢查當成「圖投影是健康的」。
+/// Bolt 連線失敗時 `AppState.graph_resolver` 是 `None`，那條路由回 503；
+/// 不要把這個 HTTP 檢查當成「圖投影是健康的」。
 pub struct GraphCheck {
     client: reqwest::Client,
     url: String,

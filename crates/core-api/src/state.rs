@@ -9,8 +9,8 @@ use core_jobs::JobService;
 use core_observability::MetricsRegistry;
 use core_security::{ApiTokenStore, AuditLog, JwtService};
 use merge::MergeService;
-use resolver::ResolverService;
-use storage_core::mock::{MockEmbeddingProvider, MockGraphStore};
+use resolver::{GraphContextResolver, ResolverService};
+use storage_core::mock::MockEmbeddingProvider;
 use storage_core::{ObjectStore, RelationalStore};
 use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
@@ -23,11 +23,13 @@ pub type SharedJobService = Arc<JobService<PostgresCanonicalStore>>;
 /// 理由同 [`SharedJobService`]：`MergeService<S: TransactionalStore>` 的泛型參數
 /// 不能吃 `Arc<dyn RelationalStore>`（沒有 blanket impl）。直接綁生產 adapter。
 pub type SharedMergeService = Arc<MergeService<PostgresCanonicalStore>>;
-/// 目前用 [`MockEmbeddingProvider::unsupported`] 與空的 [`MockGraphStore`]：
-/// `semantic_similarity`／`graph_context` 誠實回空，不是假裝已接上。
-/// Phase 2 接 `storage-neo4j` 與 ml-commons adapter 後才換真的。
+/// 目前用 [`MockEmbeddingProvider::unsupported`]：`semantic_similarity` 誠實回空，
+/// 不是假裝已接上。ml-commons adapter 接上後才換真的。
+/// `graph_context` 不在這個 service 上，見 [`SharedGraphContextResolver`]。
 pub type SharedResolverService =
-    Arc<ResolverService<PostgresCanonicalStore, MockEmbeddingProvider, MockGraphStore>>;
+    Arc<ResolverService<PostgresCanonicalStore, MockEmbeddingProvider>>;
+pub type SharedGraphContextResolver =
+    Arc<GraphContextResolver<PostgresCanonicalStore, storage_neo4j::Neo4jStore>>;
 pub type SharedSearchState = Arc<SearchState>;
 
 /// 泛用的 canonical store handle。
@@ -103,10 +105,16 @@ pub struct AppState {
     pub jobs: Option<SharedJobService>,
     /// Entity merge。`None` 代表沒接上 Postgres，對應 handler 回 503。
     pub merge: Option<SharedMergeService>,
-    /// Entity resolution。`None` 代表沒接上 Postgres。embedder／graph 目前是 mock
+    /// Entity resolution。`None` 代表沒接上 Postgres。embedder 目前是 mock
     /// （見 [`SharedResolverService`]），不要假設 `POST /entities/{id}/resolve`
-    /// 會產出 `semantic_similarity` 或 `graph_context` 候選。
+    /// 會產出 `semantic_similarity` 候選。`graph_context` 走獨立欄位
+    /// [`AppState::graph_resolver`]。
     pub resolver: Option<SharedResolverService>,
+    /// graph_context resolution。`None` 代表沒接上 Neo4j——**跟 [`AppState::resolver`]
+    /// 完全獨立**，Neo4j 斷線只影響 `POST /entities/{id}/resolve/graph-context`
+    /// 這一條路由，不影響 resolve_entity 的另外幾個方法。這正是拆成獨立 endpoint
+    /// 的目的，見 docs/developer/resolver.md。
+    pub graph_resolver: Option<SharedGraphContextResolver>,
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
     pub ready: ReadyProbe,

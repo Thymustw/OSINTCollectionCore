@@ -1,6 +1,7 @@
 //! SPEC §6「semantic similarity」：同 type 的 Entity 用 embedding cosine 比對。
 //!
-//! 由 [`crate::ResolverService::resolve_entity`] 聚合呼叫（門檻
+//! 由 [`crate::ResolverService::resolve_entity`] 聚合呼叫，也有獨立入口
+//! [`crate::ResolverService::resolve_semantic_similarity`]（門檻
 //! [`crate::SEMANTIC_SIMILARITY_THRESHOLD`]）；也仍以自由函式公開。
 //! **不寫 candidate 表**。還沒接真實 ml-commons adapter 時，注入
 //! [`storage_core::mock::MockEmbeddingProvider`] 或 `unsupported()` 即可測 plumbing。

@@ -4,7 +4,7 @@
 //! [`EntityId`] 丟進來，這裡查 canonical store、跑目前已實作的方法、把新產生的
 //! candidate 寫回去。
 //!
-//! # [`ResolverService::resolve_entity`] 目前聚合六種掃描方法
+//! # [`ResolverService::resolve_entity`] 聚合五種只需要 Postgres 的掃描方法
 //!
 //! SPEC_V0.2 §6 列了十種方法。掃描式聚合目前跑：
 //!
@@ -12,8 +12,16 @@
 //! * [`check_alias`]（共用 alias 文字）
 //! * [`check_domain`]（兩個 Entity 都連到同一個衍生 Domain Entity）
 //! * [`check_semantic_similarity`]（同 type embedding cosine）
-//! * [`check_graph_context`]（一跳鄰居 Jaccard）
 //! * [`check_account_handle`]（同一個 handle 出現在不同平台 namespace）
+//!
+//! [`check_graph_context`] **不**在 `resolve_entity` 裡：它需要 Neo4j，獨立成
+//! [`GraphContextResolver`]（HTTP 入口 `POST /entities/{id}/resolve/graph-context`）。
+//! 圖後端有獨立的可用性狀態，不能讓它拖累另外幾個只需要 Postgres 的方法。
+//!
+//! `semantic_similarity` 目前仍由 `resolve_entity` 聚合，另有獨立入口
+//! [`ResolverService::resolve_semantic_similarity`]。現在 embedder 還是 mock，
+//! 行為不變；Phase 3 接 ml-commons 時若也需要跟 `resolve_entity` 解耦合，
+//! 可以比照 [`GraphContextResolver`] 的模式再抽一次。
 //!
 //! 舊版 `check_url` 已退場：URL 與 Email 共用網域都由 entity-worker 寫成
 //! Relationship，走 [`check_domain`] 即可。舊版靠 `entity_identifiers` 反查
@@ -42,18 +50,25 @@
 //! [`check_semantic_similarity`]: crate::semantic::check_semantic_similarity
 //! [`check_graph_context`]: crate::graph_context::check_graph_context
 //! [`ResolverService::resolve_entity`]: crate::ResolverService::resolve_entity
+//! [`ResolverService::resolve_semantic_similarity`]:
+//!     crate::ResolverService::resolve_semantic_similarity
+//! [`GraphContextResolver`]: crate::GraphContextResolver
 
 mod conflict;
 mod error;
 mod graph_context;
+mod graph_context_resolver;
 mod identifier_methods;
+mod persist;
 mod semantic;
 mod service;
 
 pub use conflict::resolution_candidate_from_identifier_conflict;
 pub use error::ResolverError;
 pub use graph_context::check_graph_context;
+pub use graph_context_resolver::GraphContextResolver;
 pub use identifier_methods::{check_account_handle, check_alias, check_domain};
+pub use persist::persist_candidate;
 pub use semantic::check_semantic_similarity;
 pub use service::{
     ALL_ENTITY_TYPES, GRAPH_CONTEXT_THRESHOLD, ResolverService, SEMANTIC_SIMILARITY_THRESHOLD,

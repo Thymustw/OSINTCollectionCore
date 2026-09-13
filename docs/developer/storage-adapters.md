@@ -468,6 +468,14 @@ Neo4j adapter（`storage-neo4j`）同時實作 `GraphStore` + `ProjectionStore`�
 
 真實圖投影。連線由呼叫端注入（`Neo4jStore::connect(bolt_uri, username, password, pool_max)`），
 **不**讀 env、不寫死 `bolt://127.0.0.1:7687`。驅動是 `neo4rs 0.8.0`（穩定版，不用 0.9 RC）。
+`pool_max` 來自 `[storage.graph].pool_max`（預設 5）。
+
+`osint-api` 的 graph-context resolution 走
+`GraphContextResolver<PostgresCanonicalStore, Neo4jStore>`，**不**再把
+`GraphStore` 塞進 `ResolverService`。`ResolverService` 只吃
+`RelationalStore` + `EmbeddingProvider`；Neo4j 斷線只讓
+`POST /entities/{id}/resolve/graph-context` 回 503。
+單元測試仍可注入 `storage_core::mock::MockGraphStore`。
 
 ```rust
 let store = Neo4jStore::connect(&uri, &user, &password, 5).await?;

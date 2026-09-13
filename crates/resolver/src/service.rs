@@ -5,13 +5,12 @@ use core_model::{
     Entity, EntityId, EntityType, RESOLUTION_METHODS, ResolutionCandidate, ResolutionStatus,
 };
 use serde_json::json;
-use storage_core::{EmbeddingProvider, GraphStore, RelationalStore, StorageError};
-use tracing::info;
+use storage_core::{EmbeddingProvider, RelationalStore};
 use uuid::Uuid;
 
 use crate::error::ResolverError;
-use crate::graph_context::check_graph_context;
 use crate::identifier_methods::{check_account_handle, check_alias, check_domain};
+use crate::persist::persist_candidate;
 use crate::semantic::check_semantic_similarity;
 
 /// SPEC §10 的 13 種 EntityType。新增變體時下面的 match 會編譯失敗，
@@ -70,30 +69,33 @@ pub const GRAPH_CONTEXT_THRESHOLD: f64 = 0.5;
 
 const METHOD_NORMALIZED_NAME: &str = RESOLUTION_METHODS[1];
 
-/// 對 Entity 跑 resolution method、把新候選寫進 store。
-pub struct ResolverService<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> {
+/// 對 Entity 跑**只需要 Postgres** 的 resolution method、把新候選寫進 store。
+///
+/// `graph_context` 不在這裡：它依賴 Neo4j，獨立成 [`crate::GraphContextResolver`]，
+/// 避免圖後端斷線拖累另外幾個方法。`semantic_similarity` 目前仍由
+/// [`Self::resolve_entity`] 聚合，另有獨立入口 [`Self::resolve_semantic_similarity`]
+/// 預留給 Phase 3——接上 ml-commons 時若也需要解耦合，可再比照
+/// `GraphContextResolver` 抽一次。
+pub struct ResolverService<S: RelationalStore, E: EmbeddingProvider> {
     store: S,
     embedder: E,
-    graph: G,
 }
 
-impl<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> ResolverService<S, E, G> {
+impl<S: RelationalStore, E: EmbeddingProvider> ResolverService<S, E> {
     #[must_use]
-    pub fn new(store: S, embedder: E, graph: G) -> Self {
-        Self {
-            store,
-            embedder,
-            graph,
-        }
+    pub fn new(store: S, embedder: E) -> Self {
+        Self { store, embedder }
     }
 
-    /// 依序跑所有目前已實作的掃描方法，回傳**這次新寫入**的 candidate。
+    /// 依序跑所有目前已實作、只需要 Postgres 的掃描方法，回傳**這次新寫入**的 candidate。
     ///
     /// 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity`
-    /// → `graph_context` → `account_handle`。某一筆候選已經存在
-    /// （`StorageError::Conflict`）視為已處理，記一行 log 後繼續，不讓整次
-    /// resolve 失敗。底層 storage 錯誤（含 semantic／graph 路徑）用 `?` 往上
-    /// 傳播，只有 persist 那一層吞 Conflict。
+    /// → `account_handle`。`graph_context` 已抽到 [`crate::GraphContextResolver`]，
+    /// 不在這條呼叫鏈上——Neo4j 有獨立的後端可用性，不能拖累另外幾個方法。
+    ///
+    /// 某一筆候選已經存在（`StorageError::Conflict`）視為已處理，記一行 log
+    /// 後繼續，不讓整次 resolve 失敗。底層 storage 錯誤用 `?` 往上傳播，
+    /// 只有 persist 那一層吞 Conflict。
     pub async fn resolve_entity(
         &self,
         entity_id: EntityId,
@@ -116,13 +118,44 @@ impl<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> ResolverService<S,
             )
             .await?,
         );
-        candidates
-            .extend(check_graph_context(&self.graph, entity_id, GRAPH_CONTEXT_THRESHOLD).await?);
         candidates.extend(check_account_handle(&self.store, &entity).await?);
 
         let mut written = Vec::new();
         for candidate in candidates {
-            if let Some(kept) = self.persist_candidate(candidate).await? {
+            if let Some(kept) = persist_candidate(&self.store, candidate).await? {
+                written.push(kept);
+            }
+        }
+        Ok(written)
+    }
+
+    /// 只跑 `semantic_similarity`，回傳**這次新寫入**的 candidate。
+    ///
+    /// 預留給 Phase 3：現在 embedder 還是 mock，行為與聚合路徑相同；
+    /// 之後接上 ml-commons 時，呼叫端可以走這條入口，不必經過
+    /// [`Self::resolve_entity`] 的另外幾個方法。找不到 Entity 回
+    /// [`ResolverError::EntityNotFound`]，與 `resolve_entity` 一致。
+    pub async fn resolve_semantic_similarity(
+        &self,
+        entity_id: EntityId,
+    ) -> Result<Vec<ResolutionCandidate>, ResolverError> {
+        let entity = self
+            .store
+            .get_entity(entity_id)
+            .await?
+            .ok_or(ResolverError::EntityNotFound { entity_id })?;
+
+        let candidates = check_semantic_similarity(
+            &self.store,
+            &self.embedder,
+            &entity,
+            SEMANTIC_SIMILARITY_THRESHOLD,
+        )
+        .await?;
+
+        let mut written = Vec::new();
+        for candidate in candidates {
+            if let Some(kept) = persist_candidate(&self.store, candidate).await? {
                 written.push(kept);
             }
         }
@@ -139,7 +172,7 @@ impl<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> ResolverService<S,
     /// `entity.id == 傳入的 entity.id` 也跳過，不要對自己產生 candidate。
     ///
     /// 這個方法**不寫入 store**，只組出候選；寫入由 [`Self::resolve_entity`]
-    /// 負責，方便單測直接斷言組出來的內容。
+    /// 經 [`crate::persist::persist_candidate`] 負責，方便單測直接斷言組出來的內容。
     pub async fn check_normalized_name(
         &self,
         entity: &Entity,
@@ -163,26 +196,6 @@ impl<S: RelationalStore, E: EmbeddingProvider, G: GraphStore> ResolverService<S,
             out.push(normalized_name_candidate(entity, &other));
         }
         Ok(out)
-    }
-
-    async fn persist_candidate(
-        &self,
-        candidate: ResolutionCandidate,
-    ) -> Result<Option<ResolutionCandidate>, ResolverError> {
-        match self.store.put_resolution_candidate(&candidate).await {
-            Ok(()) => Ok(Some(candidate)),
-            Err(StorageError::Conflict { message }) => {
-                info!(
-                    entity_a_id = %candidate.entity_a_id,
-                    entity_b_id = %candidate.entity_b_id,
-                    method = %candidate.method,
-                    %message,
-                    "resolution candidate 已存在，沿用既有列，不中斷本次 resolve"
-                );
-                Ok(None)
-            }
-            Err(err) => Err(ResolverError::Storage(err)),
-        }
     }
 }
 
@@ -233,6 +246,9 @@ mod tests {
     use storage_core::health::{HealthProvider, StorageHealth};
     use storage_core::mock::{MockEmbeddingProvider, MockGraphStore};
     use storage_core::traits::SimhashCandidate;
+    use storage_core::{GraphEdge, GraphNode, GraphStore, StorageError};
+
+    use crate::GraphContextResolver;
 
     fn ts() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 12, 8, 0, 0).unwrap()
@@ -311,10 +327,6 @@ mod tests {
             self.inner.lock().expect("mutex").force_conflict = true;
         }
 
-        fn skip_semantic_and_graph() -> (MockEmbeddingProvider, MockGraphStore) {
-            (MockEmbeddingProvider::unsupported(), MockGraphStore::new())
-        }
-
         fn queried_types(&self) -> Vec<EntityType> {
             self.inner.lock().expect("mutex").queried_types.clone()
         }
@@ -340,11 +352,8 @@ mod tests {
         }
     }
 
-    fn svc(
-        store: MemoryStore,
-    ) -> ResolverService<MemoryStore, MockEmbeddingProvider, MockGraphStore> {
-        let (embedder, graph) = MemoryStore::skip_semantic_and_graph();
-        ResolverService::new(store, embedder, graph)
+    fn svc(store: MemoryStore) -> ResolverService<MemoryStore, MockEmbeddingProvider> {
+        ResolverService::new(store, MockEmbeddingProvider::unsupported())
     }
 
     #[async_trait]
@@ -589,11 +598,23 @@ mod tests {
         }
         async fn list_entities_by_type(
             &self,
-            _: Option<EntityType>,
-            _: Option<EntityId>,
-            _: u32,
+            entity_type: Option<EntityType>,
+            after: Option<EntityId>,
+            limit: u32,
         ) -> Result<Vec<Entity>, StorageError> {
-            Self::unsupported("list_entities_by_type")
+            let inner = self.inner.lock().expect("mutex");
+            let mut items: Vec<Entity> = inner
+                .entities
+                .values()
+                .filter(|e| entity_type.is_none_or(|t| e.entity_type == t))
+                .cloned()
+                .collect();
+            items.sort_by_key(|a| std::cmp::Reverse(a.id));
+            if let Some(after) = after {
+                items.retain(|e| e.id < after);
+            }
+            items.truncate(limit as usize);
+            Ok(items)
         }
         async fn put_relationship(&self, _: &Relationship) -> Result<(), StorageError> {
             Self::unsupported("put_relationship")
@@ -1120,5 +1141,165 @@ mod tests {
             hits[0].score,
             crate::identifier_methods::ACCOUNT_HANDLE_SCORE
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_semantic_similarity_writes_hit() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        let b_id = Uuid::from_u128(0x2222);
+        store.seed(entity(a_id, EntityType::Person, "alice example"));
+        store.seed(entity(b_id, EntityType::Person, "alice example"));
+        let svc = ResolverService::new(store, MockEmbeddingProvider::new());
+        let written = svc
+            .resolve_semantic_similarity(a_id)
+            .await
+            .expect("resolve_semantic");
+        assert_eq!(
+            written.len(),
+            1,
+            "相同文字應寫入一筆 semantic_similarity 候選，實際 {written:?}"
+        );
+        assert_eq!(written[0].method, "semantic_similarity");
+        assert_eq!(written[0].entity_a_id, a_id);
+        assert_eq!(written[0].entity_b_id, b_id);
+        assert_eq!(written[0].status, ResolutionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn resolve_semantic_similarity_missing_is_error() {
+        let store = MemoryStore::new();
+        let svc = ResolverService::new(store, MockEmbeddingProvider::new());
+        let missing = Uuid::from_u128(0xdead);
+        let err = svc
+            .resolve_semantic_similarity(missing)
+            .await
+            .expect_err("missing");
+        match err {
+            ResolverError::EntityNotFound { entity_id } => assert_eq!(entity_id, missing),
+            other => panic!("預期 EntityNotFound，得到 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_semantic_similarity_unsupported_embedder_writes_nothing() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(0x1111);
+        store.seed(entity(a_id, EntityType::Person, "lonely"));
+        let svc = ResolverService::new(store, MockEmbeddingProvider::unsupported());
+        let written = svc
+            .resolve_semantic_similarity(a_id)
+            .await
+            .expect("resolve_semantic");
+        assert!(
+            written.is_empty(),
+            "unsupported embedder 應誠實回空，實際 {written:?}"
+        );
+    }
+
+    fn graph_node(id: EntityId, name: &str) -> GraphNode {
+        GraphNode {
+            entity_id: id,
+            entity_type: "person".into(),
+            display_name: name.into(),
+            attributes: json!({}),
+        }
+    }
+
+    fn graph_edge(id: u128, src: EntityId, dst: EntityId) -> GraphEdge {
+        GraphEdge {
+            relationship_id: Uuid::from_u128(id + 1000),
+            source: src,
+            target: dst,
+            relationship_type: "associated_with".into(),
+            confidence: 1.0,
+            first_seen: ts(),
+            last_seen: ts(),
+        }
+    }
+
+    async fn seed_diamond(
+        graph: &MockGraphStore,
+        a: EntityId,
+        b: EntityId,
+        c: EntityId,
+        d: EntityId,
+    ) {
+        for (id, name) in [(a, "a"), (b, "b"), (c, "c"), (d, "d")] {
+            graph
+                .upsert_node(&graph_node(id, name))
+                .await
+                .expect("upsert_node");
+        }
+        // A-B、A-C、D-B、D-C
+        graph
+            .upsert_edge(&graph_edge(1, a, b))
+            .await
+            .expect("upsert_edge");
+        graph
+            .upsert_edge(&graph_edge(2, a, c))
+            .await
+            .expect("upsert_edge");
+        graph
+            .upsert_edge(&graph_edge(3, d, b))
+            .await
+            .expect("upsert_edge");
+        graph
+            .upsert_edge(&graph_edge(4, d, c))
+            .await
+            .expect("upsert_edge");
+    }
+
+    #[tokio::test]
+    async fn graph_context_resolver_writes_diamond_hit() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(1);
+        let b_id = Uuid::from_u128(2);
+        let c_id = Uuid::from_u128(3);
+        let d_id = Uuid::from_u128(4);
+        store.seed(entity(a_id, EntityType::Person, "a"));
+        store.seed(entity(d_id, EntityType::Person, "d"));
+        let graph = MockGraphStore::new();
+        seed_diamond(&graph, a_id, b_id, c_id, d_id).await;
+        let resolver = GraphContextResolver::new(store, graph);
+        let written = resolver.resolve(a_id).await.expect("resolve");
+        assert_eq!(
+            written.len(),
+            1,
+            "菱形圖應寫入一筆 graph_context 候選，實際 {written:?}"
+        );
+        assert_eq!(written[0].method, "graph_context");
+        let (left, right) = ResolutionCandidate::ordered_pair(a_id, d_id);
+        assert_eq!(written[0].entity_a_id, left);
+        assert_eq!(written[0].entity_b_id, right);
+        assert_eq!(written[0].status, ResolutionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn graph_context_resolver_missing_entity_is_error() {
+        let store = MemoryStore::new();
+        let graph = MockGraphStore::new();
+        let resolver = GraphContextResolver::new(store, graph);
+        let missing = Uuid::from_u128(0xdead);
+        let err = resolver.resolve(missing).await.expect_err("missing");
+        match err {
+            ResolverError::EntityNotFound { entity_id } => assert_eq!(entity_id, missing),
+            other => panic!("預期 EntityNotFound，得到 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_context_resolver_isolated_node_writes_nothing() {
+        let store = MemoryStore::new();
+        let a_id = Uuid::from_u128(1);
+        store.seed(entity(a_id, EntityType::Person, "lonely"));
+        let graph = MockGraphStore::new();
+        graph
+            .upsert_node(&graph_node(a_id, "lonely"))
+            .await
+            .expect("upsert_node");
+        let resolver = GraphContextResolver::new(store, graph);
+        let written = resolver.resolve(a_id).await.expect("resolve");
+        assert!(written.is_empty(), "沒有鄰居應回空清單，實際 {written:?}");
     }
 }

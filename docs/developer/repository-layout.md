@@ -33,7 +33,7 @@ crates/
   normalizer/            正規化服務（osint-normalizer）：raw.collected → Document
   deduplicator/          去重服務（osint-deduplicator）：object.normalized → DuplicateGroup（SPEC §15／§16）
   entity-worker/         抽取服務（osint-entity-worker）：dedup.completed → Entity/Relationship/Evidence（SPEC §17／§11／§12）
-  resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／graph_context／account_handle；無獨立 binary
+  resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／account_handle；graph_context 走獨立 GraphContextResolver；無獨立 binary
   merge/                 Entity merge／undo（SPEC_V0.2 §7）：execute_merge／undo_merge；無獨立 binary
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/MinIO，不經 core-api

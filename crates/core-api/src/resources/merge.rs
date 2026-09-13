@@ -1,20 +1,23 @@
 //! Entity resolve／merge／undo（SPEC_V0.2 §5／§6／§7）。
 //!
-//! 這五個 endpoint 只組裝既有的 [`MergeService`]／[`ResolverService`]，
-//! 不重寫 merge／resolution 邏輯。
+//! 這些 endpoint 只組裝既有的 [`MergeService`]／[`ResolverService`]／
+//! [`GraphContextResolver`]，不重寫 merge／resolution 邏輯。
 //!
-//! # `POST /entities/{id}/resolve` 目前只會真的產出三種候選
+//! # `POST /entities/{id}/resolve` 目前只會真的產出 Postgres 路徑的候選
 //!
 //! `ResolverService` 在 API 組裝時注入的是
-//! [`MockEmbeddingProvider::unsupported`] 與空的 [`MockGraphStore`]：
-//! `semantic_similarity`／`graph_context` **誠實回空**，不是假造相似度。
-//! 等 Phase 2（`storage-neo4j`）與 ml-commons adapter 接上才會補齊。
-//! 目前會真的產生候選的方法只有 `normalized_name`／`alias`／`domain`。
+//! [`MockEmbeddingProvider::unsupported`]：`semantic_similarity` **誠實回空**，
+//! 不是假造相似度。等 ml-commons adapter 接上才會補齊。目前會真的產生候選的
+//! 方法是 `normalized_name`／`alias`／`domain`／`account_handle`。
+//!
+//! `graph_context` 走獨立路由 `POST /entities/{id}/resolve/graph-context`，
+//! 由 [`GraphContextResolver`] 處理。Neo4j 沒接上只有那條路由回 503，
+//! 不影響 `resolve_entity`。
 //!
 //! [`MergeService`]: merge::MergeService
 //! [`ResolverService`]: resolver::ResolverService
+//! [`GraphContextResolver`]: resolver::GraphContextResolver
 //! [`MockEmbeddingProvider::unsupported`]: storage_core::mock::MockEmbeddingProvider::unsupported
-//! [`MockGraphStore`]: storage_core::mock::MockGraphStore
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -32,7 +35,9 @@ use crate::error::ApiError;
 use crate::extractors::ClientIp;
 use crate::pagination::{CursorPage, Pagination};
 use crate::resources::{AuditEvent, audit, rejected_metadata, storage_error, store};
-use crate::state::{AppState, SharedMergeService, SharedResolverService};
+use crate::state::{
+    AppState, SharedGraphContextResolver, SharedMergeService, SharedResolverService,
+};
 
 const RESOURCE_ENTITY: &str = "entity";
 const RESOURCE_MERGE: &str = "merge_history";
@@ -40,6 +45,7 @@ const RESOURCE_MERGE: &str = "merge_history";
 /// 稽核 action。字串會進 `audit_log.action`，改動等於改稽核查詢條件——
 /// `docs/developer/security.md` 的動作清單要一起改。
 pub const AUDIT_ENTITY_RESOLVE: &str = "entity.resolve";
+pub const AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT: &str = "entity.resolve_graph_context";
 pub const AUDIT_ENTITY_MERGE: &str = "entity.merge";
 pub const AUDIT_MERGE_UNDO: &str = "merge.undo";
 
@@ -76,6 +82,17 @@ fn resolver_service(state: &AppState) -> Result<&SharedResolverService, ApiError
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
             "Entity resolution 未接上 canonical store。請設定 DATABASE_URL 並重啟 osint-api",
+        )
+    })
+}
+
+fn graph_resolver_service(state: &AppState) -> Result<&SharedGraphContextResolver, ApiError> {
+    state.graph_resolver.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "graph_context 未接上 Neo4j。請確認 [storage.graph] 設定與 Neo4j 是否啟動；\
+             這不影響 POST /entities/{id}/resolve 的其他方法",
         )
     })
 }
@@ -144,6 +161,55 @@ pub async fn resolve_entity(
                 &ip,
                 AuditEvent {
                     action: AUDIT_ENTITY_RESOLVE,
+                    resource_type: RESOURCE_ENTITY,
+                    resource_id: Some(id.to_string()),
+                    outcome: "rejected",
+                    metadata: rejected_metadata(&api_err, json!({})),
+                },
+            )
+            .await;
+            Err(api_err)
+        }
+    }
+}
+
+/// `POST /api/v1/entities/{id}/resolve/graph-context`。operator 以上。
+///
+/// 跟 `resolve_entity` 分開的獨立 endpoint——Neo4j 沒接上只有這條路由回 503，
+/// 不影響 `POST /entities/{id}/resolve` 的另外幾個方法。
+pub async fn resolve_graph_context(
+    State(state): State<AppState>,
+    principal: Principal,
+    ip: ClientIp,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ResolutionCandidate>>, ApiError> {
+    principal.role.require(Permission::Write)?;
+    let resolver = graph_resolver_service(&state)?;
+    match resolver.resolve(id).await {
+        Ok(candidates) => {
+            audit(
+                &state,
+                &principal,
+                &ip,
+                AuditEvent {
+                    action: AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT,
+                    resource_type: RESOURCE_ENTITY,
+                    resource_id: Some(id.to_string()),
+                    outcome: "success",
+                    metadata: json!({ "candidate_count": candidates.len() }),
+                },
+            )
+            .await;
+            Ok(Json(candidates))
+        }
+        Err(err) => {
+            let api_err = resolver_error(err);
+            audit(
+                &state,
+                &principal,
+                &ip,
+                AuditEvent {
+                    action: AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT,
                     resource_type: RESOURCE_ENTITY,
                     resource_id: Some(id.to_string()),
                     outcome: "rejected",

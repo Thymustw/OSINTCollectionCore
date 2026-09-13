@@ -2,7 +2,7 @@
 //!
 //! 三個函式都由 [`crate::ResolverService::resolve_entity`] 聚合呼叫；也仍以
 //! 自由函式公開，方便單測直接斷言組出來的候選。**不寫 candidate 表**——
-//! 寫入由 `resolve_entity` 的 `persist_candidate` 負責。
+//! 寫入由 `resolve_entity` 經 [`crate::persist::persist_candidate`] 負責。
 //!
 //! # `alias` 的空表是預期
 //!

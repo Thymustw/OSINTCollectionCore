@@ -22,52 +22,64 @@ SPEC §6 列了十種方法（`core_model::RESOLUTION_METHODS` 是拼法來源�
 | `url` | **已併入 `domain`，函式退場** | URL／Email 共用網域都由 entity-worker 寫成 Relationship |
 | `account_handle` | **已實作，接進 `resolve_entity` 聚合** | 跨平台同 handle（namespace 字串不同，UNIQUE 擋不住）；分數 0.35 |
 | `email`／`external_id` | **刻意不做** | 訊號已被 `exact_identifier` 寫入衝突機制蓋掉（entity-worker 寫 `email`／`cve` namespace 時，UNIQUE 撞號會直接觸發 `exact_identifier` 候選）。批次掃描版本會是跟舊版 `check_domain` 一樣的結構性死碼 |
-| `semantic_similarity` | **已實作，接進 `resolve_entity` 聚合** | 暴力 cosine，只適合驗證 plumbing；門檻 `SEMANTIC_SIMILARITY_THRESHOLD` |
-| `graph_context` | **已實作，接進 `resolve_entity` 聚合** | 只依賴 `GraphStore`，不查 Entity 本體；門檻 `GRAPH_CONTEXT_THRESHOLD` |
+| `semantic_similarity` | **已實作**；`resolve_entity` 仍聚合，另有獨立入口 `resolve_semantic_similarity` | 暴力 cosine，只適合驗證 plumbing；門檻 `SEMANTIC_SIMILARITY_THRESHOLD`。獨立入口預留給 Phase 3 接 ml-commons |
+| `graph_context` | **已實作，獨立成 `GraphContextResolver`** | 只依賴 `GraphStore`，不查 Entity 本體；門檻 `GRAPH_CONTEXT_THRESHOLD`。不進 `resolve_entity`，避免 Neo4j 斷線拖累另外幾個方法 |
 
-骨架把聚合點留在 `ResolverService::resolve_entity`，每加一個方法就接進那條呼叫鏈。
+`resolve_entity` 只聚合五個只需要 Postgres 的方法。`graph_context` 走獨立的 `GraphContextResolver`／獨立 endpoint。`semantic_similarity` 雖然還在 `ResolverService` 上，但也有獨立呼叫 `resolve_semantic_similarity`；Phase 3 接 ml-commons 時若也需要解耦合，可以比照 `GraphContextResolver` 再抽一次。
 
 ## HTTP API
 
 `osint-api` 把 `ResolverService` 放進
 `AppState.resolver: Option<SharedResolverService>`
-（`Arc<ResolverService<PostgresCanonicalStore, MockEmbeddingProvider, MockGraphStore>>`）。
-組裝時注入的是 `MockEmbeddingProvider::unsupported()` 與空的 `MockGraphStore`：
+（`Arc<ResolverService<PostgresCanonicalStore, MockEmbeddingProvider>>`）。
+組裝時注入的是 `MockEmbeddingProvider::unsupported()`：
 
 - `check_semantic_similarity` 誠實回空（不是假造相似度）
-- `check_graph_context` 誠實回空（圖上沒有邊，本來就沒有鄰居）
+
+`graph_context` **不**在這個 service 上。它走獨立欄位
+`AppState.graph_resolver: Option<SharedGraphContextResolver>`
+（`Arc<GraphContextResolver<PostgresCanonicalStore, Neo4jStore>>`）。
+Neo4j 沒接上時這個欄位是 `None`，**只有**
+`POST /api/v1/entities/{id}/resolve/graph-context` 回 503，
+不影響 `POST /entities/{id}/resolve` 的另外幾個方法。這是刻意拆開的設計。
 
 因此 `POST /api/v1/entities/{id}/resolve` **目前會真的產生候選的**是
 `normalized_name`／`alias`／`domain`／`account_handle`。
-`semantic_similarity` 與 `graph_context` 在 API 組裝路徑上仍因 mock embedder／空圖
-而誠實回空。這不是 workaround，是已知限制——等 Phase 2（`storage-neo4j`）與
-ml-commons adapter 接上才會補齊，不要假裝已經接上。
+`semantic_similarity` 在 API 組裝路徑上仍因 mock embedder 而誠實回空。
+這不是 workaround，是已知限制——等 ml-commons adapter 接上才會補齊。
 
 | 方法 | 路徑 | 角色 | 成功碼 |
 |---|---|---|---|
-| POST | `/api/v1/entities/{id}/resolve` | operator | 200（這次新寫入的候選） |
+| POST | `/api/v1/entities/{id}/resolve` | operator | 200（這次新寫入的候選；不含 graph_context） |
+| POST | `/api/v1/entities/{id}/resolve/graph-context` | operator | 200（這次新寫入的 graph_context 候選；Neo4j 沒接上回 503） |
 | GET | `/api/v1/entities/{id}/resolution-candidates` | viewer | 200（cursor 分頁，`?status=`） |
 
-Entity 不存在回 404。成功與失敗都寫稽核（`entity.resolve`）。
+Entity 不存在回 404。成功與失敗都寫稽核
+（`entity.resolve`／`entity.resolve_graph_context`）。
 請求／回應形狀見 `docs/developer/api-skeleton.md`。
 
 ## `ResolverService`
 
 ```text
-ResolverService<S: RelationalStore, E: EmbeddingProvider, G: GraphStore>
-  new(store, embedder, graph)
+ResolverService<S: RelationalStore, E: EmbeddingProvider>
+  new(store, embedder)
   resolve_entity(entity_id) -> Result<Vec<ResolutionCandidate>, ResolverError>
+  resolve_semantic_similarity(entity_id) -> Result<Vec<ResolutionCandidate>, ResolverError>
   check_normalized_name(entity) -> Result<Vec<ResolutionCandidate>, ResolverError>
 ```
 
 - `resolve_entity` 先 `get_entity`。找不到回 `ResolverError::EntityNotFound`，不 panic。
-- 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity` → `graph_context` → `account_handle`。
-- 組好的 candidate 經 `put_resolution_candidate` 寫入。`StorageError::Conflict`
+- 聚合順序：`normalized_name` → `alias` → `domain` → `semantic_similarity` → `account_handle`。
+  **不含** `graph_context`（見下方 `GraphContextResolver`）。
+- 組好的 candidate 經 `persist_candidate` 寫入。`StorageError::Conflict`
   （同一對同一方法已存在）視為已處理：記一行 log、continue，不讓整次 resolve 失敗。
-  其他 storage 錯誤（含 semantic／graph 路徑）用 `?` 往上傳播。
+  其他 storage 錯誤用 `?` 往上傳播。
 - `check_normalized_name`／`check_alias`／`check_domain`／`check_semantic_similarity`／
   `check_graph_context`／`check_account_handle` **不寫 store**，只組候選；寫入由
-  `resolve_entity` 負責。
+  `resolve_entity`／`resolve_semantic_similarity`／`GraphContextResolver::resolve`
+  經共用的 `persist_candidate` 負責。
+- `resolve_semantic_similarity` 是獨立入口：先 `get_entity`（找不到同樣回
+  `EntityNotFound`），再跑 `check_semantic_similarity`、persist。預留給 Phase 3。
 - `SEMANTIC_SIMILARITY_THRESHOLD = 0.85`、`GRAPH_CONTEXT_THRESHOLD = 0.5` 是合理預設，
   之後應該可設定，不是最終定案。
 
@@ -238,7 +250,8 @@ check_semantic_similarity(store, embedder, entity, threshold)
 ```
 
 同 type 的 Entity 用 embedding cosine 比對。**不寫 candidate 表**；
-`resolve_entity` 用 `SEMANTIC_SIMILARITY_THRESHOLD`（0.85）呼叫。
+`resolve_entity` 與獨立入口 `resolve_semantic_similarity` 都用
+`SEMANTIC_SIMILARITY_THRESHOLD`（0.85）呼叫。
 
 ### 跳過 identity-type
 
@@ -293,7 +306,19 @@ check_graph_context(graph, entity_id, threshold) -> Result<Vec<ResolutionCandida
 ```
 
 純圖結構比對，**不吃 `RelationalStore`、不寫 candidate 表、不查 Entity 本體**。
-`resolve_entity` 用 `GRAPH_CONTEXT_THRESHOLD`（0.5）呼叫。
+`GraphContextResolver::resolve` 用 `GRAPH_CONTEXT_THRESHOLD`（0.5）呼叫，
+**不**由 `resolve_entity` 聚合。
+
+```text
+GraphContextResolver<S: RelationalStore, G: GraphStore>
+  new(store, graph)
+  resolve(entity_id) -> Result<Vec<ResolutionCandidate>, ResolverError>
+```
+
+- 先 `get_entity`。找不到回 `ResolverError::EntityNotFound`，與 `resolve_entity` 一致。
+- 再 `check_graph_context`，命中的候選經 `persist_candidate` 寫入。
+- HTTP 入口是 `POST /api/v1/entities/{id}/resolve/graph-context`。Neo4j 沒接上
+  這條路由回 503，訊息會講明這不影響 `POST /entities/{id}/resolve`。
 
 ### 候選集合怎麼產生
 
@@ -370,7 +395,7 @@ helper 再 `put_resolution_candidate`。這**不是** `ResolverService::resolve_
 | 變體 | 何時 |
 |---|---|
 | `ResolverError::Storage` | 底層 `StorageError`（Conflict 在 persist 路徑已被吃掉） |
-| `ResolverError::EntityNotFound` | `resolve_entity` 的 id 在 store 裡沒有對應列 |
+| `ResolverError::EntityNotFound` | `resolve_entity`／`resolve_semantic_similarity`／`GraphContextResolver::resolve` 的 id 在 store 裡沒有對應列 |
 
 ## 測試策略
 
@@ -385,8 +410,10 @@ helper 再 `put_resolution_candidate`。這**不是** `ResolverService::resolve_
   不需要 identifier UNIQUE 的假衝突。
 - adapter 對 `find_entity_by_normalized_name`、`put_resolution_candidate`、
   `list_relationships_by_object` 的契約已由 `storage-core::conformance` 覆蓋。
-- `resolve_entity` 聚合測試注入 `MockEmbeddingProvider::unsupported()` 與空的
-  `MockGraphStore`，讓 semantic／graph 回空，不干擾 normalized_name／alias 斷言。
+- `resolve_entity` 聚合測試注入 `MockEmbeddingProvider::unsupported()`，
+  讓 semantic 回空，不干擾 normalized_name／alias 斷言。`graph_context` 已不在
+  這條呼叫鏈上。`GraphContextResolver` 與 `resolve_semantic_similarity` 各自有
+  獨立測試（菱形圖命中、entity 不存在、空鄰居／unsupported embedder）。
 
 未覆蓋：對真實 Docker Postgres 跑一次 end-to-end 的 Relationship-based `check_domain`。
 那要等 Phase 1h 接上事件之後，用 entity-worker 抽出的真實 Entity 再補。

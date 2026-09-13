@@ -82,6 +82,11 @@ fn write_requests() -> Vec<(&'static str, String, Value)> {
         ("POST", format!("/api/v1/entities/{id}/resolve"), json!({})),
         (
             "POST",
+            format!("/api/v1/entities/{id}/resolve/graph-context"),
+            json!({}),
+        ),
+        (
+            "POST",
             "/api/v1/entities/merge".into(),
             json!({
                 "survivor_id": id,

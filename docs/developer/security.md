@@ -129,6 +129,7 @@ Cargo.toml 與 deny/audit 面，而且要各自維護一份連線池與 `map_sql
 | `collection.create` | `collection` | 成功與失敗都寫 |
 | `object.create` | `object` | 每次（V0.1 一律是 `rejected` + 501，見 ADR-006） |
 | `entity.resolve` | `entity` | 成功與失敗都寫 |
+| `entity.resolve_graph_context` | `entity` | 成功與失敗都寫 |
 | `entity.merge` | `entity` | 成功與失敗都寫（含空 `reason` 被拒） |
 | `merge.undo` | `merge_history` | 成功與失敗都寫 |
 | `token.issue` / `token.list` / `token.revoke` | `api_token` | 每次 |

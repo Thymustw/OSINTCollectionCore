@@ -16,11 +16,11 @@ use core_jobs::JobService;
 use core_observability::{MetricsRegistry, init_tracing};
 use core_security::{AuditLog, JwtService, MemoryApiTokenStore, MemoryAuditLog};
 use merge::MergeService;
-use resolver::ResolverService;
+use resolver::{GraphContextResolver, ResolverService};
 use storage_core::conformance::{
     assert_opensearch_identity, load_workspace_dotenv, verify_not_opencti_search,
 };
-use storage_core::mock::{MockEmbeddingProvider, MockGraphStore};
+use storage_core::mock::MockEmbeddingProvider;
 use storage_postgres::{PostgresApiTokenStore, PostgresAuditLog, PostgresCanonicalStore};
 use tokio::net::TcpListener;
 
@@ -69,6 +69,10 @@ async fn run() -> Result<(), String> {
 
     let mut shared_store: Option<SharedStore> = None;
     let mut shared_objects: Option<SharedObjects> = None;
+    // 具體型別的 Postgres store，給 GraphContextResolver 用。
+    // `shared_store` 是型別擦除過的 `Arc<dyn RelationalStore>`，裝不進
+    // `GraphContextResolver<PostgresCanonicalStore, _>`。
+    let mut pg_store: Option<PostgresCanonicalStore> = None;
     // `/api/v1/ops/health` 要敲的後端。**用具體型別建**：
     // `Arc<dyn RelationalStore>` 沒辦法直接當成 `Arc<dyn HealthProvider>`
     // （trait object 之間不能互轉），而這裡手上正好有具體的 store。
@@ -125,13 +129,14 @@ async fn run() -> Result<(), String> {
             };
             let jobs = Some(Arc::new(JobService::new(store.clone(), producer.clone())));
             let merge = Some(Arc::new(MergeService::new(store.clone(), producer.clone())));
-            // MockEmbeddingProvider::unsupported() 讓 semantic_similarity 誠實回空；
-            // 空的 MockGraphStore 讓 graph_context 誠實回空。不是假裝已接上。
+            // MockEmbeddingProvider::unsupported() 讓 semantic_similarity 誠實回空，
+            // 不是假裝已接上。graph_context 不在 ResolverService 上，見下方
+            // 獨立的 graph_resolver。
             let resolver = Some(Arc::new(ResolverService::new(
-                store,
+                store.clone(),
                 MockEmbeddingProvider::unsupported(),
-                MockGraphStore::new(),
             )));
+            pg_store = Some(store);
             (jobs, merge, resolver, import, ready)
         }
         Err(err) => {
@@ -144,6 +149,26 @@ async fn run() -> Result<(), String> {
             missing.push("object_store");
             (None, None, None, None, ReadyProbe::always_ready())
         }
+    };
+
+    // graph_resolver 跟 resolver 是獨立的可用性——Neo4j 沒接上只讓
+    // POST /entities/{id}/resolve/graph-context 回 503，resolve_entity
+    // 的另外幾個方法不受影響（這是刻意拆開的設計，不是巧合）。
+    // Postgres 沒接上時也是 None：沒有 canonical store 就沒辦法 persist candidate。
+    let graph_resolver = if let Some(store) = pg_store {
+        match connect_graph(&cfg).await {
+            Ok(neo4j) => Some(Arc::new(GraphContextResolver::new(store, neo4j))),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Neo4j 未連上；POST /api/v1/entities/{{id}}/resolve/graph-context 會回 503"
+                );
+                missing.push("neo4j");
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // 搜尋接不上時只有 POST /api/v1/search 回 503，其他路由照常——
@@ -178,26 +203,32 @@ async fn run() -> Result<(), String> {
         None => missing.push("redpanda"),
     }
 
-    // Neo4j（V0.2 Phase 0b）。與 Redis 同樣的定位：V0.2 Phase 0b 還沒有任何
-    // API 路由讀它，但運維要看得到圖投影的後端活著。
+    // Neo4j HTTP 探活（7474）。Bolt 連線由上面的 `connect_graph` 負責。
     //
     // 空字串 = 刻意未設定（例如還沒起 Neo4j 的環境），列進 not_configured
     // 而不是每次 health 都去連一個不存在的位址然後報 down。
     // 這裡**不建立 Bolt 連線**，只有 HTTP 探活，理由見 GraphCheck 的文件註解。
+    //
+    // `connect_graph` 失敗時已經把 "neo4j" 推進 missing——不要再推一次，
+    // 否則 `/ops/health` 的 `not_configured` 會出現兩個 neo4j。
     let graph_url = cfg.storage.graph.http_url.trim();
-    if graph_url.is_empty() {
-        tracing::info!("[storage.graph].http_url 未設定；GET /api/v1/ops/health 會標示為未設定");
-        missing.push("neo4j");
-    } else {
-        match core_api::GraphCheck::new(graph_url) {
-            Some(check) => health_checks.push(Arc::new(check)),
-            None => {
-                tracing::warn!(
-                    url = graph_url,
-                    "Neo4j 探針建立失敗（HTTP client 無法建立）；\
-                     GET /api/v1/ops/health 會標示為未設定"
-                );
-                missing.push("neo4j");
+    if !missing.contains(&"neo4j") {
+        if graph_url.is_empty() {
+            tracing::info!(
+                "[storage.graph].http_url 未設定；GET /api/v1/ops/health 會標示為未設定"
+            );
+            missing.push("neo4j");
+        } else {
+            match core_api::GraphCheck::new(graph_url) {
+                Some(check) => health_checks.push(Arc::new(check)),
+                None => {
+                    tracing::warn!(
+                        url = graph_url,
+                        "Neo4j 探針建立失敗（HTTP client 無法建立）；\
+                         GET /api/v1/ops/health 會標示為未設定"
+                    );
+                    missing.push("neo4j");
+                }
             }
         }
     }
@@ -227,6 +258,7 @@ async fn run() -> Result<(), String> {
         jobs,
         merge,
         resolver,
+        graph_resolver,
         import,
         search,
         ready,
@@ -309,6 +341,23 @@ async fn connect_postgres(cfg: &AppConfig) -> Result<PostgresCanonicalStore, Str
         .map_err(|err| err.to_string())?;
     store.migrate().await.map_err(|err| err.to_string())?;
     Ok(store)
+}
+
+async fn connect_graph(cfg: &AppConfig) -> Result<storage_neo4j::Neo4jStore, String> {
+    let password = cfg
+        .storage
+        .graph
+        .password_secret_ref
+        .resolve()
+        .map_err(|e| e.to_string())?;
+    storage_neo4j::Neo4jStore::connect(
+        &cfg.storage.graph.bolt_uri,
+        &cfg.storage.graph.username,
+        &password,
+        cfg.storage.graph.pool_max,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 連 OpenSearch 並驗證它真的是 OpenSearch。

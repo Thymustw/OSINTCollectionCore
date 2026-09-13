@@ -76,7 +76,9 @@ pub const AUDIT_CONNECTOR_CREATE: &str = "connector.create";
 pub const AUDIT_CONNECTOR_UPDATE: &str = "connector.update";
 pub const AUDIT_COLLECTION_CREATE: &str = "collection.create";
 pub const AUDIT_OBJECT_CREATE: &str = "object.create";
-pub use merge::{AUDIT_ENTITY_MERGE, AUDIT_ENTITY_RESOLVE, AUDIT_MERGE_UNDO};
+pub use merge::{
+    AUDIT_ENTITY_MERGE, AUDIT_ENTITY_RESOLVE, AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT, AUDIT_MERGE_UNDO,
+};
 
 /// canonical store handle。沒接上 Postgres 時回 503。
 pub(crate) fn store(state: &AppState) -> Result<&SharedStore, ApiError> {

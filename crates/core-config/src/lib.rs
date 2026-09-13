@@ -99,7 +99,7 @@ pub struct CacheStorage {
 /// `bolt_uri`（7687），由 `storage-neo4j` 的 `Neo4jStore` 讀取。
 /// 密碼只存 [`SecretRef`]，與 PostgreSQL／Redis 同一套，不要寫明文。
 ///
-/// 三個新欄位都有 `#[serde(default)]`：V0.1／Phase 0b 的設定檔只有
+/// Bolt／帳密／`pool_max` 都有 `#[serde(default)]`：V0.1／Phase 0b 的設定檔只有
 /// `adapter` + `http_url`，缺欄位時必須仍能載入，不能整份解析失敗。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphStorage {
@@ -116,6 +116,10 @@ pub struct GraphStorage {
     /// `[storage.canonical].dsn_secret_ref` 同一套格式。
     #[serde(default = "default_neo4j_password_secret_ref")]
     pub password_secret_ref: SecretRef,
+    /// Bolt 連線池上限。傳給 `storage-neo4j` 的 `Neo4jStore::connect`。
+    /// 0 會被 adapter 拒絕。
+    #[serde(default = "default_graph_pool_max")]
+    pub pool_max: usize,
 }
 
 fn default_bolt_uri() -> String {
@@ -130,6 +134,10 @@ fn default_neo4j_password_secret_ref() -> SecretRef {
     SecretRef::parse("env:NEO4J_PASSWORD").expect("literal SecretRef")
 }
 
+fn default_graph_pool_max() -> usize {
+    5
+}
+
 impl Default for GraphStorage {
     fn default() -> Self {
         Self {
@@ -138,6 +146,7 @@ impl Default for GraphStorage {
             bolt_uri: default_bolt_uri(),
             username: default_neo4j_username(),
             password_secret_ref: default_neo4j_password_secret_ref(),
+            pool_max: default_graph_pool_max(),
         }
     }
 }
@@ -462,17 +471,16 @@ mod tests {
         unsafe {
             std::env::remove_var("OSINT__APP__ENVIRONMENT");
             std::env::remove_var("OSINT__STORAGE__CANONICAL__POOL_MAX");
-            // GraphStorage（Phase 2 Step 2）四個欄位都有 CI/docker-compose 會設的
-            // OSINT__ 覆寫（目前只有 HTTP_URL 真的設了，但 BOLT_URI／USERNAME／
-            // PASSWORD_SECRET_REF 是同一個結構的手足欄位，清單先補齊四個，
-            // 免得下次哪個 workflow 也加了對應覆寫又重演這次的漏清問題）。
+            // GraphStorage 欄位都有 CI/docker-compose 會設的 OSINT__ 覆寫。
             // 2026-09-13 CI run 34724946970 實測：clear 清單漏了 HTTP_URL，
             // ci.yml 的 job env 設 OSINT__STORAGE__GRAPH__HTTP_URL=http://localhost:7474，
             // 滲進 load_default_toml，斷言 "127.0.0.1" 對不上而 panic。
+            // 之後每加一個 GraphStorage 欄位都要在這裡同步 remove_var，不要重演。
             std::env::remove_var("OSINT__STORAGE__GRAPH__HTTP_URL");
             std::env::remove_var("OSINT__STORAGE__GRAPH__BOLT_URI");
             std::env::remove_var("OSINT__STORAGE__GRAPH__USERNAME");
             std::env::remove_var("OSINT__STORAGE__GRAPH__PASSWORD_SECRET_REF");
+            std::env::remove_var("OSINT__STORAGE__GRAPH__POOL_MAX");
         }
     }
 
@@ -524,6 +532,7 @@ mod tests {
             cfg.storage.graph.password_secret_ref.as_str(),
             "env:NEO4J_PASSWORD"
         );
+        assert_eq!(cfg.storage.graph.pool_max, 5);
         assert_eq!(cfg.graph_worker.bind, "127.0.0.1:18086");
         assert_eq!(cfg.graph_worker.consumer_group, "osint-graph-worker");
         assert_eq!(cfg.graph_worker.projection, "osint-graph");
@@ -591,6 +600,7 @@ mod tests {
         assert_eq!(graph.bolt_uri, "bolt://127.0.0.1:7687");
         assert_eq!(graph.username, "neo4j");
         assert_eq!(graph.password_secret_ref.as_str(), "env:NEO4J_PASSWORD");
+        assert_eq!(graph.pool_max, 5);
         assert_eq!(graph, GraphStorage::default());
     }
 

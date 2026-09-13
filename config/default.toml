@@ -35,6 +35,7 @@ url_secret_ref = "env:REDIS_URL"
 # http_url（7474）給 /api/v1/ops/health 的 HTTP 探活。空字串 = 未設定，
 # /ops/health 會列進 not_configured 而不是 unhealthy。
 # bolt_uri（7687）給 storage-neo4j 的 Neo4jStore；密碼只存 SecretRef，不要寫明文。
+# pool_max 是 Bolt 連線池上限，傳給 Neo4jStore::connect；0 會被 adapter 拒絕。
 # 容器內請用 OSINT__STORAGE__GRAPH__BOLT_URI=bolt://neo4j:7687 覆寫。
 [storage.graph]
 adapter = "neo4j"
@@ -42,6 +43,7 @@ http_url = "http://127.0.0.1:7474"
 bolt_uri = "bolt://127.0.0.1:7687"
 username = "neo4j"
 password_secret_ref = "env:NEO4J_PASSWORD"
+pool_max = 5
 
 [broker]
 brokers = "127.0.0.1:9092"
