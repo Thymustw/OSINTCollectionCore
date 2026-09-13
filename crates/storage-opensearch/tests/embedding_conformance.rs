@@ -2,6 +2,20 @@
 //!
 //! **唯讀查詢＋推論。** 不要 undeploy／delete 任何模型——這台機器的兩個模型
 //! 是 Phase 0 手動驗證過的，弄壞了要重跑整段下載＋部署。
+//!
+//! ⚠️ **兩個測試都標了 `#[ignore]`，CI 預設不跑。** 這是 Phase 3 規劃時
+//! 跟使用者確認過的決定（2026-09-14）：CI runner 只有 4 vCPU / 16 GB /
+//! 14 GB SSD，要跑這兩個模型得多下載 ~1.2 GB（600 MB MiniLM + 135 MB e5 +
+//! 500 MB DJL PyTorch native libs）、OpenSearch heap 要 3 GB／1536m——
+//! CI 目前的 OpenSearch 是 512m heap 的基礎建設容器，沒有跑過
+//! `opensearch-ml-setup.sh`／`-e5.sh`，硬跑只會穩定失敗（模型查不到 DEPLOYED），
+//! 不是這批程式碼壞了。本機驗證方式：
+//!
+//! ```bash
+//! bash scripts/opensearch-ml-setup.sh
+//! bash scripts/opensearch-ml-setup-e5.sh
+//! cargo test -p storage-opensearch --test embedding_conformance -- --ignored --nocapture
+//! ```
 
 use std::time::Instant;
 
@@ -25,6 +39,7 @@ fn req(text: &str, kind: EmbeddingKind, lang: Option<&str>) -> EmbeddingRequest 
 }
 
 #[tokio::test]
+#[ignore = "需要本機 ml-commons 已部署兩個模型；CI 沒有這個環境，見檔頭說明"]
 async fn ml_commons_embedding_conformance() {
     load_workspace_dotenv();
     let url = required_env("OPENSEARCH_URL").expect("OPENSEARCH_URL");
