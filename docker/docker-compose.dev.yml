@@ -97,15 +97,17 @@ services:
   # 宿主）套到這台開發機的實際規格：約 31 GB RAM / 8 核心，而且同時跑著
   # 一整套 OpenCTI。上面的基礎建設已經佔掉 5.25 GB / 4.5 CPU
   # （V0.2 Phase 0b 起：opensearch 1g→2g、新增 neo4j 1g），
-  # 這六個服務再加 1.9 GB / 2.5 CPU，合計 7.15 GB / 7.0 CPU。
+  # 這七個服務再加約 2.1 GB / 2.75 CPU，合計約 7.4 GB / 7.25 CPU
+  # （V0.2 Phase 2 Step 7 加了 osint-graph-worker）。
   #
   # 分配依據：osint-api 同時是 HTTP 入口與匯入解析點，拿最多；indexer 要做
-  # bulk 批次與 OpenSearch 投影，次之；其餘四個消費者是輕量常駐。
+  # bulk 批次與 OpenSearch 投影，次之；graph-worker 逐筆寫 Neo4j、沒有批次，
+  # 跟其餘輕量消費者同一個等級。
   #
   # ⚠️ 這些是**本機開發**的天花板，不是容量規劃。正式佈署要依
   # RESOURCE_BUDGET.md 的 OSINT_RAM_SOFT_LIMIT_GB / OSINT_CPU_SOFT_PERCENT 重算。
   #
-  # 宿主埠**不覆寫**：18080–18085 在這台機器上是空的（`ss -ltn` 實測），
+  # 宿主埠**不覆寫**：18080–18086 在這台機器上是空的（`ss -ltn` 實測），
   # 沒有像 9200/9000 那樣的 OpenCTI 衝突要規避。
 
   osint-api:
@@ -131,3 +133,9 @@ services:
   osint-indexer:
     mem_limit: 384m
     cpus: "0.50"
+
+  # 逐筆寫 Neo4j，沒有 bulk API 也不累積批次——跟 entity-worker 同一個等級
+  # 的輕量常駐消費者，不是 indexer 那種批次/backpressure 的角色。
+  osint-graph-worker:
+    mem_limit: 256m
+    cpus: "0.25"
