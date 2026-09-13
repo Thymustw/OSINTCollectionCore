@@ -402,6 +402,26 @@ curl -s -XPUT 'http://127.0.0.1:19200/_cluster/settings' -H 'Content-Type: appli
 
 細節：`docs/developer/indexer.md`、`docs/developer/search-api.md`、`docs/user/search.md`。
 
+## Graph worker
+
+```bash
+cargo run -p graph-worker --bin osint-graph-worker
+cargo run -p graph-worker --bin osint-graph-worker -- --rebuild
+cargo run -p graph-worker --bin osint-graph-worker -- --rebuild --drop
+curl -s http://127.0.0.1:18086/health
+```
+
+設定在 `config/default.toml` 的 `[graph_worker]`，health 埠 18086。
+**只有 Entity→Entity 的邊才進 Neo4j**；Document→Entity（例如 `mentions`）會被跳過。
+尚未進 compose；Operations Center 整合（Step 6）之前用本機 `cargo run`。
+
+```bash
+cargo test -p graph-worker --all-targets
+cargo test -p storage-neo4j --all-targets
+```
+
+細節：`docs/developer/graph-worker.md`。
+
 細節：`docs/developer/deduplicator.md`、`docs/developer/entity-worker.md`。
 
 ## Failure／recovery 測試（會真的停掉 Docker 服務）

@@ -1733,6 +1733,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "graph-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "core-config",
+ "core-events",
+ "core-model",
+ "core-observability",
+ "serde_json",
+ "storage-core",
+ "storage-neo4j",
+ "storage-postgres",
+ "storage-sqlite",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

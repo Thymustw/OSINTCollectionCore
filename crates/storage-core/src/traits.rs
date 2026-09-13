@@ -1278,6 +1278,12 @@ pub trait GraphStore: HealthProvider {
     /// `POST /graph/query` 對應的自由查詢面。吃 [`GraphQuery`]，
     /// **不吃**使用者原始 Cypher／Gremlin 字串。
     async fn query(&self, query: &GraphQuery) -> Result<Vec<GraphPath>, StorageError>;
+    /// 刪掉所有 `:Entity` 節點與邊，**不碰** `:ProjectionState`（那是
+    /// [`ProjectionStore::reset_projection`] 的事）。給 `--rebuild --drop` 用。
+    ///
+    /// Entity 在 Postgres 被刪之後，Neo4j 裡對應的節點不會自動消失；只有 upsert
+    /// 沒有 diff-delete，所以 `--drop` 必須能真正從零開始。空圖也回 `Ok`（冪等）。
+    async fn wipe(&self) -> Result<(), StorageError>;
 }
 
 // ---------------------------------------------------------------------------

@@ -2731,6 +2731,56 @@ pub async fn assert_graph_store_contract<S: GraphStore>(store: &S) -> Result<(),
             return Err(fail("delete_node(b) 之後 neighbors(a) 仍有 b".into()));
         }
 
+        // ⚠️ 實測過（2026-09-13）：`wipe()` 刪的是**整個資料庫**的 `:Entity`，
+        // 不是只刪這個測試自己建立的節點。對本機共用 Neo4j 跑這個 conformance
+        // 測試，會把 `osint-graph-worker --rebuild` 投影出來的真實資料也一起
+        // 清空（親身遇到：跑完這段之後 `MATCH (n:Entity) RETURN count(n)` 從
+        // 1482 變成 0）。不是資料遺失——PostgreSQL 才是 canonical truth，重跑
+        // `osint-graph-worker --rebuild` 就補回來——但這是會讓人嚇一跳的副作用，
+        // 跑 `cargo test -p storage-neo4j` 之前要有心理準備，跑完如果需要圖投影
+        // 請記得重新 rebuild。
+        //
+        // wipe 必須在既有 cleanup 之前測：測完還要讓外層 `delete_node` 清掉殘留。
+        // 用新的節點／邊，避免跟上面已經刪掉的 a/b/c 狀態糾纏。
+        let w1 = Uuid::now_v7();
+        let w2 = Uuid::now_v7();
+        let e_w = Uuid::now_v7();
+        store.upsert_node(&node(w1, "person", "WipeA")).await?;
+        store
+            .upsert_node(&node(w2, "organization", "WipeB"))
+            .await?;
+        store
+            .upsert_edge(&edge(e_w, w1, w2, "associated_with", 0.5, t0, t100))
+            .await?;
+        store.wipe().await?;
+        let n = store
+            .neighbors(&w1, &GraphTraversalOptions::one_hop())
+            .await?;
+        if !n.is_empty() {
+            return Err(fail(format!(
+                "wipe 之後 neighbors(w1) 應為空，實際 {} 筆",
+                n.len()
+            )));
+        }
+        let path = store
+            .shortest_path(&w1, &w2, &GraphTraversalOptions::one_hop())
+            .await?;
+        if path.is_some() {
+            return Err(fail(
+                "wipe 之後 shortest_path 仍找得到路徑。wipe 必須連帶刪邊".into(),
+            ));
+        }
+        let health_after = store.health().await?;
+        if !health_after.healthy {
+            return Err(fail(format!(
+                "wipe 不該把連線弄壞，health={}",
+                health_after.message
+            )));
+        }
+        // 連線還能寫才算沒壞。寫完立刻刪，避免外層 cleanup 漏掉這顆。
+        store.upsert_node(&node(w1, "person", "AfterWipe")).await?;
+        store.delete_node(&w1).await?;
+
         Ok(())
     };
 

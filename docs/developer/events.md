@@ -50,7 +50,9 @@ timeline.updated
 `topic_names_are_unique_and_all_is_complete` 測試會擋住重複）。
 
 > ⚠️ V0.2 九個 topic 裡，目前**有生產者**的是 `relationship.changed`
-> （entity-worker 抽取、merge／undo）。其餘仍只有定義、沒有生產者與消費者，
+> （entity-worker 抽取、merge／undo）。**消費者**是 `osint-graph-worker`
+> （訂 `relationship.changed`，把 Entity→Entity 的邊寫進 Neo4j；寫法對照
+> indexer 訂 `entity.extracted`）。其餘仍只有定義、沒有生產者與消費者，
 > 同 V0.1 的 `search.index.requested`。
 
 `relationship.changed` 與 V0.1 的 `object.updated` 語意不同，容易訂錯：
@@ -113,6 +115,10 @@ Partition key：job 派工使用 `job_id`（TECH_STACK 預設表沒有 job；這
 `search.index.requested` 在 V0.1 **沒有生產者也沒有消費者**：indexer 直接訂 `entity.extracted`，重新索引走 `osint-indexer --rebuild`（CLI）而不是事件。topic 名稱保留在 `EventTopic`，留給 V0.2 的 on-demand 重新索引。
 
 ⚠️ indexer 是批次消費者：**offset 只在 bulk flush 成功之後才提交**。先提交再送出的話，flush 失敗或行程被殺時那一批會永遠不進 index 且沒有任何跡象。理由與批次／backpressure 設計見 `docs/developer/indexer.md`。
+
+`osint-graph-worker` 訂閱 **`relationship.changed`**，逐筆寫進 Neo4j（沒有 bulk API，不累積批次）。**只有兩端都是 Entity 的邊才進圖**——Document→Entity（例如 `mentions`）會被跳過，這是預期行為不是錯誤。事件內容不可信，`confidence`／時間戳／型別一律重讀 PostgreSQL。offset 在成功或優雅跳過（非 Entity 端點／race 刪除）之後才提交；Neo4j 寫入失敗不提交。`--rebuild`／`--rebuild --drop` 從 PostgreSQL 全量重建。細節見 `docs/developer/graph-worker.md`。
+
+`graph.sync.requested`／`graph.sync.completed` 目前**沒有生產者與消費者**：重建走 `osint-graph-worker --rebuild`（CLI）而不是事件。topic 名稱保留在 `EventTopic`。
 
 ## Broker health check
 

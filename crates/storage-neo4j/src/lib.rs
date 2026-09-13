@@ -731,6 +731,12 @@ impl GraphStore for Neo4jStore {
         Ok(Some(path_from_bolt(&path)?))
     }
 
+    async fn wipe(&self) -> Result<(), StorageError> {
+        // 只刪 `:Entity`。`:ProjectionState` 是 ProjectionStore 的事，
+        // `--rebuild --drop` 會另外呼叫 `reset_projection`。
+        self.run("MATCH (n:Entity) DETACH DELETE n").await
+    }
+
     async fn query(&self, query_req: &GraphQuery) -> Result<Vec<GraphPath>, StorageError> {
         if query_req.starts.is_empty() {
             return Err(StorageError::ConstraintViolation {

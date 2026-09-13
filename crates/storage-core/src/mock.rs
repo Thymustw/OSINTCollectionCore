@@ -237,6 +237,13 @@ impl GraphStore for MockGraphStore {
         }
         Ok(paths)
     }
+
+    async fn wipe(&self) -> Result<(), StorageError> {
+        let mut inner = self.lock()?;
+        inner.nodes.clear();
+        inner.edges.clear();
+        Ok(())
+    }
 }
 
 fn check_hops(max_hops: u32) -> Result<(), StorageError> {
@@ -837,6 +844,27 @@ mod tests {
         let g = MockGraphStore::new();
         g.delete_node(&nid(99)).await.unwrap();
         g.delete_edge(&rid(99)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wipe_clears_nodes_and_edges_but_health_stays_ok() {
+        let g = triangle().await;
+        g.wipe().await.unwrap();
+        let n = g
+            .neighbors(&nid(1), &GraphTraversalOptions::one_hop())
+            .await
+            .unwrap();
+        assert!(n.is_empty());
+        let path = g
+            .shortest_path(&nid(1), &nid(3), &GraphTraversalOptions::one_hop())
+            .await
+            .unwrap();
+        assert!(path.is_none());
+        let health = g.health().await.unwrap();
+        assert!(health.healthy, "{}", health.message);
+        g.upsert_node(&node(1, "person", "AfterWipe"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

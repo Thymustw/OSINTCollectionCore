@@ -181,7 +181,7 @@ SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / 
 `find_entity_identifier_owner`／`put_resolution_candidate`。
 `crates/merge` 會在交易裡呼叫 `list_*`／`put_*`／`delete_relationship`／
 `put_merge_history`（見 `docs/developer/merge.md`）。
-graph-worker／DLQ 重放仍沒有生產呼叫端。
+DLQ 重放仍沒有生產呼叫端。graph-worker（`osint-graph-worker`）是 `GraphStore` 的生產寫入端：訂 `relationship.changed`，只投影 Entity→Entity 的邊。
 
 | 方法 | 排序／契約 |
 |---|---|
@@ -237,6 +237,15 @@ graph-worker／DLQ 重放仍沒有生產呼叫端。
   relationship uniqueness 的那 13 種。ProjectionStore 用 per-run 名稱
   `osint-conformance-graph-<uuid>`，測完 `reset_projection`（只刪
   `:ProjectionState` 那一點）。
+  ⚠️ **例外：`wipe()` 那段斷言不是 per-run 隔離的。** `GraphStore::wipe`
+  刪的是**整個資料庫**所有 `:Entity`（`MATCH (n:Entity) DETACH DELETE n`），
+  跟上面「用 per-run UUID、只清自己建立的節點」的慣例不同——這是它本來的
+  設計目的（給 `graph-worker --rebuild --drop` 用），沒辦法做成 per-run 隔離。
+  **對本機共用 Neo4j 跑 `cargo test -p storage-neo4j` 會把
+  `osint-graph-worker --rebuild` 投影出來的真實資料一起清空**（2026-09-13
+  實測：1482 個 `:Entity` 節點變成 0）。不是資料遺失（PostgreSQL 才是
+  canonical truth），但跑完如果需要圖投影，記得重新
+  `cargo run -p graph-worker --bin osint-graph-worker -- --rebuild`。
 
 跑測試前：
 
@@ -450,6 +459,7 @@ Neo4j adapter（`storage-neo4j`）同時實作 `GraphStore` + `ProjectionStore`�
 | `upsert_node`／`upsert_edge` | graph-worker 同步 | upsert |
 | `delete_node` | 實體刪除／merge 後清理 | **連帶刪邊**。不連帶會留下幽靈邊，shortest path 會算錯而且不報錯 |
 | `delete_edge` | 關係刪除 | 不存在也 `Ok` |
+| `wipe` | `osint-graph-worker --rebuild --drop` | 刪掉所有 `:Entity` 節點與邊（`DETACH DELETE`），**不碰** `:ProjectionState`。空圖也 `Ok`。沒有這個方法的話 `--drop` 只能靠逐筆 `delete_node`，Entity 已從 Postgres 刪掉的幽靈節點清不掉 |
 | `neighbors`／`relationships` | `GET .../neighbors`、`GET .../relationships` | 邊當**無向**；`entity_types` 過濾的是**結果**不是沿途（否則 1→org→domain 的兩跳會走不到 domain） |
 | `shortest_path` | `GET /graph/path` | 找不到或節點不存在回 `Ok(None)`，不是 `Err` |
 | `query` | `POST /graph/query` | 吃結構化 `GraphQuery`，**不吃** Cypher／Gremlin 字串 |

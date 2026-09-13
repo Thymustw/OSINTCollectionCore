@@ -1,0 +1,31 @@
+[package]
+name = "graph-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "relationship.changed → Neo4j 圖投影（SPEC_V0.2 §8）；可從 PostgreSQL 全量重建"
+
+[[bin]]
+name = "osint-graph-worker"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+chrono = { workspace = true }
+core-config = { workspace = true }
+core-events = { workspace = true }
+core-model = { workspace = true }
+core-observability = { workspace = true }
+serde_json = { workspace = true }
+storage-core = { workspace = true }
+storage-neo4j = { path = "../storage-neo4j" }
+storage-postgres = { path = "../storage-postgres" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+storage-sqlite = { path = "../storage-sqlite" }
