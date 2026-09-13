@@ -44,6 +44,7 @@ Phase 6a 起 `AuditLog` 落地到 Postgres 的 `audit_log` 表。哪些動作會
 | `GET /metrics` | 公開 | 聚合計數器（收了幾筆、重複率、佇列深度…） | Prometheus |
 | `GET /api/v1/ops/health` | viewer+ | **整套系統**哪一塊壞了 | 運維的人 |
 | `GET /api/v1/ops/metrics` | viewer+ | **這個行程**吃了多少記憶體／CPU | 運維的人 |
+| `GET /api/v1/ops/graph` | viewer+ | 圖投影 lag／rebuild | 運維的人 |
 
 ### 為什麼 Redis／Redpanda 不放進 `/ready`
 

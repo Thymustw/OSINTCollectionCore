@@ -49,6 +49,7 @@ fn read_paths() -> Vec<String> {
         format!("/api/v1/raw/{id}"),
         "/api/v1/ops/health".into(),
         "/api/v1/ops/metrics".into(),
+        "/api/v1/ops/graph".into(),
         format!("/api/v1/graph/entities/{id}/neighbors"),
         format!("/api/v1/graph/entities/{id}/relationships"),
         format!("/api/v1/graph/path?from={id}&to={id}&max_hops=2"),
@@ -201,8 +202,8 @@ async fn viewer_may_read_and_gets_503_without_a_store() {
     let (app, _, _) = test_app_parts(jwt);
 
     for path in read_paths() {
-        // ops 的兩條不需要 store。
-        if path.starts_with("/api/v1/ops/") {
+        // ops 的 health／metrics 不需要 store；graph 沒接 Neo4j 仍是 503。
+        if path == "/api/v1/ops/health" || path == "/api/v1/ops/metrics" {
             continue;
         }
         let (status, body) = send(&app, get(&path, Some(&viewer))).await;
@@ -213,7 +214,7 @@ async fn viewer_may_read_and_gets_503_without_a_store() {
         );
         assert_eq!(body["error"], "unavailable");
         let message = body["message"].as_str().unwrap();
-        if path.starts_with("/api/v1/graph/") {
+        if path.starts_with("/api/v1/graph/") || path == "/api/v1/ops/graph" {
             assert!(
                 message.contains("Neo4j") || message.contains("bolt_uri"),
                 "Graph 503 訊息要講 Neo4j／bolt_uri：{body}"
@@ -443,8 +444,8 @@ async fn ops_health_separates_not_configured_from_broken() {
     assert!(body["checks"].as_array().unwrap().is_empty());
     assert_eq!(
         body["not_configured"].as_array().unwrap().len(),
-        6,
-        "六個後端都沒接就要六個都列出來：{body}"
+        7,
+        "七個後端名稱都沒接就要七個都列出來（含 neo4j 與 neo4j_bolt）：{body}"
     );
 }
 
@@ -473,7 +474,11 @@ async fn ops_metrics_reports_real_process_usage() {
 async fn ops_endpoints_are_not_public() {
     let (jwt, _) = issue_test_jwt(Role::Viewer);
     let (app, _, _) = test_app_parts(jwt);
-    for path in ["/api/v1/ops/health", "/api/v1/ops/metrics"] {
+    for path in [
+        "/api/v1/ops/health",
+        "/api/v1/ops/metrics",
+        "/api/v1/ops/graph",
+    ] {
         let (status, _) = send(&app, get(path, None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 不該公開");
     }

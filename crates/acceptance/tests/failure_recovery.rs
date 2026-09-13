@@ -243,6 +243,7 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, search: Option<SearchS
         resolver: None,
         graph_resolver: None,
         graph: None,
+        graph_projection: None,
         import: Some(Arc::new(ImportState {
             store: Arc::new(stack.pg.clone()),
             sink: Arc::new(sink),

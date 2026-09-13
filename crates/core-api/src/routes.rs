@@ -150,6 +150,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ops/connectors", get(ops::connectors))
         .route("/api/v1/ops/queues", get(ops::queues))
         .route("/api/v1/ops/dlq", get(ops::dlq))
+        .route("/api/v1/ops/graph", get(ops::graph_projection))
         .route(
             "/api/v1/graph/entities/{id}/neighbors",
             get(resources::graph::neighbors),

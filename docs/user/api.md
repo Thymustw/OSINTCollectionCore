@@ -238,9 +238,12 @@ curl -s "$API/raw/$RAW_ID?body=true" -H "Authorization: Bearer $TOKEN"   # 連�
 ## 7. 出事的時候
 
 ```bash
-# 六個後端服務活著沒有（任一掛掉整體回 503，並指出是哪一個）
+# 後端服務活著沒有（任一掛掉整體回 503，並指出是哪一個；含 neo4j HTTP 與 neo4j_bolt）
 curl -s -o /dev/null -w '%{http_code}\n' $API/ops/health -H "Authorization: Bearer $TOKEN"
 curl -s $API/ops/health -H "Authorization: Bearer $TOKEN"
+
+# 圖投影 lag／rebuild（沒接 Neo4j 回 503）
+curl -s $API/ops/graph -H "Authorization: Bearer $TOKEN"
 
 # 這個 API 行程用了多少記憶體與 CPU
 curl -s $API/ops/metrics -H "Authorization: Bearer $TOKEN"

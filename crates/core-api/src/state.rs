@@ -54,6 +54,19 @@ pub type SharedSearchState = Arc<SearchState>;
 /// 這個 capability，不要綁死在 `Neo4jStore`。
 pub type SharedGraphStore = Arc<dyn storage_core::GraphStore + Send + Sync>;
 
+/// `GET /ops/graph` 用。跟 [`SearchState`] 同一個模式——把 store 跟
+/// 它對應的投影名稱包在一起，不要讓 handler 自己去猜投影叫什麼。
+///
+/// **不要**跟 [`SharedGraphStore`] 合併：那個是圖讀取 API 已經在用的型別，
+/// 這份只服務投影 lag／rebuild 狀態。
+#[derive(Clone)]
+pub struct GraphProjectionState {
+    pub store: Arc<dyn storage_core::ProjectionStore + Send + Sync>,
+    pub projection: String,
+}
+
+pub type SharedGraphProjection = Arc<GraphProjectionState>;
+
 pub type SharedStore = Arc<dyn RelationalStore + Send + Sync>;
 
 /// 物件儲存（Raw Evidence blob）handle。理由同 [`SharedStore`]：
@@ -124,6 +137,10 @@ pub struct AppState {
     /// 不受影響（三者是分開的可用性狀態，各自獨立組裝）。
     /// 與 [`AppState::graph_resolver`] 共用同一個 Neo4j 連線，不要連兩次。
     pub graph: Option<SharedGraphStore>,
+    /// 圖投影 lag／rebuild 狀態。`None` 代表沒接上 Neo4j，
+    /// **只有** `GET /api/v1/ops/graph` 回 503。
+    /// 與 [`AppState::graph`] 分開：讀圖與讀投影狀態是兩件不同的事。
+    pub graph_projection: Option<SharedGraphProjection>,
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
     pub ready: ReadyProbe,
@@ -141,7 +158,7 @@ pub struct AppState {
     /// 沒接上（因此不在 [`AppState::backends`] 裡）的後端名稱。
     ///
     /// 少了這一欄，一個「只接了 Postgres」的部署會回 `healthy: true`，
-    /// 看起來跟六個後端全綠一模一樣——那是最危險的一種假綠燈。
+    /// 看起來跟七個後端名稱全綠一模一樣——那是最危險的一種假綠燈。
     pub backends_missing: Vec<&'static str>,
     pub rate_limit_per_second: u32,
     pub request_body_limit_bytes: u32,

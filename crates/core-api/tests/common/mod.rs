@@ -48,15 +48,17 @@ pub fn test_app_parts(jwt: JwtService) -> (axum::Router, MemoryAuditLog, Arc<Mem
 ///
 /// 這份清單要跟 `core-api/src/main.rs` 會 push 進 `missing` 的後端維持一致——
 /// 少一個的話，`ops_health_separates_not_configured_from_broken` 就不再是在驗
-/// 「全部沒接」，而是在驗「五個沒接、一個不知道去哪了」。
-/// neo4j 是 V0.2 phase 0b 加的。
-const DEFAULT_MISSING: [&str; 6] = [
+/// 「全部沒接」，而是在驗「六個沒接、一個不知道去哪了」。
+/// `neo4j` 是 V0.2 phase 0b 加的 HTTP 探活；`neo4j_bolt` 是 Phase 2 Step 6
+/// 加的 Cypher 探活。沒接上時兩個都列——粒度不同，不能合併。
+const DEFAULT_MISSING: [&str; 7] = [
     "postgres",
     "object_store",
     "redis",
     "opensearch",
     "redpanda",
     "neo4j",
+    "neo4j_bolt",
 ];
 
 /// 同 [`test_app_parts`]，但可以指定 `/api/v1/ops/health` 要跑哪些檢查。
@@ -86,6 +88,7 @@ pub fn test_app_with_backends(
         resolver: None,
         graph_resolver: None,
         graph: None,
+        graph_projection: None,
         import: None,
         // 不接 OpenSearch：`POST /api/v1/search` 回 503。
         search: None,

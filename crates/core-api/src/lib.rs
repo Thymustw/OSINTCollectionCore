@@ -36,8 +36,9 @@ pub use import::{AUDIT_ACTION as IMPORT_AUDIT_ACTION, ImportRequest};
 pub use jobs::{AUDIT_JOB_CREATE, AUDIT_JOB_DISPATCH, AUDIT_JOB_RETRY, AUDIT_JOB_TRANSITION};
 pub use middleware::{AUDIT_AUTH_FAILED, AUDIT_AUTHZ_DENIED};
 pub use ops::{
-    BackendCheck, BrokerCheck, ConnectorHealth, ConnectorsView, DlqView, GraphCheck, OpsHealth,
-    ProcessMetrics, QueueBinding, QueueEntry, QueueInspector, QueueSummary,
+    BackendCheck, BrokerCheck, ConnectorHealth, ConnectorsView, DlqView, GraphCheck,
+    GraphProjectionView, OpsHealth, ProcessMetrics, QueueBinding, QueueEntry, QueueInspector,
+    QueueSummary,
 };
 pub use pagination::{CursorPage, Pagination};
 pub use rate_limit::RateLimiter;
@@ -54,8 +55,8 @@ pub use resources::{
 pub use routes::router;
 pub use search::{EntitySummary, SearchHitBody, SearchResponse};
 pub use state::{
-    AppState, AuthState, ImportState, SearchState, SharedGraphStore, SharedObjects, SharedStore,
-    SharedTokenStore,
+    AppState, AuthState, GraphProjectionState, ImportState, SearchState, SharedGraphProjection,
+    SharedGraphStore, SharedObjects, SharedStore, SharedTokenStore,
 };
 pub use tokens::{
     AUDIT_TOKEN_ISSUE, AUDIT_TOKEN_LIST, AUDIT_TOKEN_REVOKE, IssueTokenBody, TokenSummary,

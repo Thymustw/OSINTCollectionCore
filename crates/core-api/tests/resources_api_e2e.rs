@@ -91,7 +91,7 @@ struct TestApi {
 }
 
 fn build_api(stack: &Stack, producer: Option<Arc<EventProducer>>) -> TestApi {
-    build_api_with_backends(stack, producer, Vec::new(), Vec::new())
+    build_api_with_backends(stack, producer, Vec::new(), Vec::new(), None)
 }
 
 fn build_api_with_backends(
@@ -99,6 +99,7 @@ fn build_api_with_backends(
     producer: Option<Arc<EventProducer>>,
     checks: Vec<Arc<dyn core_api::ReadyCheck>>,
     missing: Vec<&'static str>,
+    graph_projection: Option<core_api::SharedGraphProjection>,
 ) -> TestApi {
     let jwt = JwtService::new(&[b't'; 32], "osint-core", chrono::Duration::hours(1)).expect("jwt");
     let viewer = jwt.issue("e2e-viewer", Role::Viewer).expect("issue");
@@ -126,6 +127,7 @@ fn build_api_with_backends(
         ))),
         graph_resolver: None,
         graph: None,
+        graph_projection,
         import: None,
         search: None,
         ready: ready_always(),
@@ -1465,6 +1467,7 @@ async fn ops_health_reports_a_broken_redis() {
             Arc::new(core_api::BackendCheck::new("redis", Arc::new(good))),
         ],
         Vec::new(),
+        None,
     );
     let (status, body, _) = send(&api_ok.app, get("/api/v1/ops/health", &api_ok.viewer)).await;
     assert_eq!(status, StatusCode::OK, "全部活著時要 200：{body}");
@@ -1481,6 +1484,7 @@ async fn ops_health_reports_a_broken_redis() {
             Arc::new(core_api::BackendCheck::new("redis", Arc::new(broken))),
         ],
         Vec::new(),
+        None,
     );
     let (status, body, _) = send(&api_bad.app, get("/api/v1/ops/health", &api_bad.viewer)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -1499,6 +1503,60 @@ async fn ops_health_reports_a_broken_redis() {
         postgres["healthy"], true,
         "一個壞掉不該讓其他檢查也被標成壞的：{body}"
     );
+}
+
+/// 沒接 Neo4j 時 `/ops/graph` 回 503，訊息要指出是圖投影沒接上。
+#[tokio::test]
+async fn ops_graph_is_503_without_neo4j() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+    let (status, body, _) = send(&api.app, get("/api/v1/ops/graph", &api.viewer)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "unavailable");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("Neo4j") || message.contains("storage.graph"),
+        "503 訊息要講下一步怎麼做：{body}"
+    );
+}
+
+/// 真實 Neo4j：`/ops/graph` 回設定檔裡的投影名稱，rebuild.state 是合法值。
+///
+/// 不斷言成固定字串：這台機器可能已經跑過 Step 4／5 rebuild，
+/// `state` 多半是 `completed`，那是環境現況不是這支測試該鎖死的東西。
+#[tokio::test]
+async fn ops_graph_reports_projection_status_from_neo4j() {
+    load_workspace_dotenv();
+    let uri = required_env("NEO4J_URI").expect("NEO4J_URI");
+    let user = required_env("NEO4J_USER").expect("NEO4J_USER");
+    let password = required_env("NEO4J_PASSWORD").expect("NEO4J_PASSWORD");
+    assert!(
+        uri.contains("127.0.0.1") || uri.contains("localhost"),
+        "e2e 只連本機 Neo4j"
+    );
+    let neo4j = storage_neo4j::Neo4jStore::connect(&uri, &user, &password, 5)
+        .await
+        .expect("連 Neo4j");
+    let projection = core_config::GraphWorkerSection::default().projection;
+    let graph_projection = Arc::new(core_api::GraphProjectionState {
+        store: Arc::new(neo4j) as Arc<dyn storage_core::ProjectionStore + Send + Sync>,
+        projection: projection.clone(),
+    });
+
+    let stack = connect_stack().await;
+    let api = build_api_with_backends(&stack, None, Vec::new(), Vec::new(), Some(graph_projection));
+    let (status, body, _) = send(&api.app, get("/api/v1/ops/graph", &api.viewer)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["projection"], projection, "{body}");
+    let state = body["rebuild"]["state"]
+        .as_str()
+        .expect("rebuild.state 是字串");
+    assert!(
+        matches!(state, "idle" | "running" | "completed" | "failed"),
+        "rebuild.state 必須是 RebuildState 的合法值，實際是 {state}：{body}"
+    );
+    assert!(body["rebuild"]["written"].is_number(), "{body}");
+    assert!(body["lag"].is_object(), "{body}");
 }
 
 // ---------------------------------------------------------------- resolve / merge

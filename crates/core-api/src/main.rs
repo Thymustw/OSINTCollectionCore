@@ -6,9 +6,9 @@ use std::sync::Arc;
 use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
-    AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, ImportState, PostgresReady,
-    QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SharedGraphStore, SharedObjects,
-    SharedStore, SharedTokenStore, router,
+    AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, GraphProjectionState, ImportState,
+    PostgresReady, QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SharedGraphStore,
+    SharedObjects, SharedStore, SharedTokenStore, router,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -151,33 +151,50 @@ async fn run() -> Result<(), String> {
         }
     };
 
-    // graph_resolver 與 graph 共用**同一次** `connect_graph`——不要連兩次。
+    // graph_resolver、graph、graph_projection 共用**同一次** `connect_graph`——不要連兩次。
     // `Neo4jStore` 是 Clone（連線池 handle），clone 很便宜。
-    // 兩者跟 resolver 都是獨立的可用性：Neo4j 沒接上只讓
-    // POST /entities/{id}/resolve/graph-context 與 /graph/* 讀取路由回 503，
+    // 三者跟 resolver 都是獨立的可用性：Neo4j 沒接上只讓
+    // POST /entities/{id}/resolve/graph-context、/graph/* 讀取路由與 /ops/graph 回 503，
     // resolve_entity 的另外幾個方法不受影響。
     // Postgres 沒接上時 graph_resolver 也是 None：沒有 canonical store 就沒辦法 persist candidate。
     // graph 讀取端只需要 Neo4j，理論上 Postgres 掛了仍可查圖；但目前 connect_graph
     // 只在有 pg_store 時呼叫一次，兩邊一起 None——不要為了這個分叉再開第二次連線。
-    let (graph_resolver, graph) = if let Some(store) = pg_store {
+    let (graph_resolver, graph, graph_projection) = if let Some(store) = pg_store {
         match connect_graph(&cfg).await {
             Ok(neo4j) => {
+                // Bolt 健康檢查用同一個 clone，不要再開第二次連線。
+                // 名字刻意是 `neo4j_bolt`：現有 HTTP 檢查已經叫 `neo4j`，兩筆獨立。
+                // `Arc::new(neo4j.clone())` 從具體型別建 `Arc<dyn HealthProvider>`，
+                // 不要寫 trait upcasting（workspace 鎖 1.85，upcasting 1.86 才穩定）。
+                health_checks.push(Arc::new(BackendCheck::new(
+                    "neo4j_bolt",
+                    Arc::new(neo4j.clone()),
+                )));
                 let graph: SharedGraphStore = Arc::new(neo4j.clone());
+                let graph_projection = Some(Arc::new(GraphProjectionState {
+                    store: Arc::new(neo4j.clone())
+                        as Arc<dyn storage_core::ProjectionStore + Send + Sync>,
+                    projection: cfg.graph_worker.projection.clone(),
+                }));
                 let resolver = Arc::new(GraphContextResolver::new(store, neo4j));
-                (Some(resolver), Some(graph))
+                (Some(resolver), Some(graph), graph_projection)
             }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "Neo4j 未連上；POST /api/v1/entities/{{id}}/resolve/graph-context \
-                     與 GET／POST /api/v1/graph/* 讀取路由會回 503"
+                     與 GET／POST /api/v1/graph/* 讀取路由、GET /api/v1/ops/graph 會回 503"
                 );
                 missing.push("neo4j");
-                (None, None)
+                missing.push("neo4j_bolt");
+                (None, None, None)
             }
         }
     } else {
-        (None, None)
+        // 沒有 Postgres 就不會連 Bolt。HTTP 探活下面仍可能獨立掛上，
+        // 但 `neo4j_bolt` 必須列進 not_configured，否則它會從清單上消失。
+        missing.push("neo4j_bolt");
+        (None, None, None)
     };
 
     // 搜尋接不上時只有 POST /api/v1/search 回 503，其他路由照常——
@@ -212,11 +229,11 @@ async fn run() -> Result<(), String> {
         None => missing.push("redpanda"),
     }
 
-    // Neo4j HTTP 探活（7474）。Bolt 連線由上面的 `connect_graph` 負責。
+    // Neo4j HTTP 探活（7474）。Bolt 探活是上面 `connect_graph` 成功時推進去的
+    // `neo4j_bolt`（`BackendCheck` 跑 `RETURN 1`），兩個檢查各自獨立。
     //
     // 空字串 = 刻意未設定（例如還沒起 Neo4j 的環境），列進 not_configured
     // 而不是每次 health 都去連一個不存在的位址然後報 down。
-    // 這裡**不建立 Bolt 連線**，只有 HTTP 探活，理由見 GraphCheck 的文件註解。
     //
     // `connect_graph` 失敗時已經把 "neo4j" 推進 missing——不要再推一次，
     // 否則 `/ops/health` 的 `not_configured` 會出現兩個 neo4j。
@@ -269,6 +286,7 @@ async fn run() -> Result<(), String> {
         resolver,
         graph_resolver,
         graph,
+        graph_projection,
         import,
         search,
         ready,
@@ -434,7 +452,7 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
             error: "not_found".into(),
             message: "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs、\
                  /api/v1/tokens（admin）、/api/v1/ops/health、/api/v1/ops/metrics、\
-                 /api/v1/ops/connectors、/api/v1/ops/queues 與 /api/v1/ops/dlq、\
+                 /api/v1/ops/connectors、/api/v1/ops/queues、/api/v1/ops/dlq 與 /api/v1/ops/graph、\
                  sources／connectors／collections／objects／entities／relationships／events／raw、\
                  /api/v1/graph/*、POST /api/v1/import 與 POST /api/v1/search"
                 .into(),

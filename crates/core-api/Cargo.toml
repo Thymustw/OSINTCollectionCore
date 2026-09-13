@@ -32,9 +32,9 @@ hex = { workspace = true }
 merge = { workspace = true }
 # GET /api/v1/ops/metrics 的 Disk 指標（statvfs）。見 src/ops.rs 的 disk_usage。
 libc = { workspace = true }
-# GET /api/v1/ops/health 的 Neo4j 探針仍走 HTTP 7474（見 `GraphCheck`）。
-# 真正的圖查詢（`POST /entities/{id}/resolve/graph-context`）走 Bolt，
-# 經 `storage-neo4j` 的 `Neo4jStore`。
+# GET /api/v1/ops/health 的 `neo4j` 探針仍走 HTTP 7474（見 `GraphCheck`）。
+# Bolt 探活是同一份清單裡的 `neo4j_bolt`（`BackendCheck` 包 `Neo4jStore`，跑 `RETURN 1`）。
+# 真正的圖查詢（`POST /entities/{id}/resolve/graph-context`、`/graph/*`）也走 Bolt。
 reqwest = { workspace = true }
 resolver = { workspace = true }
 serde = { workspace = true }

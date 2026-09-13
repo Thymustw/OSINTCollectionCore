@@ -1,14 +1,16 @@
 //! `/api/v1/ops/*`：Operations Center 的基礎面板（SPEC §31）。
 //!
-//! * `GET /ops/health`：六個後端（PostgreSQL／物件儲存／Redis／OpenSearch／Redpanda／
-//!   Neo4j）的聚合健康。任一 down → 整體 **503**，回應裡指出是哪一個。
-//!   Neo4j 是 V0.2 phase 0b 加的，**只做 HTTP 探活**，見 [`GraphCheck`]。
+//! * `GET /ops/health`：七個後端名稱（PostgreSQL／物件儲存／Redis／OpenSearch／
+//!   Redpanda／`neo4j` HTTP／`neo4j_bolt`）的聚合健康。任一 down → 整體 **503**，
+//!   回應裡指出是哪一個。`neo4j` 是 HTTP 7474 探活（見 [`GraphCheck`]）；
+//!   `neo4j_bolt` 才真的跑一次 Cypher（`BackendCheck` 包 `Neo4jStore`）。
 //! * `GET /ops/metrics`：本行程的資源用量（RSS、CPU 時間、執行緒數、
 //!   以及工作目錄所在檔案系統的容量／剩餘空間）。
 //! * `GET /ops/connectors`：每個 connector 的採集健康（SPEC §31「connector health」）。
 //! * `GET /ops/queues`：四個 consumer group 的 lag（SPEC §31「queue summary」）。
 //! * `GET /ops/dlq`：失敗的 Job 清單（SPEC §31「basic DLQ view」）。
 //!   **V0.1 沒有 DLQ topic**，回應裡的 `dlq_topic: null` 就是這件事的宣告。
+//! * `GET /ops/graph`：圖投影 lag 與 rebuild 狀態。沒接 Neo4j 回 503。
 //!
 //! # 為什麼與 `/ready`、`/metrics` 分開
 //!
@@ -34,6 +36,7 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use chrono::Utc;
 use core_observability::{CheckResult, ReadyStatus};
 use serde::{Deserialize, Serialize};
 use storage_core::HealthProvider;
@@ -42,6 +45,7 @@ use core_security::{Permission, Principal};
 
 use crate::error::ApiError;
 use crate::ready::ReadyCheck;
+use crate::resources::storage_error;
 use crate::state::AppState;
 
 /// 把任何 `HealthProvider`（storage adapter）包成一個具名的 ops 檢查。
@@ -116,19 +120,21 @@ impl ReadyCheck for BrokerCheck {
     }
 }
 
-/// Neo4j 的 ops 檢查（V0.2 Phase 0b）。
+/// Neo4j 的 HTTP 探活（7474）。
 ///
-/// # 為什麼是 HTTP 而不是 Bolt
+/// # 為什麼 HTTP 檢查還在
 ///
 /// 探活只打 HTTP 埠（預設 7474）的 `GET /`：那個端點**不需要認證**就會回
 /// 叢集的 discovery JSON，所以這個檢查不必持有任何憑證。
-/// Bolt（7687）連線與 Cypher 查詢走 `storage-neo4j` 的 `Neo4jStore`，
-/// 由 `POST /entities/{id}/resolve/graph-context` 使用。
+///
+/// Bolt 能不能跑 Cypher，由 `/ops/health` 裡另一筆 `neo4j_bolt` 負責
+/// （`BackendCheck` 包 `Neo4jStore`，執行 `RETURN 1`）。兩個檢查故意分開、
+/// 名字也不一樣：`neo4j_bolt` 需要密碼；這個 `GraphCheck` 不需要，
+/// 在還沒設 `NEO4J_PASSWORD` 的環境仍能告訴運維「HTTP 埠活著」。
 ///
 /// ⚠️ **這只證明 HTTP 埠活著，不證明資料庫可寫。** Neo4j 在還原、
 /// 資料庫處於 `offline`／`failed` 狀態時，7474 仍然會回 200。
-/// Bolt 連線失敗時 `AppState.graph_resolver` 是 `None`，那條路由回 503；
-/// 不要把這個 HTTP 檢查當成「圖投影是健康的」。
+/// 圖投影健不健康看 `neo4j_bolt` 與 `GET /api/v1/ops/graph`，不要只看這一筆。
 pub struct GraphCheck {
     client: reqwest::Client,
     url: String,
@@ -658,6 +664,49 @@ pub async fn dlq(
         failed_job_count: failed_jobs.len(),
         failed_jobs,
         truncated,
+    }))
+}
+
+// --------------------------------------------------------------- graph projection
+
+/// `GET /ops/graph` 的回應。
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphProjectionView {
+    pub projection: String,
+    pub lag: storage_core::ProjectionLag,
+    pub rebuild: storage_core::RebuildStatus,
+}
+
+/// `GET /api/v1/ops/graph`。viewer 以上。沒接上 Neo4j 回 503，
+/// 不影響 `/ops/health`（那邊已經有 `neo4j`／`neo4j_bolt` 兩筆）。
+///
+/// 唯讀、不寫稽核——跟 `/ops/queues`／`/ops/dlq` 同一級。
+pub async fn graph_projection(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<Json<GraphProjectionView>, ApiError> {
+    principal.role.require(Permission::Read)?;
+    let gp = state.graph_projection.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "圖投影狀態未接上 Neo4j。請確認 [storage.graph] 設定並重啟 osint-api",
+        )
+    })?;
+    let lag = gp
+        .store
+        .projection_lag(&gp.projection, Utc::now())
+        .await
+        .map_err(storage_error)?;
+    let rebuild = gp
+        .store
+        .rebuild_status(&gp.projection)
+        .await
+        .map_err(storage_error)?;
+    Ok(Json(GraphProjectionView {
+        projection: gp.projection.clone(),
+        lag,
+        rebuild,
     }))
 }
 

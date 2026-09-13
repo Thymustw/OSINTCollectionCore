@@ -62,11 +62,12 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | POST | `/api/v1/jobs/{id}/transition` | operator | 200 | |
 | POST | `/api/v1/jobs/{id}/dispatch` | operator | 200 | |
 | POST | `/api/v1/jobs/{id}/retry` | operator | 200 | 只對 `failed` |
-| GET | `/api/v1/ops/health` | viewer | 200／503 | 六個後端聚合 |
+| GET | `/api/v1/ops/health` | viewer | 200／503 | 七個後端名稱聚合（`neo4j` HTTP + `neo4j_bolt` Cypher） |
 | GET | `/api/v1/ops/metrics` | viewer | 200 | 行程資源用量（RAM／CPU／Disk） |
 | GET | `/api/v1/ops/connectors` | viewer | 200 | connector 採集健康。`?unhealthy=`、`?stale_after_secs=`、`?limit=` |
 | GET | `/api/v1/ops/queues` | viewer | 200／503 | consumer group lag。沒接 Redpanda 回 503 |
 | GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`。沒接 Postgres 回 503 |
+| GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
 | POST | `/api/v1/import` | operator | 201 | multipart |
 | POST | `/api/v1/search` | viewer | 200 | |
 | GET | `/api/v1/graph/entities/{id}/neighbors` | viewer | 200 | 圖鄰居。沒有這個節點回空陣列，不是 404 |
@@ -373,15 +374,20 @@ curl -s "http://127.0.0.1:18080/api/v1/raw/$ID?body=true" -H "Authorization: Bea
 
 ## Operations Center（`/api/v1/ops/*`，SPEC §31）
 
-`GET /ops/health` 聚合六個後端：`postgres`／`object_store`／`redis`／
-`opensearch`／`redpanda`／`neo4j`。
+`GET /ops/health` 聚合七個後端名稱：`postgres`／`object_store`／`redis`／
+`opensearch`／`redpanda`／`neo4j`／`neo4j_bolt`。
 
-`neo4j` 是 V0.2 phase 0b 加的，設定鍵是 `[storage.graph].http_url`。
-⚠️ 它**只打 HTTP `GET /`（7474）**，沒有建立 Bolt 連線，因此
+`neo4j` 是 V0.2 phase 0b 加的 HTTP 探活，設定鍵是 `[storage.graph].http_url`。
+它**只打 HTTP `GET /`（7474）**，沒有建立 Bolt 連線，因此
 **只證明 HTTP 埠活著，不證明 Bolt 可連或資料庫可寫**——Neo4j 在還原中、
 或某個 database 處於 `offline`／`failed` 時 7474 仍回 200。
-Phase 2a 接上 `storage-neo4j` adapter 後要升級成真的跑一次 Cypher。
-選擇 HTTP 而非 Bolt 的理由見 `crates/core-api/src/ops.rs` 的 `GraphCheck`。
+選擇 HTTP 而非 Bolt 的理由見 `crates/core-api/src/ops.rs` 的 `GraphCheck`：
+這個檢查不需要密碼，還沒設 `NEO4J_PASSWORD` 的環境仍能告訴運維 HTTP 埠活著。
+
+`neo4j_bolt` 是 Phase 2 Step 6 加的。`connect_graph` 成功時用同一個
+`Neo4jStore` clone 包成 `BackendCheck`，真的跑一次 `RETURN 1`。
+兩個檢查各自獨立，`checks` 陣列裡會同時看到兩筆。Bolt 連不上時
+`not_configured` 會同時出現 `neo4j` 與 `neo4j_bolt`。
 
 ```json
 {
@@ -398,7 +404,7 @@ Phase 2a 接上 `storage-neo4j` adapter 後要升級成真的跑一次 Cypher。
 - `unhealthy` 是給告警規則盯的欄位，不用叫呼叫端自己 filter `checks`
 - `not_configured` 與「壞掉」是兩回事：前者要去看設定檔，後者要去看那個服務。
   少了這一欄，一個「只接了 Postgres」的部署會回 `healthy: true`，
-  看起來跟六個後端全綠一模一樣——那是最危險的一種假綠燈
+  看起來跟七個後端名稱全綠一模一樣——那是最危險的一種假綠燈
 
 與 `/ready`、`/metrics` 的分工：
 
@@ -411,6 +417,7 @@ Phase 2a 接上 `storage-neo4j` adapter 後要升級成真的跑一次 Cypher。
 | `/api/v1/ops/connectors` | viewer+ | 哪個 connector 沒在採集，以及為什麼 |
 | `/api/v1/ops/queues` | viewer+ | 哪個 consumer group 落後 |
 | `/api/v1/ops/dlq` | viewer+ | 有哪些失敗的 Job（V0.1 沒有 DLQ topic） |
+| `/api/v1/ops/graph` | viewer+ | 圖投影 lag 與 rebuild 狀態 |
 
 Redis／Redpanda 刻意**不放進 `/ready`**：API 自己不需要它們，
 把它們塞進 `/ready` 會讓「Redis 掛了」變成「API 不接受流量」，
@@ -519,6 +526,53 @@ SPEC §31 的 "queue summary"。viewer 以上。
 > collector 不會依 `osint_queue_depth` 調整採集速率（見
 > `docs/developer/collector-normalizer.md` 的「已知限制」）。跨服務 backpressure 是 V0.2。
 
+## `GET /ops/graph`（圖投影 lag／rebuild）
+
+SPEC_V0.2 §27 Operations Center 的 graph sync／rebuild 可見性。viewer 以上。
+
+**沒接上 Neo4j 時只有這條路由回 503**（`[storage.graph]` 沒設定或 Bolt 連不上），
+其他路由照常。`/ops/health` 已經有 `neo4j`／`neo4j_bolt` 兩筆，這裡不重複探活，
+只讀投影狀態。
+
+```bash
+curl -s http://127.0.0.1:18080/api/v1/ops/graph \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "projection": "osint-graph",
+  "lag": {
+    "checkpoint": {
+      "projection": "osint-graph",
+      "last_source_at": "2026-09-14T03:00:00Z",
+      "last_object_id": "0199...",
+      "objects_written": 42,
+      "updated_at": "2026-09-14T03:01:00Z"
+    },
+    "lag_seconds": 3600
+  },
+  "rebuild": {
+    "projection": "osint-graph",
+    "state": "completed",
+    "started_at": "2026-09-14T02:00:00Z",
+    "finished_at": "2026-09-14T02:05:00Z",
+    "scanned": 1200,
+    "written": 80,
+    "failed": 0,
+    "last_error": null
+  }
+}
+```
+
+- `projection` 來自 `[graph_worker].projection`（預設 `osint-graph`），
+  handler 不自己猜名字。
+- `lag.lag_seconds` 沒有 checkpoint（或 checkpoint 沒有來源時間戳）時是
+  **`null`，不是 `0`**。0 會被讀成「完全沒落後」，實際狀況是「這個投影從來沒寫過東西」。
+- `rebuild.state` 是 `idle`／`running`／`completed`／`failed`。
+  從來沒跑過 rebuild 時是 `idle`（`RebuildStatus::idle`），不是錯誤。
+- `rebuild.written` 是環境現況：這台機器跑過 Step 4／5 rebuild 之後通常不是 0。
+
 ## `GET /ops/dlq`（失敗紀錄）
 
 SPEC §31 的 "basic DLQ view"。viewer 以上。沒接 Postgres 回 503。
@@ -592,6 +646,7 @@ Phase 6b 另外加了三個欄位：
 | `backends` | `ReadyProbe` | `GET /api/v1/ops/health` 要敲的後端檢查清單 |
 | `backends_missing` | `Vec<&'static str>` | **沒接上**（因此不在 `backends` 裡）的後端名稱 |
 | `object_bucket` | `String` | `GET /raw/{id}?body=true` 用來把 `s3://{bucket}/{key}` 形式的 `storage_path` 還原成物件 key；沒接物件儲存時是空字串 |
+| `graph_projection` | `Option<SharedGraphProjection>`（`GraphProjectionState`：`ProjectionStore` + 投影名稱） | `GET /api/v1/ops/graph` 的 lag／rebuild。`None` 回 503。回應型別是 `GraphProjectionView` |
 
 `backends` 與 `ready` **刻意分開**：`/ready` 只檢查 API 自己非有不可的依賴
 （給 orchestrator 決定要不要送流量），`backends` 是整套 pipeline 的後端
@@ -601,7 +656,7 @@ Phase 6b 另外加了三個欄位：
 `backends_missing` 不是可有可無的裝飾：空的檢查清單在 `ReadyStatus::from_checks`
 底下是 `healthy: true`（空集合的「全部通過」是 true），
 少了這一欄，一個只接了 Postgres 的部署會回 200 且 `healthy: true`，
-看起來跟六個後端全綠一模一樣。
+看起來跟七個後端名稱全綠一模一樣。
 
 > `core-api` 為此多了一個 `storage-redis` 相依。API 的任何路由都不讀 Redis，
 > 它只出現在 `/ops/health` 的檢查清單裡。

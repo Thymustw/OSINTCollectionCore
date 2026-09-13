@@ -102,7 +102,9 @@ cargo run -p graph-worker --bin osint-graph-worker -- --rebuild
 cargo run -p graph-worker --bin osint-graph-worker -- --rebuild --drop
 ```
 
-Operations Center 整合（Step 6）之前，這支服務**不**跑在 compose 裡，本機驗證用上面的 `cargo run`。
+Operations Center 已可看投影狀態：`GET /api/v1/ops/graph`（viewer 以上）回
+`[graph_worker].projection` 的 lag 與 rebuild。這支服務目前仍**不**跑在 compose 裡，
+本機驗證用上面的 `cargo run`。
 
 ### 兩者的差別很容易被誤會
 

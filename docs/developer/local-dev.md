@@ -174,11 +174,10 @@ CLAUDE.md §15 的磁碟紀律：這 516 MB 是常駐的，要算進共用工作
 docker exec osint-core-neo4j-1 cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1 AS ok;"
 ```
 
-#### `/ops/health` 只做 HTTP 探活
+#### `/ops/health` 同時有 HTTP 探活與 Bolt Cypher
 
 `GET /api/v1/ops/health` 的 `neo4j` 那一項只打 HTTP `GET /`（7474），
-**沒有建立 Bolt 連線**。7474 的 discovery 端點不需要認證，所以 API 行程
-在 V0.2 Phase 0b 完全不持有 Neo4j 憑證。
+**沒有建立 Bolt 連線**。7474 的 discovery 端點不需要認證。
 
 回應長這樣（實測）：
 
@@ -188,11 +187,16 @@ docker exec osint-core-neo4j-1 cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETUR
 
 ⚠️ **這只證明 HTTP 埠活著，不證明 Bolt 可連或資料庫可寫。**
 Neo4j 在還原中、或某個 database 處於 `offline`／`failed` 時，7474 仍會回 200。
-Phase 2a 接上 `storage-neo4j` adapter 之後要把判定升級成真的跑一次 Cypher。
+
+同一份 `checks` 裡另有 `neo4j_bolt`：用 `storage-neo4j` 的 `Neo4jStore`
+跑一次 `RETURN 1`。需要 `[storage.graph]` 的帳密。兩個檢查各自獨立。
+
+圖投影 lag／rebuild 看 `GET /api/v1/ops/graph`，不看這兩筆探活。
 
 `OSINT__STORAGE__GRAPH__HTTP_URL` 留空字串 = 刻意未設定，
 `/ops/health` 會把 `neo4j` 列進 `not_configured` 而不是 `unhealthy`
 （沿用 V0.1 的慣例：「沒設定」與「壞了」下一步不同）。
+Bolt 連不上時 `neo4j_bolt` 也會列進 `not_configured`。
 
 ### Embedding 模型（V0.2 semantic search 的前提）
 
