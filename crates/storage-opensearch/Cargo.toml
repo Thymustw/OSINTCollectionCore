@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "OpenSearch SearchStore adapter"
+description = "OpenSearch SearchStore adapter 與 ml-commons EmbeddingProvider"
 
 [dependencies]
 async-trait = { workspace = true }

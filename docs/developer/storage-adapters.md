@@ -26,7 +26,7 @@ Do not add database-specific code to normal domain services.
 crates/storage-core          capability traits、StorageError、health、conformance
 crates/storage-postgres      CanonicalStore + RelationalStore（sqlx 0.9、rustls-ring）
 crates/storage-sqlite        EmbeddedStore + RelationalStore（sqlx 0.9 sqlite）
-crates/storage-opensearch    SearchStore（opensearch 2.4.0、rustls-tls）
+crates/storage-opensearch    SearchStore + EmbeddingProvider（opensearch 2.4.0、rustls-tls；ml-commons `_predict`）
 crates/storage-redis         KeyValueStore（redis =1.2.2；workspace rust-version 1.85）
 crates/storage-s3            ObjectStore（object_store 0.14.1 aws + reqwest/rustls）
 crates/storage-neo4j         GraphStore + ProjectionStore（neo4rs 0.8.0）
@@ -35,7 +35,8 @@ crates/storage-neo4j         GraphStore + ProjectionStore（neo4rs 0.8.0）
 `GraphStore`／`EmbeddingProvider` trait 與記憶體 mock 在 `storage-core`
 （V0.2 Phase 0g）。上層測試仍可注入
 `storage_core::mock::{MockGraphStore, MockEmbeddingProvider}`；
-真實圖投影走 `storage-neo4j`。
+真實圖投影走 `storage-neo4j`；真實 embedding 走
+`storage_opensearch::MlCommonsEmbeddingProvider`。
 
 Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注入。
 
@@ -50,7 +51,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `SearchStore` | `storage-opensearch` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`query`／`search`／`delete`） |
 | `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
 | `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |
-| `EmbeddingProvider` | **尚未**（ml-commons adapter）；mock：`storage_core::mock::MockEmbeddingProvider` | 文字→向量（V0.2 Phase 0g）。見下方「`EmbeddingProvider`」 |
+| `EmbeddingProvider` | `storage-opensearch`（`MlCommonsEmbeddingProvider`）；mock：`storage_core::mock::MockEmbeddingProvider` | 文字→向量（V0.2 Phase 3）。見下方「`EmbeddingProvider`」 |
 | `KeyValueStore` | `storage-redis` | get/set/set_ex/del/expire |
 | `ObjectStore` | `storage-s3` | MinIO put/get/delete/exists |
 | `HealthProvider` | 全部 | `health()` |
@@ -555,10 +556,10 @@ checkpoint 與 rebuild 狀態可以同在一個節點上，寫入用 `SET` 部�
 - 累加沒有樂觀鎖（同 OpenSearch adapter）：一個投影一個 writer。
 - 沒有 adapter metrics／連線 semaphore 接到 Resource Guard（與其他 adapter 一樣，列在「尚未做」）。
 
-### `EmbeddingProvider`（V0.2 Phase 0g）
+### `EmbeddingProvider`（V0.2 Phase 0g trait／Phase 3 生產 adapter）
 
-不是資料庫 port。生產實作會包 OpenSearch ml-commons `_predict`（或之後換的
-runtime）。Phase 1 的 semantic similarity 可先注入 mock，或
+不是資料庫 port。生產實作是 `storage_opensearch::MlCommonsEmbeddingProvider`，
+包 OpenSearch ml-commons `_predict`。上層測試仍可注入 mock，或
 `MockEmbeddingProvider::unsupported()` 測「還沒接語意」的路徑。
 
 五條硬約束寫進 trait，不要留給呼叫端各自小心：
@@ -581,9 +582,39 @@ runtime）。Phase 1 的 semantic similarity 可先注入 mock，或
 `content_hash` 的唯一定義是 `embedding_content_hash`：SHA-256 打在**原始
 文字** UTF-8 上，不含前綴、不含模型名。re-generate 比的是內容有沒有變。
 
+#### `MlCommonsEmbeddingProvider`（V0.2 Phase 3）
+
+`connect(url)` 啟動時用內容雜湊查兩個模型的 `model_id`，兩個都必須是
+`DEPLOYED`，否則回 `StorageError::Configuration` 並指出該跑哪支 setup
+腳本。`model_id` **快取到重啟**：重新註冊後 id 會換，V0.2 接受「換過要
+重啟服務」，每次 `embed` 重查太浪費。
+
+`model_version` 填的是內容雜湊（MiniLM 上游 `config.json` 的 SHA-256、
+e5 是**打包後 zip** 的 SHA-256），**不是** ml-commons 內部序號 `"1"`。
+MiniLM 雜湊可由環境變數 `ML_MODEL_SHA256` 覆寫，與
+`scripts/opensearch-ml-setup.sh` 同一顆變數。
+
+`embed_batch` 真的走 `_predict` 的 `text_docs` 陣列。一批裡若同時有英文
+與非英文，會拆成兩次呼叫（MiniLM／e5 各一批）再依原始順序組回——
+不能假設呼叫端永遠傳同語言。兩次呼叫**串行**，避免兩個模型同時佔
+JVM heap 觸發已知的 429 斷路器（`docs/developer/embedding.md` §4）。
+
+錯誤分類：HTTP 429／`circuit_breaking_exception` → `Timeout`（暫時性，
+可重試、把批次調小）；連不上／逾時 → `Unavailable`；回應缺
+`inference_results` 或維度不符 → `CorruptionSuspected`。對應函式是
+`classify_ml_http`，有單元測試，不靠撐爆 heap 來驗證。
+
+conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
+**唯讀查詢＋推論**，不會 undeploy／delete 模型。
+
+#### 已知限制
+
+- 換模型（重新註冊）必須重啟吃新的 `model_id`。
+- 尚未接到 Resource Guard 的 embedding 併發上限。
+- 尚未把推論延遲／429 次數接到 Operations Center metrics。
+
 ## 尚未做（不要當成已完成）
 
 - adapter metrics 接到各 adapter／Operations Center
 - 連線 semaphore 尚未接到 Resource Guard
-- `EmbeddingProvider` 的 ml-commons 實作（不要在 Phase 0g 寫）
 - SQLite 版的 `AuditLog` / `ApiTokenStore`（0006 只建了 schema，沒有 adapter）

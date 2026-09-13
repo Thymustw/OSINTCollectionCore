@@ -562,6 +562,26 @@ e5 不在 ml-commons 的 pretrained 清單，只能走 custom model，而 custom
   容器重啟後 auto-redeploy 已經在跑同一個模型。腳本會把它當成功處理，
   判斷依據是 `model_state` 而不是 task。
 
+### 7.4 Rust adapter `MlCommonsEmbeddingProvider`
+
+`crates/storage-opensearch/src/embedding.rs`。HTTP client 與
+`OpenSearchStore` 同一套（`opensearch` crate，不另引 reqwest）。
+
+- 查 `model_id`：`POST /_plugins/_ml/models/_search`，鍵是
+  `model_content_hash_value`，`must_not chunk_number`。這是 plugin
+  API，與 setup 腳本相同；不要打內部 index `/.plugins-ml-model`。
+- 推論：`POST /_plugins/_ml/_predict/text_embedding/<model_id>`，
+  body 必帶 `return_number: true` 與 `target_response: ["sentence_embedding"]`。
+- `model_id` 在 `connect` 時查一次並快取。重新註冊後必須重啟。
+- `model_version` 填內容雜湊，不是 ml-commons 的 `"1"`。
+- 混合語言的 `embed_batch` 拆成 MiniLM／e5 兩次**串行** `_predict`，
+  再依原始順序組回。
+- HTTP 429／`circuit_breaking_exception` 對成 `StorageError::Timeout`
+  （暫時性）。對應函式 `classify_ml_http` 有單元測試。
+
+conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
+**只查詢與推論，不會 undeploy／delete 模型。**
+
 ---
 
 ## 8. 未決事項（V0.2 規劃時處理，本文件不決定）
@@ -577,8 +597,12 @@ e5 不在 ml-commons 的 pretrained 清單，只能走 custom model，而 custom
   `EmbeddingVector { model, model_version, dimensions, content_hash, vector }`
   寫進 SPEC §11 的 Embedding record。`query:`／`passage:` 前綴由實作依
   `EmbeddingKind` 決定要不要加（MiniLM 不加、e5 加）；呼叫端不要自己拼。
-  生產 adapter（ml-commons `_predict`）尚未寫——Phase 0g 只定義 trait 與
-  確定性 mock。走 ingest pipeline 自動產生仍是一條可能的實作路徑，但
+  生產 adapter 是 `storage_opensearch::MlCommonsEmbeddingProvider`
+  （V0.2 Phase 3）：`connect` 時用內容雜湊查兩個 `DEPLOYED` 模型的
+  `model_id` 並快取到重啟；`embed`／`embed_batch` 打
+  `POST /_plugins/_ml/_predict/text_embedding/<id>`，`return_number`
+  必帶（否則回 base64）。混合語言批次會拆成 MiniLM／e5 兩次串行呼叫
+  再組回原順序。走 ingest pipeline 自動產生仍是一條可能的實作路徑，但
   也必須從這個 trait 出去，不能讓 indexer 直接打 ml-commons。
 
 ### 維持未決

@@ -354,6 +354,7 @@ index，而且不會報錯。
 cargo test -p indexer  --test e2e            -- --test-threads=1
 cargo test -p core-api --test search_api_e2e -- --test-threads=1
 cargo test -p storage-opensearch --test conformance
+cargo test -p storage-opensearch --test embedding_conformance
 ```
 
 ⚠️ **測試失敗（panic）時 index 不會被刪**——清理寫在測試結尾，panic 會跳過它。

@@ -20,7 +20,7 @@ crates/
   storage-core/          capability traits、錯誤、health、conformance
   storage-postgres/      CanonicalStore + RelationalStore
   storage-sqlite/        EmbeddedStore + RelationalStore
-  storage-opensearch/    SearchStore
+  storage-opensearch/    SearchStore + EmbeddingProvider（ml-commons）
   storage-redis/         KeyValueStore
   storage-s3/            ObjectStore
   storage-neo4j/         GraphStore + ProjectionStore

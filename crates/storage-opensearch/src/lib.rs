@@ -1,4 +1,12 @@
-//! OpenSearch SearchStore adapter。連線 URL 由呼叫端／設定注入，不寫死 9200。
+//! OpenSearch SearchStore adapter，以及 ml-commons [`MlCommonsEmbeddingProvider`]。
+//! 連線 URL 由呼叫端／設定注入，不寫死 9200。
+
+mod embedding;
+
+pub use embedding::{
+    E5_CONTENT_HASH, E5_MODEL_NAME, MINILM_CONTENT_HASH, MINILM_MODEL_NAME,
+    MlCommonsEmbeddingProvider, classify_ml_http,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -40,21 +48,8 @@ pub struct OpenSearchStore {
 
 impl OpenSearchStore {
     pub fn connect(url: &str) -> Result<Self, StorageError> {
-        let parsed = Url::parse(url).map_err(|err| StorageError::Configuration {
-            message: format!(
-                "OpenSearch URL `{url}` 無效：{err}。請用完整 URL，本機 dev 應為 http://127.0.0.1:19200"
-            ),
-        })?;
-        let pool = SingleNodeConnectionPool::new(parsed);
-        let transport = TransportBuilder::new(pool)
-            .disable_proxy()
-            .build()
-            .map_err(|err| StorageError::Unavailable {
-                backend: "opensearch",
-                message: StorageError::sanitize(&err.to_string()),
-            })?;
         Ok(Self {
-            client: OpenSearch::new(transport),
+            client: build_opensearch_client(url)?,
             refresh_on_write: false,
             projection_state_index: PROJECTION_STATE_INDEX.to_string(),
         })
@@ -294,7 +289,24 @@ impl OpenSearchStore {
     }
 }
 
-fn map_os(err: opensearch::Error) -> StorageError {
+pub(crate) fn build_opensearch_client(url: &str) -> Result<OpenSearch, StorageError> {
+    let parsed = Url::parse(url).map_err(|err| StorageError::Configuration {
+        message: format!(
+            "OpenSearch URL `{url}` 無效：{err}。請用完整 URL，本機 dev 應為 http://127.0.0.1:19200"
+        ),
+    })?;
+    let pool = SingleNodeConnectionPool::new(parsed);
+    let transport = TransportBuilder::new(pool)
+        .disable_proxy()
+        .build()
+        .map_err(|err| StorageError::Unavailable {
+            backend: "opensearch",
+            message: StorageError::sanitize(&err.to_string()),
+        })?;
+    Ok(OpenSearch::new(transport))
+}
+
+pub(crate) fn map_os(err: opensearch::Error) -> StorageError {
     let message = StorageError::sanitize(&err.to_string());
     if message.contains("timed out") || message.contains("timeout") {
         StorageError::Timeout {
