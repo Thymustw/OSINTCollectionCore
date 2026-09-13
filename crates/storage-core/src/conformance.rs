@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use core_model::{
-    AbsorberSnapshot, Collection, Connector, Document, DocumentType, DuplicateGroup, Entity,
-    EntityAlias, EntityExtraction, EntityIdentifier, EntityType, Event, FailedEvent, Job,
-    JobStatus, MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence,
-    Relationship, RelationshipEvidence, RelationshipType, RepointedReference, ResolutionCandidate,
-    ResolutionStatus, Source, SourceType,
+    AbsorberSnapshot, Collection, Connector, Document, DocumentType, DuplicateGroup, Embedding,
+    EmbeddingTarget, Entity, EntityAlias, EntityExtraction, EntityIdentifier, EntityType, Event,
+    FailedEvent, Job, JobStatus, MergeHistory, MergedRelationship, NetworkRule, Provenance,
+    RawEvidence, Relationship, RelationshipEvidence, RelationshipType, RepointedReference,
+    ResolutionCandidate, ResolutionStatus, Source, SourceType,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -597,6 +597,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         method: "sha256".into(),
         similarity: 1.0,
         first_seen: fixture_ts(),
+        model: None,
     };
     store.put_duplicate_group(&dup).await?;
     assert_eq_debug(
@@ -628,6 +629,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
 
     assert_v0_2_resolution_queries(store, &entity, source.id).await?;
     assert_v0_2_failed_events(store).await?;
+    assert_embedding_queries(store, document.id).await?;
 
     let missing = Uuid::now_v7();
     if store.get_document(missing).await?.is_some() {
@@ -973,6 +975,7 @@ async fn assert_dedup_queries<S: RelationalStore>(
         method: "content_sha256".into(),
         similarity: 1.0,
         first_seen: fixture_ts(),
+        model: None,
     };
     store.put_duplicate_group(&group).await?;
     let by_member = store
@@ -1688,6 +1691,153 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
             })?,
     );
 
+    Ok(())
+}
+
+/// V0.2 Phase 3 Step 1：Embedding metadata。
+///
+/// 驗四件事：put→find 命中、找不到回 None、UNIQUE 撞號回 Conflict、
+/// list_embeddings_by_target 多筆依 id 升序。
+async fn assert_embedding_queries<S: RelationalStore>(
+    store: &S,
+    target_id: Uuid,
+) -> Result<(), StorageError> {
+    let minilm = "huggingface/sentence-transformers/all-MiniLM-L6-v2";
+    let e5 = "intfloat/multilingual-e5-small-int8";
+    let hash_a = "a".repeat(64);
+    let hash_b = "b".repeat(64);
+
+    // id 先產生再排序：UUID v7 同一毫秒內後 74 bit 是隨機的，
+    // 不能假設「後寫的一定比較大」。主鍵仍用 now_v7，避免共用 Postgres
+    // 重跑 conformance 時撞到上一輪留下的固定 id。
+    let mut ids = [Uuid::now_v7(), Uuid::now_v7()];
+    ids.sort();
+    let first_id = ids[0];
+    let second_id = ids[1];
+    let first = Embedding {
+        id: first_id,
+        target_id,
+        target_type: EmbeddingTarget::DocumentBody,
+        model: minilm.into(),
+        model_version: "c".repeat(64),
+        dimensions: 384,
+        content_hash: hash_a.clone(),
+        created_at: fixture_ts(),
+    };
+    store.put_embedding(&first).await?;
+    let found = store
+        .find_embedding(target_id, EmbeddingTarget::DocumentBody, minilm, &hash_a)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "find_embedding 查不到剛寫入的 Embedding。\
+                 embedding-worker 靠這個方法判斷要不要重算，查不到就會每來一份文件都重跑推論"
+                .into(),
+        })?;
+    assert_eq_debug("find_embedding", &first, &found);
+
+    if store
+        .find_embedding(target_id, EmbeddingTarget::DocumentBody, minilm, &hash_b)
+        .await?
+        .is_some()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_embedding 對不存在的 content_hash 應回 None".into(),
+        });
+    }
+    if store
+        .find_embedding(
+            Uuid::now_v7(),
+            EmbeddingTarget::DocumentBody,
+            minilm,
+            &hash_a,
+        )
+        .await?
+        .is_some()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "find_embedding 對不存在的 target_id 應回 None".into(),
+        });
+    }
+
+    let clash = Embedding {
+        id: Uuid::now_v7(),
+        ..first.clone()
+    };
+    match store.put_embedding(&clash).await {
+        Err(StorageError::Conflict { .. }) => {}
+        other => {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "(target_id, target_type, model, content_hash) 應為 UNIQUE，重複寫入卻得到 {other:?}。\
+                     put_embedding 不是 upsert——同一個 key 出現第二次代表呼叫端沒先 find"
+                ),
+            });
+        }
+    }
+
+    // 第二筆用不同模型，同一目標應能並存（英文 MiniLM 與多語 e5 各留一筆）。
+    let second = Embedding {
+        id: second_id,
+        target_id,
+        target_type: EmbeddingTarget::DocumentBody,
+        model: e5.into(),
+        model_version: "d".repeat(64),
+        dimensions: 384,
+        content_hash: hash_a,
+        created_at: fixture_ts(),
+    };
+    store.put_embedding(&second).await?;
+
+    let listed = store
+        .list_embeddings_by_target(target_id, EmbeddingTarget::DocumentBody, 10)
+        .await?;
+    let ours: Vec<_> = listed
+        .iter()
+        .filter(|e| e.id == first.id || e.id == second.id)
+        .collect();
+    if ours.len() != 2 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_embeddings_by_target 應回剛寫的 2 筆（不同模型），實際 {} 筆",
+                ours.len()
+            ),
+        });
+    }
+    if ours[0].id >= ours[1].id {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_embeddings_by_target 應依 id 升序，實際 {} 然後 {}",
+                ours[0].id, ours[1].id
+            ),
+        });
+    }
+    if listed
+        .iter()
+        .any(|e| e.target_id != target_id || e.target_type != EmbeddingTarget::DocumentBody)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_embeddings_by_target 回了不屬於該目標的列".into(),
+        });
+    }
+
+    let other_type = store
+        .list_embeddings_by_target(target_id, EmbeddingTarget::DocumentTitle, 10)
+        .await?;
+    if other_type
+        .iter()
+        .any(|e| e.id == first.id || e.id == second.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_embeddings_by_target 不該把 DocumentBody 的列算進 DocumentTitle".into(),
+        });
+    }
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 use core_model::{
-    Collection, Connector, Document, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
-    EntityIdentifier, Event, FailedEvent, Job, MergeHistory, MergedRelationship, NetworkRule,
-    Provenance, RawEvidence, Relationship, RelationshipEvidence, RepointedReference,
+    Collection, Connector, Document, DuplicateGroup, Embedding, Entity, EntityAlias,
+    EntityExtraction, EntityIdentifier, Event, FailedEvent, Job, MergeHistory, MergedRelationship,
+    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, RepointedReference,
     ResolutionCandidate, Source,
 };
 use serde_json::Value;
@@ -275,6 +275,20 @@ pub fn duplicate_group(row: &PgRow) -> Result<DuplicateGroup, StorageError> {
         method: get(row, "method")?,
         similarity: get(row, "similarity")?,
         first_seen: get(row, "first_seen")?,
+        model: get(row, "model")?,
+    })
+}
+
+pub fn embedding(row: &PgRow) -> Result<Embedding, StorageError> {
+    Ok(Embedding {
+        id: get(row, "id")?,
+        target_id: get(row, "target_id")?,
+        target_type: decode_enum(&get::<String>(row, "target_type")?, "target_type")?,
+        model: get(row, "model")?,
+        model_version: get(row, "model_version")?,
+        dimensions: get(row, "dimensions")?,
+        content_hash: get(row, "content_hash")?,
+        created_at: get(row, "created_at")?,
     })
 }
 

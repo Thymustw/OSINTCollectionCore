@@ -615,6 +615,8 @@ impl Deduplicator {
             method: hit.stage.as_str().into(),
             similarity: hit.similarity,
             first_seen,
+            // Stage 1-4 不靠模型；Stage 5（語意判定）才填。SPEC §17。
+            model: None,
         };
         self.store.put_duplicate_group(&group).await?;
         Ok(id)

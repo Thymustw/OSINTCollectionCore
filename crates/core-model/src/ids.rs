@@ -26,3 +26,4 @@ pub type EntityIdentifierId = Uuid;
 pub type ResolutionCandidateId = Uuid;
 pub type MergeHistoryId = Uuid;
 pub type FailedEventId = Uuid;
+pub type EmbeddingId = Uuid;

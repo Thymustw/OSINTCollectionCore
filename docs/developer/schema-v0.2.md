@@ -192,6 +192,48 @@ merge 把指向 merged Entity 的端點改成 survivor 時，可能撞到 surviv
 不必再回表排序。這不是 UNIQUE——同一個值出現在不同 namespace 是這個方法
 要抓的訊號。
 
+## Migration 0010：`embeddings`（Phase 3 Step 1）
+
+`migrations/postgres/0010_v0_2_embeddings.sql` 與
+`migrations/sqlite/0010_v0_2_embeddings.sql`。
+
+PostgreSQL **只存 embedding metadata**，不含向量本體——向量只投影進
+OpenSearch k-NN index（Step 2）。這張表回答「這個目標、這個模型、
+這個內容雜湊算過了沒」，給 embedding-worker 判斷要不要重算。
+
+| 欄位 | 型別（PG／SQLite） | 說明 |
+|---|---|---|
+| `id` | UUID／TEXT | 主鍵 |
+| `target_id` | UUID／TEXT | 目標物件。**沒有 FK**：目標可以是 Document／Entity／Event |
+| `target_type` | TEXT | `EmbeddingTarget`（`document_title`／`document_body`／`entity_description`／`event_description`） |
+| `model` | TEXT | 例如 `huggingface/sentence-transformers/all-MiniLM-L6-v2` |
+| `model_version` | TEXT | 模型內容 SHA-256，**不是** ml-commons 內部序號 |
+| `dimensions` | INTEGER | 向量維度 |
+| `content_hash` | TEXT | 原始文字（不含 query:/passage: 前綴）的 SHA-256 |
+| `created_at` | TIMESTAMPTZ／TEXT | 寫入時間 |
+
+唯一鍵 `idx_embeddings_target_model_hash (target_id, target_type, model, content_hash)`：
+同一個 key 出現第二次代表呼叫端沒先 `find_embedding`。`put_embedding` **不是 upsert**，
+撞號回 `StorageError::Conflict`。`list_embeddings_by_target` 依 `id` 升序，`limit` 夾在 1..=100。
+對應 `RelationalStore` 三個方法都在 postgres／sqlite adapter 實作。
+設定在 `config/default.toml` 的 `[embedding]`（`EmbeddingSection`）與
+`[search_hybrid]`（`HybridSearchSection`）。
+
+
+對應型別：`Embedding`（`crates/core-model/src/embedding.rs`）、
+`EmbeddingTarget`（`crates/core-model/src/enums.rs`）、`EmbeddingId`。
+
+> ⚠️ **Step 1 只建 schema 與 storage port；沒有 embedding-worker、沒有 API。**
+> 表是空的是預期結果。
+
+## Migration 0011：`duplicate_groups.model`（Phase 3 Step 1）
+
+`migrations/postgres/0011_v0_2_duplicate_group_model.sql` 與
+`migrations/sqlite/0011_v0_2_duplicate_group_model.sql`。
+
+Semantic Dedup（SPEC §17「method/model」）的模型名稱寫在 `DuplicateGroup.model`。
+Stage 1-4 的方法不靠模型，欄位是 `NULL`；Stage 5 才填。
+
 ## 對照 V0.1 的 `/ops/dlq`
 
 ADR-008 的 `GET /api/v1/ops/dlq` 目前仍回 `dlq_topic: null` + 失敗的 **Job** 清單。

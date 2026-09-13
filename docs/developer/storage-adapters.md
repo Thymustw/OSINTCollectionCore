@@ -47,7 +47,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `CanonicalStore` | `storage-postgres` | PostgreSQL 17（Core 真實來源） |
 | `EmbeddedStore` | `storage-sqlite` | SQLite（本機／App／投影，不是高併發 canonical） |
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
-| `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`，見 `schema-v0.2.md`） |
+| `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`）；Phase 3 Step 1 再加 `0010`（`embeddings` metadata，`put_embedding` **不是** upsert）與 `0011`（`duplicate_groups.model`）。見 `schema-v0.2.md` |
 | `SearchStore` | `storage-opensearch` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`query`／`search`／`delete`） |
 | `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
 | `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |

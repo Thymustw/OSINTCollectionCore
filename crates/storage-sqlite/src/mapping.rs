@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use core_model::{
-    Collection, Connector, Document, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
-    EntityIdentifier, Event, FailedEvent, Job, MergeHistory, MergedRelationship, NetworkRule,
-    Provenance, RawEvidence, Relationship, RelationshipEvidence, RepointedReference,
+    Collection, Connector, Document, DuplicateGroup, Embedding, Entity, EntityAlias,
+    EntityExtraction, EntityIdentifier, Event, FailedEvent, Job, MergeHistory, MergedRelationship,
+    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, RepointedReference,
     ResolutionCandidate, Source,
 };
 use serde_json::Value;
@@ -348,6 +348,20 @@ pub fn duplicate_group(row: &SqliteRow) -> Result<DuplicateGroup, StorageError> 
         method: get_str(row, "method")?,
         similarity: get_f64(row, "similarity")?,
         first_seen: ts(row, "first_seen")?,
+        model: get_opt_str(row, "model")?,
+    })
+}
+
+pub fn embedding(row: &SqliteRow) -> Result<Embedding, StorageError> {
+    Ok(Embedding {
+        id: uuid_from(row, "id")?,
+        target_id: uuid_from(row, "target_id")?,
+        target_type: decode_enum(&get_str(row, "target_type")?, "target_type")?,
+        model: get_str(row, "model")?,
+        model_version: get_str(row, "model_version")?,
+        dimensions: i32_from(row, "dimensions")?,
+        content_hash: get_str(row, "content_hash")?,
+        created_at: ts(row, "created_at")?,
     })
 }
 

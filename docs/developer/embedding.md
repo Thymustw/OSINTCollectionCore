@@ -605,11 +605,27 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
   再組回原順序。走 ingest pipeline 自動產生仍是一條可能的實作路徑，但
   也必須從這個 trait 出去，不能讓 indexer 直接打 ml-commons。
 
+### 已由 Phase 3 Step 1 接住（schema／config，還沒有 worker）
+
+- **PostgreSQL 存 embedding metadata**：`embeddings` 表（migration `0010`）
+  只記「這個目標、這個模型、這個內容雜湊算過了」。向量本體仍不在這裡，
+  等 Step 2 的 OpenSearch k-NN 投影。re-generate 走
+  `RelationalStore::find_embedding`；`put_embedding` 撞 UNIQUE 回 Conflict，
+  不是 upsert。
+- **`[embedding]`／`[search_hybrid]` config**：batch／併發／cosine 門檻與
+  hybrid RRF 權重。OpenSearch URL **不**另開一份，沿用 `[storage.search].url`。
+  `similarity_threshold` 預設 0.90 是**暫定值**（e5-small 不相關文字也有
+  ~0.83，見 §5），Step 6 要用真實 OSINT 語料重校。hybrid 的
+  entity_match／recency／source_score／confidence 權重預設 0.0（Step 5 才接）。
+- **Semantic Dedup 的 model 欄位**：`duplicate_groups.model`（migration `0011`）。
+  Stage 1-4 是 `NULL`；Stage 5 才填模型名稱。
+
 ### 維持未決
 
 - **兩個模型的向量能不能放同一個欄位**：維度都是 384，mapping 可共用，
   但**不同模型的向量空間不相通**，混在同一個欄位做 k-NN 會得到無意義的
-  鄰居。要嘛分欄位、要嘛分 index，這要在 SPEC §14 定案。trait 只保證呼叫端
+  鄰居。要嘛分欄位、要嘛分 index，這要在 SPEC §14 定案（Step 2 會拆成
+  `embedding_en`／`embedding_multi` 兩個欄位）。trait 只保證呼叫端
   一定問得到 `model_for`／`EmbeddingVector.model`，沒有替你拆欄位。
 - k-NN index 的 `space_type`（MiniLM 上游宣告 `l2`；e5 已 normalize，
   cosine 與內積等價）與 mapping 版本化（SPEC §14）。

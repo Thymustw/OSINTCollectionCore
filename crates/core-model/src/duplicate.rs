@@ -16,4 +16,7 @@ pub struct DuplicateGroup {
     pub method: String,
     pub similarity: f64,
     pub first_seen: DateTime<Utc>,
+    /// 語意判定用的模型名稱（`Some` 才是 Stage 5 真的判的；Stage 1-4
+    /// 的方法不靠模型，是 `None`）。SPEC §17「method/model」。
+    pub model: Option<String>,
 }

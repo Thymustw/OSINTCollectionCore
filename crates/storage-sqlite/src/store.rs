@@ -5,12 +5,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-    DuplicateGroup, DuplicateGroupId, Entity, EntityAlias, EntityAliasId, EntityExtraction,
-    EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId, EntityType, Event, EventId,
-    FailedEvent, FailedEventId, Job, JobId, JobStatus, MergeHistory, MergeHistoryId, NetworkRule,
-    NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship,
-    RelationshipEvidence, RelationshipEvidenceId, RelationshipId, RelationshipType,
-    ResolutionCandidate, ResolutionCandidateId, ResolutionStatus, Source, SourceId,
+    DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity, EntityAlias,
+    EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
+    EntityIdentifierId, EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId,
+    JobStatus, MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
+    ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
+    RelationshipEvidenceId, RelationshipId, RelationshipType, ResolutionCandidate,
+    ResolutionCandidateId, ResolutionStatus, Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -1598,15 +1599,16 @@ impl RelationalStore for SqliteEmbeddedStore {
             r#"
             INSERT INTO duplicate_groups (
                 id, canonical_object_id, member_object_id, member_raw_evidence_id,
-                method, similarity, first_seen
-            ) VALUES (?,?,?,?,?,?,?)
+                method, similarity, first_seen, model
+            ) VALUES (?,?,?,?,?,?,?,?)
             ON CONFLICT (id) DO UPDATE SET
                 canonical_object_id = excluded.canonical_object_id,
                 member_object_id = excluded.member_object_id,
                 member_raw_evidence_id = excluded.member_raw_evidence_id,
                 method = excluded.method,
                 similarity = excluded.similarity,
-                first_seen = excluded.first_seen
+                first_seen = excluded.first_seen,
+                model = excluded.model
             "#,
         )
         .bind(uuid_text(group.id))
@@ -1616,6 +1618,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(&group.method)
         .bind(group.similarity)
         .bind(rfc3339(group.first_seen))
+        .bind(&group.model)
         .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
@@ -2174,5 +2177,76 @@ impl RelationalStore for SqliteEmbeddedStore {
             .await
             .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // ===== V0.2 Phase 3 Step 1：Embedding metadata =====
+
+    async fn put_embedding(&self, embedding: &Embedding) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO embeddings (
+                id, target_id, target_type, model, model_version, dimensions,
+                content_hash, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            "#,
+        )
+        .bind(uuid_text(embedding.id))
+        .bind(uuid_text(embedding.target_id))
+        .bind(encode_enum(&embedding.target_type)?)
+        .bind(&embedding.model)
+        .bind(&embedding.model_version)
+        .bind(i64::from(embedding.dimensions))
+        .bind(&embedding.content_hash)
+        .bind(rfc3339(embedding.created_at))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn find_embedding(
+        &self,
+        target_id: ObjectId,
+        target_type: EmbeddingTarget,
+        model: &str,
+        content_hash: &str,
+    ) -> Result<Option<Embedding>, StorageError> {
+        let row = sqlx::query(
+            r#"
+            SELECT * FROM embeddings
+            WHERE target_id = ?1 AND target_type = ?2 AND model = ?3 AND content_hash = ?4
+            "#,
+        )
+        .bind(uuid_text(target_id))
+        .bind(encode_enum(&target_type)?)
+        .bind(model)
+        .bind(content_hash)
+        .fetch_optional(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        row.as_ref().map(mapping::embedding).transpose()
+    }
+
+    async fn list_embeddings_by_target(
+        &self,
+        target_id: ObjectId,
+        target_type: EmbeddingTarget,
+        limit: u32,
+    ) -> Result<Vec<Embedding>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM embeddings
+            WHERE target_id = ?1 AND target_type = ?2
+            ORDER BY id ASC
+            LIMIT ?3
+            "#,
+        )
+        .bind(uuid_text(target_id))
+        .bind(encode_enum(&target_type)?)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::embedding).collect()
     }
 }

@@ -37,6 +37,10 @@ pub struct AppConfig {
     pub graph_worker: GraphWorkerSection,
     #[serde(default)]
     pub import: ImportSection,
+    #[serde(default)]
+    pub embedding: EmbeddingSection,
+    #[serde(default)]
+    pub search_hybrid: HybridSearchSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,6 +394,68 @@ impl Default for ImportSection {
     }
 }
 
+/// Embedding 產生的參數（V0.2 Phase 3）。OpenSearch 連線位址**不**在這裡——
+/// 直接沿用 `[storage.search].url`，ml-commons 跑在同一個 OpenSearch 叢集上，
+/// 兩個各自維護一份 URL 只會製造「兩者不一致」的坑。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingSection {
+    /// `embed_batch` 一次送幾筆給 ml-commons `_predict`。
+    pub batch_size: usize,
+    /// 同時進行中的推論請求數上限（bounded semaphore，CLAUDE.md §6）。
+    pub concurrent_inferences: usize,
+    /// Semantic dedup／resolver 語意比對的 cosine 門檻。
+    ///
+    /// ⚠️ **這個預設值是暫定的，不是校準過的。** e5-small 的 baseline cosine
+    /// 很高（不相關文字也有 ~0.83，見 docs/developer/embedding.md §5），
+    /// resolver 舊的 0.85 常數離這個 baseline 太近，容易誤判。Phase 3 Step 6
+    /// （Semantic Dedup）要用真實 OSINT 語料重新校準，這裡先給一個保守值，
+    /// 不要在 Step 6 之前假設這個數字是對的。
+    pub similarity_threshold: f64,
+}
+
+impl Default for EmbeddingSection {
+    fn default() -> Self {
+        Self {
+            batch_size: 32,
+            concurrent_inferences: 4,
+            similarity_threshold: 0.90,
+        }
+    }
+}
+
+/// Hybrid search（`POST /search/hybrid`，SPEC §15）的排序權重。
+///
+/// SPEC 明講「權重放 config，不可 hardcode route handler」。V0.2 用 RRF
+/// （Reciprocal Rank Fusion）合成各訊號的排名，不是加權和——RRF 不需要
+/// 把 BM25 分數與 cosine 分數強行對齊到同一個範圍。權重是「這個訊號在
+/// RRF 公式裡的比重」，不是原始分數的乘數。
+///
+/// `entity_match`／`recency`／`source_score`／`confidence` 預設 0.0
+/// （等於停用，只留 BM25＋vector）：Step 5 才會真的接上這些訊號的計算
+/// 邏輯，現在把它們的權重設非零會誤導看設定檔的人以為已經生效。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HybridSearchSection {
+    pub bm25_weight: f64,
+    pub vector_weight: f64,
+    pub entity_match_weight: f64,
+    pub recency_weight: f64,
+    pub source_score_weight: f64,
+    pub confidence_weight: f64,
+}
+
+impl Default for HybridSearchSection {
+    fn default() -> Self {
+        Self {
+            bm25_weight: 1.0,
+            vector_weight: 1.0,
+            entity_match_weight: 0.0,
+            recency_weight: 0.0,
+            source_score_weight: 0.0,
+            confidence_weight: 0.0,
+        }
+    }
+}
+
 /// 設定載入失敗。訊息會指出缺哪個檔／哪個鍵，以及建議怎麼修。
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -543,6 +609,15 @@ mod tests {
         assert_eq!(cfg.import.max_field_bytes, 65_536);
         assert_eq!(cfg.import.max_depth, 32);
         assert_eq!(cfg.import.max_columns, 512);
+        assert_eq!(cfg.embedding.batch_size, 32);
+        assert_eq!(cfg.embedding.concurrent_inferences, 4);
+        assert_eq!(cfg.embedding.similarity_threshold, 0.90);
+        assert_eq!(cfg.search_hybrid.bm25_weight, 1.0);
+        assert_eq!(cfg.search_hybrid.vector_weight, 1.0);
+        assert_eq!(cfg.search_hybrid.entity_match_weight, 0.0);
+        assert_eq!(cfg.search_hybrid.recency_weight, 0.0);
+        assert_eq!(cfg.search_hybrid.source_score_weight, 0.0);
+        assert_eq!(cfg.search_hybrid.confidence_weight, 0.0);
     }
 
     #[test]
@@ -635,5 +710,21 @@ mod tests {
             serde_json::from_value(value).unwrap()
         };
         assert_eq!(parsed.graph_worker, GraphWorkerSection::default());
+    }
+
+    #[test]
+    fn missing_embedding_and_hybrid_sections_do_not_fail_load() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        let parsed: AppConfig = {
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            let obj = value.as_object_mut().unwrap();
+            obj.remove("embedding");
+            obj.remove("search_hybrid");
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(parsed.embedding, EmbeddingSection::default());
+        assert_eq!(parsed.search_hybrid, HybridSearchSection::default());
     }
 }

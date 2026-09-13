@@ -95,3 +95,13 @@ pub enum ResolutionStatus {
     Rejected,
     AutoConfirmed,
 }
+
+/// Embedding 目標種類（SPEC §12）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingTarget {
+    DocumentTitle,
+    DocumentBody,
+    EntityDescription,
+    EventDescription,
+}

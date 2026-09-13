@@ -135,3 +135,27 @@ max_record_bytes = 262144
 max_field_bytes = 65536
 max_depth = 32
 max_columns = 512
+
+# Embedding 產生參數（V0.2 Phase 3）。OpenSearch 連線沿用 [storage.search].url，
+# 不要在這裡再放一份 URL。
+[embedding]
+# embed_batch 一次送幾筆給 ml-commons _predict。
+batch_size = 32
+# 同時進行中的推論請求數上限（bounded semaphore，CLAUDE.md §6）。
+concurrent_inferences = 4
+# Semantic dedup／resolver 語意比對的 cosine 門檻。
+# ⚠️ 暫定值，不是校準過的。e5-small 不相關文字也有 ~0.83（embedding.md §5），
+# Phase 3 Step 6 要用真實 OSINT 語料重校，不要在那之前假設 0.90 是對的。
+similarity_threshold = 0.90
+
+# Hybrid search（POST /search/hybrid，SPEC §15）的 RRF 權重。
+# 權重是「這個訊號在 RRF 公式裡的比重」，不是原始分數的乘數。
+# entity_match／recency／source_score／confidence 預設 0.0（停用）——
+# Step 5 才會接上這些訊號，現在設非零會讓人以為已經生效。
+[search_hybrid]
+bm25_weight = 1.0
+vector_weight = 1.0
+entity_match_weight = 0.0
+recency_weight = 0.0
+source_score_weight = 0.0
+confidence_weight = 0.0

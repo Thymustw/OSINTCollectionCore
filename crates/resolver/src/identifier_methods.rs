@@ -318,12 +318,13 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use core_model::{
         Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-        DuplicateGroup, DuplicateGroupId, EntityAlias, EntityAliasId, EntityExtraction,
-        EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId, EntityType, Event,
-        EventId, FailedEvent, FailedEventId, Job, JobId, JobStatus, MergeHistory, MergeHistoryId,
-        NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId,
-        Relationship, RelationshipEvidence, RelationshipEvidenceId, RelationshipId,
-        RelationshipType, ResolutionCandidateId, Source, SourceId,
+        DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, EntityAlias, EntityAliasId,
+        EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId,
+        EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId, JobStatus,
+        MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
+        ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
+        RelationshipEvidenceId, RelationshipId, RelationshipType, ResolutionCandidateId, Source,
+        SourceId,
     };
     use serde_json::json;
     use storage_core::health::{HealthProvider, StorageHealth};
@@ -1000,6 +1001,26 @@ mod tests {
             _: chrono::DateTime<Utc>,
         ) -> Result<bool, StorageError> {
             Self::unsupported("mark_replayed")
+        }
+        async fn put_embedding(&self, _: &Embedding) -> Result<(), StorageError> {
+            Self::unsupported("put_embedding")
+        }
+        async fn find_embedding(
+            &self,
+            _: ObjectId,
+            _: EmbeddingTarget,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Embedding>, StorageError> {
+            Self::unsupported("find_embedding")
+        }
+        async fn list_embeddings_by_target(
+            &self,
+            _: ObjectId,
+            _: EmbeddingTarget,
+            _: u32,
+        ) -> Result<Vec<Embedding>, StorageError> {
+            Self::unsupported("list_embeddings_by_target")
         }
     }
 

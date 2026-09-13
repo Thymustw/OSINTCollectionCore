@@ -8,6 +8,7 @@ pub mod connector;
 pub mod content;
 pub mod document;
 pub mod duplicate;
+pub mod embedding;
 pub mod entity;
 pub mod entity_alias;
 pub mod entity_identifier;
@@ -31,11 +32,13 @@ pub use connector::Connector;
 pub use content::{content_hash, normalize_content};
 pub use document::Document;
 pub use duplicate::DuplicateGroup;
+pub use embedding::Embedding;
 pub use entity::Entity;
 pub use entity_alias::EntityAlias;
 pub use entity_identifier::EntityIdentifier;
 pub use enums::{
-    DocumentType, EntityType, JobStatus, RelationshipType, ResolutionStatus, SourceType,
+    DocumentType, EmbeddingTarget, EntityType, JobStatus, RelationshipType, ResolutionStatus,
+    SourceType,
 };
 pub use event::Event;
 pub use extraction::EntityExtraction;
@@ -258,8 +261,19 @@ mod tests {
             method: "sha256".into(),
             similarity: 1.0,
             first_seen: ts(),
+            model: None,
         };
         assert_eq!(round_trip(&dup), dup);
+
+        let semantic = DuplicateGroup {
+            method: "semantic".into(),
+            similarity: 0.92,
+            model: Some("intfloat/multilingual-e5-small-int8".into()),
+            ..dup.clone()
+        };
+        assert_eq!(round_trip(&semantic), semantic);
+        let v = serde_json::to_value(&semantic).unwrap();
+        assert_eq!(v["model"], "intfloat/multilingual-e5-small-int8");
 
         let extraction = EntityExtraction {
             id: id(),
@@ -468,6 +482,23 @@ mod tests {
         assert_eq!(sorted.len(), before, "RESOLUTION_METHODS 有重複名稱");
         // SPEC §6 要求「至少」這十種。少一個就代表清單被改壞了。
         assert_eq!(RESOLUTION_METHODS.len(), 10);
+    }
+
+    #[test]
+    fn embedding_round_trip() {
+        let original = Embedding {
+            id: id(),
+            target_id: id(),
+            target_type: EmbeddingTarget::DocumentTitle,
+            model: "huggingface/sentence-transformers/all-MiniLM-L6-v2".into(),
+            model_version: "c".repeat(64),
+            dimensions: 384,
+            content_hash: "d".repeat(64),
+            created_at: ts(),
+        };
+        assert_eq!(round_trip(&original), original);
+        let v: Value = serde_json::to_value(&original).unwrap();
+        assert_eq!(v["target_type"], "document_title");
     }
 
     #[test]

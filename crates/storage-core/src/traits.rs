@@ -7,12 +7,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use core_model::{
     Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-    DuplicateGroup, DuplicateGroupId, Entity, EntityAlias, EntityAliasId, EntityExtraction,
-    EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId, EntityType, Event, EventId,
-    FailedEvent, FailedEventId, Job, JobId, JobStatus, MergeHistory, MergeHistoryId, NetworkRule,
-    NetworkRuleId, ObjectId, Provenance, ProvenanceId, RawEvidence, RawEvidenceId, Relationship,
-    RelationshipEvidence, RelationshipEvidenceId, RelationshipId, RelationshipType,
-    ResolutionCandidate, ResolutionCandidateId, ResolutionStatus, Source, SourceId,
+    DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity, EntityAlias,
+    EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
+    EntityIdentifierId, EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId,
+    JobStatus, MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
+    ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
+    RelationshipEvidenceId, RelationshipId, RelationshipType, ResolutionCandidate,
+    ResolutionCandidateId, ResolutionStatus, Source, SourceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -607,6 +608,36 @@ pub trait RelationalStore: HealthProvider {
         id: FailedEventId,
         replayed_at: DateTime<Utc>,
     ) -> Result<bool, StorageError>;
+
+    // =========================================================================
+    // ===== V0.2 Phase 3 Step 1：Embedding metadata =====
+    //
+    // Schema 在 `migrations/*/0010_v0_2_embeddings.sql`。**不含向量本體**。
+    // =========================================================================
+
+    /// 寫入一筆 Embedding metadata。**不是 upsert**。
+    ///
+    /// 撞到 `idx_embeddings_target_model_hash`（同一目標、同一模型、同一內容雜湊）
+    /// 或主鍵時回 [`StorageError::Conflict`]。同一個 key 出現第二次代表呼叫端
+    /// 邏輯有問題——應該先 [`RelationalStore::find_embedding`] 確認不存在才 `put`。
+    async fn put_embedding(&self, embedding: &Embedding) -> Result<(), StorageError>;
+    /// 查「這個目標、這個模型、這個內容雜湊」算過了沒——re-generate 判斷的
+    /// 唯一入口，Step 3 的 embedding-worker 靠這個決定要不要重算。
+    async fn find_embedding(
+        &self,
+        target_id: ObjectId,
+        target_type: EmbeddingTarget,
+        model: &str,
+        content_hash: &str,
+    ) -> Result<Option<Embedding>, StorageError>;
+    /// 查一個目標的所有 embedding（不同模型／語言可能各留一筆）。
+    /// `limit` 夾在 1..=100，依 `id` 升序。
+    async fn list_embeddings_by_target(
+        &self,
+        target_id: ObjectId,
+        target_type: EmbeddingTarget,
+        limit: u32,
+    ) -> Result<Vec<Embedding>, StorageError>;
 }
 
 /// Dedup Stage 4 的候選列。

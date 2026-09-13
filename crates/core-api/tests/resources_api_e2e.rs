@@ -905,6 +905,7 @@ async fn object_detail_carries_the_provenance_chain() {
             method: "content_hash".into(),
             similarity: 1.0,
             first_seen: Utc::now(),
+            model: None,
         })
         .await
         .expect("seed group");
