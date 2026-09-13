@@ -13,6 +13,10 @@ yanked = "deny"
 # 這裡多一條 ID、那邊沒有對應紀錄，就是流程違規，不是合法例外。
 ignore = [
     "RUSTSEC-2023-0071", # rsa (Marvin Attack)，經 jsonwebtoken 帶入，見 VULNERABILITY_TRIAGE.md
+    "RUSTSEC-2025-0012", # backoff unmaintained，經 neo4rs 帶入，見 VULNERABILITY_TRIAGE.md
+    "RUSTSEC-2024-0384", # instant unmaintained，經 backoff→neo4rs 帶入，見 VULNERABILITY_TRIAGE.md
+    "RUSTSEC-2024-0436", # paste unmaintained，經 neo4rs 帶入，見 VULNERABILITY_TRIAGE.md
+    "RUSTSEC-2025-0134", # rustls-pemfile unmaintained，經 neo4rs 帶入，見 VULNERABILITY_TRIAGE.md
 ]
 
 [licenses]
