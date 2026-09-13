@@ -29,11 +29,13 @@ crates/storage-sqlite        EmbeddedStore + RelationalStore（sqlx 0.9 sqlite�
 crates/storage-opensearch    SearchStore（opensearch 2.4.0、rustls-tls）
 crates/storage-redis         KeyValueStore（redis =1.2.2；workspace rust-version 1.85）
 crates/storage-s3            ObjectStore（object_store 0.14.1 aws + reqwest/rustls）
+crates/storage-neo4j         GraphStore + ProjectionStore（neo4rs 0.8.0）
 ```
 
-`storage-neo4j` 尚未建立（V0.2 Phase 2）。`GraphStore`／`EmbeddingProvider`
-trait 與記憶體 mock 已在 `storage-core`（V0.2 Phase 0g）；上層測試先注入
-`storage_core::mock::{MockGraphStore, MockEmbeddingProvider}`。
+`GraphStore`／`EmbeddingProvider` trait 與記憶體 mock 在 `storage-core`
+（V0.2 Phase 0g）。上層測試仍可注入
+`storage_core::mock::{MockGraphStore, MockEmbeddingProvider}`；
+真實圖投影走 `storage-neo4j`。
 
 Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注入。
 
@@ -46,8 +48,8 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
 | `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`，見 `schema-v0.2.md`） |
 | `SearchStore` | `storage-opensearch` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`query`／`search`／`delete`） |
-| `ProjectionStore` | `storage-opensearch` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
-| `GraphStore` | **尚未**（Phase 2 `storage-neo4j`）；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g）。見下方「`GraphStore`」 |
+| `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
+| `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |
 | `EmbeddingProvider` | **尚未**（ml-commons adapter）；mock：`storage_core::mock::MockEmbeddingProvider` | 文字→向量（V0.2 Phase 0g）。見下方「`EmbeddingProvider`」 |
 | `KeyValueStore` | `storage-redis` | get/set/set_ex/del/expire |
 | `ObjectStore` | `storage-s3` | MinIO put/get/delete/exists |
@@ -229,6 +231,12 @@ graph-worker／DLQ 重放仍沒有生產呼叫端。
 - OpenSearch：index 名 `osint-core-conformance-<uuid>`；`assert_opensearch_identity`（拒絕 Elasticsearch tagline `You Know, for Search`）是唯一的環境無關身分驗證。`verify_not_opencti_search`（函式名稱裡的 `opencti` 反映了原始撰寫時的本機衝突對象，函式名稱本身沒有改）只在本機 `.env` 設了 `OSINT_STRICT_PORT_ISOLATION=1` 時才額外擋埠 9200——這是本機專屬防線，不是通則，CI 等其他環境不會擋。ADR-005 的決策：該 port-isolation guard 原本被寫死為無條件規則，結果第一次 CI run 就失敗（CI 沒有那個本機衝突，`docker/docker-compose.yml` 正確地把 OpenSearch 綁在 9200，卻被 hard-coded 規則拒絕）；決策是把 hard rejection 改成由 `OSINT_STRICT_PORT_ISOLATION=1` opt-in，並改以 `assert_opensearch_identity` 驗實際遠端身分（環境無關），而非用 port 號推斷。
 - S3：key prefix `conformance/<uuid>`；`verify_not_opencti_s3`（函式名稱同上，反映本機原始衝突對象）同樣只在本機開 `OSINT_STRICT_PORT_ISOLATION=1` 時才擋埠 9000。MinIO 沒有等同 OpenSearch 的身分驗證 API，所以這是目前唯一防線，僅在已知衝突的機器生效。可 `ensure_bucket`（`object_store` 本身沒有 CreateBucket，adapter 用同一套 rustls HTTP client 簽 SigV4 打 `PUT /{bucket}`），不清空既有物件。測試另外用 `delete_empty_bucket`（同樣是 SigV4 `DELETE /{bucket}`）清掉為驗證新建而建的空 bucket。
 - Redis：key prefix `osint-core-conformance:`；TTL 用毫秒（PSETEX / PEXPIRE）。
+- Neo4j GraphStore：`assert_graph_store_contract`，節點／邊用 per-run UUID，測完
+  `delete_node`（`DETACH DELETE`）清掉。**不 DROP constraint**。
+  `GRAPH_MAX_HOPS` 是 adapter 硬上限 10；`KNOWN_RELATIONSHIP_TYPES` 是建
+  relationship uniqueness 的那 13 種。ProjectionStore 用 per-run 名稱
+  `osint-conformance-graph-<uuid>`，測完 `reset_projection`（只刪
+  `:ProjectionState` 那一點）。
 
 跑測試前：
 
@@ -337,8 +345,8 @@ merge 橫跨 `entities`／`entity_aliases`／`entity_identifiers`／`relationshi
 
 ## `ProjectionStore`（V0.2 Phase 0f）
 
-投影的**進度與重建狀態**。介面在 `storage_core::traits`，目前只有
-`storage-opensearch` 實作（Neo4j 是 Phase 0g 之後）。
+投影的**進度與重建狀態**。介面在 `storage_core::traits`，
+`storage-opensearch` 與 `storage-neo4j` 都實作。
 
 ```rust
 store.checkpoint("osint-documents").await?          // Option<ProjectionCheckpoint>
@@ -435,8 +443,7 @@ indexer 的兩支 rebuild e2e 從超過 60 s（各自）降到兩支合計 20.6 
 PostgreSQL 仍是 relationship truth。這個 trait 是圖**投影**的寫入與查詢面
 （SPEC_V0.2 §8／§9）。`POST /graph/rebuild` 走 `ProjectionStore`，不在這裡。
 
-Neo4j adapter 之後要**同時**實作 `GraphStore` + `ProjectionStore`（對照表
-本來就這樣標）。Phase 0g 只定義 trait；沒有 `storage-neo4j` crate。
+Neo4j adapter（`storage-neo4j`）同時實作 `GraphStore` + `ProjectionStore`。
 
 | 方法 | 對應 Graph API | 備註 |
 |---|---|---|
@@ -456,6 +463,79 @@ Neo4j adapter 之後要**同時**實作 `GraphStore` + `ProjectionStore`（對�
 不是 `last_seen` 落在區間內。
 
 沒有「原始查詢字串」的後門。運維臨時查詢走 Neo4j Browser。
+
+### `storage-neo4j`（V0.2 Phase 2）
+
+真實圖投影。連線由呼叫端注入（`Neo4jStore::connect(bolt_uri, username, password, pool_max)`），
+**不**讀 env、不寫死 `bolt://127.0.0.1:7687`。驅動是 `neo4rs 0.8.0`（穩定版，不用 0.9 RC）。
+
+```rust
+let store = Neo4jStore::connect(&uri, &user, &password, 5).await?;
+store.health().await?;
+store.upsert_node(&node).await?;
+store.upsert_edge(&edge).await?;
+```
+
+啟動時 `connect` 會呼叫 `ensure_constraints`（也可單獨再跑；`IF NOT EXISTS` 冪等）：
+
+- `:Entity` 上 `entity_id` unique
+- `core_model::RelationshipType` 的 13 個變體各一條 relationship uniqueness
+  （`relationship_id`）。Community 版的這個 constraint **必須綁特定關聯型別**，
+  不能寫一條涵蓋全部型別的。執行期才出現的未知型別字串不建 constraint，
+  靠 `MERGE (s)-[r:$($relType)]->(t)` 保證同一對同一型別只有一條。
+
+#### Cypher schema
+
+| 東西 | 決定 | 為什麼 |
+|---|---|---|
+| 節點 label | `:Entity` + 具體型別（`person` → `:Person`，`snake_to_pascal`） | 共用 constraint 掛 `:Entity`；型別 label 給運維在 Browser 裡看 |
+| `entity_id` | hyphenated UUID 字串 | Neo4j 沒有 UUID 型別 |
+| `attributes` | 整包 JSON 字串存 `attributes_json` | Neo4j 沒有原生 JSON；目前呼叫端多數是 `{}`，不拆 property |
+| 時間 | RFC 3339 `Z` 字串（毫秒） | neo4rs 0.8 的 `From` 接 `DateTime<FixedOffset>` 不接 `Utc`；固定 `Z` 下字串比較等同時間序 |
+| 邊方向 | 寫入 `source → target`；查詢 `-[r]-` 無向 | Neo4j 底層關聯有方向。讀取語意對齊 `MockGraphStore` |
+| 關聯型別 | `associated_with` → `ASSOCIATED_WITH`（`to_uppercase`） | Cypher 型別慣例 |
+| `max_hops` | 硬上限 **10**，超過回 `ConstraintViolation` | 無界 `[*]` 會掃完整張圖 |
+| 關係型別過濾 | 變長路徑用 `[*1..N]` + `WHERE ALL(... type(r) IN $relTypes)` | Neo4j 5.26 的 `[:$any($list)*1..N]` 在變長時**不過濾**（單跳 `$any` 正常；`*1..1` 仍會掃到其他型別）。本機 Community 5.26.30 已實測 |
+
+`delete_node` 用 `DETACH DELETE`。`delete_edge` 只靠 `relationship_id` property
+定位（`MATCH ()-[r {relationship_id: $rid}]-() DELETE r`），不需要兩端 entity_id。
+
+時間過濾是邊的 `[first_seen, last_seen]` 與查詢區間**重疊**：
+`r.first_seen <= $to AND r.last_seen >= $from`。
+
+#### 沒有 APOC 時怎麼設動態 label
+
+`NEO4J_PLUGINS` 是空陣列，不能 `CALL apoc.create.addLabels`。
+Neo4j 5.26 的 `$()` 動態語法（與關聯型別同一組擴充）在本機 Community 實測可用：
+
+```cypher
+MERGE (n:Entity {entity_id: $id})
+SET n:$($label)
+```
+
+`REMOVE n:$($old)` 同樣可用，用來在 `entity_type` 變更時清掉舊的型別 label。
+進 query 之前 label／關聯型別都經過 sanitize（ASCII 字母開頭、只含字母數字底線），
+避免字串拼接造成 Cypher injection。未知的 `entity_type` 仍會寫入，不 panic。
+
+#### `ProjectionStore` 為什麼存在 `:ProjectionState`
+
+對齊 OpenSearch 把狀態放獨立 index 的理由：`--rebuild --drop` 會清空 `:Entity`。
+狀態若掛在圖節點上，「上次 rebuild 何時、寫了幾筆」會在重建開始的瞬間消失。
+`ProjectionStore` 的方法**只**操作 `:ProjectionState`，不碰 `:Entity`。
+graph-worker 清空圖時必須排除這個 label（那是 worker 的責任）。
+
+checkpoint 與 rebuild 狀態可以同在一個節點上，寫入用 `SET` 部分欄位，
+不會整節點覆寫——conformance 有一條驗兩者不會互相蓋掉。
+
+#### 已知限制
+
+- unique constraint 只覆蓋 13 種既知 `RelationshipType`。未知型別靠 MERGE 冪等，
+  **不**保證 `relationship_id` 全域唯一（兩條不同型別的邊可以碰巧同 id；
+  呼叫端的 id 是 UUID v5／v7，實務上不會撞）。
+- 寫入仍用 `$($relType)` 動態關聯型別（單跳 MERGE 已實測可用）。讀取不要用變長 `$any()`。
+- `max_hops` 上限 10，比 mock 的 32 緊。Graph API 的預設是 1 跳。
+- 累加沒有樂觀鎖（同 OpenSearch adapter）：一個投影一個 writer。
+- 沒有 adapter metrics／連線 semaphore 接到 Resource Guard（與其他 adapter 一樣，列在「尚未做」）。
 
 ### `EmbeddingProvider`（V0.2 Phase 0g）
 
@@ -487,6 +567,5 @@ runtime）。Phase 1 的 semantic similarity 可先注入 mock，或
 
 - adapter metrics 接到各 adapter／Operations Center
 - 連線 semaphore 尚未接到 Resource Guard
-- `storage-neo4j`（`GraphStore` + `ProjectionStore` 的真實 adapter）
 - `EmbeddingProvider` 的 ml-commons 實作（不要在 Phase 0g 寫）
 - SQLite 版的 `AuditLog` / `ApiTokenStore`（0006 只建了 schema，沒有 adapter）

@@ -15,15 +15,16 @@ use core_model::{
     Relationship, RelationshipEvidence, RelationshipType, RepointedReference, ResolutionCandidate,
     ResolutionStatus, Source, SourceType,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
 use crate::error::StorageError;
 use crate::traits::{
-    CanonicalStore, EmbeddedStore, KeyValueStore, ObjectStore, ProjectionCheckpoint,
-    ProjectionStore, RebuildState, RebuildStatus, RelationalStore, SearchDocument, SearchQuery,
-    SearchStore, StructuredSearch, TransactionalStore,
+    CanonicalStore, EmbeddedStore, GraphEdge, GraphNode, GraphPattern, GraphQuery, GraphStore,
+    GraphTraversalOptions, KeyValueStore, ObjectStore, ProjectionCheckpoint, ProjectionStore,
+    RebuildState, RebuildStatus, RelationalStore, SearchDocument, SearchQuery, SearchStore,
+    StructuredSearch, TransactionalStore,
 };
 
 /// 從 workspace 根目錄載入 `.env`（若存在）。已設定的環境變數不被覆蓋。
@@ -2514,6 +2515,232 @@ pub async fn assert_projection_store_contract<S: ProjectionStore>(
     Ok(())
 }
 
+/// GraphStore 契約（V0.2 Phase 2 `storage-neo4j`）。
+///
+/// 用 per-run UUID 當 entity_id／relationship_id，測完 `delete_node` 清掉。
+/// **不刪 constraint**——那是全域 schema，重複 `CREATE CONSTRAINT IF NOT EXISTS` 是安全的。
+///
+/// 覆蓋：
+/// - upsert_node 後用 `shortest_path(id, id)` 讀回一致（trait 沒有 get_node）
+/// - upsert_edge 後 neighbors 雙向都找得到（邊當無向）
+/// - `relationship_types`／`min_confidence`／`time_range`（重疊語意）過濾生效
+/// - shortest_path 找得到／找不到（含節點不存在）
+/// - `query` 對空 `starts` 回 `ConstraintViolation`
+/// - delete_edge 只刪那條邊
+/// - delete_node 連帶刪邊
+pub async fn assert_graph_store_contract<S: GraphStore>(store: &S) -> Result<(), StorageError> {
+    let fail = |message: String| StorageError::Unknown {
+        backend: "conformance",
+        message,
+    };
+
+    let health = store.health().await?;
+    if !health.healthy {
+        return Err(StorageError::Unavailable {
+            backend: "neo4j",
+            message: health.message,
+        });
+    }
+
+    let a = Uuid::now_v7();
+    let b = Uuid::now_v7();
+    let c = Uuid::now_v7();
+    let missing = Uuid::now_v7();
+    let e_ab = Uuid::now_v7();
+    let e_bc = Uuid::now_v7();
+    let e_ac = Uuid::now_v7();
+    let cleanup = [a, b, c];
+
+    let run = async {
+        let node = |id: Uuid, ty: &str, name: &str| GraphNode {
+            entity_id: id,
+            entity_type: ty.into(),
+            display_name: name.into(),
+            attributes: json!({"k": name}),
+        };
+        let t0 = fixture_ts();
+        let t100 = t0 + chrono::Duration::seconds(100);
+        let t200 = t0 + chrono::Duration::seconds(200);
+        let t300 = t0 + chrono::Duration::seconds(300);
+
+        store.upsert_node(&node(a, "person", "Alice")).await?;
+        store.upsert_node(&node(a, "person", "Alicia")).await?;
+        let me = store
+            .shortest_path(&a, &a, &GraphTraversalOptions::one_hop())
+            .await?
+            .ok_or_else(|| fail("upsert_node 之後 shortest_path(自己, 自己) 讀不到節點".into()))?;
+        if me.nodes.len() != 1 || !me.edges.is_empty() {
+            return Err(fail(format!(
+                "shortest_path(a, a) 應為單節點無邊，實際 nodes={} edges={}",
+                me.nodes.len(),
+                me.edges.len()
+            )));
+        }
+        if me.nodes[0].display_name != "Alicia" || me.nodes[0].entity_type != "person" {
+            return Err(fail(format!(
+                "upsert_node 覆寫後讀回不符：{:?}",
+                me.nodes[0]
+            )));
+        }
+        if me.nodes[0].attributes.get("k").and_then(Value::as_str) != Some("Alicia") {
+            return Err(fail(format!(
+                "attributes 沒 round-trip，實際 {:?}",
+                me.nodes[0].attributes
+            )));
+        }
+
+        store
+            .upsert_node(&node(b, "organization", "ExampleOrg"))
+            .await?;
+        store.upsert_node(&node(c, "domain", "example.com")).await?;
+
+        let edge = |id: Uuid, src: Uuid, tgt: Uuid, ty: &str, conf: f64, from, to| GraphEdge {
+            relationship_id: id,
+            source: src,
+            target: tgt,
+            relationship_type: ty.into(),
+            confidence: conf,
+            first_seen: from,
+            last_seen: to,
+        };
+        store
+            .upsert_edge(&edge(e_ab, a, b, "mentions", 0.9, t0, t100))
+            .await?;
+        store
+            .upsert_edge(&edge(e_bc, b, c, "associated_with", 0.4, t100, t200))
+            .await?;
+        store
+            .upsert_edge(&edge(e_ac, a, c, "belongs_to", 0.8, t200, t300))
+            .await?;
+
+        let mut n = store
+            .neighbors(&a, &GraphTraversalOptions::one_hop())
+            .await?;
+        n.sort_by_key(|x| x.entity_id);
+        let got_set: std::collections::BTreeSet<_> = n.iter().map(|x| x.entity_id).collect();
+        let expect: std::collections::BTreeSet<_> = [b, c].into_iter().collect();
+        if got_set != expect {
+            return Err(fail(format!(
+                "一跳 neighbors(a) 應為 {{b,c}}（無向），實際 {got_set:?}"
+            )));
+        }
+
+        let mut only_mentions = GraphTraversalOptions::one_hop();
+        only_mentions.relationship_types = Some(vec!["mentions".into()]);
+        let n = store.neighbors(&a, &only_mentions).await?;
+        if n.len() != 1 || n[0].entity_id != b {
+            return Err(fail(format!(
+                "relationship_types=[mentions] 應只回 b，實際 {:?}",
+                n.iter().map(|x| x.entity_id).collect::<Vec<_>>()
+            )));
+        }
+
+        let mut high = GraphTraversalOptions::one_hop();
+        high.min_confidence = Some(0.85);
+        let n = store.neighbors(&a, &high).await?;
+        if n.len() != 1 || n[0].entity_id != b {
+            return Err(fail(format!(
+                "min_confidence=0.85 應只留 mentions(0.9)，實際 {} 筆",
+                n.len()
+            )));
+        }
+
+        let mut window = GraphTraversalOptions::one_hop();
+        window.time_range = Some((
+            t0 - chrono::Duration::seconds(10),
+            t0 + chrono::Duration::seconds(50),
+        ));
+        let n = store.neighbors(&a, &window).await?;
+        if n.len() != 1 || n[0].entity_id != b {
+            return Err(fail(
+                "time_range 重疊語意失敗：區間只跟 mentions 的 [t0,t100] 重疊，應只回 b".into(),
+            ));
+        }
+
+        let path = store
+            .shortest_path(&a, &c, &{
+                let mut o = GraphTraversalOptions::one_hop();
+                o.max_hops = 2;
+                o
+            })
+            .await?
+            .ok_or_else(|| fail("a 到 c 應找得到路徑（直連 belongs_to 或經 b）".into()))?;
+        if path.nodes.is_empty() || path.nodes[0].entity_id != a {
+            return Err(fail(format!(
+                "shortest_path 起點應為 a，實際 {:?}",
+                path.nodes
+            )));
+        }
+        if path.nodes.last().map(|n| n.entity_id) != Some(c) {
+            return Err(fail(format!(
+                "shortest_path 終點應為 c，實際 {:?}",
+                path.nodes.last()
+            )));
+        }
+
+        let none = store
+            .shortest_path(&a, &missing, &GraphTraversalOptions::one_hop())
+            .await?;
+        if none.is_some() {
+            return Err(fail(
+                "終點不存在時 shortest_path 應為 None，不是 Err 也不是 Some".into(),
+            ));
+        }
+
+        let err = store
+            .query(&GraphQuery {
+                starts: vec![],
+                pattern: GraphPattern::Neighbors,
+                options: GraphTraversalOptions::one_hop(),
+            })
+            .await
+            .err()
+            .ok_or_else(|| fail("空 starts 的 query 應回 Err".into()))?;
+        if !matches!(err, StorageError::ConstraintViolation { .. }) {
+            return Err(fail(format!(
+                "空 starts 應為 ConstraintViolation，實際 {err}"
+            )));
+        }
+
+        store.delete_edge(&e_ac).await?;
+        let n = store
+            .neighbors(&a, &GraphTraversalOptions::one_hop())
+            .await?;
+        if n.iter().any(|x| x.entity_id == c) {
+            return Err(fail(
+                "delete_edge(belongs_to) 之後 neighbors(a) 仍看得到 c".into(),
+            ));
+        }
+        if !n.iter().any(|x| x.entity_id == b) {
+            return Err(fail("delete_edge 不該把另一條 mentions 一起刪掉".into()));
+        }
+
+        store.delete_node(&b).await?;
+        let to_b = store
+            .shortest_path(&a, &b, &GraphTraversalOptions::one_hop())
+            .await?;
+        if to_b.is_some() {
+            return Err(fail(
+                "delete_node 之後不該還找得到路徑（邊必須連帶刪）".into(),
+            ));
+        }
+        let n = store
+            .neighbors(&a, &GraphTraversalOptions::one_hop())
+            .await?;
+        if n.iter().any(|x| x.entity_id == b) {
+            return Err(fail("delete_node(b) 之後 neighbors(a) 仍有 b".into()));
+        }
+
+        Ok(())
+    };
+
+    let result = run.await;
+    for id in cleanup {
+        let _ = store.delete_node(&id).await;
+    }
+    result
+}
+
 /// KeyValueStore：get/set/del/expire。
 pub async fn assert_kv_round_trip<S: KeyValueStore>(store: &S) -> Result<(), StorageError> {
     let health = store.health().await?;
@@ -2718,5 +2945,11 @@ mod tests {
             "version": {"distribution": "opensearch", "number": "2.19.6"}
         });
         assert_opensearch_identity(&json).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_graph_store_satisfies_contract() {
+        let g = crate::mock::MockGraphStore::new();
+        assert_graph_store_contract(&g).await.unwrap();
     }
 }

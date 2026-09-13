@@ -1,0 +1,21 @@
+[package]
+name = "storage-neo4j"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "Neo4j GraphStore + ProjectionStore adapter"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+core-model = { workspace = true }
+neo4rs = { workspace = true }
+serde_json = { workspace = true }
+storage-core = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

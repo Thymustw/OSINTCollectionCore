@@ -1,4 +1,4 @@
-# Repository layout（V0.2 Phase 1e：27 個 crate；V0.1 的 6 個服務仍在，resolver／merge 目前是函式庫）
+# Repository layout（V0.2 Phase 2：28 個 crate；V0.1 的 6 個服務仍在，resolver／merge 目前是函式庫）
 
 Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.85.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 stable channel。
 
@@ -23,6 +23,7 @@ crates/
   storage-opensearch/    SearchStore
   storage-redis/         KeyValueStore
   storage-s3/            ObjectStore
+  storage-neo4j/         GraphStore + ProjectionStore
   connector-sdk/         ConnectorTrait、SSRF Guard、NetworkRule、RawEvidence sink
   connector-rss/         RSS 2.0／Atom 1.0（feed-rs）
   connector-static-web/  Static Web（scraper）
@@ -64,7 +65,7 @@ Manual／JSON／CSV import 不是 connector，也沒有 crate：它們是 push �
 用同一套正規化規則——兩份實作分岔不會報錯，只會悄悄產生「看起來一樣但字串不同」的重複 Entity。
 `deduplicator::url_norm` 仍以 re-export 保留原路徑。
 
-尚未加入：`storage-neo4j`、resolver 的事件消費者（Phase 1h）、`email`／`external_id` 掃描方法（**刻意不做**，見 `docs/developer/resolver.md`）、自由文本 NER（V0.3，見 `entity-worker.md`）。`NetworkRule` 寫入 API 尚未接到 `core-api`（驗證函式在 `connector-sdk::validate_network_rule`）。`account_handle` 已實作。
+尚未加入：resolver 的事件消費者（Phase 1h）、`email`／`external_id` 掃描方法（**刻意不做**，見 `docs/developer/resolver.md`）、自由文本 NER（V0.3，見 `entity-worker.md`）。`NetworkRule` 寫入 API 尚未接到 `core-api`（驗證函式在 `connector-sdk::validate_network_rule`）。`account_handle` 已實作。
 
 API token **已經**持久化到 Postgres（Phase 6a 的 `PostgresApiTokenStore`，
 migration 0006 建 `api_tokens` 表）。SQLite 版的 `ApiTokenStore` 與 `AuditLog`
