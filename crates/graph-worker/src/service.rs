@@ -12,7 +12,8 @@
 //! 一萬次還是同一條邊。刻意沒有 provenance claim：投影是可重建的衍生資料。
 
 use chrono::{DateTime, Utc};
-use core_model::{Entity, Relationship, RelationshipId};
+use core_jobs::{JobError, JobService};
+use core_model::{Entity, JobStatus, Relationship, RelationshipId};
 use core_observability::MetricsRegistry;
 use serde_json::Value;
 use storage_core::codec::encode_enum;
@@ -23,6 +24,10 @@ use storage_core::{
 use uuid::Uuid;
 
 use crate::error::GraphWorkerError;
+
+/// `job.dispatched` 上 graph-worker 認得的唯一 job type。
+/// 其他 type（例如之後的 `collect`）在這個 topic 上也會出現，忽略即可。
+pub const GRAPH_REBUILD_JOB_TYPE: &str = "graph_rebuild";
 
 pub const PROCESSOR: &str = "graph-worker";
 
@@ -64,6 +69,38 @@ impl ProcessOutcome {
             Self::SkippedNonEntity { .. } => "osint_graph_worker_skipped_non_entity_total",
             Self::SkippedRace { .. } => "osint_graph_worker_race_total",
             Self::Deleted { .. } => "osint_graph_worker_deleted_total",
+        }
+    }
+}
+
+/// 一則 `job.dispatched` 處理完的結果。給呼叫端記 log 與 metrics。
+///
+/// # 為什麼跟 [`ProcessOutcome`] 分開
+///
+/// `relationship.changed` 的失敗代表「這則事件還沒處理完，不該 commit」；
+/// job 的失敗代表「這份工作本身跑失敗了，事件已經消費完」。兩者 commit 語意
+/// 相反，混在同一個 enum 會讓呼叫端用錯分支。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobDispatchOutcome {
+    /// `job_type` 不是 `graph_rebuild`。已忽略，不是錯誤。
+    Ignored { job_type: String },
+    /// rebuild 跑完且成功。Job 已轉 `Completed`。
+    Completed { job_id: Uuid },
+    /// rebuild 回 `Err`。Job 已轉 `Failed`（錯誤訊息寫進 job.error）。
+    Failed { job_id: Uuid },
+    /// `JobService::transition` 本身失敗（例如 job_id 在 Postgres 查不到）。
+    /// 重送也不會讓那個 id 出現，呼叫端仍應 commit。
+    TransitionFailed { job_id: Option<Uuid> },
+}
+
+impl JobDispatchOutcome {
+    fn metric_name(&self) -> &'static str {
+        match self {
+            Self::Ignored { .. } => "osint_graph_worker_job_ignored_total",
+            Self::Completed { .. } => "osint_graph_worker_job_completed_total",
+            Self::Failed { .. } | Self::TransitionFailed { .. } => {
+                "osint_graph_worker_job_failed_total"
+            }
         }
     }
 }
@@ -341,6 +378,132 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
         );
         Ok(report)
     }
+
+    /// 處理一則 `job.dispatched` payload。
+    ///
+    /// `JobService` 由呼叫端持有，不塞進 [`GraphWorker`]：這個 struct 的職責是
+    /// 「處理一則 relationship 變更／跑 rebuild」，job 狀態轉移是呼叫端的事。
+    /// 方法放在這裡是為了讓單元測試能用同一個 harness 覆蓋三條路徑，
+    /// 不要把分流邏輯全堆在 `main.rs`。
+    ///
+    /// # offset 一律由呼叫端提交
+    ///
+    /// 這個方法**永遠回 `Ok`**——「job 跑失敗」不是「消費事件失敗」。
+    /// 重送同一則 `job.dispatched` 只會讓 already-failed 的 job 再走一次
+    /// `Running → Completed/Failed`，`can_transition` 擋下後變成處理失敗、
+    /// offset 又不 commit……迴圈。執行完（不管成敗）就該 commit。
+    pub async fn process_dispatched_job(
+        &self,
+        jobs: &JobService<R>,
+        payload: &Value,
+        page_size: u32,
+    ) -> JobDispatchOutcome {
+        let outcome = self
+            .process_dispatched_job_inner(jobs, payload, page_size)
+            .await;
+        self.metrics.inc(outcome.metric_name(), 1);
+        outcome
+    }
+
+    async fn process_dispatched_job_inner(
+        &self,
+        jobs: &JobService<R>,
+        payload: &Value,
+        page_size: u32,
+    ) -> JobDispatchOutcome {
+        let job_type = payload
+            .get("job_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if job_type != GRAPH_REBUILD_JOB_TYPE {
+            tracing::debug!(
+                job_type,
+                "job.dispatched 的 job_type 不是 graph_rebuild，graph-worker 忽略"
+            );
+            return JobDispatchOutcome::Ignored {
+                job_type: job_type.to_string(),
+            };
+        }
+
+        let Some(job_id) = payload
+            .get("job_id")
+            .and_then(Value::as_str)
+            .and_then(|s| Uuid::parse_str(s).ok())
+        else {
+            tracing::error!(
+                payload = %payload,
+                "graph_rebuild job.dispatched 缺少合法 job_id。重送也不會讓它出現在 Postgres，提交 offset"
+            );
+            return JobDispatchOutcome::TransitionFailed { job_id: None };
+        };
+
+        tracing::info!(%job_id, "收到 graph_rebuild job，開始非破壞性重建（drop_graph=false）");
+
+        if let Err(err) = jobs.transition(job_id, JobStatus::Running, None).await {
+            log_job_transition_error(job_id, "Running", &err);
+            return JobDispatchOutcome::TransitionFailed {
+                job_id: Some(job_id),
+            };
+        }
+
+        let rebuild = self
+            .rebuild(RebuildOptions {
+                drop_graph: false,
+                page_size: page_size.max(1),
+            })
+            .await;
+
+        match rebuild {
+            Ok(report) => {
+                if let Err(err) = jobs.transition(job_id, JobStatus::Completed, None).await {
+                    log_job_transition_error(job_id, "Completed", &err);
+                    return JobDispatchOutcome::TransitionFailed {
+                        job_id: Some(job_id),
+                    };
+                }
+                tracing::info!(
+                    %job_id,
+                    scanned = report.scanned,
+                    applied = report.applied,
+                    skipped_non_entity = report.skipped_non_entity,
+                    failed = report.failed,
+                    "graph_rebuild job 完成"
+                );
+                JobDispatchOutcome::Completed { job_id }
+            }
+            Err(err) => {
+                if let Err(trans_err) = jobs
+                    .transition(job_id, JobStatus::Failed, Some(err.to_string()))
+                    .await
+                {
+                    tracing::error!(
+                        error = %trans_err,
+                        rebuild_error = %err,
+                        %job_id,
+                        "graph_rebuild 失敗，且標記 Failed 也失敗。重送不會讓 already-failed 的 job 重跑，提交 offset"
+                    );
+                    return JobDispatchOutcome::TransitionFailed {
+                        job_id: Some(job_id),
+                    };
+                }
+                tracing::error!(
+                    error = %err,
+                    %job_id,
+                    "graph_rebuild job 失敗，已標記 Failed"
+                );
+                JobDispatchOutcome::Failed { job_id }
+            }
+        }
+    }
+}
+
+fn log_job_transition_error(job_id: Uuid, to: &str, err: &JobError) {
+    tracing::error!(
+        error = %err,
+        %job_id,
+        to,
+        "graph_rebuild job 狀態轉移失敗。重送也不會讓這個 job_id 變成可轉移，提交 offset"
+    );
 }
 
 /// `--rebuild` 的選項。
@@ -520,7 +683,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use chrono::{TimeZone, Utc};
-    use core_model::{Entity, EntityType, Relationship, RelationshipType};
+    use core_jobs::JobService;
+    use core_model::{Entity, EntityType, JobStatus, Relationship, RelationshipType};
     use serde_json::json;
     use storage_core::conformance::find_workspace_root;
     use storage_core::mock::MockGraphStore;
@@ -798,5 +962,108 @@ mod tests {
             .await
             .unwrap();
         assert!(neighbors.is_empty());
+    }
+
+    fn job_payload(job_id: Uuid, job_type: &str) -> Value {
+        json!({
+            "job_id": job_id,
+            "job_type": job_type,
+            "status": "queued",
+            "retry_count": 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn dispatched_job_of_other_type_is_ignored() {
+        let h = open_harness().await;
+        let jobs = JobService::new(h.db.clone(), None);
+        let outcome = h
+            .worker
+            .process_dispatched_job(&jobs, &job_payload(Uuid::now_v7(), "collect"), 100)
+            .await;
+        assert_eq!(
+            outcome,
+            JobDispatchOutcome::Ignored {
+                job_type: "collect".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_rebuild_job_runs_and_completes() {
+        let h = open_harness().await;
+        let a = entity("alice", EntityType::Person);
+        let b = entity("acme", EntityType::Organization);
+        h.db.put_entity(&a).await.unwrap();
+        h.db.put_entity(&b).await.unwrap();
+        let rel = relationship(a.id, RelationshipType::AssociatedWith, b.id);
+        h.db.put_relationship(&rel).await.unwrap();
+
+        let jobs = JobService::new(h.db.clone(), None);
+        let job = jobs.create(GRAPH_REBUILD_JOB_TYPE, None).await.unwrap();
+        assert_eq!(job.status, JobStatus::Queued);
+
+        let outcome = h
+            .worker
+            .process_dispatched_job(&jobs, &job_payload(job.id, GRAPH_REBUILD_JOB_TYPE), 100)
+            .await;
+        assert_eq!(outcome, JobDispatchOutcome::Completed { job_id: job.id });
+
+        let finished = jobs.get(job.id).await.unwrap();
+        assert_eq!(finished.status, JobStatus::Completed);
+        assert!(finished.started_at.is_some());
+        assert!(finished.completed_at.is_some());
+
+        let neighbors = h
+            .worker
+            .graph()
+            .neighbors(&a.id, &GraphTraversalOptions::one_hop())
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].entity_id, b.id);
+    }
+
+    #[tokio::test]
+    async fn graph_rebuild_job_marks_failed_when_rebuild_errors() {
+        // rebuild 讀的是 GraphWorker 自己的 store。給它一個沒跑過 migrate 的
+        // SQLite，list_relationships 會失敗；Job 仍寫在已 migrate 的那份，
+        // 才能斷言狀態真的走到 Failed 而不是卡在 Running。
+        let jobs_harness = open_harness().await;
+        let jobs = JobService::new(jobs_harness.db.clone(), None);
+        let job = jobs.create(GRAPH_REBUILD_JOB_TYPE, None).await.unwrap();
+
+        let root = find_workspace_root().expect("workspace root");
+        let broken_path: PathBuf = root.join(format!(
+            "var/osint-graph-worker-broken-{}.sqlite",
+            Uuid::now_v7()
+        ));
+        cleanup(&broken_path);
+        let broken = SqliteEmbeddedStore::connect(&broken_path)
+            .await
+            .expect("開未 migrate 的 SQLite");
+        let worker = GraphWorker::new(
+            broken,
+            MockGraphStore::new(),
+            MetricsRegistry::new(),
+            "osint-graph-test",
+        );
+
+        let outcome = worker
+            .process_dispatched_job(&jobs, &job_payload(job.id, GRAPH_REBUILD_JOB_TYPE), 100)
+            .await;
+        assert_eq!(outcome, JobDispatchOutcome::Failed { job_id: job.id });
+
+        let finished = jobs.get(job.id).await.unwrap();
+        assert_eq!(finished.status, JobStatus::Failed);
+        assert!(
+            finished.error.as_ref().is_some_and(|e| !e.is_empty()),
+            "Failed 必須留下錯誤訊息：{:?}",
+            finished.error
+        );
+
+        let _ = std::fs::remove_file(&broken_path);
+        let _ = std::fs::remove_file(format!("{}-wal", broken_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", broken_path.display()));
     }
 }

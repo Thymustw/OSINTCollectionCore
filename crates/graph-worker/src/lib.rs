@@ -30,5 +30,6 @@ pub mod service;
 pub use error::GraphWorkerError;
 pub use health::serve as serve_health;
 pub use service::{
-    GraphWorker, ProcessOutcome, RebuildOptions, RebuildReport, apply_relationship, parse_change,
+    GRAPH_REBUILD_JOB_TYPE, GraphWorker, JobDispatchOutcome, ProcessOutcome, RebuildOptions,
+    RebuildReport, apply_relationship, parse_change,
 };

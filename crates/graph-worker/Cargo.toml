@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "relationship.changed → Neo4j 圖投影（SPEC_V0.2 §8）；可從 PostgreSQL 全量重建"
+description = "relationship.changed → Neo4j 圖投影（SPEC_V0.2 §8）；消費 job.dispatched 執行 graph_rebuild"
 
 [[bin]]
 name = "osint-graph-worker"
@@ -16,6 +16,7 @@ axum = { workspace = true }
 chrono = { workspace = true }
 core-config = { workspace = true }
 core-events = { workspace = true }
+core-jobs = { workspace = true }
 core-model = { workspace = true }
 core-observability = { workspace = true }
 serde_json = { workspace = true }

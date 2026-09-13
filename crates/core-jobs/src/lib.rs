@@ -1,4 +1,4 @@
-//! Job 狀態機與派工。儲存走 `CanonicalStore`，不直接寫 SQL。
+//! Job 狀態機與派工。儲存走 `RelationalStore`（生產路徑是 Postgres canonical），不直接寫 SQL。
 
 mod error;
 mod service;

@@ -50,6 +50,10 @@ pub type SharedSearchState = Arc<SearchState>;
 /// 所以 `Arc<dyn RelationalStore>` 預設**不是** `Send + Sync`，
 /// `AppState` 會因此無法當 axum 的 state——而編譯器報的是
 /// 「`FromFn<…>: Service<…>` 不滿足」這種完全指不到真因的訊息。
+/// Graph API 讀取端。理由同 [`SharedStore`]：handler 綁 [`storage_core::GraphStore`]
+/// 這個 capability，不要綁死在 `Neo4jStore`。
+pub type SharedGraphStore = Arc<dyn storage_core::GraphStore + Send + Sync>;
+
 pub type SharedStore = Arc<dyn RelationalStore + Send + Sync>;
 
 /// 物件儲存（Raw Evidence blob）handle。理由同 [`SharedStore`]：
@@ -115,6 +119,11 @@ pub struct AppState {
     /// 這一條路由，不影響 resolve_entity 的另外幾個方法。這正是拆成獨立 endpoint
     /// 的目的，見 docs/developer/resolver.md。
     pub graph_resolver: Option<SharedGraphContextResolver>,
+    /// Graph API 讀取端。`None` 代表沒接上 Neo4j——這 4 條讀取路由
+    /// （neighbors／relationships／path／query）回 503，`resolver`／`graph_resolver`
+    /// 不受影響（三者是分開的可用性狀態，各自獨立組裝）。
+    /// 與 [`AppState::graph_resolver`] 共用同一個 Neo4j 連線，不要連兩次。
+    pub graph: Option<SharedGraphStore>,
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
     pub ready: ReadyProbe,

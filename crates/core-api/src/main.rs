@@ -7,8 +7,8 @@ use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
     AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, ImportState, PostgresReady,
-    QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SharedObjects, SharedStore,
-    SharedTokenStore, router,
+    QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SharedGraphStore, SharedObjects,
+    SharedStore, SharedTokenStore, router,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -151,24 +151,33 @@ async fn run() -> Result<(), String> {
         }
     };
 
-    // graph_resolver 跟 resolver 是獨立的可用性——Neo4j 沒接上只讓
-    // POST /entities/{id}/resolve/graph-context 回 503，resolve_entity
-    // 的另外幾個方法不受影響（這是刻意拆開的設計，不是巧合）。
-    // Postgres 沒接上時也是 None：沒有 canonical store 就沒辦法 persist candidate。
-    let graph_resolver = if let Some(store) = pg_store {
+    // graph_resolver 與 graph 共用**同一次** `connect_graph`——不要連兩次。
+    // `Neo4jStore` 是 Clone（連線池 handle），clone 很便宜。
+    // 兩者跟 resolver 都是獨立的可用性：Neo4j 沒接上只讓
+    // POST /entities/{id}/resolve/graph-context 與 /graph/* 讀取路由回 503，
+    // resolve_entity 的另外幾個方法不受影響。
+    // Postgres 沒接上時 graph_resolver 也是 None：沒有 canonical store 就沒辦法 persist candidate。
+    // graph 讀取端只需要 Neo4j，理論上 Postgres 掛了仍可查圖；但目前 connect_graph
+    // 只在有 pg_store 時呼叫一次，兩邊一起 None——不要為了這個分叉再開第二次連線。
+    let (graph_resolver, graph) = if let Some(store) = pg_store {
         match connect_graph(&cfg).await {
-            Ok(neo4j) => Some(Arc::new(GraphContextResolver::new(store, neo4j))),
+            Ok(neo4j) => {
+                let graph: SharedGraphStore = Arc::new(neo4j.clone());
+                let resolver = Arc::new(GraphContextResolver::new(store, neo4j));
+                (Some(resolver), Some(graph))
+            }
             Err(err) => {
                 tracing::warn!(
                     error = %err,
-                    "Neo4j 未連上；POST /api/v1/entities/{{id}}/resolve/graph-context 會回 503"
+                    "Neo4j 未連上；POST /api/v1/entities/{{id}}/resolve/graph-context \
+                     與 GET／POST /api/v1/graph/* 讀取路由會回 503"
                 );
                 missing.push("neo4j");
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     // 搜尋接不上時只有 POST /api/v1/search 回 503，其他路由照常——
@@ -259,6 +268,7 @@ async fn run() -> Result<(), String> {
         merge,
         resolver,
         graph_resolver,
+        graph,
         import,
         search,
         ready,
@@ -426,7 +436,7 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
                  /api/v1/tokens（admin）、/api/v1/ops/health、/api/v1/ops/metrics、\
                  /api/v1/ops/connectors、/api/v1/ops/queues 與 /api/v1/ops/dlq、\
                  sources／connectors／collections／objects／entities／relationships／events／raw、\
-                 POST /api/v1/import 與 POST /api/v1/search"
+                 /api/v1/graph/*、POST /api/v1/import 與 POST /api/v1/search"
                 .into(),
         }),
     )

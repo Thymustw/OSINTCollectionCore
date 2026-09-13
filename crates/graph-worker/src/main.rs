@@ -1,4 +1,4 @@
-//! `osint-graph-worker`：訂閱 `relationship.changed`，把 Entity→Entity 的邊寫進 Neo4j。
+//! `osint-graph-worker`：訂閱 `relationship.changed` 與 `job.dispatched`。
 //!
 //! 兩種模式：
 //!
@@ -8,6 +8,9 @@
 //! osint-graph-worker --rebuild --drop    先清空 :Entity 再從零重建後結束
 //! ```
 //!
+//! 常駐模式只執行 `job_type=graph_rebuild` 的 job；其他 type 忽略並 commit。
+//! API 觸發的 rebuild **永遠** `drop_graph=false`（`--drop` 只留給 CLI）。
+//!
 //! 沒有用 clap：這支 binary 只有兩個旗標，為它多一個相依不划算
 //! （`osint-cli` 才是有子命令的那一支）。
 
@@ -15,9 +18,10 @@ use std::time::Duration;
 
 use core_config::AppConfig;
 use core_events::{EventConsumer, EventTopic};
+use core_jobs::JobService;
 use core_observability::{MetricsRegistry, init_tracing};
 use graph_worker::service::{GraphWorker, RebuildOptions};
-use graph_worker::{ProcessOutcome, serve_health};
+use graph_worker::{JobDispatchOutcome, ProcessOutcome, serve_health};
 use storage_core::conformance::load_workspace_dotenv;
 use storage_neo4j::Neo4jStore;
 use storage_postgres::PostgresCanonicalStore;
@@ -159,20 +163,32 @@ async fn run() -> Result<(), String> {
         }
     });
 
+    let jobs = JobService::new(store.clone(), None);
+
     let consumer = EventConsumer::connect(
         &cfg.broker.brokers,
         &cfg.graph_worker.consumer_group,
-        &[EventTopic::RelationshipChanged.as_str()],
+        &[
+            EventTopic::RelationshipChanged.as_str(),
+            EventTopic::JobDispatched.as_str(),
+        ],
     )
     .map_err(|err| err.to_string())?;
 
     tracing::info!(
         group = %cfg.graph_worker.consumer_group,
         projection = %cfg.graph_worker.projection,
-        "graph-worker 開始消費 relationship.changed"
+        "graph-worker 開始消費 relationship.changed 與 job.dispatched"
     );
 
-    consume_loop(&service, &consumer, &metrics).await;
+    consume_loop(
+        &service,
+        &jobs,
+        &consumer,
+        &metrics,
+        cfg.graph_worker.page_size.max(1),
+    )
+    .await;
     Ok(())
 }
 
@@ -195,17 +211,27 @@ async fn connect_graph(cfg: &AppConfig) -> Result<Neo4jStore, String> {
     .map_err(|e| e.to_string())
 }
 
-/// 消費迴圈。逐則處理，沒有批次。
+/// 消費迴圈。逐則處理，沒有批次。同一個 consumer group 訂兩個 topic，
+/// 靠 `EventEnvelope.event_type` 分流（那個欄位就是 topic 字串）。
 ///
-/// # offset 只在成功或「優雅跳過」之後才提交
+/// # offset 提交規則因事件而異
 ///
-/// 真的失敗（Neo4j 連不上、非預期 `StorageError`）**不 commit**，讓 broker 重送。
-/// 先提交再寫的話，寫入失敗或行程被殺時那則邊會永遠不進圖，而且沒有任何跡象。
-/// `SkippedNonEntity`／`SkippedRace` 是預期行為，重送結果一樣，所以提交。
+/// `relationship.changed`：真的失敗（Neo4j 連不上、非預期 `StorageError`）
+/// **不 commit**，讓 broker 重送。先提交再寫的話，寫入失敗或行程被殺時那則邊
+/// 會永遠不進圖，而且沒有任何跡象。`SkippedNonEntity`／`SkippedRace` 是預期
+/// 行為，重送結果一樣，所以提交。
+///
+/// `job.dispatched`：**執行完（不管成敗）就 commit**。這裡的「失敗」是 job
+/// 本身跑失敗，不是消費事件失敗；重送只會讓同一個 job_id 再跑一次
+/// `Running → Completed/Failed`，`can_transition` 會擋下不合法的轉移並回錯，
+/// 這則事件變成處理失敗、offset 又不 commit……迴圈。already-failed 的 job
+/// 重送也跑不起來。
 async fn consume_loop(
     service: &GraphWorker<PostgresCanonicalStore, Neo4jStore>,
+    jobs: &JobService<PostgresCanonicalStore>,
     consumer: &EventConsumer,
     metrics: &MetricsRegistry,
+    page_size: u32,
 ) {
     let mut processed = 0_u64;
     loop {
@@ -219,29 +245,21 @@ async fn consume_loop(
             result = consumer.next_envelope(IDLE_POLL) => {
                 match result {
                     Ok(envelope) => {
-                        match service.process_change(&envelope.payload).await {
-                            Ok(outcome) => {
-                                if let ProcessOutcome::Applied {
-                                    relationship_id,
-                                    last_seen,
-                                } = &outcome
-                                {
-                                    service
-                                        .record_checkpoint(Some(*last_seen), Some(*relationship_id))
-                                        .await;
-                                }
-                                log_outcome(&envelope.id.to_string(), &outcome);
+                        match envelope.event_type.as_str() {
+                            "relationship.changed" => {
+                                handle_relationship_changed(service, consumer, metrics, &envelope).await;
+                            }
+                            "job.dispatched" => {
+                                handle_job_dispatched(service, jobs, consumer, page_size, &envelope).await;
+                            }
+                            other => {
+                                tracing::warn!(
+                                    event_type = other,
+                                    "graph-worker 訂了不認識的 topic，跳過但仍 commit"
+                                );
                                 if let Err(err) = consumer.commit_last() {
                                     tracing::warn!(error = %err, "commit offset 失敗");
                                 }
-                            }
-                            Err(err) => {
-                                metrics.inc("osint_graph_worker_errors_total", 1);
-                                tracing::error!(
-                                    error = %err,
-                                    event_id = %envelope.id,
-                                    "處理 relationship.changed 失敗，不提交 offset，這則事件會被重送"
-                                );
                             }
                         }
                         processed += 1;
@@ -253,12 +271,87 @@ async fn consume_loop(
                         update_queue_depth(consumer, metrics);
                     }
                     Err(err) => {
-                        tracing::error!(error = %err, "消費 relationship.changed 失敗");
+                        tracing::error!(error = %err, "消費事件失敗");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
             }
         }
+    }
+}
+
+async fn handle_relationship_changed(
+    service: &GraphWorker<PostgresCanonicalStore, Neo4jStore>,
+    consumer: &EventConsumer,
+    metrics: &MetricsRegistry,
+    envelope: &core_events::EventEnvelope,
+) {
+    match service.process_change(&envelope.payload).await {
+        Ok(outcome) => {
+            if let ProcessOutcome::Applied {
+                relationship_id,
+                last_seen,
+            } = &outcome
+            {
+                service
+                    .record_checkpoint(Some(*last_seen), Some(*relationship_id))
+                    .await;
+            }
+            log_outcome(&envelope.id.to_string(), &outcome);
+            if let Err(err) = consumer.commit_last() {
+                tracing::warn!(error = %err, "commit offset 失敗");
+            }
+        }
+        Err(err) => {
+            metrics.inc("osint_graph_worker_errors_total", 1);
+            tracing::error!(
+                error = %err,
+                event_id = %envelope.id,
+                "處理 relationship.changed 失敗，不提交 offset，這則事件會被重送"
+            );
+        }
+    }
+}
+
+async fn handle_job_dispatched(
+    service: &GraphWorker<PostgresCanonicalStore, Neo4jStore>,
+    jobs: &JobService<PostgresCanonicalStore>,
+    consumer: &EventConsumer,
+    page_size: u32,
+    envelope: &core_events::EventEnvelope,
+) {
+    let outcome = service
+        .process_dispatched_job(jobs, &envelope.payload, page_size)
+        .await;
+    log_job_outcome(&envelope.id.to_string(), &outcome);
+    // 執行完（不管成敗）就 commit。理由見 consume_loop 的文件註解。
+    if let Err(err) = consumer.commit_last() {
+        tracing::warn!(error = %err, "commit offset 失敗");
+    }
+}
+
+fn log_job_outcome(event_id: &str, outcome: &JobDispatchOutcome) {
+    match outcome {
+        JobDispatchOutcome::Ignored { job_type } => tracing::debug!(
+            job_type,
+            event_id,
+            "job.dispatched 不是 graph_rebuild，已忽略"
+        ),
+        JobDispatchOutcome::Completed { job_id } => tracing::info!(
+            %job_id,
+            event_id,
+            "graph_rebuild job 完成"
+        ),
+        JobDispatchOutcome::Failed { job_id } => tracing::error!(
+            %job_id,
+            event_id,
+            "graph_rebuild job 失敗，已標記 Failed"
+        ),
+        JobDispatchOutcome::TransitionFailed { job_id } => tracing::error!(
+            ?job_id,
+            event_id,
+            "graph_rebuild job 狀態轉移失敗，仍提交 offset"
+        ),
     }
 }
 

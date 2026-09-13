@@ -85,6 +85,7 @@ pub fn test_app_with_backends(
         merge: None,
         resolver: None,
         graph_resolver: None,
+        graph: None,
         import: None,
         // 不接 OpenSearch：`POST /api/v1/search` 回 503。
         search: None,

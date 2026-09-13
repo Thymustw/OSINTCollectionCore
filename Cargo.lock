@@ -1740,6 +1740,7 @@ dependencies = [
  "chrono",
  "core-config",
  "core-events",
+ "core-jobs",
  "core-model",
  "core-observability",
  "serde_json",

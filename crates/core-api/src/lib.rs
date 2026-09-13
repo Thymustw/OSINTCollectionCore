@@ -48,13 +48,14 @@ pub use resources::objects::{ExtractedEntity, ObjectDetail};
 pub use resources::relationships::RelationshipDetail;
 pub use resources::{
     AUDIT_COLLECTION_CREATE, AUDIT_CONNECTOR_CREATE, AUDIT_CONNECTOR_UPDATE, AUDIT_ENTITY_MERGE,
-    AUDIT_ENTITY_RESOLVE, AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT, AUDIT_MERGE_UNDO,
-    AUDIT_OBJECT_CREATE, AUDIT_SOURCE_CREATE, AUDIT_SOURCE_UPDATE,
+    AUDIT_ENTITY_RESOLVE, AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT, AUDIT_GRAPH_REBUILD,
+    AUDIT_MERGE_UNDO, AUDIT_OBJECT_CREATE, AUDIT_SOURCE_CREATE, AUDIT_SOURCE_UPDATE,
 };
 pub use routes::router;
 pub use search::{EntitySummary, SearchHitBody, SearchResponse};
 pub use state::{
-    AppState, AuthState, ImportState, SearchState, SharedObjects, SharedStore, SharedTokenStore,
+    AppState, AuthState, ImportState, SearchState, SharedGraphStore, SharedObjects, SharedStore,
+    SharedTokenStore,
 };
 pub use tokens::{
     AUDIT_TOKEN_ISSUE, AUDIT_TOKEN_LIST, AUDIT_TOKEN_REVOKE, IssueTokenBody, TokenSummary,

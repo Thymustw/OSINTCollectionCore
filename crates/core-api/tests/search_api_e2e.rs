@@ -118,6 +118,7 @@ fn build_api(stack: &Stack, index: &str, role: Role) -> TestApi {
         merge: None,
         resolver: None,
         graph_resolver: None,
+        graph: None,
         import: None,
         search: Some(Arc::new(SearchState {
             store: stack.os.clone(),

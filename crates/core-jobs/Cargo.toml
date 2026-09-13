@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license-file.workspace = true
 publish.workspace = true
-description = "Job 狀態機、CRUD（經 CanonicalStore）、Redpanda 派工"
+description = "Job 狀態機、CRUD（經 RelationalStore）、Redpanda 派工"
 
 [dependencies]
 async-trait = { workspace = true }

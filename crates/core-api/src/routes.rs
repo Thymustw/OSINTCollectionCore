@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/merge-history/{id}/undo",
             post(resources::merge::undo_merge),
         )
+        .route("/api/v1/graph/rebuild", post(resources::graph::rebuild))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_mw::require_write,
@@ -148,7 +149,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ops/metrics", get(ops::metrics))
         .route("/api/v1/ops/connectors", get(ops::connectors))
         .route("/api/v1/ops/queues", get(ops::queues))
-        .route("/api/v1/ops/dlq", get(ops::dlq));
+        .route("/api/v1/ops/dlq", get(ops::dlq))
+        .route(
+            "/api/v1/graph/entities/{id}/neighbors",
+            get(resources::graph::neighbors),
+        )
+        .route(
+            "/api/v1/graph/entities/{id}/relationships",
+            get(resources::graph::relationships),
+        )
+        .route("/api/v1/graph/path", get(resources::graph::path));
 
     let protected = Router::new()
         .route("/api/v1/jobs", get(jobs::list_jobs))
@@ -159,6 +169,9 @@ pub fn router(state: AppState) -> Router {
         // （entity 物件、日期、布林語法），塞進 query string 會需要多層編碼，
         // 而且長查詢會撞到 URL 長度上限。這與 SPEC §19 的 `POST /search` 一致。
         .route("/api/v1/search", post(search::search))
+        // 圖查詢是唯讀的（viewer 以上），但用 POST：body 是結構化 GraphQuery，
+        // 塞進 query string 不划算。權限與 POST /search 同一級，不掛 require_write。
+        .route("/api/v1/graph/query", post(resources::graph::query))
         .merge(write)
         .merge(admin)
         .route_layer(middleware::from_fn_with_state(

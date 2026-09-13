@@ -36,7 +36,7 @@ crates/
   resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／account_handle；graph_context 走獨立 GraphContextResolver；無獨立 binary
   merge/                 Entity merge／undo（SPEC_V0.2 §7）：execute_merge／undo_merge；無獨立 binary
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
-  graph-worker/          圖投影（osint-graph-worker）：relationship.changed → Neo4j（SPEC_V0.2 §8）；只有 Entity→Entity 的邊才進圖
+  graph-worker/          圖投影（osint-graph-worker）：relationship.changed → Neo4j（SPEC_V0.2 §8）；常駐模式也消費 job.dispatched 執行 graph_rebuild；只有 Entity→Entity 的邊才進圖
   osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/MinIO，不經 core-api
   acceptance/            跨服務驗收測試（SPEC §26 Acceptance F、failure/recovery）。無生產程式碼
 docker/

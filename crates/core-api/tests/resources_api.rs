@@ -49,6 +49,9 @@ fn read_paths() -> Vec<String> {
         format!("/api/v1/raw/{id}"),
         "/api/v1/ops/health".into(),
         "/api/v1/ops/metrics".into(),
+        format!("/api/v1/graph/entities/{id}/neighbors"),
+        format!("/api/v1/graph/entities/{id}/relationships"),
+        format!("/api/v1/graph/path?from={id}&to={id}&max_hops=2"),
     ]
 }
 
@@ -99,6 +102,7 @@ fn write_requests() -> Vec<(&'static str, String, Value)> {
             format!("/api/v1/merge-history/{id}/undo"),
             json!({}),
         ),
+        ("POST", "/api/v1/graph/rebuild".into(), json!({})),
     ]
 }
 
@@ -208,11 +212,69 @@ async fn viewer_may_read_and_gets_503_without_a_store() {
             "GET {path} 沒接 store 時應回 503（而不是 403／500）：{body}"
         );
         assert_eq!(body["error"], "unavailable");
-        assert!(
-            body["message"].as_str().unwrap().contains("DATABASE_URL"),
-            "503 訊息要講下一步怎麼做：{body}"
-        );
+        let message = body["message"].as_str().unwrap();
+        if path.starts_with("/api/v1/graph/") {
+            assert!(
+                message.contains("Neo4j") || message.contains("bolt_uri"),
+                "Graph 503 訊息要講 Neo4j／bolt_uri：{body}"
+            );
+        } else {
+            assert!(
+                message.contains("DATABASE_URL"),
+                "503 訊息要講下一步怎麼做：{body}"
+            );
+        }
     }
+}
+
+/// `POST /graph/query` 是唯讀（viewer 即可），沒接 Neo4j 回 503 不是 403。
+#[tokio::test]
+async fn viewer_may_post_graph_query_and_gets_503_without_neo4j() {
+    let (jwt, viewer) = issue_test_jwt(Role::Viewer);
+    let (app, _, _) = test_app_parts(jwt);
+    let (status, body) = send(
+        &app,
+        write(
+            "POST",
+            "/api/v1/graph/query",
+            Some(&viewer),
+            &json!({
+                "starts": [Uuid::now_v7()],
+                "pattern": {"kind": "neighbors"},
+                "options": {"max_hops": 1}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "unavailable");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("Neo4j") || message.contains("bolt_uri"),
+        "Graph 503 訊息要講 Neo4j／bolt_uri：{body}"
+    );
+}
+
+/// 未認證打 `POST /graph/query` 仍是 401。
+#[tokio::test]
+async fn graph_query_requires_authentication() {
+    let (jwt, _) = issue_test_jwt(Role::Viewer);
+    let (app, _, _) = test_app_parts(jwt);
+    let (status, body) = send(
+        &app,
+        write(
+            "POST",
+            "/api/v1/graph/query",
+            None,
+            &json!({
+                "starts": [Uuid::now_v7()],
+                "pattern": {"kind": "neighbors"},
+                "options": {"max_hops": 1}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 }
 
 /// `POST /objects` 回 501，訊息要指向 `/import`，而且要留稽核（含 IP）。

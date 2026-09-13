@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use core_model::{EntityId, RelationshipId};
 use sha2::{Digest, Sha256};
 
@@ -15,7 +16,7 @@ use crate::health::{HealthProvider, StorageHealth};
 use crate::traits::{
     EmbeddingKind, EmbeddingModelRef, EmbeddingProvider, EmbeddingRequest, EmbeddingVector,
     GraphEdge, GraphNode, GraphPath, GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions,
-    embedding_content_hash,
+    ProjectionCheckpoint, ProjectionLag, ProjectionStore, RebuildStatus, embedding_content_hash,
 };
 
 /// mock 拒絕超過這個跳數的遍歷。無界查詢會掃完整張圖。
@@ -42,6 +43,9 @@ const MOCK_DEFAULT_DIM: usize = 384;
 struct GraphInner {
     nodes: HashMap<EntityId, GraphNode>,
     edges: HashMap<RelationshipId, GraphEdge>,
+    /// 記憶體版 projection checkpoint。給 graph-worker 單元測試走 `rebuild()`。
+    checkpoints: HashMap<String, ProjectionCheckpoint>,
+    rebuilds: HashMap<String, RebuildStatus>,
 }
 
 /// 記憶體圖。CRUD 與有界遍歷足夠讓上層測試寫，不是 Neo4j 語意模擬器。
@@ -242,6 +246,55 @@ impl GraphStore for MockGraphStore {
         let mut inner = self.lock()?;
         inner.nodes.clear();
         inner.edges.clear();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProjectionStore for MockGraphStore {
+    async fn checkpoint(
+        &self,
+        projection: &str,
+    ) -> Result<Option<ProjectionCheckpoint>, StorageError> {
+        Ok(self.lock()?.checkpoints.get(projection).cloned())
+    }
+
+    async fn save_checkpoint(&self, checkpoint: &ProjectionCheckpoint) -> Result<(), StorageError> {
+        self.lock()?
+            .checkpoints
+            .insert(checkpoint.projection.clone(), checkpoint.clone());
+        Ok(())
+    }
+
+    async fn projection_lag(
+        &self,
+        projection: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProjectionLag, StorageError> {
+        let checkpoint = self.lock()?.checkpoints.get(projection).cloned();
+        Ok(ProjectionLag::from_checkpoint(checkpoint, now))
+    }
+
+    async fn rebuild_status(&self, projection: &str) -> Result<RebuildStatus, StorageError> {
+        Ok(self
+            .lock()?
+            .rebuilds
+            .get(projection)
+            .cloned()
+            .unwrap_or_else(|| RebuildStatus::idle(projection)))
+    }
+
+    async fn set_rebuild_status(&self, status: &RebuildStatus) -> Result<(), StorageError> {
+        self.lock()?
+            .rebuilds
+            .insert(status.projection.clone(), status.clone());
+        Ok(())
+    }
+
+    async fn reset_projection(&self, projection: &str) -> Result<(), StorageError> {
+        let mut inner = self.lock()?;
+        inner.checkpoints.remove(projection);
+        inner.rebuilds.remove(projection);
         Ok(())
     }
 }

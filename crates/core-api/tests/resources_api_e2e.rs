@@ -125,6 +125,7 @@ fn build_api_with_backends(
             storage_core::mock::MockEmbeddingProvider::unsupported(),
         ))),
         graph_resolver: None,
+        graph: None,
         import: None,
         search: None,
         ready: ready_always(),

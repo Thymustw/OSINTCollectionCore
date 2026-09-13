@@ -1,6 +1,8 @@
 # Job 系統（V0.1 Phase 2）
 
-欄位對齊 SPEC §21。CRUD 經 `CanonicalStore`（Postgres），不在 domain 寫 SQL。
+欄位對齊 SPEC §21。CRUD 經 `RelationalStore`（生產仍是 Postgres canonical），不在 domain 寫 SQL。
+
+`JobService` 的 generic bound 是 `RelationalStore` 不是 `CanonicalStore`：`CanonicalStore` 是標記 trait、沒有額外的 job 方法；SQLite 的 `SqliteEmbeddedStore` 實作 job CRUD 卻沒實作 `CanonicalStore`。graph-worker 的 unit test 需要在 SQLite 上跑 `process_dispatched_job`，所以 bound 放寬。生產路徑不變。
 
 ## 狀態機
 
@@ -36,9 +38,10 @@ queued ──► running ──► completed
 
 ## 派工
 
-`JobService::dispatch` 對 Redpanda produce `job.dispatched`（envelope v1）。沒有 consumer worker 在這階段；只保證事件出得去。
+`JobService::dispatch` 對 Redpanda produce `job.dispatched`（envelope v1）。
+目前真正消費這個 topic 去執行工作的只有 `osint-graph-worker`，而且只認 `job_type=graph_rebuild`（`POST /api/v1/graph/rebuild` 建立）。其他 type 在那個 consumer 上會被忽略並 commit，不是錯誤。collector 的 `collect` job **不**走這條路徑。
 
-collector 每次收集會建立 `job_type=collect`（`correlation_id=connector.id`），自己把狀態轉 `running`／`completed`／`failed`，**不**走 `job.dispatched`。Job 轉態失敗只記 warn，不中止收集。
+collector 每次收集會建立 `job_type=collect`（`correlation_id=connector.id`），自己把狀態轉 `running`／`completed`／`failed`，**不**走 `job.dispatched`。Job 轉態失敗只記 warn，不中止收集。`graph_rebuild` 才是第一個由 worker 消費 `job.dispatched` 執行的 job type。
 
 ## 驗證
 

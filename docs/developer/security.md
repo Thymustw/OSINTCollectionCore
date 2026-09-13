@@ -132,6 +132,7 @@ Cargo.toml 與 deny/audit 面，而且要各自維護一份連線池與 `map_sql
 | `entity.resolve_graph_context` | `entity` | 成功與失敗都寫 |
 | `entity.merge` | `entity` | 成功與失敗都寫（含空 `reason` 被拒） |
 | `merge.undo` | `merge_history` | 成功與失敗都寫 |
+| `graph.rebuild` | `graph` | 成功與失敗都寫（`POST /graph/rebuild` 建 job） |
 | `token.issue` / `token.list` / `token.revoke` | `api_token` | 每次 |
 | `auth.failed` | `auth` | 每一次 401 |
 | `authz.denied` | `auth` | 每一次 403 |

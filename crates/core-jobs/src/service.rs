@@ -1,4 +1,9 @@
-//! Job CRUD 與派工。儲存走 CanonicalStore。
+//! Job CRUD 與派工。儲存走 [`RelationalStore`]。
+//!
+//! 生產路徑仍是 Postgres canonical；bound 不綁 [`storage_core::CanonicalStore`]
+//! 是因為那只是標記 trait（沒有多出 job 方法），而單元測試用的
+//! `SqliteEmbeddedStore` 實作 `RelationalStore` 卻沒實作 `CanonicalStore`。
+//! 真正寫 SQL 的仍是 adapter，domain 不直接碰資料表。
 
 use std::sync::Arc;
 
@@ -6,7 +11,7 @@ use chrono::Utc;
 use core_events::{EventProducer, EventTopic};
 use core_model::{Job, JobId, JobStatus};
 use serde_json::json;
-use storage_core::CanonicalStore;
+use storage_core::RelationalStore;
 use uuid::Uuid;
 
 use crate::error::JobError;
@@ -18,7 +23,7 @@ pub struct JobService<S> {
     producer: Option<Arc<EventProducer>>,
 }
 
-impl<S: CanonicalStore> JobService<S> {
+impl<S: RelationalStore> JobService<S> {
     #[must_use]
     pub fn new(store: S, producer: Option<Arc<EventProducer>>) -> Self {
         Self { store, producer }

@@ -69,6 +69,11 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`。沒接 Postgres 回 503 |
 | POST | `/api/v1/import` | operator | 201 | multipart |
 | POST | `/api/v1/search` | viewer | 200 | |
+| GET | `/api/v1/graph/entities/{id}/neighbors` | viewer | 200 | 圖鄰居。沒有這個節點回空陣列，不是 404 |
+| GET | `/api/v1/graph/entities/{id}/relationships` | viewer | 200 | 圖邊。語意同上 |
+| GET | `/api/v1/graph/path` | viewer | 200 | `from`／`to` 必填。找不到路徑回 `null`，永遠 200 |
+| POST | `/api/v1/graph/query` | viewer | 200 | 結構化圖查詢。`starts` 空陣列回 400 |
+| POST | `/api/v1/graph/rebuild` | operator | 201 | 建立 `graph_rebuild` Job；**不會 drop** |
 | POST | `/api/v1/tokens` | **admin** | 201 | 明文只回一次 |
 | GET | `/api/v1/tokens` | **admin** | 200 | |
 | DELETE | `/api/v1/tokens/{id}` | **admin** | 204 | |
@@ -106,7 +111,7 @@ POST `/api/v1/import`（Manual／JSON／CSV 上傳）是 `multipart/form-data`�
 | 422 | 引用的資源不存在（connector 的 `source_id`、collection 的 `source_ids`） | 先建立那個資源 |
 | 428 | PATCH 沒帶 `If-Match` | 先 GET 拿 `ETag` |
 | 501 | `POST /objects`（ADR-006）；`/ops/metrics` 在非 Linux | 改用 `POST /import` |
-| 503 | 後端沒接上（Postgres／MinIO／OpenSearch／Redpanda）；`/ops/health` 有任一後端 down | 看訊息裡指的環境變數 |
+| 503 | 後端沒接上（Postgres／MinIO／OpenSearch／Redpanda／Neo4j）；`/ops/health` 有任一後端 down | 看訊息裡指的環境變數 |
 
 錯誤 body 一律是 `{"error": "...", "message": "…下一步建議…"}`。
 
@@ -290,6 +295,38 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 路由 `POST /entities/{id}/resolve/graph-context`（接 `storage-neo4j`；沒接上
 回 503，不影響上一條）。完整理由見 `docs/developer/resolver.md`。
 merge 行為見 `docs/developer/merge.md`。
+
+### Graph
+
+```bash
+# 一跳鄰居。max_hops 省略 = 1。relationship_types／entity_types 是逗號分隔。
+curl -s "http://127.0.0.1:18080/api/v1/graph/entities/$ID/neighbors?max_hops=1" \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -s "http://127.0.0.1:18080/api/v1/graph/entities/$ID/relationships" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 找不到路徑回 JSON null，HTTP 仍是 200（不是 404）
+# ⚠️ GraphPathQuery 不能 serde flatten GraphTraversalQuery：
+# serde_urlencoded 會把 max_hops=4 當字串，整條變 400。
+curl -s "http://127.0.0.1:18080/api/v1/graph/path?from=$FROM&to=$TO&max_hops=4" \
+  -H "Authorization: Bearer $TOKEN"
+
+# 結構化查詢。starts 空陣列回 400。
+curl -s -X POST http://127.0.0.1:18080/api/v1/graph/query \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"starts":["'$ID'"],"pattern":{"kind":"neighbors"},"options":{"max_hops":1}}'
+
+# 派一個非破壞性 rebuild job。201、body 是 Job（status=queued）。
+# 真正執行的是 osint-graph-worker 消費 job.dispatched。
+# ⚠️ 這條路由永遠 drop_graph=false：Job model 沒有參數欄位，
+# 全清重建只有 CLI `osint-graph-worker --rebuild --drop`。
+curl -s -X POST http://127.0.0.1:18080/api/v1/graph/rebuild \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+`time_from` 與 `time_to` 必須成對提供，只給一端回 **400**（不會靜默忽略——那樣會讓人以為時間過濾生效了）。
+Neo4j 沒接上時這 4 條讀取路由回 503；`POST /graph/rebuild` 只需要 Job 系統（Postgres + 能發 `job.dispatched`），跟圖連線是分開的。
 
 ## Relationships
 

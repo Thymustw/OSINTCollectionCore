@@ -46,7 +46,9 @@ pub struct TransitionBody {
     pub error: Option<String>,
 }
 
-fn jobs_or_unavailable(state: &AppState) -> Result<&crate::state::SharedJobService, ApiError> {
+pub(crate) fn jobs_or_unavailable(
+    state: &AppState,
+) -> Result<&crate::state::SharedJobService, ApiError> {
     state.jobs.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,

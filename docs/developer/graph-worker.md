@@ -1,16 +1,40 @@
 # graph-worker（`osint-graph-worker`）
 
-`relationship.changed` → Neo4j 圖投影（SPEC_V0.2 §8）。
-V0.2 Phase 2 Step 4。程式在 `crates/graph-worker/`。
+`relationship.changed` → Neo4j 圖投影（SPEC_V0.2 §8），並消費 `job.dispatched` 執行 `graph_rebuild`。
+V0.2 Phase 2 Step 5。程式在 `crates/graph-worker/`。
 
 ```text
 entity-worker／merge ──relationship.changed──▶ graph-worker ──逐筆──▶ Neo4j
                                                     │                   ▲
+core-api POST /graph/rebuild ──job.dispatched──┘                   │
                                                     └── 讀 PostgreSQL ──┘
                                                         （Relationship + Entity）
 ```
 
 目前**不發** `graph.sync.completed`：這條 topic 還沒有消費者，硬發一則沒人訂閱的事件不算完成。漏發靠 `--rebuild` 補齊。
+
+## 常駐模式訂兩個 topic
+
+同一個 consumer、同一個 group，靠 `EventEnvelope.event_type`（就是 topic 字串）分流：
+
+| topic | 行為 |
+|---|---|
+| `relationship.changed` | 既有：把 Entity→Entity 的邊投影進 Neo4j |
+| `job.dispatched` | 只處理 `job_type=graph_rebuild`。其他 type（例如之後的 `collect`）**忽略並 commit**，debug log，不是錯誤 |
+
+不認識的 `event_type` 也 commit（防禦性；訂閱清單就這兩個）。
+
+### `graph_rebuild` job
+
+1. `JobService::transition(job_id, Running)` 標記開始。graph-worker 自己不 `create`／`dispatch`，`JobService::new(store, None)` 不帶 `EventProducer`。
+2. 跑 `rebuild(RebuildOptions { drop_graph: false, page_size })`。**`drop_graph` 永遠是 `false`**：Job model 沒有參數欄位，沒有安全的方式讓 API 傳「要不要 drop」。全清重建只留給 CLI `--rebuild --drop`。
+3. 成功 → `Completed`；`rebuild()` 回 `Err` → `Failed`（錯誤訊息寫進 `job.error`）。
+4. **執行完（不管成敗）就 commit offset**。這裡的「失敗」是 job 本身跑失敗，不是消費事件失敗。重送只會讓同一個 job_id 再走一次 `Running→Completed/Failed`，`can_transition` 擋下後變成處理失敗、offset 又不 commit……迴圈。already-failed 的 job 重送也跑不起來。
+5. `transition` 本身失敗（例如 `job_id` 在 Postgres 查不到）也 commit：重送不會讓那個 id 出現。
+
+對應 metric：`osint_graph_worker_job_completed_total`／`osint_graph_worker_job_failed_total`／`osint_graph_worker_job_ignored_total`。
+
+觸發方式是 `POST /api/v1/graph/rebuild`（見 `docs/developer/api-skeleton.md` 的 Graph 小節），不是 collector 排程。
 
 ## 為什麼訂 `relationship.changed` 而不是 `object.updated`
 
@@ -62,9 +86,10 @@ consumer lag 仍寫進 `osint_queue_depth` gauge（給人／Prometheus 看）。
 
 | 結果 | commit？ | 理由 |
 |---|---|---|
-| `Applied`／`Deleted` | 是 | 已經寫進圖 |
-| `SkippedNonEntity`／`SkippedRace` | 是 | 預期行為，重送結果一樣，卡住 partition 沒意義 |
-| `StorageError`／Neo4j 連不上 | **否** | 這則邊還沒進圖；先提交會讓它永遠消失且沒有跡象 |
+| `relationship.changed`：`Applied`／`Deleted` | 是 | 已經寫進圖 |
+| `relationship.changed`：`SkippedNonEntity`／`SkippedRace` | 是 | 預期行為，重送結果一樣，卡住 partition 沒意義 |
+| `relationship.changed`：`StorageError`／Neo4j 連不上 | **否** | 這則邊還沒進圖；先提交會讓它永遠消失且沒有跡象 |
+| `job.dispatched`：任何結果（含 rebuild 失敗、不認識的 job_type、transition 失敗） | **是** | job 已經跑完（或確定不該跑）；重送不會讓 already-failed 的 job 重跑 |
 
 關機（SIGINT）時**不再**多 commit 一次：上一則成功時已經 commit 過；上一則失敗時必須留給 broker 重送。
 
@@ -126,6 +151,9 @@ checkpoint 與 rebuild 狀態寫失敗只 warn，不擋投影本身。理由同 
 | `osint_graph_worker_deleted_total` | `change_kind=deleted` |
 | `osint_graph_worker_race_total` | upserted 但 Postgres 已查不到（當刪除） |
 | `osint_graph_worker_errors_total` | 真正的失敗（不提交 offset） |
+| `osint_graph_worker_job_completed_total` | `graph_rebuild` job 跑完且成功 |
+| `osint_graph_worker_job_failed_total` | rebuild 回錯，或 job 狀態轉移失敗 |
+| `osint_graph_worker_job_ignored_total` | `job.dispatched` 的 `job_type` 不是 `graph_rebuild` |
 
 每個結果分支都有計數器。少一個的話那個分支悄悄一直失敗不會被發現。
 
