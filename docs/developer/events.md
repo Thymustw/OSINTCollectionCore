@@ -30,7 +30,13 @@ search.index.requested
 search.index.completed
 ```
 
-另外 **`job.dispatched`** 供 Job 派工。SPEC §20 沒列這個 topic。
+另外 **`job.dispatched`** 供 Job 派工。SPEC §20 沒列這個 topic。生產者是
+`JobService::dispatch`（`POST /api/v1/jobs`／`POST /api/v1/graph/rebuild`
+帶 `dispatch=true`）；**第一個真的消費它的服務是 `osint-graph-worker`**
+（Phase 2 Step 5）——過濾 `job_type == "graph_rebuild"`，其餘 job type
+忽略但仍提交 offset。這個 topic 在那之前只有生產者，Job 系統的狀態機
+沒有任何服務真的去執行工作，只是記錄；細節見
+`docs/developer/graph-worker.md`。
 
 ### V0.2 新增（`SPEC_V0.2.md` §20，Phase 0d）
 
@@ -116,7 +122,7 @@ Partition key：job 派工使用 `job_id`（TECH_STACK 預設表沒有 job；這
 
 ⚠️ indexer 是批次消費者：**offset 只在 bulk flush 成功之後才提交**。先提交再送出的話，flush 失敗或行程被殺時那一批會永遠不進 index 且沒有任何跡象。理由與批次／backpressure 設計見 `docs/developer/indexer.md`。
 
-`osint-graph-worker` 訂閱 **`relationship.changed`**，逐筆寫進 Neo4j（沒有 bulk API，不累積批次）。**只有兩端都是 Entity 的邊才進圖**——Document→Entity（例如 `mentions`）會被跳過，這是預期行為不是錯誤。事件內容不可信，`confidence`／時間戳／型別一律重讀 PostgreSQL。offset 在成功或優雅跳過（非 Entity 端點／race 刪除）之後才提交；Neo4j 寫入失敗不提交。`--rebuild`／`--rebuild --drop` 從 PostgreSQL 全量重建。細節見 `docs/developer/graph-worker.md`。
+`osint-graph-worker` 同一個 consumer group 訂閱**兩個** topic：`relationship.changed` 與 `job.dispatched`（靠 `EventEnvelope.event_type` 分流）。`relationship.changed` 逐筆寫進 Neo4j（沒有 bulk API，不累積批次）。**只有兩端都是 Entity 的邊才進圖**——Document→Entity（例如 `mentions`）會被跳過，這是預期行為不是錯誤。事件內容不可信，`confidence`／時間戳／型別一律重讀 PostgreSQL。offset 在成功或優雅跳過（非 Entity 端點／race 刪除）之後才提交；Neo4j 寫入失敗不提交。`job.dispatched` 只處理 `job_type == "graph_rebuild"`（其餘忽略但仍提交 offset），跑非破壞性 rebuild 並把 Job 狀態從 `Running` 轉到 `Completed`／`Failed`——執行完不管成敗都提交 offset，跟 `relationship.changed` 的規則不同（job 跑失敗重送只會撞狀態機合法性檢查造成迴圈，不是消費事件失敗）。`--rebuild`／`--rebuild --drop`（CLI）與 `POST /api/v1/graph/rebuild`（API，只會非破壞性，`--drop` 不透過 API 開放）都是從 PostgreSQL 全量重建。細節見 `docs/developer/graph-worker.md`。
 
 `graph.sync.requested`／`graph.sync.completed` 目前**沒有生產者與消費者**：重建走 `osint-graph-worker --rebuild`（CLI）而不是事件。topic 名稱保留在 `EventTopic`。
 
