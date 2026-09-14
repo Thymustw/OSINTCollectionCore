@@ -7,6 +7,7 @@
 	run-api run-collector run-normalizer run-deduplicator run-entity-worker \
 	run-indexer rebuild-index rebuild-index-drop run-cli \
 	run-graph-worker rebuild-graph rebuild-graph-drop \
+	run-embedding-worker rebuild-embeddings rebuild-embeddings-drop \
 	image-build image-scan image-prune image-ls \
 	compose-up-full compose-down-full compose-ps-full \
 	disk clean
@@ -45,12 +46,15 @@ help:
 	@echo "  make run-graph-worker  啟動 osint-graph-worker（需 compose 與 .env）"
 	@echo "  make rebuild-graph     從 PostgreSQL 補齊 Neo4j 圖投影後結束"
 	@echo "  make rebuild-graph-drop 先清空 :Entity 再從零重建（Entity 已從 Postgres 刪掉時用）"
+	@echo "  make run-embedding-worker 啟動 osint-embedding-worker（需 compose、.env、ml-commons 模型）"
+	@echo "  make rebuild-embeddings 從 PostgreSQL 補齊 Document／Entity 向量後結束"
+	@echo "  make rebuild-embeddings-drop 先刪 osint-entities 再從零重建（永不刪 osint-documents）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
-	@echo "  make image-build       建七個服務的容器 image（不 push）"
-	@echo "  make image-scan        trivy image 掃七個 image（需已安裝 trivy）"
+	@echo "  make image-build       建八個服務的容器 image（不 push）"
+	@echo "  make image-scan        trivy image 掃八個 image（需已安裝 trivy）"
 	@echo "  make image-ls          列出本專案的 image 與大小"
 	@echo "  make image-prune       清掉 dangling layer 與 builder 快取"
-	@echo "  make compose-up-full   基礎建設 + 七個應用服務（會先 build）"
+	@echo "  make compose-up-full   基礎建設 + 八個應用服務（會先 build）"
 	@echo "  make compose-down-full 停掉含應用服務的整套"
 	@echo "  make compose-ps-full   含應用服務的狀態"
 	@echo "  make disk              顯示 target/、.git、docker volume 的磁碟用量"
@@ -110,13 +114,14 @@ compose-ps:
 	$(COMPOSE) $(COMPOSE_FILES) ps
 
 # --- 容器化（Phase 7a）--------------------------------------------------
-# 七個應用服務在 compose 的 `app` profile 底下，預設不啟動。
+# 八個應用服務在 compose 的 `app` profile 底下，預設不啟動。
 # 沒有 --profile app 的目標（compose-up / compose-down / compose-ps）行為不變。
 
 IMAGE_TAG ?= 0.1.0
 IMAGE_PREFIX ?= osint-core
 SERVICES := osint-api osint-collector osint-normalizer \
-	osint-deduplicator osint-entity-worker osint-indexer osint-graph-worker
+	osint-deduplicator osint-entity-worker osint-indexer \
+	osint-graph-worker osint-embedding-worker
 
 # 只 build，不啟動。image 名稱固定成 $(IMAGE_PREFIX)/<服務>:$(IMAGE_TAG)，
 # 所以重 build 會覆蓋同一個 tag（舊的變成 dangling，用 image-prune 清）。
@@ -232,6 +237,22 @@ rebuild-graph:
 # ⚠️ 對本機共用 Neo4j 跑這個等於整個圖清空重來；跑之前確認沒有別人在用。
 rebuild-graph-drop:
 	$(CARGO) run -p graph-worker --bin osint-graph-worker -- --rebuild --drop
+
+# V0.2 Phase 3 §11–§14 向量投影。訂閱 entity.extracted（與 indexer 同一 topic、
+# 獨立 consumer group）。Document 向量疊加進 osint-documents；Entity 向量寫進
+# osint-entities。推論在 OpenSearch ml-commons，本行程不載模型。
+# 細節見 docs/developer/embedding-worker.md。
+run-embedding-worker:
+	$(CARGO) run -p embedding-worker --bin osint-embedding-worker
+
+# 從 PostgreSQL 補齊向量（略過 find_embedding cache，因為 Postgres 沒存向量本體）。
+rebuild-embeddings:
+	$(CARGO) run -p embedding-worker --bin osint-embedding-worker -- --rebuild
+
+# 先刪掉 osint-entities 再從零重建。mapping 有破壞性變更時必須用這個。
+# **永不**刪 osint-documents——那個 index 是 indexer 的，本服務只疊加向量欄位。
+rebuild-embeddings-drop:
+	$(CARGO) run -p embedding-worker --bin osint-embedding-worker -- --rebuild --drop
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。

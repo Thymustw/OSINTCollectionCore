@@ -60,12 +60,14 @@ const BACKEND: &str = "opensearch-ml";
 /// 每次 `embed` 都打 `_search` 會把推論延遲加上一次查詢，而且
 /// `model_id` 在正常運作下不會自己變；變了代表有人重跑 setup 腳本，
 /// 那本來就該重啟吃新設定。
+#[derive(Clone)]
 pub struct MlCommonsEmbeddingProvider {
     client: OpenSearch,
     minilm: DeployedModel,
     e5: DeployedModel,
 }
 
+#[derive(Clone)]
 struct DeployedModel {
     /// ml-commons 內部 id（每次重新註冊都會變）。
     model_id: String,

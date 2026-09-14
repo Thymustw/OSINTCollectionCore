@@ -97,8 +97,9 @@ services:
   # 宿主）套到這台開發機的實際規格：約 31 GB RAM / 8 核心，而且同時跑著
   # 一整套 OpenCTI。上面的基礎建設已經佔掉 5.25 GB / 4.5 CPU
   # （V0.2 Phase 0b 起：opensearch 1g→2g、新增 neo4j 1g），
-  # 這七個服務再加約 2.1 GB / 2.75 CPU，合計約 7.4 GB / 7.25 CPU
-  # （V0.2 Phase 2 Step 7 加了 osint-graph-worker）。
+  # 這八個服務再加約 2.35 GB / 3.0 CPU，合計約 8.6 GB / 7.5 CPU
+  # （V0.2 Phase 2 Step 7 加了 osint-graph-worker；Phase 3 Step 3
+  # 加了 osint-embedding-worker，推論在 OpenSearch JVM，本行程 256m/0.25）。
   #
   # 分配依據：osint-api 同時是 HTTP 入口與匯入解析點，拿最多；indexer 要做
   # bulk 批次與 OpenSearch 投影，次之；graph-worker 逐筆寫 Neo4j、沒有批次，
@@ -107,7 +108,7 @@ services:
   # ⚠️ 這些是**本機開發**的天花板，不是容量規劃。正式佈署要依
   # RESOURCE_BUDGET.md 的 OSINT_RAM_SOFT_LIMIT_GB / OSINT_CPU_SOFT_PERCENT 重算。
   #
-  # 宿主埠**不覆寫**：18080–18086 在這台機器上是空的（`ss -ltn` 實測），
+  # 宿主埠**不覆寫**：18080–18087 在這台機器上是空的（`ss -ltn` 實測），
   # 沒有像 9200/9000 那樣的 OpenCTI 衝突要規避。
 
   osint-api:
@@ -137,5 +138,11 @@ services:
   # 逐筆寫 Neo4j，沒有 bulk API 也不累積批次——跟 entity-worker 同一個等級
   # 的輕量常駐消費者，不是 indexer 那種批次/backpressure 的角色。
   osint-graph-worker:
+    mem_limit: 256m
+    cpus: "0.25"
+
+  # 推論在 OpenSearch JVM（ml-commons），本行程只是 Kafka 消費者 + HTTP
+  # overlay。跟 entity-worker 同一個等級。
+  osint-embedding-worker:
     mem_limit: 256m
     cpus: "0.25"

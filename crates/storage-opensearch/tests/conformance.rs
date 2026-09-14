@@ -1,6 +1,7 @@
 use storage_core::conformance::{
-    assert_opensearch_identity, assert_projection_store_contract, assert_search_round_trip,
-    assert_structured_search, load_workspace_dotenv, required_env, verify_not_opencti_search,
+    assert_bulk_upsert_preserves_unknown_fields, assert_opensearch_identity,
+    assert_projection_store_contract, assert_search_round_trip, assert_structured_search,
+    load_workspace_dotenv, required_env, verify_not_opencti_search,
 };
 use storage_opensearch::OpenSearchStore;
 
@@ -32,6 +33,10 @@ async fn opensearch_search_conformance() {
     assert_search_round_trip(&store, &index)
         .await
         .expect("search round-trip");
+    // indexer 與 embedding-worker 共用同一份文件：upsert 只能覆寫自己知道的欄位。
+    assert_bulk_upsert_preserves_unknown_fields(&store, &index)
+        .await
+        .expect("bulk upsert 不清空未知欄位");
     // StructuredSearch 是面向使用者的那條路徑（過濾、NOT、search_after）。
     // 未來新增的 SearchStore adapter 也要通過這一支。
     //

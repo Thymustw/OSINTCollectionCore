@@ -1408,6 +1408,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedding-worker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "core-config",
+ "core-events",
+ "core-model",
+ "core-observability",
+ "indexer",
+ "serde_json",
+ "storage-core",
+ "storage-opensearch",
+ "storage-postgres",
+ "storage-sqlite",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"

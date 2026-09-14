@@ -946,6 +946,19 @@ pub trait SearchStore: HealthProvider {
         &self,
         documents: Vec<SearchDocument>,
     ) -> Result<BulkIndexResult, StorageError>;
+    /// 批次部分更新／建立（`_update` bulk action，`doc_as_upsert=true`）。
+    ///
+    /// 跟 [`Self::update_fields`] 的關鍵差異：**這個方法允許 upsert**——文件不存在
+    /// 就直接用整份 `body` 當新文件建立。`update_fields` 刻意不 upsert，是因為
+    /// embedding-worker 的向量欄位邏輯上必須疊加在「已存在」的文件上；這個方法
+    /// 是給 indexer 這類「本來就要負責建立文件」的寫入者用的：只覆寫呼叫端知道的
+    /// 欄位，**不會動呼叫端不知道的欄位**（例如別的服務事後疊加上去的向量欄位）。
+    /// 跟 [`Self::bulk_index`] 的差異：`bulk_index` 整份取代 `_source`，這個方法
+    /// 只合併 `body` 裡列出的欄位，其餘既有欄位維持原樣。
+    async fn bulk_upsert_fields(
+        &self,
+        documents: Vec<SearchDocument>,
+    ) -> Result<BulkIndexResult, StorageError>;
     /// 原始查詢字串。**只給 conformance 與運維臨時查詢用**，不要接使用者輸入
     /// （理由見 [`SearchQuery`]）。
     async fn query(&self, query: SearchQuery) -> Result<SearchHits, StorageError>;
@@ -956,6 +969,8 @@ pub trait SearchStore: HealthProvider {
     /// 部分更新既有文件的欄位（`_update` API，`doc_as_upsert=false`）。
     ///
     /// **不會整份覆寫 `_source`**——[`Self::index`]／[`Self::bulk_index`] 才會那樣做。
+    /// indexer 的寫入路徑是 [`Self::bulk_upsert_fields`]（部分合併 + upsert），
+    /// 不是這兩個整份取代的方法。
     /// 用於 embedding-worker 事後補寫向量欄位：文件本體已由 indexer 寫入，
     /// 只需要疊加 `embedding_en`／`embedding_en_model_version` 等欄位；用
     /// `index()` 整份覆寫會把 title／body／entities 全部清空，因為 OpenSearch

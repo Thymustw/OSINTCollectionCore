@@ -34,7 +34,7 @@ crates/storage-neo4j         GraphStore + ProjectionStore（neo4rs 0.8.0）
 
 `GraphStore`／`EmbeddingProvider` trait 與記憶體 mock 在 `storage-core`
 （V0.2 Phase 0g）。上層測試仍可注入
-`storage_core::mock::{MockGraphStore, MockEmbeddingProvider}`；
+`storage_core::mock::{MockGraphStore, MockEmbeddingProvider, MockSearchStore}`；
 真實圖投影走 `storage-neo4j`；真實 embedding 走
 `storage_opensearch::MlCommonsEmbeddingProvider`。
 
@@ -48,7 +48,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `EmbeddedStore` | `storage-sqlite` | SQLite（本機／App／投影，不是高併發 canonical） |
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
 | `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`）；Phase 3 Step 1 再加 `0010`（`embeddings` metadata，`put_embedding` **不是** upsert）與 `0011`（`duplicate_groups.model`）。見 `schema-v0.2.md` |
-| `SearchStore` | `storage-opensearch` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`query`／`search`／`delete`／`update_fields`／`vector_search`） |
+| `SearchStore` | `storage-opensearch`；mock：`storage_core::mock::MockSearchStore` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`bulk_upsert_fields`／`query`／`search`／`delete`／`update_fields`／`vector_search`） |
 | `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
 | `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |
 | `EmbeddingProvider` | `storage-opensearch`（`MlCommonsEmbeddingProvider`）；mock：`storage_core::mock::MockEmbeddingProvider` | 文字→向量（V0.2 Phase 3）。見下方「`EmbeddingProvider`」 |
@@ -66,12 +66,24 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `query()` | `SearchQuery`（原始 `query_string`） | **只給 conformance 與運維臨時查詢**。字串會被原樣交給後端查詢語言，使用者可以用 `欄位名:值`／`*`／`~` 存取任意欄位或做 wildcard DoS |
 | `search()` | `StructuredSearch`（後端中立的語法樹 + 過濾 + 排序 + `search_after` + highlight） | **面向使用者的路徑**。任何使用者字串都只可能落在 `QueryExpr::Term`／`Phrase` 的值裡，不可能變成查詢語言的結構 |
 | `update_fields()` | index + id + 部分欄位 JSON | OpenSearch `_update`，**不** `doc_as_upsert`。疊加欄位、不覆寫整個 `_source`。給 embedding-worker 事後補寫 `embedding_en` 等向量欄位用——用 `index()` 會把 title／body／entities 清空。文件不存在回 `NotFound`，不憑空建立一份殘缺文件 |
+| `bulk_upsert_fields()` | `Vec<SearchDocument>` → `BulkIndexResult` | OpenSearch bulk `"update"` + `doc_as_upsert=true`。跟 `bulk_index` 一樣回逐筆失敗，但**只合併 `body` 裡列出的欄位**，其餘既有欄位維持原樣。給 indexer 用：它本來就要負責建立文件（所以允許 upsert），但不能把 embedding-worker 疊加的向量欄位整份取代掉。跟 `update_fields` 的差異是文件不存在時會建立，而不是回 `NotFound` |
 | `vector_search()` | `VectorSearch`（欄位 + 向量 + k + filters） | k-NN 最近鄰。filter 放 knn 子句**內**（lucene engine 的 native filtered knn）；外層 bool post-filter 在 k 很小且最近鄰不符合條件時會回空。呼叫端自己選 `embedding_en`／`embedding_multi`，trait 不做語言判斷 |
 
-`bulk_index` 回 `BulkIndexResult { indexed, errors, failures }`。`failures` 逐筆帶
-`id`／`status`／`reason`，`BulkFailure::is_retryable()` 區分暫時性（429/502/503/504）
-與永久性（400）。**只回一個 `errors: 3` 沒辦法重試也沒辦法分類**，呼叫端只能整批重送
-或整批放棄——那是資料靜默消失的入口。
+`MockSearchStore`（V0.2 Phase 3 Step 3）給 embedding-worker 單元測試用：
+`index()`／`bulk_index()` 整份覆寫 `_source`；`bulk_upsert_fields()` 已存在就合併
+`body` 的鍵、不存在就整份寫入；`update_fields()` 合併欄位，缺 id 回 `NotFound`。
+`set_update_not_found_remaining(n)` 即使文件已在 store 也先回 n 次 NotFound，
+用來測 indexer lag 的重試。`vector_search` 是記憶體 brute-force cosine，
+不是 HNSW。實作是 `Arc<Mutex<...>>`，可 `Clone` 後從 worker 取出同一份記憶體斷言。
+
+`bulk_index` 與 `bulk_upsert_fields` 都回 `BulkIndexResult { indexed, errors, failures }`。
+`failures` 逐筆帶 `id`／`status`／`reason`，`BulkFailure::is_retryable()` 區分暫時性
+（429/502/503/504）與永久性（400）。**只回一個 `errors: 3` 沒辦法重試也沒辦法分類**，
+呼叫端只能整批重送或整批放棄——那是資料靜默消失的入口。
+
+`bulk_index` 整份取代 `_source`（OpenSearch `"index"` action）。`osint-documents` 從
+V0.2 Phase 3 Step 2 起有兩個寫入者，indexer 改走 `bulk_upsert_fields`；新的 SearchStore
+adapter 必須通過 `storage_core::conformance::assert_bulk_upsert_preserves_unknown_fields`。
 
 新增 SearchStore adapter 必須通過 `storage_core::conformance::assert_structured_search`
 （驗過濾真的過濾、`Not` 真的排除、hit 帶得回 `sort`、`search_after` 真的接續）。
@@ -578,8 +590,10 @@ checkpoint 與 rebuild 狀態可以同在一個節點上，寫入用 `SET` 部�
    `model_version`／`dimensions`／`content_hash`／`vector`。上游沒版本號時
    用 `model_content_hash_value` 頂替，不要填 ml-commons 的 `"1"`。
 5. **向量空間不相通**：同一段文字、兩個模型，向量不可比。呼叫端用
-   `model_for` 決定寫進哪個 k-NN 欄位／index。欄位怎麼拆仍是 SPEC §14
-   未決事項。
+   `model_for` 決定寫進哪個 k-NN 欄位／index。Document 分
+   `embedding_en`／`embedding_multi`（Phase 3 Step 2）；Entity 寫進獨立
+   `osint-entities` 的 `description_vector_multi`（Phase 3 Step 3，見
+   `docs/developer/embedding-worker.md`）。
 
 `content_hash` 的唯一定義是 `embedding_content_hash`：SHA-256 打在**原始
 文字** UTF-8 上，不含前綴、不含模型名。re-generate 比的是內容有沒有變。

@@ -36,6 +36,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub graph_worker: GraphWorkerSection,
     #[serde(default)]
+    pub embedding_worker: EmbeddingWorkerSection,
+    #[serde(default)]
     pub import: ImportSection,
     #[serde(default)]
     pub embedding: EmbeddingSection,
@@ -360,6 +362,33 @@ impl Default for GraphWorkerSection {
     }
 }
 
+/// embedding-worker（`osint-embedding-worker`）的 health 與投影設定。
+///
+/// `batch_size`／`concurrent_inferences` **不**在這裡——沿用 [`EmbeddingSection`]。
+/// 兩個各自維護一份只會製造「兩者不一致」的坑。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingWorkerSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// Entity 向量投影的 index 名。Document 向量仍寫進 `[indexer].index`。
+    pub entities_index: String,
+    /// rebuild 時每頁掃描筆數。
+    pub page_size: u32,
+}
+
+impl Default for EmbeddingWorkerSection {
+    fn default() -> Self {
+        Self {
+            // 18080–18086 已分別是 api／collector／normalizer／deduplicator／
+            // entity-worker／indexer／graph-worker 的 health 埠。
+            bind: "127.0.0.1:18087".into(),
+            consumer_group: "osint-embedding-worker".into(),
+            entities_index: "osint-entities".into(),
+            page_size: 100,
+        }
+    }
+}
+
 /// `POST /api/v1/import` 的上傳與解析上限。每一項都必須有值，沒有「不限」這個選項。
 ///
 /// `max_upload_bytes` 與 `[http].request_body_limit_bytes` 是兩條獨立的界線：
@@ -603,6 +632,13 @@ mod tests {
         assert_eq!(cfg.graph_worker.consumer_group, "osint-graph-worker");
         assert_eq!(cfg.graph_worker.projection, "osint-graph");
         assert_eq!(cfg.graph_worker.page_size, 100);
+        assert_eq!(cfg.embedding_worker.bind, "127.0.0.1:18087");
+        assert_eq!(
+            cfg.embedding_worker.consumer_group,
+            "osint-embedding-worker"
+        );
+        assert_eq!(cfg.embedding_worker.entities_index, "osint-entities");
+        assert_eq!(cfg.embedding_worker.page_size, 100);
         assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.import.max_records, 10_000);
         assert_eq!(cfg.import.max_record_bytes, 262_144);
@@ -666,6 +702,15 @@ mod tests {
     }
 
     #[test]
+    fn embedding_worker_section_default_values() {
+        let section = EmbeddingWorkerSection::default();
+        assert_eq!(section.bind, "127.0.0.1:18087");
+        assert_eq!(section.consumer_group, "osint-embedding-worker");
+        assert_eq!(section.entities_index, "osint-entities");
+        assert_eq!(section.page_size, 100);
+    }
+
+    #[test]
     fn graph_storage_missing_bolt_fields_use_serde_defaults() {
         // Phase 0b 設定檔只有 adapter + http_url；新欄位必須靠 serde default
         // 補上，不能讓整份設定解析失敗。
@@ -722,9 +767,11 @@ mod tests {
             let obj = value.as_object_mut().unwrap();
             obj.remove("embedding");
             obj.remove("search_hybrid");
+            obj.remove("embedding_worker");
             serde_json::from_value(value).unwrap()
         };
         assert_eq!(parsed.embedding, EmbeddingSection::default());
         assert_eq!(parsed.search_hybrid, HybridSearchSection::default());
+        assert_eq!(parsed.embedding_worker, EmbeddingWorkerSection::default());
     }
 }

@@ -1,22 +1,26 @@
-//! GraphStore／EmbeddingProvider 的確定性 mock。
+//! GraphStore／EmbeddingProvider／SearchStore 的確定性 mock。
 //!
-//! 給 Phase 1 的 semantic similarity 與圖 API 上層測試用，**不**打真實後端。
-//! Neo4j adapter 是 Phase 2 的 `storage-neo4j`，不要把這裡當成它的雛形。
+//! 給 Phase 1 的 semantic similarity、圖 API，以及 Phase 3 embedding-worker
+//! 上層測試用，**不**打真實後端。Neo4j adapter 是 Phase 2 的 `storage-neo4j`，
+//! OpenSearch adapter 是 `storage-opensearch`，不要把這裡當成它們的雛形。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use core_model::{EntityId, RelationshipId};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::error::StorageError;
 use crate::health::{HealthProvider, StorageHealth};
 use crate::traits::{
-    EmbeddingKind, EmbeddingModelRef, EmbeddingProvider, EmbeddingRequest, EmbeddingVector,
-    GraphEdge, GraphNode, GraphPath, GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions,
-    ProjectionCheckpoint, ProjectionLag, ProjectionStore, RebuildStatus, embedding_content_hash,
+    BulkIndexResult, EmbeddingKind, EmbeddingModelRef, EmbeddingProvider, EmbeddingRequest,
+    EmbeddingVector, GraphEdge, GraphNode, GraphPath, GraphPattern, GraphQuery, GraphStore,
+    GraphTraversalOptions, ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
+    RebuildStatus, SearchDocument, SearchFilter, SearchHit, SearchHits, SearchQuery, SearchStore,
+    StructuredSearch, VectorSearch, embedding_content_hash,
 };
 
 /// mock 拒絕超過這個跳數的遍歷。無界查詢會掃完整張圖。
@@ -623,6 +627,7 @@ fn collect_bounded_walks(
 /// 向量內容**不是**真的語意——只保證同一輸入穩定、不同 (model, kind, text) 不同。
 ///
 /// [`MockEmbeddingProvider::unsupported`] 讓呼叫端測「還沒接語意相似度」的路徑。
+#[derive(Clone)]
 pub struct MockEmbeddingProvider {
     dimensions: usize,
     unsupported: bool,
@@ -789,6 +794,369 @@ impl EmbeddingProvider for MockEmbeddingProvider {
             out.push(self.embed(request).await?);
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockSearchStore
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct SearchInner {
+    docs: HashMap<(String, String), Value>,
+    /// `(index, id)` → 還要再回幾次 [`StorageError::NotFound`]。
+    ///
+    /// 給 embedding-worker 測 indexer race：前 N 次 `update_fields` 假裝文件
+    /// 還沒被 indexer 寫進 `osint-documents`。即使文件已經在 store 裡也照樣
+    /// 回 NotFound，直到計數耗盡。
+    not_found_remaining: HashMap<(String, String), u32>,
+}
+
+/// 記憶體 SearchStore。CRUD 與 brute-force k-NN 足夠讓 embedding-worker
+/// 單元測試寫，不是 OpenSearch 語意模擬器。
+///
+/// 對齊 [`SearchStore`] 契約的關鍵點：
+///
+/// * [`Self::index`] 整份覆寫 `_source`
+/// * [`Self::update_fields`] 部分合併；id 不存在回 [`StorageError::NotFound`]，
+///   **不** upsert（對齊 OpenSearch `_update` + `doc_as_upsert=false`）
+/// * [`Self::bulk_upsert_fields`] 部分合併＋upsert：已存在就合併 `body` 的鍵，
+///   不存在就整份寫入（對齊 OpenSearch `_update` + `doc_as_upsert=true`）
+///
+/// `Clone` 共用同一份記憶體（`Arc`），這樣測試才能從 `EmbeddingWorker`
+/// 拿出 `search()` 再斷言寫入結果。
+#[derive(Clone)]
+pub struct MockSearchStore {
+    inner: Arc<Mutex<SearchInner>>,
+}
+
+impl MockSearchStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SearchInner::default())),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, SearchInner>, StorageError> {
+        self.inner.lock().map_err(|_| StorageError::Unknown {
+            backend: "mock-search",
+            message: "MockSearchStore mutex 已中毒（先前有 panic 持有鎖）。請重開測試行程".into(),
+        })
+    }
+
+    /// 測試 helper：讀回目前的 `_source`。文件不存在回 `None`。
+    pub fn get(&self, index: &str, id: &str) -> Result<Option<Value>, StorageError> {
+        let inner = self.lock()?;
+        Ok(inner
+            .docs
+            .get(&(index.to_string(), id.to_string()))
+            .cloned())
+    }
+
+    /// 接下來 `n` 次 `update_fields(index, id)` 回 [`StorageError::NotFound`]，
+    /// 即使文件已經在 store 裡。第 `n + 1` 次起才真正合併。
+    ///
+    /// 給 embedding-worker 測「indexer 還沒寫進 osint-documents」的 race，
+    /// 不必真的連 OpenSearch。
+    pub fn set_update_not_found_remaining(
+        &self,
+        index: &str,
+        id: &str,
+        n: u32,
+    ) -> Result<(), StorageError> {
+        let mut inner = self.lock()?;
+        inner
+            .not_found_remaining
+            .insert((index.to_string(), id.to_string()), n);
+        Ok(())
+    }
+}
+
+impl Default for MockSearchStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn match_query_string(source: &Value, query_string: &str) -> bool {
+    let q = query_string.trim();
+    if q.is_empty() || q == "*" {
+        return true;
+    }
+    if let Some((field, value)) = q.split_once(':') {
+        field_equals(source, field.trim(), value.trim())
+    } else {
+        source.to_string().contains(q)
+    }
+}
+
+fn field_equals(source: &Value, field: &str, expected: &str) -> bool {
+    source.get(field).is_some_and(|v| match v {
+        Value::String(s) => s == expected,
+        other => other.to_string().trim_matches('"') == expected,
+    })
+}
+
+fn match_filters(source: &Value, filters: &[SearchFilter]) -> bool {
+    filters.iter().all(|f| match f {
+        SearchFilter::Term { field, value } => field_equals(source, field, value),
+        SearchFilter::Missing { field } => source.get(field).is_none_or(Value::is_null),
+        SearchFilter::DateRange { field, from, to } => {
+            let Some(raw) = source.get(field).and_then(Value::as_str) else {
+                return false;
+            };
+            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) else {
+                return false;
+            };
+            let ts = parsed.with_timezone(&Utc);
+            from.is_none_or(|start| ts >= start) && to.is_none_or(|end| ts <= end)
+        }
+        SearchFilter::Nested { path, terms } => source
+            .get(path)
+            .and_then(Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter().any(|elem| {
+                    terms.iter().all(|(k, v)| {
+                        field_equals(elem, k, v) || field_equals(elem, &format!("{path}.{k}"), v)
+                    })
+                })
+            }),
+    })
+}
+
+fn match_expr(source: &Value, expr: &QueryExpr) -> bool {
+    let haystack = source.to_string();
+    match expr {
+        QueryExpr::Term(t) | QueryExpr::Phrase(t) => haystack.contains(t),
+        QueryExpr::And(xs) => xs.iter().all(|x| match_expr(source, x)),
+        QueryExpr::Or(xs) => xs.iter().any(|x| match_expr(source, x)),
+        QueryExpr::Not(inner) => !match_expr(source, inner),
+    }
+}
+
+fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    let denom = na.sqrt() * nb.sqrt();
+    if denom == 0.0 { 0.0 } else { dot / denom }
+}
+
+fn parse_vector(value: &Value) -> Option<Vec<f32>> {
+    value.as_array().map(|arr| {
+        arr.iter()
+            .map(|n| n.as_f64().unwrap_or(0.0) as f32)
+            .collect()
+    })
+}
+
+#[async_trait]
+impl HealthProvider for MockSearchStore {
+    async fn health(&self) -> Result<StorageHealth, StorageError> {
+        Ok(StorageHealth::ok("mock-search", "記憶體 SearchStore 可用"))
+    }
+}
+
+#[async_trait]
+impl SearchStore for MockSearchStore {
+    async fn index(&self, document: SearchDocument) -> Result<(), StorageError> {
+        let mut inner = self.lock()?;
+        inner
+            .docs
+            .insert((document.index, document.id), document.body);
+        Ok(())
+    }
+
+    async fn bulk_index(
+        &self,
+        documents: Vec<SearchDocument>,
+    ) -> Result<BulkIndexResult, StorageError> {
+        let n = documents.len() as u32;
+        for document in documents {
+            self.index(document).await?;
+        }
+        Ok(BulkIndexResult {
+            indexed: n,
+            errors: 0,
+            failures: Vec::new(),
+        })
+    }
+
+    async fn bulk_upsert_fields(
+        &self,
+        documents: Vec<SearchDocument>,
+    ) -> Result<BulkIndexResult, StorageError> {
+        // mock 是記憶體 map，沒有 OpenSearch 那種「只合併列出的欄位」的底層 API。
+        // 行為對齊真實 adapter 的語意：已存在就合併 `body` 的鍵，不存在就整份寫入。
+        let n = documents.len() as u32;
+        let mut inner = self.lock()?;
+        for document in documents {
+            let key = (document.index, document.id);
+            match inner.docs.get_mut(&key) {
+                Some(existing) => {
+                    if let (Some(obj), Some(patch)) =
+                        (existing.as_object_mut(), document.body.as_object())
+                    {
+                        for (k, v) in patch {
+                            obj.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        inner.docs.insert(key, document.body);
+                    }
+                }
+                None => {
+                    inner.docs.insert(key, document.body);
+                }
+            }
+        }
+        Ok(BulkIndexResult {
+            indexed: n,
+            errors: 0,
+            failures: Vec::new(),
+        })
+    }
+
+    async fn query(&self, query: SearchQuery) -> Result<SearchHits, StorageError> {
+        let inner = self.lock()?;
+        let mut hits: Vec<SearchHit> = inner
+            .docs
+            .iter()
+            .filter(|((index, _), source)| {
+                index == &query.index && match_query_string(source, &query.query_string)
+            })
+            .map(|((_, id), source)| SearchHit {
+                id: id.clone(),
+                score: None,
+                source: source.clone(),
+                sort: Vec::new(),
+                highlights: Default::default(),
+            })
+            .collect();
+        let total = hits.len() as u64;
+        let from = query.from as usize;
+        if from >= hits.len() {
+            hits.clear();
+        } else {
+            let end = (from + query.size as usize).min(hits.len());
+            hits = hits[from..end].to_vec();
+        }
+        Ok(SearchHits { total, hits })
+    }
+
+    async fn search(&self, query: StructuredSearch) -> Result<SearchHits, StorageError> {
+        let inner = self.lock()?;
+        let mut hits: Vec<SearchHit> = inner
+            .docs
+            .iter()
+            .filter(|((index, _), source)| {
+                if index != &query.index {
+                    return false;
+                }
+                if !match_filters(source, &query.filters) {
+                    return false;
+                }
+                query
+                    .expression
+                    .as_ref()
+                    .is_none_or(|expr| match_expr(source, expr))
+            })
+            .map(|((_, id), source)| SearchHit {
+                id: id.clone(),
+                score: None,
+                source: source.clone(),
+                sort: Vec::new(),
+                highlights: Default::default(),
+            })
+            .collect();
+        let total = hits.len() as u64;
+        hits.truncate(query.size as usize);
+        Ok(SearchHits { total, hits })
+    }
+
+    async fn delete(&self, index: &str, id: &str) -> Result<bool, StorageError> {
+        let mut inner = self.lock()?;
+        Ok(inner
+            .docs
+            .remove(&(index.to_string(), id.to_string()))
+            .is_some())
+    }
+
+    async fn update_fields(
+        &self,
+        index: &str,
+        id: &str,
+        fields: Value,
+    ) -> Result<(), StorageError> {
+        let mut inner = self.lock()?;
+        let key = (index.to_string(), id.to_string());
+        if let Some(remaining) = inner.not_found_remaining.get_mut(&key) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(StorageError::NotFound {
+                    message: format!(
+                        "mock 延遲 NotFound：index `{index}` id `{id}` 還要再等 indexer 寫入"
+                    ),
+                });
+            }
+        }
+        let Some(existing) = inner.docs.get_mut(&key) else {
+            return Err(StorageError::NotFound {
+                message: format!("index `{index}` 找不到 id `{id}`，無法部分更新"),
+            });
+        };
+        let Some(obj) = existing.as_object_mut() else {
+            return Err(StorageError::ConstraintViolation {
+                message: format!("index `{index}` id `{id}` 的 _source 不是物件，無法合併欄位"),
+            });
+        };
+        let Some(patch) = fields.as_object() else {
+            return Err(StorageError::ConstraintViolation {
+                message: "update_fields 的 fields 必須是 JSON 物件".into(),
+            });
+        };
+        for (k, v) in patch {
+            obj.insert(k.clone(), v.clone());
+        }
+        Ok(())
+    }
+
+    async fn vector_search(&self, query: VectorSearch) -> Result<SearchHits, StorageError> {
+        let inner = self.lock()?;
+        let mut scored: Vec<(f32, SearchHit)> = inner
+            .docs
+            .iter()
+            .filter(|((index, _), source)| {
+                index == &query.index && match_filters(source, &query.filters)
+            })
+            .filter_map(|((_, id), source)| {
+                let vec = source.get(&query.field).and_then(parse_vector)?;
+                let score = cosine_sim(&query.vector, &vec);
+                Some((
+                    score,
+                    SearchHit {
+                        id: id.clone(),
+                        score: Some(f64::from(score)),
+                        source: source.clone(),
+                        sort: Vec::new(),
+                        highlights: Default::default(),
+                    },
+                ))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(query.k as usize);
+        let hits: Vec<SearchHit> = scored.into_iter().map(|(_, h)| h).collect();
+        let total = hits.len() as u64;
+        Ok(SearchHits { total, hits })
     }
 }
 
@@ -1286,5 +1654,153 @@ mod tests {
             .unwrap();
         assert_eq!(a.content_hash, b.content_hash);
         assert_ne!(a.vector, b.vector);
+    }
+
+    #[tokio::test]
+    async fn search_index_overwrites_whole_source() {
+        let s = MockSearchStore::new();
+        s.index(SearchDocument {
+            index: "osint-documents".into(),
+            id: "d1".into(),
+            body: json!({"title": "old", "keep": 1}),
+        })
+        .await
+        .unwrap();
+        s.index(SearchDocument {
+            index: "osint-documents".into(),
+            id: "d1".into(),
+            body: json!({"title": "new"}),
+        })
+        .await
+        .unwrap();
+        let got = s.get("osint-documents", "d1").unwrap().unwrap();
+        assert_eq!(got["title"], "new");
+        assert!(got.get("keep").is_none(), "index() 必須整份覆寫，不能合併");
+    }
+
+    #[tokio::test]
+    async fn update_fields_merges_and_missing_is_not_found() {
+        let s = MockSearchStore::new();
+        s.index(SearchDocument {
+            index: "osint-documents".into(),
+            id: "d1".into(),
+            body: json!({"title": "keep", "body": "x"}),
+        })
+        .await
+        .unwrap();
+        s.update_fields(
+            "osint-documents",
+            "d1",
+            json!({"embedding_en": [0.1, 0.2], "embedding_en_model_version": "v"}),
+        )
+        .await
+        .unwrap();
+        let got = s.get("osint-documents", "d1").unwrap().unwrap();
+        assert_eq!(got["title"], "keep");
+        assert_eq!(got["embedding_en_model_version"], "v");
+
+        let err = s
+            .update_fields("osint-documents", "missing", json!({"a": 1}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::NotFound { .. }),
+            "缺文件必須 NotFound，不可 upsert：{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_fields_merges_and_creates() {
+        let s = MockSearchStore::new();
+        s.index(SearchDocument {
+            index: "osint-documents".into(),
+            id: "d1".into(),
+            body: json!({"title": "keep", "overlay": "vector"}),
+        })
+        .await
+        .unwrap();
+        let result = s
+            .bulk_upsert_fields(vec![
+                SearchDocument {
+                    index: "osint-documents".into(),
+                    id: "d1".into(),
+                    body: json!({"title": "new", "body": "x"}),
+                },
+                SearchDocument {
+                    index: "osint-documents".into(),
+                    id: "d2".into(),
+                    body: json!({"title": "created"}),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(result.indexed, 2);
+        let d1 = s.get("osint-documents", "d1").unwrap().unwrap();
+        assert_eq!(d1["title"], "new");
+        assert_eq!(d1["body"], "x");
+        assert_eq!(d1["overlay"], "vector", "呼叫端沒寫進 body 的欄位必須留下");
+        let d2 = s.get("osint-documents", "d2").unwrap().unwrap();
+        assert_eq!(d2["title"], "created");
+    }
+
+    #[tokio::test]
+    async fn delayed_not_found_then_succeeds() {
+        let s = MockSearchStore::new();
+        s.index(SearchDocument {
+            index: "osint-documents".into(),
+            id: "d1".into(),
+            body: json!({"title": "t"}),
+        })
+        .await
+        .unwrap();
+        s.set_update_not_found_remaining("osint-documents", "d1", 2)
+            .unwrap();
+        for i in 0..2 {
+            let err = s
+                .update_fields("osint-documents", "d1", json!({"embedding_en": [1.0]}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, StorageError::NotFound { .. }),
+                "第 {i} 次應為延遲 NotFound：{err}"
+            );
+        }
+        s.update_fields("osint-documents", "d1", json!({"embedding_en": [1.0]}))
+            .await
+            .unwrap();
+        let got = s.get("osint-documents", "d1").unwrap().unwrap();
+        assert_eq!(got["title"], "t");
+        assert_eq!(got["embedding_en"][0], 1.0);
+    }
+
+    #[tokio::test]
+    async fn vector_search_ranks_by_cosine() {
+        let s = MockSearchStore::new();
+        s.index(SearchDocument {
+            index: "osint-entities".into(),
+            id: "near".into(),
+            body: json!({"name": "near", "vec": [1.0, 0.0, 0.0]}),
+        })
+        .await
+        .unwrap();
+        s.index(SearchDocument {
+            index: "osint-entities".into(),
+            id: "far".into(),
+            body: json!({"name": "far", "vec": [0.0, 1.0, 0.0]}),
+        })
+        .await
+        .unwrap();
+        let hits = s
+            .vector_search(VectorSearch {
+                index: "osint-entities".into(),
+                field: "vec".into(),
+                vector: vec![1.0, 0.0, 0.0],
+                k: 1,
+                filters: vec![],
+            })
+            .await
+            .unwrap();
+        assert_eq!(hits.hits.len(), 1);
+        assert_eq!(hits.hits[0].id, "near");
     }
 }

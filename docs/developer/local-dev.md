@@ -51,8 +51,8 @@ storage conformance 對非 19200 / 19000 的 URL **硬失敗**。
 
 ## 全容器化：`make compose-up-full`
 
-上面那套是「基礎建設在容器裡、七個服務在本機 `cargo run`」。Phase 7a 之後也可以
-把七個服務一起放進容器：
+上面那套是「基礎建設在容器裡、八個服務在本機 `cargo run`」。Phase 7a 之後也可以
+把八個服務一起放進容器：
 
 ```bash
 make compose-up-full      # 含 --build --wait，全部 healthy 才返回
@@ -60,7 +60,7 @@ make compose-ps-full      # 看狀態
 make compose-down-full    # 停掉
 ```
 
-七個應用服務在 compose 裡標了 `profiles: ["app"]`，**預設不啟動**。
+八個應用服務在 compose 裡標了 `profiles: ["app"]`，**預設不啟動**。
 `make compose-up`／`make compose-down`／CI 的 integration-test 行為完全不變
 （它們不帶 `--profile app`，所以不會被迫先 build image）。
 
@@ -73,8 +73,9 @@ make compose-down-full    # 停掉
 | osint-entity-worker | `osint-core/osint-entity-worker:0.1.0` | 18084 | 同上 |
 | osint-indexer | `osint-core/osint-indexer:0.1.0` | 18085 | 同上 |
 | osint-graph-worker | `osint-core/osint-graph-worker:0.1.0` | 18086 | 同上 |
+| osint-embedding-worker | `osint-core/osint-embedding-worker:0.1.0` | 18087 | 同上 |
 
-⚠️ 容器版與 `cargo run` 版**不能同時跑**，兩者搶同一組 18080–18086。
+⚠️ 容器版與 `cargo run` 版**不能同時跑**，兩者搶同一組 18080–18087。
 
 ### 本機跑 vs 容器內跑：設定完全不一樣
 
@@ -223,8 +224,8 @@ DJL 的 PyTorch native libs 507 MB），OpenSearch volume 會從 2 MB 長到約 
 ```bash
 make compose-up-full
 
-# 七個 health 埠
-for p in 18080 18081 18082 18083 18084 18085 18086; do curl -s localhost:$p/health; echo; done
+# 八個 health 埠
+for p in 18080 18081 18082 18083 18084 18085 18086 18087; do curl -s localhost:$p/health; echo; done
 
 # 後端連通性（需要 JWT；role 至少 viewer）
 curl -s -H "Authorization: Bearer $JWT" localhost:18080/api/v1/ops/health
@@ -363,7 +364,7 @@ cargo test -p storage-opensearch --test embedding_conformance
 
 ```bash
 curl -s 'http://127.0.0.1:19200/_cat/indices?h=index' \
-  | grep -E '^(osint-core-conformance-|osint-documents-e2e-|osint-documents-api-e2e-|osint-documents-failrec-)' \
+  | grep -E '^(osint-core-conformance-|osint-documents-e2e-|osint-documents-api-e2e-|osint-documents-failrec-|osint-entities-e2e-)' \
   | xargs -r -I{} curl -s -XDELETE 'http://127.0.0.1:19200/{}' > /dev/null
 ```
 
@@ -427,6 +428,28 @@ cargo test -p storage-neo4j --all-targets
 ```
 
 細節：`docs/developer/graph-worker.md`。
+
+## Embedding worker
+
+```bash
+make run-embedding-worker        # 訂閱 entity.extracted → 向量 overlay／osint-entities
+make rebuild-embeddings          # 從 PostgreSQL 補齊向量後結束
+make rebuild-embeddings-drop     # 先刪 osint-entities 再從零重建（永不刪 osint-documents）
+curl -s http://127.0.0.1:18087/health
+```
+
+設定在 `config/default.toml` 的 `[embedding_worker]`，health 埠 18087。
+推論在 OpenSearch ml-commons，本行程不載模型；需要先跑
+`scripts/opensearch-ml-setup.sh` 與 `scripts/opensearch-ml-setup-e5.sh`。
+`--drop` 只刪 `osint-entities`。Document 向量疊加進 indexer 的 `osint-documents`。
+
+```bash
+cargo test -p embedding-worker --all-targets
+cargo test -p embedding-worker --test e2e -- --test-threads=1
+```
+
+schema／k-NN 路徑沒有 `#[ignore]`。打 `_predict` 的那條才 ignore。
+細節：`docs/developer/embedding-worker.md`、`docs/developer/embedding.md`。
 
 細節：`docs/developer/deduplicator.md`、`docs/developer/entity-worker.md`。
 

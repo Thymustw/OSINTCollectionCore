@@ -211,11 +211,12 @@ jobs:
           - osint-entity-worker
           - osint-indexer
           - osint-graph-worker
+          - osint-embedding-worker
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
-      # 六個 target 共用同一個 builder stage。GHA cache 讓第二個之後的
-      # service 直接命中，不會把同一份 workspace 編六次。
+      # 八個 target 共用同一個 builder stage。GHA cache 讓第二個之後的
+      # service 直接命中，不會把同一份 workspace 編八次。
       #
       # 產出存成 tar 給 sbom / image-scan job 用。分成不同 job 是為了讓
       # DEVSECOPS §12 的 gate 在 CI 上各自可見（哪一關擋下來一目了然），
@@ -252,6 +253,7 @@ jobs:
           - osint-entity-worker
           - osint-indexer
           - osint-graph-worker
+          - osint-embedding-worker
     steps:
       # V0.1 只要求「有產生路徑」（DEVSECOPS.md §25：正式 SBOM 是 V1.0 的
       # release gate）。這裡用 trivy 而不是 syft，理由是 SECURITY_CI.md 的
@@ -293,6 +295,7 @@ jobs:
           - osint-entity-worker
           - osint-indexer
           - osint-graph-worker
+          - osint-embedding-worker
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4

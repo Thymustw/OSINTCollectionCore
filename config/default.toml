@@ -126,6 +126,17 @@ projection = "osint-graph"
 # rebuild 掃 canonical store 時每頁筆數。硬上限，沒有「不限」。
 page_size = 100
 
+[embedding_worker]
+# 18080–18086 已分別是 api／collector／normalizer／deduplicator／
+# entity-worker／indexer／graph-worker 的 health 埠。
+bind = "127.0.0.1:18087"
+consumer_group = "osint-embedding-worker"
+# Entity 向量投影的 index。Document 向量仍寫進 [indexer].index。
+# 改名等於換一個空投影，要跑 --rebuild。
+entities_index = "osint-entities"
+# rebuild 掃 canonical store 時每頁筆數。硬上限，沒有「不限」。
+page_size = 100
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

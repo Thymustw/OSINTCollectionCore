@@ -1,4 +1,4 @@
-# Repository layout（V0.2 Phase 2：29 個 crate；V0.1 的 6 個服務仍在，resolver／merge 目前是函式庫；graph-worker 是第 7 個服務 binary，尚未進 compose）
+# Repository layout（V0.2 Phase 3：30 個 crate；resolver／merge 目前是函式庫；八個服務 binary 都在 compose 的 `app` profile）
 
 Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.85.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 stable channel。
 
@@ -37,6 +37,7 @@ crates/
   merge/                 Entity merge／undo（SPEC_V0.2 §7）：execute_merge／undo_merge；無獨立 binary
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   graph-worker/          圖投影（osint-graph-worker）：relationship.changed → Neo4j（SPEC_V0.2 §8）；常駐模式也消費 job.dispatched 執行 graph_rebuild；只有 Entity→Entity 的邊才進圖
+  embedding-worker/      向量投影（osint-embedding-worker）：entity.extracted → osint-documents overlay + osint-entities（SPEC_V0.2 §11–§14）；不訂 embedding.requested
   osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/MinIO，不經 core-api
   acceptance/            跨服務驗收測試（SPEC §26 Acceptance F、failure/recovery）。無生產程式碼
 docker/

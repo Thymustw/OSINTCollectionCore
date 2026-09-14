@@ -2339,6 +2339,110 @@ pub async fn assert_search_round_trip<S: SearchStore>(
     Ok(())
 }
 
+/// `SearchStore::bulk_upsert_fields` 必須建立新文件、且**不清空呼叫端沒寫進 body 的欄位**。
+///
+/// 這是 indexer 與 embedding-worker 共用 `osint-documents` 的契約：indexer 重寫
+/// 文件本體時，不能把 embedding-worker 事後疊加的向量欄位整份取代掉。
+/// `bulk_index`（`"index"` action）會整份覆寫 `_source`，這支驗的就是改用
+/// `"update"` + `doc_as_upsert` 之後那個行為真的成立——組錯 NDJSON 在單元測試
+/// 就能抓到，但「合併語意」只能對真實後端證明。
+///
+/// 未來任何新 `SearchStore` adapter 都必須通過這一支。
+pub async fn assert_bulk_upsert_preserves_unknown_fields<S: SearchStore>(
+    store: &S,
+    index: &str,
+) -> Result<(), StorageError> {
+    let fail = |message: String| StorageError::Unknown {
+        backend: "search",
+        message,
+    };
+
+    let created_id = Uuid::now_v7().to_string();
+    let created = store
+        .bulk_upsert_fields(vec![SearchDocument {
+            index: index.to_string(),
+            id: created_id.clone(),
+            body: json!({"title": "fresh", "kind": "created"}),
+        }])
+        .await?;
+    if created.errors > 0 || created.indexed != 1 {
+        return Err(fail(format!(
+            "文件不存在時 bulk_upsert_fields 應建立一份，實際 indexed={} errors={} failures={:?}",
+            created.indexed, created.errors, created.failures
+        )));
+    }
+
+    let overlay_id = Uuid::now_v7().to_string();
+    store
+        .index(SearchDocument {
+            index: index.to_string(),
+            id: overlay_id.clone(),
+            body: json!({"title": "original", "kind": "keep"}),
+        })
+        .await?;
+    store
+        .update_fields(
+            index,
+            &overlay_id,
+            json!({"overlay": "must-survive", "overlay_version": "v1"}),
+        )
+        .await?;
+
+    let upserted = store
+        .bulk_upsert_fields(vec![SearchDocument {
+            index: index.to_string(),
+            id: overlay_id.clone(),
+            body: json!({"title": "rewritten", "kind": "keep"}),
+        }])
+        .await?;
+    if upserted.errors > 0 || upserted.indexed != 1 {
+        return Err(fail(format!(
+            "對既有文件 bulk_upsert_fields 應成功，實際 indexed={} errors={} failures={:?}",
+            upserted.indexed, upserted.errors, upserted.failures
+        )));
+    }
+
+    let mut source = None;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let hits = store.query(SearchQuery::new(index, "kind:keep")).await?;
+        if let Some(hit) = hits.hits.iter().find(|h| h.id == overlay_id) {
+            source = Some(hit.source.clone());
+            break;
+        }
+    }
+    let source = source.ok_or_else(|| StorageError::NotFound {
+        message: format!("bulk_upsert_fields 之後 4 秒內查不到 `{overlay_id}`"),
+    })?;
+
+    if source.get("title").and_then(Value::as_str) != Some("rewritten") {
+        return Err(fail(format!(
+            "indexer 自己的欄位應被更新，實際 title={}",
+            source.get("title").unwrap_or(&Value::Null)
+        )));
+    }
+    if source.get("overlay").and_then(Value::as_str) != Some("must-survive") {
+        return Err(fail(format!(
+            "呼叫端沒寫進 body 的 overlay 被清掉了。這就是 indexer 用 bulk_index \
+             整份覆寫時會發生的事；bulk_upsert_fields 必須留下它。實際：{source}"
+        )));
+    }
+    if source.get("overlay_version").and_then(Value::as_str) != Some("v1") {
+        return Err(fail(format!("overlay_version 也被清掉了：{source}")));
+    }
+
+    let created_hits = store.query(SearchQuery::new(index, "kind:created")).await?;
+    if !created_hits.hits.iter().any(|h| h.id == created_id) {
+        return Err(fail(
+            "文件不存在時 bulk_upsert_fields 宣稱建立成功，但查詢找不到那份文件".into(),
+        ));
+    }
+
+    let _ = store.delete(index, &created_id).await;
+    let _ = store.delete(index, &overlay_id).await;
+    Ok(())
+}
+
 /// `SearchStore::search`（[`StructuredSearch`]）的後端契約。
 ///
 /// **未來新增任何 SearchStore adapter 都必須通過這一支。** 這裡驗的四件事全部都是

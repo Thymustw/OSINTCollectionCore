@@ -57,9 +57,11 @@ timeline.updated
 
 > ⚠️ V0.2 九個 topic 裡，目前**有生產者**的是 `relationship.changed`
 > （entity-worker 抽取、merge／undo）。**消費者**是 `osint-graph-worker`
-> （訂 `relationship.changed`，把 Entity→Entity 的邊寫進 Neo4j；寫法對照
-> indexer 訂 `entity.extracted`）。其餘仍只有定義、沒有生產者與消費者，
-> 同 V0.1 的 `search.index.requested`。
+> （訂 `relationship.changed`，把 Entity→Entity 的邊寫進 Neo4j）。
+> `embedding.requested`／`embedding.completed` **仍沒有生產者與消費者**：
+> embedding-worker 直接訂 V0.1 的 `entity.extracted`（與 indexer 同一 topic、
+> 獨立 consumer group），重新產生走 `osint-embedding-worker --rebuild`。
+> 其餘仍只有定義，同 V0.1 的 `search.index.requested`。
 
 `relationship.changed` 與 V0.1 的 `object.updated` 語意不同，容易訂錯：
 前者是「relationship 這條**邊**變了」，後者是「某個 canonical object 改了」。
@@ -116,7 +118,7 @@ graph-worker 寫入不存在的邊。發送失敗**不讓** `execute_merge`／`u
 
 Partition key：job 派工使用 `job_id`（TECH_STACK 預設表沒有 job；這是實作補充）。收集事件 `raw.collected`／`raw.failed` 使用 `source_id`（TECH_STACK 預設）。
 
-生產 consumer 關掉 auto-commit：處理完呼叫 `EventConsumer::commit_last()`（提交上一則的 offset+1）。`osint-normalizer` 訂閱 `raw.collected`，寫完 Document 後 produce `object.normalized`。`osint-deduplicator` 訂閱 `object.normalized`，跑完 SPEC §15 五階段後 produce `dedup.completed`（partition key = `document_id`；payload 與 `AlreadyDone` 不發事件的理由見 `docs/developer/deduplicator.md`）。 `osint-entity-worker` 訂閱 `dedup.completed`，**只處理 `is_duplicate=false` 的 Document**，抽完 Entity 後 produce `entity.extracted`（partition key = `document_id`）以及每條邊一則 `relationship.changed`（partition key = `relationship_id`，見上節）。payload 欄位與「跳過／已處理不發事件」的理由見 `docs/developer/entity-worker.md`。 `osint-indexer` 訂閱 **`entity.extracted`**（不是 `dedup.completed`——要等 entity 抽完才索引，SPEC §18 的 entity 過濾才成立），bulk 寫進 OpenSearch 後 produce **`search.index.completed`**（partition key = 該批第一筆 `document_id`；payload 含 `index`／`document_ids`／`indexed`／`failed`／`failed_document_ids`／`retries`）。
+生產 consumer 關掉 auto-commit：處理完呼叫 `EventConsumer::commit_last()`（提交上一則的 offset+1）。`osint-normalizer` 訂閱 `raw.collected`，寫完 Document 後 produce `object.normalized`。`osint-deduplicator` 訂閱 `object.normalized`，跑完 SPEC §15 五階段後 produce `dedup.completed`（partition key = `document_id`；payload 與 `AlreadyDone` 不發事件的理由見 `docs/developer/deduplicator.md`）。 `osint-entity-worker` 訂閱 `dedup.completed`，**只處理 `is_duplicate=false` 的 Document**，抽完 Entity 後 produce `entity.extracted`（partition key = `document_id`）以及每條邊一則 `relationship.changed`（partition key = `relationship_id`，見上節）。payload 欄位與「跳過／已處理不發事件」的理由見 `docs/developer/entity-worker.md`。 `osint-indexer` 訂閱 **`entity.extracted`**（不是 `dedup.completed`——要等 entity 抽完才索引，SPEC §18 的 entity 過濾才成立），bulk 寫進 OpenSearch 後 produce **`search.index.completed`**（partition key = 該批第一筆 `document_id`；payload 含 `index`／`document_ids`／`indexed`／`failed`／`failed_document_ids`／`retries`）。`osint-embedding-worker` 同樣訂閱 **`entity.extracted`**（獨立 consumer group `osint-embedding-worker`），把 Document 向量 overlay 進 `osint-documents`、Entity 向量寫進 `osint-entities`。**不**訂 `embedding.requested`，也**不**發 `embedding.completed`。`update_fields` 碰到 NotFound（indexer lag）重試後仍提交 offset；真失敗不提交。細節見 `docs/developer/embedding-worker.md`。
 
 `search.index.requested` 在 V0.1 **沒有生產者也沒有消費者**：indexer 直接訂 `entity.extracted`，重新索引走 `osint-indexer --rebuild`（CLI）而不是事件。topic 名稱保留在 `EventTopic`，留給 V0.2 的 on-demand 重新索引。
 
@@ -125,6 +127,8 @@ Partition key：job 派工使用 `job_id`（TECH_STACK 預設表沒有 job；這
 `osint-graph-worker` 同一個 consumer group 訂閱**兩個** topic：`relationship.changed` 與 `job.dispatched`（靠 `EventEnvelope.event_type` 分流）。`relationship.changed` 逐筆寫進 Neo4j（沒有 bulk API，不累積批次）。**只有兩端都是 Entity 的邊才進圖**——Document→Entity（例如 `mentions`）會被跳過，這是預期行為不是錯誤。事件內容不可信，`confidence`／時間戳／型別一律重讀 PostgreSQL。offset 在成功或優雅跳過（非 Entity 端點／race 刪除）之後才提交；Neo4j 寫入失敗不提交。`job.dispatched` 只處理 `job_type == "graph_rebuild"`（其餘忽略但仍提交 offset），跑非破壞性 rebuild 並把 Job 狀態從 `Running` 轉到 `Completed`／`Failed`——執行完不管成敗都提交 offset，跟 `relationship.changed` 的規則不同（job 跑失敗重送只會撞狀態機合法性檢查造成迴圈，不是消費事件失敗）。`--rebuild`／`--rebuild --drop`（CLI）與 `POST /api/v1/graph/rebuild`（API，只會非破壞性，`--drop` 不透過 API 開放）都是從 PostgreSQL 全量重建。細節見 `docs/developer/graph-worker.md`。
 
 `graph.sync.requested`／`graph.sync.completed` 目前**沒有生產者與消費者**：重建走 `osint-graph-worker --rebuild`（CLI）而不是事件。topic 名稱保留在 `EventTopic`。
+
+`embedding.requested`／`embedding.completed` 同樣**沒有生產者與消費者**：embedding-worker 直接訂 `entity.extracted`，重新產生走 `osint-embedding-worker --rebuild`。topic 名稱保留在 `EventTopic`。
 
 ## Broker health check
 

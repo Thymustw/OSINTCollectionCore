@@ -641,6 +641,15 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
   **不能**用 `index()`：index API 取代整個 `_source`，會把
   title／body／entities 清空。文件不存在回 `NotFound`，不憑空 upsert。
 
+### 已由 Phase 3 Step 3 接住（embedding-worker）
+
+- **觸發**：訂閱 `entity.extracted`（與 indexer 同一 topic、獨立 consumer group）。**不**訂 `embedding.requested`（SPEC §20 保留名、零生產者）。不發 `embedding.completed`。
+- **兩個目標、兩個 index**：Document title／body 用 `update_fields` 疊加進既有 `osint-documents`；Entity description 用 `index()` 寫進獨立 `osint-entities`。永不對 documents 呼叫 `index()`。
+- **Entity 語言永遠未知**：`language = None` → 多語 e5。V0.2 只寫 `description_vector_multi`。
+- **跳過 merged／duplicate**：`merged_into`／`duplicate_of` 不寫向量。
+- **`--rebuild --drop` 只刪 `osint-entities`**，永不刪 `osint-documents`。
+- 服務文件：`docs/developer/embedding-worker.md`。
+
 ### 已由 Phase 3 Step 1 接住（schema／config，還沒有 worker）
 
 - **PostgreSQL 存 embedding metadata**：`embeddings` 表（migration `0010`）

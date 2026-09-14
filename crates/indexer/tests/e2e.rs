@@ -649,6 +649,67 @@ async fn indexing_the_same_document_twice_yields_one_hit() {
     cleanup(&stack, &index).await;
 }
 
+/// indexer 重寫同一份文件時，不可清掉別的服務疊加的欄位。
+///
+/// 模擬：indexer 寫入 → embedding-worker 用 `update_fields` 疊加
+/// `embedding_en_model_version`（mapping 已宣告的 keyword；`dynamic: strict`
+/// 下不能用完全陌生的欄位）→ indexer 再 flush 一次（`--rebuild` 同一條路徑）
+/// → overlay 還在。V0.1 的 `bulk_index` 會整份取代 `_source`，這一支就是在
+/// 證明那個行為已經改掉。
+#[tokio::test]
+async fn rebuild_flush_preserves_fields_written_by_other_services() {
+    let stack = connect_stack().await;
+    let index = test_index();
+    let service = indexer_for(&stack, &index);
+    service.ensure_index().await.expect("ensure index");
+
+    let fx = Fixture::new();
+    let source = seed_source(&stack.pg).await;
+    let connector = seed_connector(&stack.pg, &source).await;
+    let document = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        DocSpec::new(
+            &format!("{} overlay keep", fx.tag),
+            &format!("{} overlay body", fx.tag),
+        ),
+    )
+    .await;
+    index_document(&stack, &service, &document).await;
+
+    stack
+        .os
+        .update_fields(
+            &index,
+            &document.id.to_string(),
+            json!({ schema::F_EMBEDDING_EN_MODEL_VERSION: "overlay-v1" }),
+        )
+        .await
+        .expect("模擬 embedding-worker 疊加向量版本欄位");
+
+    // 第二次 flush = `--rebuild` 對同一份文件再寫一次。
+    index_document(&stack, &service, &document).await;
+
+    let hits = run_search(&stack, &index, request_for(&source, &fx.tag)).await;
+    assert_eq!(hits.total, 1, "重建後仍應只有一筆");
+    let source_doc = &hits.hits[0].source;
+    assert_eq!(
+        source_doc
+            .get(schema::F_EMBEDDING_EN_MODEL_VERSION)
+            .and_then(Value::as_str),
+        Some("overlay-v1"),
+        "indexer 第二次 flush 把 embedding-worker 疊加的欄位清掉了：{source_doc}"
+    );
+    assert_eq!(
+        source_doc.get(schema::F_TITLE).and_then(Value::as_str),
+        Some(document.title.as_deref().unwrap_or("")),
+        "indexer 自己的欄位仍應在"
+    );
+
+    cleanup(&stack, &index).await;
+}
+
 // ---------------------------------------------------------------------------
 // duplicate 不進搜尋結果
 // ---------------------------------------------------------------------------

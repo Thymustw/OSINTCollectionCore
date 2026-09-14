@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.11
 #
-# OSINT Intelligence Core — 七個服務的 multi-stage build。
+# OSINT Intelligence Core — 八個服務的 multi-stage build。
 #
 # 用法（從 repo 根目錄）：
 #   docker build -f docker/Dockerfile --target osint-api -t osint-core/osint-api:0.1.0 .
-# 七個 target：osint-api / osint-collector / osint-normalizer /
+# 八個 target：osint-api / osint-collector / osint-normalizer /
 #              osint-deduplicator / osint-entity-worker / osint-indexer /
-#              osint-graph-worker
+#              osint-graph-worker / osint-embedding-worker
 #
 # ---------------------------------------------------------------------------
 # 為什麼用 BuildKit cache mount 而不是 cargo-chef
@@ -61,7 +61,7 @@ ENV CARGO_TERM_COLOR=never \
 
 COPY . .
 
-# 一次把七個服務都編出來。--locked 確保用的是 committed 的 Cargo.lock，
+# 一次把八個服務都編出來。--locked 確保用的是 committed 的 Cargo.lock，
 # 而不是讓 cargo 在容器裡悄悄解析出另一組版本（那會讓 image 掃出來的相依
 # 跟 cargo-deny/cargo-audit 看到的不一致）。
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
@@ -70,13 +70,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && mkdir -p /out \
  && for bin in osint-api osint-collector osint-normalizer \
                osint-deduplicator osint-entity-worker osint-indexer \
-               osint-graph-worker; do \
+               osint-graph-worker osint-embedding-worker; do \
         cp "target/release/$bin" "/out/$bin"; \
     done \
  && ls -l /out
 
 # ===========================================================================
-# runtime-base：七個服務共用的執行期底座
+# runtime-base：八個服務共用的執行期底座
 # ===========================================================================
 #
 # **為什麼是 debian:bookworm-slim 而不是 distroless**
@@ -121,7 +121,7 @@ COPY --chown=root:root --chmod=444 config/default.toml /app/config/default.toml
 USER 10001:10001
 
 # ===========================================================================
-# 七個服務 stage
+# 八個服務 stage
 # ===========================================================================
 #
 # 每個 stage 只複製自己那一支 binary。HEALTHCHECK 一律打 127.0.0.1——
@@ -179,3 +179,10 @@ EXPOSE 18086
 HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
     CMD curl -fsS http://127.0.0.1:18086/health || exit 1
 ENTRYPOINT ["/usr/local/bin/osint-graph-worker"]
+
+FROM runtime-base AS osint-embedding-worker
+COPY --from=builder --chown=root:root --chmod=555 /out/osint-embedding-worker /usr/local/bin/osint-embedding-worker
+EXPOSE 18087
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
+    CMD curl -fsS http://127.0.0.1:18087/health || exit 1
+ENTRYPOINT ["/usr/local/bin/osint-embedding-worker"]

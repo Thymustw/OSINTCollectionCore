@@ -13,9 +13,19 @@
 //! # 冪等
 //!
 //! OpenSearch 的 `_id` 就是 `Document.id`（見 [`crate::projection`]）。
-//! index 動作對既有 `_id` 是覆寫，同一則事件重送一萬次還是一筆 hit。
-//! 這裡**刻意沒有** provenance claim：投影是可重建的衍生資料，
-//! 為它寫一列 canonical 的 claim 會讓「重建」變成需要先刪 claim 才能跑。
+//! 寫入走 [`SearchStore::bulk_upsert_fields`]（部分更新 + upsert），同一則事件
+//! 重送一萬次還是一筆 hit。這裡**刻意沒有** provenance claim：投影是可重建的
+//! 衍生資料，為它寫一列 canonical 的 claim 會讓「重建」變成需要先刪 claim 才能跑。
+//!
+//! # 為什麼 flush 用部分更新而不是整份覆寫
+//!
+//! indexer **不是** `osint-documents` 唯一的寫入者。V0.2 Phase 3 Step 2 起
+//! embedding-worker 會用 [`SearchStore::update_fields`] 事後疊加
+//! `embedding_en`／`embedding_multi` 與對應的 `_model_version`。
+//! `bulk_index`（OpenSearch `"index"` action）會整份取代 `_source`，
+//! 把那些 indexer 根本不知道的欄位靜默清掉——`--rebuild` 不必 `--drop`
+//! 就會發生，而且不會報錯。`bulk_upsert_fields` 只合併 indexer 自己組出來的
+//! 欄位，其餘既有欄位維持原樣。
 //!
 //! # 已知限制
 //!
@@ -364,6 +374,13 @@ impl Indexer {
     }
 
     /// 送出一批。暫時性失敗會退避重試；永久性失敗回報在 [`FlushReport`] 裡。
+    ///
+    /// 走 [`SearchStore::bulk_upsert_fields`] 而不是 [`SearchStore::bulk_index`]：
+    /// `osint-documents` 從 V0.2 Phase 3 Step 2 起有兩個寫入者——indexer 寫文件本體，
+    /// embedding-worker 用 `update_fields` 疊加向量欄位。`bulk_index` 的 `"index"`
+    /// action 會整份取代 `_source`，把 indexer 投影裡沒有的那四個欄位靜默清掉；
+    /// live 消費與 `--rebuild`（不必 `--drop`）都走這條 `flush`，所以一定要用
+    /// 只合併已知欄位的 upsert。
     pub async fn flush(&self, batch: Vec<SearchDocument>) -> Result<FlushReport, IndexerError> {
         let submitted = batch.len();
         if submitted == 0 {
@@ -376,7 +393,7 @@ impl Indexer {
         };
 
         for attempt in 0..=self.bounds.bulk_max_retries {
-            let result = self.search.bulk_index(pending.clone()).await?;
+            let result = self.search.bulk_upsert_fields(pending.clone()).await?;
             report.indexed += result.indexed;
 
             if result.failures.is_empty() {
@@ -600,9 +617,10 @@ impl Indexer {
     ///
     /// # 這是「補上缺的」還是「完整重建」
     ///
-    /// `drop_index = false` 時是**補上缺的**：既有文件會被覆寫成最新內容，
-    /// 但**已經不該存在的文件不會被刪掉**（例如 Document 在 PostgreSQL 被刪除之後）。
-    /// 要真正的完整重建請用 `drop_index = true`。
+    /// `drop_index = false` 時是**補上缺的**：既有文件的 indexer 已知欄位會被
+    /// 覆寫成最新內容（`bulk_upsert_fields`，不會清掉 embedding-worker 疊加的
+    /// 向量欄位），但**已經不該存在的文件不會被刪掉**（例如 Document 在
+    /// PostgreSQL 被刪除之後）。要真正的完整重建請用 `drop_index = true`。
     /// 這個差別很容易被當成「重建過了就一定一致」，所以在這裡寫清楚。
     ///
     /// # 進度

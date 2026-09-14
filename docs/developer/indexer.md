@@ -5,7 +5,8 @@ V0.1 Phase 5。程式在 `crates/indexer/`。
 
 ```text
 entity-worker ──entity.extracted──▶ indexer ──bulk──▶ OpenSearch osint-documents
-                                       │                        ▲
+                         │                                    ▲
+                         └── embedding-worker ──update_fields─┘  （向量 overlay，見 embedding-worker.md）
                                        └── 讀 PostgreSQL ────────┘
                                            （Document + Entity + RawEvidence）
                                        └──search.index.completed──▶
@@ -142,8 +143,8 @@ IP 走標準形式），搜尋端沒有辦法重現那套規則。用內建的 `
 
 ## 冪等
 
-**OpenSearch 的 `_id` 就是 `Document.id`。** index 動作對既有 `_id` 是覆寫
-（`_version` +1），同一則事件重送一萬次還是一筆 hit。e2e 有對應測試
+**OpenSearch 的 `_id` 就是 `Document.id`。** 寫入走 `SearchStore::bulk_upsert_fields`
+（部分更新 + upsert），同一則事件重送一萬次還是一筆 hit。e2e 有對應測試
 （`indexing_the_same_document_twice_yields_one_hit`）。
 
 刻意**沒有** provenance claim：投影是可重建的衍生資料，為它寫一列 canonical 的
@@ -329,8 +330,25 @@ make rebuild-index-drop     # 先刪 index 再從零重建
 
 | 模式 | 行為 |
 |---|---|
-| `--rebuild` | 既有文件被覆寫成最新內容，但**已經不該存在的文件不會被刪掉**（例如 Document 已從 PostgreSQL 刪除） |
+| `--rebuild` | 既有文件的 **indexer 已知欄位**被覆寫成最新內容，但**已經不該存在的文件不會被刪掉**（例如 Document 已從 PostgreSQL 刪除） |
 | `--rebuild --drop` | 真正的完整重建 |
+
+### 為什麼 `--rebuild` 不會清掉 embedding-worker 疊加的欄位
+
+V0.1 的 indexer 用 `SearchStore::bulk_index`（OpenSearch `"index"` action）寫入，
+語意是**整份取代 `_source`**。那時候沒差：`osint-documents` 只有 indexer 一個寫入者，
+投影裡有的欄位就是全部欄位。
+
+V0.2 Phase 3 Step 2 起 mapping 多了 `embedding_en`／`embedding_multi` 與對應的
+`_model_version`，由 embedding-worker 事後用 `SearchStore::update_fields` 疊加。
+indexer 的 `build_body()` 完全不知道這四個欄位。若 `--rebuild`（不必 `--drop`）
+繼續走整份取代，那些向量會被靜默清空——官方文件本來就寫「既有文件會被覆寫成最新
+內容」，這是 V0.1 就存在的行為，只是當時沒有第二個寫入者所以沒被發現。
+
+所以 `flush()`（live 消費與 rebuild 的唯一寫入路徑）改成 `bulk_upsert_fields`：
+只合併 indexer 自己組出來的欄位，其餘既有欄位維持原樣。文件不存在時仍會建立
+（indexer 本來就要負責這件事）；這與 embedding-worker 的 `update_fields`（文件
+不存在回 `NotFound`、不憑空補一份殘缺文件）是刻意相反的。
 
 mapping 有**破壞性**變更（欄位改型別、analyzer 換掉）時**必須**用 `--drop`：
 OpenSearch 的 `_mapping` 只能新增欄位。不加的話重建會成功，但舊欄位仍用舊型別，

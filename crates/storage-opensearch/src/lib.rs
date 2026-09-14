@@ -457,6 +457,69 @@ impl SearchStore for OpenSearchStore {
         })
     }
 
+    async fn bulk_upsert_fields(
+        &self,
+        documents: Vec<SearchDocument>,
+    ) -> Result<BulkIndexResult, StorageError> {
+        if documents.is_empty() {
+            return Ok(BulkIndexResult::empty());
+        }
+        let mut seen = Vec::new();
+        for doc in &documents {
+            if !seen.iter().any(|i| i == &doc.index) {
+                self.ensure_index(&doc.index).await?;
+                seen.push(doc.index.clone());
+            }
+        }
+        // `_update` + `doc_as_upsert`：文件不存在就用整份 doc 建立；已存在則只合併
+        // 這份 body 裡的欄位。`bulk_index` 的 `"index"` action 會整份取代 `_source`，
+        // 把別的服務（embedding-worker）事後疊加的向量欄位靜默清掉。
+        let body: Vec<JsonBody<Value>> = bulk_upsert_action_lines(&documents)
+            .into_iter()
+            .map(JsonBody::from)
+            .collect();
+        let response = self
+            .client
+            .bulk(BulkParts::None)
+            .body(body)
+            .send()
+            .await
+            .map_err(map_os)?;
+        if !response.status_code().is_success() {
+            return Err(StorageError::Unknown {
+                backend: "opensearch",
+                message: format!("bulk upsert 失敗：{}", response.status_code()),
+            });
+        }
+        let payload: Value = response.json().await.map_err(map_os)?;
+        // ⚠️ bulk 的 HTTP 狀態碼是 200，**即使每一筆都失敗**。錯誤只在 items 裡逐筆出現。
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let total = items.len() as u32;
+        let failures = collect_bulk_failures(&items);
+        let errors = failures.len() as u32;
+        for index in seen {
+            self.maybe_refresh(&index).await?;
+        }
+        if total != documents.len() as u32 {
+            return Err(StorageError::Unknown {
+                backend: "opensearch",
+                message: format!(
+                    "bulk upsert 送出 {} 筆但只回 {total} 筆結果。差額的文件狀態未知，請整批重送",
+                    documents.len()
+                ),
+            });
+        }
+        Ok(BulkIndexResult {
+            indexed: total.saturating_sub(errors),
+            errors,
+            failures,
+        })
+    }
+
     async fn query(&self, query: SearchQuery) -> Result<SearchHits, StorageError> {
         let response = self
             .client
@@ -890,6 +953,28 @@ impl ProjectionStore for OpenSearchStore {
 // ---------------------------------------------------------------------------
 // 回應解析
 // ---------------------------------------------------------------------------
+
+/// `bulk_upsert_fields` 的 NDJSON 列（action + payload 成對）。
+///
+/// 抽出函式是為了單元測試能直接斷言組出來的是 `"update"` + `doc_as_upsert`，
+/// 而不是 `"index"`——那兩種 bulk 對既有 `_source` 的語意完全不同，組錯了
+/// 要等真實 OpenSearch 才會被發現。
+fn bulk_upsert_action_lines(documents: &[SearchDocument]) -> Vec<Value> {
+    documents
+        .iter()
+        .flat_map(|doc| {
+            [
+                json!({
+                    "update": { "_index": doc.index, "_id": doc.id }
+                }),
+                json!({
+                    "doc": doc.body.clone(),
+                    "doc_as_upsert": true
+                }),
+            ]
+        })
+        .collect()
+}
 
 /// bulk 回應的 items 陣列 → 逐筆失敗細節。
 ///
@@ -1460,13 +1545,59 @@ mod tests {
                    "error": {"type": "mapper_parsing_exception", "reason": "欄位型別不符"}}}),
             json!({"create": {"_id": "busy", "status": 429,
                    "error": {"type": "es_rejected_execution_exception", "reason": "queue full"}}}),
+            json!({"update": {"_id": "conflict", "status": 409,
+                   "error": {"type": "version_conflict_engine_exception", "reason": "version conflict"}}}),
         ];
         let failures = collect_bulk_failures(&items);
-        assert_eq!(failures.len(), 2);
+        assert_eq!(failures.len(), 3);
         assert_eq!(failures[0].id, "bad");
         assert!(!failures[0].is_retryable(), "400 重試幾次都一樣，應進 DLQ");
         assert_eq!(failures[1].id, "busy");
         assert!(failures[1].is_retryable(), "429 是暫時性的，退避後應重試");
+        assert_eq!(
+            failures[2].id, "conflict",
+            "update action 的失敗必須被讀到，不能因為 key 不是 index 就漏掉"
+        );
+    }
+
+    #[test]
+    fn bulk_upsert_ndjson_uses_update_action_with_doc_as_upsert() {
+        let lines = bulk_upsert_action_lines(&[SearchDocument {
+            index: "osint-documents".into(),
+            id: "d1".into(),
+            body: json!({"title": "t", "body": "x"}),
+        }]);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].get("update").is_some(),
+            "action 必須是 update，不能是 index：{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].get("index").is_none(),
+            "用 index action 會整份取代 _source，把未知欄位清掉"
+        );
+        assert_eq!(
+            lines[0].pointer("/update/_index").and_then(Value::as_str),
+            Some("osint-documents")
+        );
+        assert_eq!(
+            lines[0].pointer("/update/_id").and_then(Value::as_str),
+            Some("d1")
+        );
+        assert_eq!(
+            lines[1].get("doc_as_upsert").and_then(Value::as_bool),
+            Some(true),
+            "文件不存在時必須用整份 doc 建立，否則 indexer 第一次寫入會失敗"
+        );
+        assert_eq!(
+            lines[1].pointer("/doc/title").and_then(Value::as_str),
+            Some("t")
+        );
+        assert!(
+            lines[1].get("doc").is_some(),
+            "payload 必須包在 doc 裡：裸 body 會被當成 script 或整份覆寫"
+        );
     }
 
     #[test]

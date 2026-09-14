@@ -1,11 +1,11 @@
-# 本機／共用工作站基礎建設 + 七個應用服務。正式資源上限在 docker-compose.dev.yml。
+# 本機／共用工作站基礎建設 + 八個應用服務。正式資源上限在 docker-compose.dev.yml。
 #
 # 只起基礎建設（本機用 cargo run 跑服務）：
 #   make compose-up
 # 連應用服務一起起（全容器化）：
 #   make compose-up-full
 #
-# 七個應用服務放在 `profiles: ["app"]` 底下，**預設不啟動**。這是刻意的：
+# 八個應用服務放在 `profiles: ["app"]` 底下，**預設不啟動**。這是刻意的：
 # CI 的 integration-test job 與 `make compose-up` 都只要基礎建設，若應用服務
 # 是預設啟動，那兩條路徑都會被迫先跑一次十幾分鐘的 image build。
 # 要啟動它們必須明確加 `--profile app`。
@@ -38,7 +38,7 @@ volumes:
   minio-data:
   neo4j-data:
 
-# 七個應用服務共用的連線設定。全部指向 compose network 的服務名，不是 127.0.0.1。
+# 八個應用服務共用的連線設定。全部指向 compose network 的服務名，不是 127.0.0.1。
 x-osint-env: &osint-env
   # core-config 的 SecretRef `env:DATABASE_URL`（config/default.toml
   # [storage.canonical].dsn_secret_ref）。
@@ -72,7 +72,7 @@ x-osint-env: &osint-env
   # 刻意**不設** OSINT_STRICT_PORT_ISOLATION：容器內的 opensearch:9200 /
   # minio:9000 是本專案自己的服務，不是宿主上的 OpenCTI。理由見檔頭。
 
-# 全部依賴基礎建設就緒。七個服務啟動時都會各自跑一次 store.migrate()；
+# 全部依賴基礎建設就緒。八個服務啟動時都會各自跑一次 store.migrate()；
 # 已確認 sqlx-core 0.9.0 的 Migrator 預設 `locking: true`
 # （sqlx-core-0.9.0/src/migrate/migrator.rs:39），Postgres 端是 advisory lock，
 # 所以同時啟動會序列化而不是互相踩踏——不需要額外的 one-shot migrate 服務。
@@ -451,6 +451,23 @@ services:
       OSINT__GRAPH_WORKER__BIND: 0.0.0.0:18086
     ports:
       - "18086:18086"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+
+  osint-embedding-worker:
+    build:
+      <<: *osint-build
+      target: osint-embedding-worker
+    image: osint-core/osint-embedding-worker:0.1.0
+    hostname: osint-embedding-worker
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__EMBEDDING_WORKER__BIND: 0.0.0.0:18087
+    ports:
+      - "18087:18087"
     networks:
       - osint-core
     depends_on: *osint-depends
