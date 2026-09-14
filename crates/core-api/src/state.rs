@@ -31,6 +31,7 @@ pub type SharedResolverService =
 pub type SharedGraphContextResolver =
     Arc<GraphContextResolver<PostgresCanonicalStore, storage_neo4j::Neo4jStore>>;
 pub type SharedSearchState = Arc<SearchState>;
+pub type SharedSemanticSearchState = Arc<SemanticSearchState>;
 
 /// 泛用的 canonical store handle。
 ///
@@ -84,6 +85,21 @@ pub struct SearchState {
     pub index: String,
 }
 
+/// `POST /api/v1/search/semantic` 要用到的下游。沒接上時只有這條路由回 503。
+///
+/// 跟 [`SearchState`] 刻意分開：這條路由多需要一個 `EmbeddingProvider`
+/// （ml-commons），ml-commons 掛掉不該連帶讓 `POST /api/v1/search`
+/// （純全文，不需要 embedding）也跟著回 503。
+///
+/// `index` 與 [`SearchState::index`] 讀同一個 `[indexer].index`（Document index），
+/// **不是** `[embedding_worker].entities_index`。這條路由只查 `osint-documents`。
+#[derive(Clone)]
+pub struct SemanticSearchState {
+    pub store: OpenSearchStore,
+    pub embeddings: storage_opensearch::MlCommonsEmbeddingProvider,
+    pub index: String,
+}
+
 /// 匯入路徑要用到的下游。沒接上時 `POST /api/v1/import` 回 503，其他路由不受影響。
 ///
 /// `sink` 直接用 `connector-sdk` 的 `EvidenceSink`：push 與 pull 兩條路徑寫 RawEvidence
@@ -108,8 +124,8 @@ pub struct AuthState {
 /// 整個 API 的狀態。
 ///
 /// `store` 與 `objects` 是**通用** handle：Phase 6b 之後每個資源 handler 都從這裡拿，
-/// 不要再各自持有一份連線。`import`／`jobs`／`search` 是有額外組裝需求的子狀態
-/// （分別要 EvidenceSink、JobService、index 名稱），才維持獨立欄位。
+/// 不要再各自持有一份連線。`import`／`jobs`／`search`／`semantic_search` 是有額外組裝需求的子狀態
+/// （分別要 EvidenceSink、JobService、index 名稱、ml-commons EmbeddingProvider），才維持獨立欄位。
 #[derive(Clone)]
 pub struct AppState {
     pub metrics: MetricsRegistry,
@@ -143,6 +159,9 @@ pub struct AppState {
     pub graph_projection: Option<SharedGraphProjection>,
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
+    /// 語意搜尋。`None` 代表沒接上 OpenSearch 或 ml-commons 模型未部署，
+    /// **只有** `POST /api/v1/search/semantic` 回 503；全文搜尋不受影響。
+    pub semantic_search: Option<SharedSemanticSearchState>,
     pub ready: ReadyProbe,
     /// `GET /api/v1/ops/health` 要敲的後端。與 [`AppState::ready`] **刻意分開**：
     /// `/ready` 只檢查 API 自己非有不可的依賴（給 orchestrator 判斷要不要送流量），

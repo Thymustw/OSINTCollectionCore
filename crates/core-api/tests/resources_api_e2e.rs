@@ -130,6 +130,7 @@ fn build_api_with_backends(
         graph_projection,
         import: None,
         search: None,
+        semantic_search: None,
         ready: ready_always(),
         backends: ReadyProbe::new(checks),
         // 真的接本機 Redpanda：`/ops/queues` 要驗的正是「查得到 group lag」，

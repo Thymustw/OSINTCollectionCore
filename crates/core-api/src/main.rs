@@ -7,8 +7,8 @@ use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
     AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, GraphProjectionState, ImportState,
-    PostgresReady, QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SharedGraphStore,
-    SharedObjects, SharedStore, SharedTokenStore, router,
+    PostgresReady, QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SemanticSearchState,
+    SharedGraphStore, SharedObjects, SharedStore, SharedTokenStore, router,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -214,6 +214,21 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    // 語意搜尋跟全文搜尋分開組裝：ml-commons 模型沒部署時，只有
+    // POST /api/v1/search/semantic 回 503，不要連帶讓 BM25 搜尋掛掉。
+    // 連線失敗不推進 `missing`：`/ops/health` 的後端名單沒有獨立的
+    // ml-commons 項目，OpenSearch 本身的健康已經由上面的 `opensearch` 檢查覆蓋。
+    let semantic_search = match connect_semantic_search(&cfg).await {
+        Ok(state) => Some(Arc::new(state)),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "語意搜尋未接上（OpenSearch 或 ml-commons）；POST /api/v1/search/semantic 會回 503"
+            );
+            None
+        }
+    };
+
     // Redis 在 V0.1 沒有 API 路由用到它（它是 collector／worker 的節流與去重快取），
     // 但運維要看得到它活著——pipeline 會因為它掛掉而變慢卻不報錯。
     match connect_cache(&cfg) {
@@ -289,6 +304,7 @@ async fn run() -> Result<(), String> {
         graph_projection,
         import,
         search,
+        semantic_search,
         ready,
         // 沒接上的後端不會變成「壞掉」，而是列進 `backends_missing`——
         // 「沒設定」與「壞了」的下一步完全不同。
@@ -410,6 +426,36 @@ async fn connect_search(cfg: &AppConfig) -> Result<core_api::SearchState, String
     })
 }
 
+/// 連 OpenSearch + ml-commons。任一失敗整份 state 是 `None`。
+///
+/// 與 [`connect_search`] 分開各自持有連線：比照 `graph`／`graph_resolver`／
+/// `graph_projection` 各自獨立 wiring 的既有慣例。`index` 讀 `[indexer].index`
+/// （Document index），不要看成 `[embedding_worker].entities_index`。
+async fn connect_semantic_search(cfg: &AppConfig) -> Result<SemanticSearchState, String> {
+    let url = &cfg.storage.search.url;
+    verify_not_opencti_search(url).map_err(|err| err.to_string())?;
+    let store = storage_opensearch::OpenSearchStore::connect(url).map_err(|err| err.to_string())?;
+    let info = store
+        .cluster_info()
+        .await
+        .map_err(|err| format!("連不上 OpenSearch（{url}）：{err}"))?;
+    assert_opensearch_identity(&info).map_err(|err| err.to_string())?;
+    let embeddings = storage_opensearch::MlCommonsEmbeddingProvider::connect(url)
+        .await
+        .map_err(|err| {
+            format!(
+                "連不上 OpenSearch ml-commons 或模型不是 DEPLOYED（{url}）：{err}。\
+                 請跑 `bash scripts/opensearch-ml-setup.sh` 與 \
+                 `bash scripts/opensearch-ml-setup-e5.sh` 後重啟 osint-api"
+            )
+        })?;
+    Ok(SemanticSearchState {
+        store,
+        embeddings,
+        index: cfg.indexer.index.clone(),
+    })
+}
+
 /// 連 Redis。只給 `/api/v1/ops/health` 用，連不上不影響其他路由。
 fn connect_cache(cfg: &AppConfig) -> Result<storage_redis::RedisKeyValueStore, String> {
     let url = cfg
@@ -454,7 +500,7 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
                  /api/v1/tokens（admin）、/api/v1/ops/health、/api/v1/ops/metrics、\
                  /api/v1/ops/connectors、/api/v1/ops/queues、/api/v1/ops/dlq 與 /api/v1/ops/graph、\
                  sources／connectors／collections／objects／entities／relationships／events／raw、\
-                 /api/v1/graph/*、POST /api/v1/import 與 POST /api/v1/search"
+                 /api/v1/graph/*、POST /api/v1/import、POST /api/v1/search 與 POST /api/v1/search/semantic"
                 .into(),
         }),
     )

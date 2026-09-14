@@ -641,6 +641,18 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
   **不能**用 `index()`：index API 取代整個 `_source`，會把
   title／body／entities 清空。文件不存在回 `NotFound`，不憑空 upsert。
 
+### 已由 Phase 3 Step 4 接住（`POST /api/v1/search/semantic`）
+
+- 面向使用者的 k-NN 入口在 `crates/core-api/src/semantic_search.rs`。
+  查詢向量由 `EmbeddingProvider::embed(kind=Query)` 產生，比對欄位由
+  `model_for(language)` 回傳的模型名稱與 `MINILM_MODEL_NAME`／
+  `E5_MODEL_NAME` **精確相等**決定（MiniLM → `embedding_en`，否則
+  `embedding_multi`）。不查 `osint-entities`。
+- 與 `POST /api/v1/search` 分開組裝：ml-commons 沒部署時只有語意搜尋
+  回 503，BM25 全文搜尋不受影響。
+- 三個已知限制（語言不做偵測、`matched_section` 是 overlay 近似值、
+  k-NN 分數不能跟 BM25 比）寫在 `docs/user/api.md` 與模組說明，不要藏。
+
 ### 已由 Phase 3 Step 3 接住（embedding-worker）
 
 - **觸發**：訂閱 `entity.extracted`（與 indexer 同一 topic、獨立 consumer group）。**不**訂 `embedding.requested`（SPEC §20 保留名、零生產者）。不發 `embedding.completed`。

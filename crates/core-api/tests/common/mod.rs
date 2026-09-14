@@ -90,8 +90,10 @@ pub fn test_app_with_backends(
         graph: None,
         graph_projection: None,
         import: None,
-        // 不接 OpenSearch：`POST /api/v1/search` 回 503。
+        // 不接 OpenSearch／ml-commons：`POST /api/v1/search` 與
+        // `POST /api/v1/search/semantic` 回 503。
         search: None,
+        semantic_search: None,
         ready: ready_always(),
         backends: ReadyProbe::new(checks),
         // 這支測試不驗 /ops/queues。

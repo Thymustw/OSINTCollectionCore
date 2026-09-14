@@ -235,12 +235,15 @@ indexer 從沒跑過時 OpenSearch 會回 404。那不是伺服器錯誤，而�
 
 | metric | 意義 |
 |---|---|
-| `osint_search_latency_ms_sum` / `_count` | 搜尋延遲 |
-| `osint_search_requests_total` | 搜尋請求數 |
+| `osint_search_latency_ms_sum` / `_count` | 全文搜尋延遲（BM25） |
+| `osint_search_requests_total` | 全文搜尋請求數 |
+| `osint_semantic_search_requests_total` | 語意搜尋請求數（`POST /search/semantic`） |
+| `osint_semantic_search_latency_ms_sum` / `_count` | 語意搜尋延遲（含 ml-commons 推論）。**獨立計**，不灌進上面的 BM25 histogram |
 
 ## 相關文件
 
 - `docs/developer/indexer.md`：index mapping、analyzer 取捨、rebuild
 - `docs/user/search.md`：使用者導向的語法說明
 - `docs/user/cli.md`：`osint-cli search`
+- `docs/user/api.md`：`POST /api/v1/search/semantic`（語意搜尋，SPEC_V0.2 §13）
 - 內部治理文件 API_COMPATIBILITY.md（未隨原始碼公開）

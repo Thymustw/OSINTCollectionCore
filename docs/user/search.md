@@ -15,6 +15,10 @@ curl -s http://127.0.0.1:18080/api/v1/search \
   -d '{"query": "ransomware"}'
 ```
 
+語意搜尋是另一條路由（`POST /api/v1/search/semantic`），不是這份文件講的
+關鍵字語法。它比的是向量鄰居，不是詞。request／response 形狀與三個已知限制
+見 `docs/user/api.md`「語意搜尋」。
+
 > 搜尋到的東西來自**搜尋投影**，不是資料庫本身。投影由 `osint-indexer` 建立；
 > 它沒在跑的話，新採集的文件不會出現在搜尋結果裡（資料本身還在，沒有遺失）。
 > 詳見下面的「查不到東西的時候」。

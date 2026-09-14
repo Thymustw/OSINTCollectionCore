@@ -70,6 +70,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
 | POST | `/api/v1/import` | operator | 201 | multipart |
 | POST | `/api/v1/search` | viewer | 200 | |
+| POST | `/api/v1/search/semantic` | viewer | 200／503 | 語意搜尋。沒接 ml-commons 回 503，不影響全文搜尋 |
 | GET | `/api/v1/graph/entities/{id}/neighbors` | viewer | 200 | 圖鄰居。沒有這個節點回空陣列，不是 404 |
 | GET | `/api/v1/graph/entities/{id}/relationships` | viewer | 200 | 圖邊。語意同上 |
 | GET | `/api/v1/graph/path` | viewer | 200 | `from`／`to` 必填。找不到路徑回 `null`，永遠 200 |
@@ -90,6 +91,12 @@ POST `/api/v1/jobs` body：
 POST `/api/v1/search`（SPEC §18／§19）是唯讀的（viewer 即可），用 POST 是因為查詢條件
 有巢狀結構、長查詢會撞到 URL 長度上限。OpenSearch 沒接上時**只有這條路由**回 503。
 request/response schema、八種搜尋的語法、注入防護與分頁見 `docs/developer/search-api.md`。
+
+POST `/api/v1/search/semantic`（SPEC_V0.2 §13）同樣唯讀、同樣用 POST。
+跟全文搜尋分開組裝：ml-commons 沒接上時**只有這條**回 503，不拖累 `/search`。
+語言由呼叫端提供（不做偵測）、`matched_section` 是 overlay 近似值、k-NN 分數
+不能跟 BM25 分數比——三件已知限制寫在 `docs/user/api.md` 與
+`crates/core-api/src/semantic_search.rs` 模組說明。目前只查 `osint-documents`。
 
 POST `/api/v1/import`（Manual／JSON／CSV 上傳）是 `multipart/form-data`，
 上傳大小上限與其他路由分開（`[import].max_upload_bytes`，預設 10 MiB；
@@ -676,8 +683,13 @@ Phase 6b 另外加了三個欄位：
 > 報的是同一種看不懂的錯誤。要先同步把需要的欄位抄出來再進 async。
 
 `ImportState.store` 與 `AppState.store` 是同一個 `Arc`（`main.rs` 只建一次）。
-`jobs`／`import`／`search` 維持獨立欄位是因為它們有額外組裝需求
-（JobService、EvidenceSink、index 名稱）。
+`jobs`／`import`／`search`／`semantic_search` 維持獨立欄位是因為它們有額外組裝需求
+（JobService、EvidenceSink、index 名稱、ml-commons EmbeddingProvider）。
+`search` 與 `semantic_search` 刻意分開：後者多需要已部署的 MiniLM／e5 模型，
+掛掉不該讓 BM25 全文搜尋也回 503。`semantic_search` 的型別是
+`SemanticSearchState`（`OpenSearchStore` + `MlCommonsEmbeddingProvider` +
+Document index 名），由 `osint-api` 的 `connect_semantic_search` 組裝；
+連不上時欄位是 `None`，只有 `POST /api/v1/search/semantic` 回 503。
 
 ## 錯誤格式
 

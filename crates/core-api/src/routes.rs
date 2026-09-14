@@ -24,6 +24,7 @@ use crate::ops;
 use crate::rate_limit;
 use crate::resources;
 use crate::search;
+use crate::semantic_search;
 use crate::state::AppState;
 use crate::tokens;
 
@@ -170,6 +171,12 @@ pub fn router(state: AppState) -> Router {
         // （entity 物件、日期、布林語法），塞進 query string 會需要多層編碼，
         // 而且長查詢會撞到 URL 長度上限。這與 SPEC §19 的 `POST /search` 一致。
         .route("/api/v1/search", post(search::search))
+        // 語意搜尋同樣唯讀（viewer 以上）、同樣用 POST。跟全文搜尋分開：
+        // 這條要打 ml-commons，沒接上時只有這裡回 503，不拖累 `/search`。
+        .route(
+            "/api/v1/search/semantic",
+            post(semantic_search::semantic_search),
+        )
         // 圖查詢是唯讀的（viewer 以上），但用 POST：body 是結構化 GraphQuery，
         // 塞進 query string 不划算。權限與 POST /search 同一級，不掛 require_write。
         .route("/api/v1/graph/query", post(resources::graph::query))

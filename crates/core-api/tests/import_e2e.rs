@@ -120,6 +120,7 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, import_config: ImportS
         })),
         // 這個 e2e 只驗匯入路徑，不接搜尋投影。
         search: None,
+        semantic_search: None,
         ready: ready_always(),
         // 這支 e2e 不驗 ops health，給空清單。
         backends: core_api::ReadyProbe::new(Vec::new()),

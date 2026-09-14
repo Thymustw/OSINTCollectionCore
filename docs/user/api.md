@@ -212,6 +212,48 @@ curl -s "$API/raw/$RAW_ID?body=true" -H "Authorization: Bearer $TOKEN"   # 連�
 **全文搜尋**用 `POST /search`（條件有巢狀結構，所以用 POST 而不是 query string），
 語法見 `docs/user/search.md`。
 
+**語意搜尋**用 `POST /search/semantic`（SPEC_V0.2 §13）。把一句話丟進去，
+回的是向量空間裡最近的文件，不是關鍵字命中：
+
+```bash
+curl -s $API/search/semantic \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"query": "ransomware campaign against hospitals", "language": "en", "limit": 10}'
+```
+
+```jsonc
+{
+  "hits": [
+    {
+      "document_id": "…",
+      "score": 0.91,                 // k-NN 分數，不是 BM25；見下方限制
+      "object_type": "article",
+      "matched_section": "body",     // 近似值，不是精確溯源；見下方限制
+      "title": "…",
+      "source_id": "…",
+      "published_at": "2026-09-10T12:00:00Z"
+    }
+  ],
+  "model": "huggingface/sentence-transformers/all-MiniLM-L6-v2",
+  "model_version": "89b6737c…"       // 內容雜湊，不是 ml-commons 的 "1"
+}
+```
+
+三件這條路由**現在做不到**、而且不會報錯的事：
+
+1. **語言要你自己帶。** 沒有自動偵測。省略 `language` 會走多語 e5，
+   只搜得到 `embedding_multi` 有值的文件——只寫了英文 MiniLM 向量的文件
+   會靜默消失。英文請帶 `"language": "en"`。
+2. **`matched_section` 是近似值。** 每份文件每個語言空間只有一個向量欄位，
+   title 與 body 共用、body 後寫蓋過 title。系統沒辦法回答「這次命中是靠
+   title 還是 body」，只能告訴你這份文件目前那個欄位裡放的是哪一種內容。
+3. **不要拿這裡的 `score` 跟 `POST /search` 的 `score` 比大小。**
+   一個是 cosine／l2 最近鄰，一個是 Lucene BM25，尺度不同。
+   融合是之後 hybrid search 的事。
+
+沒接上 OpenSearch 或 ml-commons 模型未部署時，**只有這條路由**回 503，
+全文搜尋不受影響。viewer 即可。目前只查文件（`osint-documents`），不查實體。
+
 ### 翻頁
 
 所有列表都長這樣：

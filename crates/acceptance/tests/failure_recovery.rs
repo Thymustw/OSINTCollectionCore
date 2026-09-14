@@ -250,6 +250,7 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, search: Option<SearchS
             producer: Some(producer),
         })),
         search: search.map(Arc::new),
+        semantic_search: None,
         ready: ready_always(),
         // 這一支不驗 /ops/health 的聚合（那是 §31 的事），給空清單。
         backends: core_api::ReadyProbe::new(Vec::new()),

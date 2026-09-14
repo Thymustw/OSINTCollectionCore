@@ -125,6 +125,7 @@ fn build_api(stack: &Stack, index: &str, role: Role) -> TestApi {
             store: stack.os.clone(),
             index: index.to_string(),
         })),
+        semantic_search: None,
         ready: ready_always(),
         // 這支 e2e 不驗 ops health，給空清單。
         backends: core_api::ReadyProbe::new(Vec::new()),

@@ -27,6 +27,7 @@ mod ready;
 mod resources;
 mod routes;
 mod search;
+mod semantic_search;
 mod state;
 mod tokens;
 
@@ -54,9 +55,10 @@ pub use resources::{
 };
 pub use routes::router;
 pub use search::{EntitySummary, SearchHitBody, SearchResponse};
+pub use semantic_search::{SemanticSearchHit, SemanticSearchRequest, SemanticSearchResponse};
 pub use state::{
-    AppState, AuthState, GraphProjectionState, ImportState, SearchState, SharedGraphProjection,
-    SharedGraphStore, SharedObjects, SharedStore, SharedTokenStore,
+    AppState, AuthState, GraphProjectionState, ImportState, SearchState, SemanticSearchState,
+    SharedGraphProjection, SharedGraphStore, SharedObjects, SharedStore, SharedTokenStore,
 };
 pub use tokens::{
     AUDIT_TOKEN_ISSUE, AUDIT_TOKEN_LIST, AUDIT_TOKEN_REVOKE, IssueTokenBody, TokenSummary,
