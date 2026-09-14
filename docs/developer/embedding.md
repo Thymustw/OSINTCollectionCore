@@ -12,7 +12,10 @@ ml-commons plugin 直接跑 embedding 模型是可行的，以及可行的代價
 | 中文／多語 | `multilingual-e5-small`（ONNX **int8**，384 維） | `scripts/opensearch-ml-setup-e5.sh` |
 
 兩支腳本都是冪等的，可重複執行。兩個模型維度相同（384），
-所以可以共用同一組 k-NN index mapping。
+**但不能共用同一個 k-NN 欄位**：向量空間不相通，混在一起做最近鄰
+會得到無意義鄰居而且不會報錯。`osint-documents` 因此分
+`embedding_en`（MiniLM，`space_type: l2`）與
+`embedding_multi`（e5，`space_type: cosinesimil`）兩個欄位。
 
 ---
 
@@ -107,8 +110,8 @@ C-MTEB 55.38。
 | 授權 | Apache-2.0（模型權重，sentence-transformers 上游） |
 | 來源 | `https://artifacts.opensearch.org/models/ml-models/huggingface/sentence-transformers/all-MiniLM-L6-v2/1.0.2/onnx/` |
 
-`space_type` 上游宣告為 `l2`。V0.2 建 k-NN index 時要和這個一致，
-或改用 cosine 並在文件裡講明為什麼。
+`space_type` 上游宣告為 `l2`。Phase 3 Step 2 的 `embedding_en` 欄位
+已照這個宣告使用 `l2`（見下方「已由 Phase 3 Step 2 接住」）。
 
 ### 上游版本號沒有被存下來——冪等檢查不能靠它
 
@@ -605,6 +608,39 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
   再組回原順序。走 ingest pipeline 自動產生仍是一條可能的實作路徑，但
   也必須從這個 trait 出去，不能讓 indexer 直接打 ml-commons。
 
+### 已由 Phase 3 Step 2 接住（OpenSearch k-NN mapping）
+
+- **兩個模型的向量分欄位，不共用**：`osint-documents` 宣告
+  `embedding_en`（MiniLM）與 `embedding_multi`（e5-small），外加
+  `embedding_en_model_version`／`embedding_multi_model_version`
+  （keyword，存內容雜湊）。查詢／稽核不用回頭查 PostgreSQL 就能看出
+  這份文件目前索引的向量是哪個模型版本算的——模型升級時用來判斷
+  哪些文件的向量已過期。維度都是 384 但空間不相通，混一個欄位做
+  k-NN 會得到無意義鄰居而且**不會報錯**。
+- **k-NN `engine`／`space_type`**（2026-09-14 在 OpenSearch 2.19.6 實測）：
+  | 欄位 | engine | space_type | 依據 |
+  |---|---|---|---|
+  | `embedding_en` | `lucene` | `l2` | MiniLM 上游宣告 l2（§2.2） |
+  | `embedding_multi` | `lucene` | `cosinesimil` | e5 已 `normalize_result: true`，正規化向量下 cosine 與內積等價 |
+  `PUT` mapping `method.engine=lucene` 回 200。官方映像
+  `opensearchproject/opensearch:2.19.6` 內建 `opensearch-knn` 2.19.6.0；
+  本機另起一個**未跑** `opensearch-ml-setup.sh` 的乾淨容器（埠 19210）
+  同樣能建 knn index 並查出最近鄰。選 lucene 而不是 faiss／nmslib：
+  純 Java、knn 子句內的 `filter` 原生可用、不需要額外 native library。
+  本機／CI 都是單節點小索引，不需要近似搜尋的效能優勢。
+- **`index.knn` 只能在建立 index 時開啟**。對既有 `osint-documents`
+  這是破壞性 mapping 變更（再加上 `dynamic: strict` 不接受未宣告欄位），
+  必須 `osint-indexer --rebuild --drop`。
+- **filter 放 knn 子句內，不是外層 bool 的 post-filter。** 同日實測：
+  lucene engine 下，最近鄰是 `kind=note`、filter `kind=report`、`k=1`
+  時，knn 子句內 `filter` 仍回傳下一份符合的 report；外層
+  `bool.must knn + filter` 回空——knn 先取 k 再過濾，最近鄰被濾掉就沒東西。
+  `SearchStore::vector_search` 走 native filter。
+- **部分更新走 `SearchStore::update_fields`**（OpenSearch `_update`，
+  `doc_as_upsert=false`）。embedding-worker 事後補寫向量欄位時
+  **不能**用 `index()`：index API 取代整個 `_source`，會把
+  title／body／entities 清空。文件不存在回 `NotFound`，不憑空 upsert。
+
 ### 已由 Phase 3 Step 1 接住（schema／config，還沒有 worker）
 
 - **PostgreSQL 存 embedding metadata**：`embeddings` 表（migration `0010`）
@@ -622,14 +658,9 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
 
 ### 維持未決
 
-- **兩個模型的向量能不能放同一個欄位**：維度都是 384，mapping 可共用，
-  但**不同模型的向量空間不相通**，混在同一個欄位做 k-NN 會得到無意義的
-  鄰居。要嘛分欄位、要嘛分 index，這要在 SPEC §14 定案（Step 2 會拆成
-  `embedding_en`／`embedding_multi` 兩個欄位）。trait 只保證呼叫端
-  一定問得到 `model_for`／`EmbeddingVector.model`，沒有替你拆欄位。
-- k-NN index 的 `space_type`（MiniLM 上游宣告 `l2`；e5 已 normalize，
-  cosine 與內積等價）與 mapping 版本化（SPEC §14）。
-- CI 是否跑 embedding 整合測試（要付 600 MB + 135 MB 下載，§3）。
+- CI 是否跑 **ml-commons embedding** 整合測試（要付 600 MB + 135 MB 下載，§3）。
+  k-NN 查詢本身**不**在這條未決裡：`opensearch-knn` 是官方映像內建 plugin，
+  `storage-opensearch` 的 `vector_search` 整合測試沒有 `#[ignore]`。
 - 3 GB 容器在兩個模型下已用到 85 %。**再加第三個模型（例如 reranker）
   必須先重估**，而且 native memory 沒有斷路器保護（§4.1），估錯的後果是
   整個 OpenSearch 被 OOM-kill，不是溫和地拒絕部署。

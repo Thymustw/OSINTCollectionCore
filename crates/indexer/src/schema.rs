@@ -47,6 +47,15 @@ pub const F_DUPLICATE_OF: &str = "duplicate_of";
 pub const F_ENTITIES: &str = "entities";
 pub const F_ENTITY_TYPE: &str = "entities.entity_type";
 pub const F_ENTITY_NORMALIZED_NAME: &str = "entities.normalized_name";
+/// MiniLM（英文）向量。與 [`F_EMBEDDING_MULTI`] 分欄位：兩個模型維度都是 384，
+/// 但向量空間不相通，混同一個欄位做 k-NN 會得到無意義鄰居。
+pub const F_EMBEDDING_EN: &str = "embedding_en";
+/// 寫入 [`F_EMBEDDING_EN`] 時用的模型版本（內容雜湊，不是 ml-commons 的 `"1"`）。
+/// 查詢／稽核不用回頭查 PostgreSQL 就能看出這份文件的向量是否過期。
+pub const F_EMBEDDING_EN_MODEL_VERSION: &str = "embedding_en_model_version";
+/// e5-small（多語／中文）向量。理由見 [`F_EMBEDDING_EN`]。
+pub const F_EMBEDDING_MULTI: &str = "embedding_multi";
+pub const F_EMBEDDING_MULTI_MODEL_VERSION: &str = "embedding_multi_model_version";
 
 /// `search_after` 的排序鍵尾巴。**必須是唯一欄位**，否則同分文件翻頁會漏或重複。
 pub const F_SORT_TIEBREAK: &str = F_DOCUMENT_ID;
@@ -112,6 +121,12 @@ pub fn index_settings() -> Value {
         // 否則叢集健康會停在 yellow。這不是「不需要備援」的意思。
         "number_of_replicas": 0,
         "refresh_interval": "1s",
+        // k-NN 必須在建立 index 時開啟。OpenSearch 的 `index.knn` 是
+        // index-level setting，事後 `_settings` 打不開——對既有
+        // `osint-documents` 加 knn_vector 欄位一定要 `--rebuild --drop`。
+        // 2026-09-14 在 2.19.6 實測：扁平的 shards／replicas 與巢狀
+        // `"index": {"knn": true}` 可以並存，叢集會把它收成 `index.knn=true`。
+        "index": { "knn": true },
     })
 }
 
@@ -221,6 +236,36 @@ pub fn index_mappings() -> Value {
                 }
             },
             "entity_count": { "type": "integer" },
+
+            // k-NN 欄位。兩個模型維度都是 384，但空間不相通，所以分欄位。
+            //
+            // engine: lucene — 2026-09-14 在 OpenSearch 2.19.6 實測可用
+            // （`PUT` mapping 回 200）。官方映像
+            // `opensearchproject/opensearch:2.19.6` 內建 `opensearch-knn`
+            // 2.19.6.0，**未跑** `opensearch-ml-setup.sh` 的乾淨容器
+            // （本機另起埠 19210）同樣能建 index 並查出最近鄰。
+            // 選 lucene 而不是 faiss／nmslib：純 Java、knn 子句內的
+            // `filter` 原生可用、不需要額外 native library。本機／CI
+            // 都是單節點小索引，不需要近似搜尋的效能優勢。
+            //
+            // space_type：
+            // * `embedding_en`（MiniLM）用 `l2`——上游宣告就是 l2
+            //   （`docs/developer/embedding.md` §2.2）。
+            // * `embedding_multi`（e5）用 `cosinesimil`——e5 已
+            //   `normalize_result: true`，正規化向量下 cosine 與內積等價，
+            //   cosine 更直接對應「方向相近」。
+            F_EMBEDDING_EN: {
+                "type": "knn_vector",
+                "dimension": 384,
+                "method": { "name": "hnsw", "engine": "lucene", "space_type": "l2" }
+            },
+            F_EMBEDDING_EN_MODEL_VERSION: { "type": "keyword" },
+            F_EMBEDDING_MULTI: {
+                "type": "knn_vector",
+                "dimension": 384,
+                "method": { "name": "hnsw", "engine": "lucene", "space_type": "cosinesimil" }
+            },
+            F_EMBEDDING_MULTI_MODEL_VERSION: { "type": "keyword" },
         }
     })
 }
@@ -310,5 +355,70 @@ mod tests {
     fn date_field_default_is_effective() {
         assert_eq!(DateField::default(), DateField::Effective);
         assert_eq!(DateField::default().field_name(), F_EFFECTIVE_DATE);
+    }
+
+    #[test]
+    fn knn_vector_fields_are_384() {
+        let mappings = index_mappings();
+        for field in [F_EMBEDDING_EN, F_EMBEDDING_MULTI] {
+            assert_eq!(
+                mappings
+                    .pointer(&format!("/properties/{field}/type"))
+                    .and_then(Value::as_str),
+                Some("knn_vector"),
+                "{field} 不是 knn_vector"
+            );
+            assert_eq!(
+                mappings
+                    .pointer(&format!("/properties/{field}/dimension"))
+                    .and_then(Value::as_u64),
+                Some(384),
+                "{field} 維度不是 384"
+            );
+            assert_eq!(
+                mappings
+                    .pointer(&format!("/properties/{field}/method/engine"))
+                    .and_then(Value::as_str),
+                Some("lucene"),
+                "{field} 的 engine 不是 lucene"
+            );
+        }
+        assert_eq!(
+            mappings
+                .pointer(&format!("/properties/{F_EMBEDDING_EN}/method/space_type"))
+                .and_then(Value::as_str),
+            Some("l2")
+        );
+        assert_eq!(
+            mappings
+                .pointer(&format!(
+                    "/properties/{F_EMBEDDING_MULTI}/method/space_type"
+                ))
+                .and_then(Value::as_str),
+            Some("cosinesimil")
+        );
+        for field in [
+            F_EMBEDDING_EN_MODEL_VERSION,
+            F_EMBEDDING_MULTI_MODEL_VERSION,
+        ] {
+            assert_eq!(
+                mappings
+                    .pointer(&format!("/properties/{field}/type"))
+                    .and_then(Value::as_str),
+                Some("keyword"),
+                "{field} 不是 keyword"
+            );
+        }
+    }
+
+    #[test]
+    fn index_settings_enable_knn() {
+        assert_eq!(
+            index_settings()
+                .pointer("/index/knn")
+                .and_then(Value::as_bool),
+            Some(true),
+            "index.knn 必須在建立 index 時開啟；事後無法動態打開"
+        );
     }
 }

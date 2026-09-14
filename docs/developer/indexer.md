@@ -62,6 +62,16 @@ core-api 與 osint-cli 都引用那裡的常數。
 | `confidence` | float | 顯示 |
 | `entities` | **nested** | entity 過濾 |
 | `entity_count` | integer | 顯示 |
+| `embedding_en` | knn_vector（384，hnsw／lucene／`l2`） | MiniLM 英文向量。與 `embedding_multi` **分欄位**：維度相同但空間不相通 |
+| `embedding_en_model_version` | keyword | 寫入 `embedding_en` 時的模型版本（內容雜湊）。模型升級時判斷向量是否過期 |
+| `embedding_multi` | knn_vector（384，hnsw／lucene／`cosinesimil`） | e5-small 多語／中文向量 |
+| `embedding_multi_model_version` | keyword | 寫入 `embedding_multi` 時的模型版本 |
+
+這四個欄位由 embedding-worker（Phase 3 Step 3）事後用 `SearchStore::update_fields`
+疊加，**不是** indexer 投影時寫入。`index.knn` 必須在建立 index 時開啟
+（OpenSearch 事後打不開這個 setting），對既有 `osint-documents` 加這些欄位
+一定要 `osint-indexer --rebuild --drop`。engine／space_type 的實測依據見
+`docs/developer/embedding.md`「已由 Phase 3 Step 2 接住」。
 
 ### analyzer 取捨：`standard` + `cjk` multi-field
 

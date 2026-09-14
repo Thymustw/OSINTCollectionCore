@@ -729,6 +729,24 @@ pub struct SearchDocument {
     pub body: Value,
 }
 
+/// k-NN 向量查詢請求。
+///
+/// 呼叫端依語言／模型自己選 [`Self::field`]（`embedding_en`／`embedding_multi`）。
+/// trait 不做語言判斷——那是 [`EmbeddingProvider`] 的責任。兩個模型維度都是 384，
+/// 但向量空間不相通，查錯欄位會得到無意義鄰居而且**不會報錯**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorSearch {
+    pub index: String,
+    /// 要查哪個向量欄位。
+    pub field: String,
+    pub vector: Vec<f32>,
+    /// 要回幾個最近鄰居。
+    pub k: u32,
+    /// 與 knn 一起送的結構化過濾條件。adapter 必須真的排除不符合的文件，
+    /// 不能先取 k 再事後過濾——最近鄰全不符合時結果會變空。
+    pub filters: Vec<SearchFilter>,
+}
+
 /// 簡易全文查詢。語法細節留給 adapter，只給 conformance 與臨時查詢用。
 ///
 /// ⚠️ **不要拿這個型別接使用者輸入**。`query_string` 會被 adapter 原樣交給後端的
@@ -934,6 +952,22 @@ pub trait SearchStore: HealthProvider {
     /// 結構化搜尋。面向使用者的路徑走這個。
     async fn search(&self, query: StructuredSearch) -> Result<SearchHits, StorageError>;
     async fn delete(&self, index: &str, id: &str) -> Result<bool, StorageError>;
+
+    /// 部分更新既有文件的欄位（`_update` API，`doc_as_upsert=false`）。
+    ///
+    /// **不會整份覆寫 `_source`**——[`Self::index`]／[`Self::bulk_index`] 才會那樣做。
+    /// 用於 embedding-worker 事後補寫向量欄位：文件本體已由 indexer 寫入，
+    /// 只需要疊加 `embedding_en`／`embedding_en_model_version` 等欄位；用
+    /// `index()` 整份覆寫會把 title／body／entities 全部清空，因為 OpenSearch
+    /// 的 index API 是取代整個 `_source`，不是合併。
+    ///
+    /// 文件不存在時回 [`StorageError::NotFound`]（不會憑空 upsert 出一份文件——
+    /// 那份文件應該已經被 indexer 建過，不存在代表上游有問題，不該悄悄補一份殘缺的）。
+    async fn update_fields(&self, index: &str, id: &str, fields: Value)
+    -> Result<(), StorageError>;
+
+    /// k-NN 向量查詢。
+    async fn vector_search(&self, query: VectorSearch) -> Result<SearchHits, StorageError>;
 }
 
 // ---------------------------------------------------------------------------

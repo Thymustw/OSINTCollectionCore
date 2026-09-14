@@ -21,5 +21,5 @@ pub use traits::{
     ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr, RebuildState, RebuildStatus,
     RelationalStore, SearchDocument, SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery,
     SearchStore, SimhashCandidate, SortField, StructuredSearch, Transaction, TransactionalStore,
-    embedding_content_hash,
+    VectorSearch, embedding_content_hash,
 };

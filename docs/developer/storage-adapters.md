@@ -48,7 +48,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `EmbeddedStore` | `storage-sqlite` | SQLite（本機／App／投影，不是高併發 canonical） |
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
 | `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`）；Phase 3 Step 1 再加 `0010`（`embeddings` metadata，`put_embedding` **不是** upsert）與 `0011`（`duplicate_groups.model`）。見 `schema-v0.2.md` |
-| `SearchStore` | `storage-opensearch` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`query`／`search`／`delete`） |
+| `SearchStore` | `storage-opensearch` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`query`／`search`／`delete`／`update_fields`／`vector_search`） |
 | `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
 | `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |
 | `EmbeddingProvider` | `storage-opensearch`（`MlCommonsEmbeddingProvider`）；mock：`storage_core::mock::MockEmbeddingProvider` | 文字→向量（V0.2 Phase 3）。見下方「`EmbeddingProvider`」 |
@@ -65,6 +65,8 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 |---|---|---|
 | `query()` | `SearchQuery`（原始 `query_string`） | **只給 conformance 與運維臨時查詢**。字串會被原樣交給後端查詢語言，使用者可以用 `欄位名:值`／`*`／`~` 存取任意欄位或做 wildcard DoS |
 | `search()` | `StructuredSearch`（後端中立的語法樹 + 過濾 + 排序 + `search_after` + highlight） | **面向使用者的路徑**。任何使用者字串都只可能落在 `QueryExpr::Term`／`Phrase` 的值裡，不可能變成查詢語言的結構 |
+| `update_fields()` | index + id + 部分欄位 JSON | OpenSearch `_update`，**不** `doc_as_upsert`。疊加欄位、不覆寫整個 `_source`。給 embedding-worker 事後補寫 `embedding_en` 等向量欄位用——用 `index()` 會把 title／body／entities 清空。文件不存在回 `NotFound`，不憑空建立一份殘缺文件 |
+| `vector_search()` | `VectorSearch`（欄位 + 向量 + k + filters） | k-NN 最近鄰。filter 放 knn 子句**內**（lucene engine 的 native filtered knn）；外層 bool post-filter 在 k 很小且最近鄰不符合條件時會回空。呼叫端自己選 `embedding_en`／`embedding_multi`，trait 不做語言判斷 |
 
 `bulk_index` 回 `BulkIndexResult { indexed, errors, failures }`。`failures` 逐筆帶
 `id`／`status`／`reason`，`BulkFailure::is_retryable()` 區分暫時性（429/502/503/504）

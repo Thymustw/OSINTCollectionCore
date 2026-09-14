@@ -23,7 +23,7 @@ use storage_core::{
     BulkFailure, BulkIndexResult, CapabilityDescriptor, HealthProvider, ProjectionCheckpoint,
     ProjectionLag, ProjectionStore, QueryExpr, RebuildState, RebuildStatus, SearchDocument,
     SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery, SearchStore, StorageAdapter,
-    StorageError, StorageHealth, StructuredSearch,
+    StorageError, StorageHealth, StructuredSearch, VectorSearch,
 };
 use uuid::Uuid;
 
@@ -361,7 +361,7 @@ impl StorageAdapter for OpenSearchStore {
             // projection：V0.2 Phase 0f 起也實作 ProjectionStore（checkpoint／lag／rebuild 狀態）。
             &["search", "projection"],
         )
-        .with_feature("vector", Value::Bool(false))
+        .with_feature("vector", Value::Bool(true))
         .with_feature("bulk_write", Value::Bool(true))
     }
 }
@@ -541,6 +541,78 @@ impl SearchStore for OpenSearchStore {
                 message: format!("delete 失敗：{code}"),
             }),
         }
+    }
+
+    async fn update_fields(
+        &self,
+        index: &str,
+        id: &str,
+        fields: Value,
+    ) -> Result<(), StorageError> {
+        // 刻意不 doc_as_upsert：文件應該已由 indexer 寫入。不存在就回 NotFound，
+        // 不要憑空補一份只有向量欄位的殘缺文件。
+        let response = self
+            .client
+            .update(UpdateParts::IndexId(index, id))
+            .body(json!({ "doc": fields }))
+            .send()
+            .await
+            .map_err(map_os)?;
+        match response.status_code().as_u16() {
+            200 | 201 => self.maybe_refresh(index).await,
+            404 => Err(StorageError::NotFound {
+                message: format!(
+                    "部分更新 `{index}/{id}` 失敗：文件不存在。\
+                     向量欄位是疊加在 indexer 已寫入的文件上，不該在這裡憑空建立一份"
+                ),
+            }),
+            code => {
+                let detail: Value = response.json().await.unwrap_or(Value::Null);
+                Err(StorageError::Unknown {
+                    backend: "opensearch",
+                    message: format!(
+                        "部分更新 `{index}/{id}` 失敗（{code}）：{}",
+                        StorageError::sanitize(&detail.to_string())
+                    ),
+                })
+            }
+        }
+    }
+
+    async fn vector_search(&self, query: VectorSearch) -> Result<SearchHits, StorageError> {
+        let body = build_knn_body(&query)?;
+        let response = self
+            .client
+            .search(SearchParts::Index(&[&query.index]))
+            .body(body)
+            .send()
+            .await
+            .map_err(map_os)?;
+        if response.status_code().as_u16() == 404 {
+            // index 還沒建立。回空結果而不是 500——還沒有任何文件被索引不是伺服器錯誤。
+            return Ok(SearchHits {
+                total: 0,
+                hits: Vec::new(),
+            });
+        }
+        if !response.status_code().is_success() {
+            let code = response.status_code().as_u16();
+            let detail: Value = response.json().await.unwrap_or(Value::Null);
+            return Err(StorageError::Unknown {
+                backend: "opensearch",
+                message: format!(
+                    "vector_search 失敗（{code}）：{}",
+                    StorageError::sanitize(&detail.to_string())
+                ),
+            });
+        }
+        let payload: Value = response.json().await.map_err(map_os)?;
+        let total = payload
+            .pointer("/hits/total/value")
+            .and_then(Value::as_u64)
+            .or_else(|| payload.pointer("/hits/total").and_then(Value::as_u64))
+            .unwrap_or(0);
+        Ok(parse_hits(&payload, total))
     }
 }
 
@@ -1064,6 +1136,60 @@ fn translate_all(
         .collect()
 }
 
+/// 組 k-NN 查詢 body。
+///
+/// filter 放在 knn 子句**裡面**，不是外層 bool 的 post-filter。
+/// 2026-09-14 在 OpenSearch 2.19.6 + lucene engine 實測：
+///
+/// * native（knn 子句內 `filter`）：k=1、最近鄰不符合條件時，仍回傳下一個符合的；
+/// * bool must knn + filter：同一組輸入回空——knn 先取 k 再過濾，最近鄰全被濾掉就沒東西。
+///
+/// 那正是「過濾條件被忽略／看似生效但其實漏結果」的靜默失效，所以這裡走 native。
+fn build_knn_body(query: &VectorSearch) -> Result<Value, StorageError> {
+    if query.field.is_empty() {
+        return Err(StorageError::Configuration {
+            message: "VectorSearch.field 是空的。請指定 embedding_en 或 embedding_multi，\
+                      兩個欄位的向量空間不相通，查錯欄位不會報錯只會得到無意義鄰居"
+                .into(),
+        });
+    }
+    if query.vector.is_empty() {
+        return Err(StorageError::Configuration {
+            message: format!(
+                "VectorSearch.vector 是空的（欄位 `{}`）。空向量無法做 k-NN",
+                query.field
+            ),
+        });
+    }
+    if query.k == 0 {
+        return Err(StorageError::Configuration {
+            message: "VectorSearch.k 不可為 0。請指定要回幾個最近鄰居".into(),
+        });
+    }
+    let k = query.k.clamp(1, MAX_SIZE);
+    let mut knn_inner = json!({
+        "vector": query.vector,
+        "k": k,
+    });
+    if !query.filters.is_empty() {
+        let translated: Vec<Value> = query.filters.iter().map(translate_filter).collect();
+        let filter = if translated.len() == 1 {
+            translated.into_iter().next().expect("長度已確認為 1")
+        } else {
+            json!({ "bool": { "filter": translated } })
+        };
+        knn_inner
+            .as_object_mut()
+            .expect("json! 建的是 object")
+            .insert("filter".into(), filter);
+    }
+    Ok(json!({
+        "query": { "knn": { query.field.clone(): knn_inner } },
+        "size": k,
+        "track_total_hits": true,
+    }))
+}
+
 fn translate_filter(filter: &SearchFilter) -> Value {
     match filter {
         SearchFilter::Term { field, value } => json!({ "term": { field: value } }),
@@ -1361,5 +1487,98 @@ mod tests {
         assert_eq!(hits.total, 2);
         assert_eq!(hits.hits[0].sort.len(), 2, "沒有 sort 就翻不了下一頁");
         assert_eq!(hits.hits[0].highlights.get("title").map(Vec::len), Some(1));
+    }
+
+    fn knn_query(filters: Vec<SearchFilter>) -> VectorSearch {
+        VectorSearch {
+            index: "osint-documents".into(),
+            field: "embedding_en".into(),
+            vector: vec![0.1, 0.2],
+            k: 5,
+            filters,
+        }
+    }
+
+    #[test]
+    fn knn_body_without_filters_is_plain_knn() {
+        let body = build_knn_body(&knn_query(Vec::new())).unwrap();
+        assert!(
+            body.pointer("/query/knn/embedding_en/vector").is_some(),
+            "空 filters 必須是最單純的 knn 子句，不要包一層空 bool"
+        );
+        assert!(
+            body.pointer("/query/knn/embedding_en/filter").is_none(),
+            "沒有 filter 時不該寫 filter key"
+        );
+        assert_eq!(
+            body.pointer("/query/knn/embedding_en/k")
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(body.get("size").and_then(Value::as_u64), Some(5));
+    }
+
+    #[test]
+    fn knn_filter_lives_inside_the_knn_clause() {
+        // 放外層 bool 是 post-filter：knn 先取 k 再過濾，最近鄰全不符合時結果變空。
+        let body = build_knn_body(&knn_query(vec![SearchFilter::Term {
+            field: "kind".into(),
+            value: "report".into(),
+        }]))
+        .unwrap();
+        assert_eq!(
+            body.pointer("/query/knn/embedding_en/filter/term/kind")
+                .and_then(Value::as_str),
+            Some("report")
+        );
+        assert!(
+            body.pointer("/query/bool").is_none(),
+            "單一 filter 不該被包進外層 bool"
+        );
+    }
+
+    #[test]
+    fn knn_multiple_filters_are_anded_inside_knn() {
+        let body = build_knn_body(&knn_query(vec![
+            SearchFilter::Term {
+                field: "kind".into(),
+                value: "report".into(),
+            },
+            SearchFilter::Term {
+                field: "language".into(),
+                value: "en".into(),
+            },
+        ]))
+        .unwrap();
+        let filters = body
+            .pointer("/query/knn/embedding_en/filter/bool/filter")
+            .and_then(Value::as_array)
+            .expect("多個 filter 應收成 knn 內的 bool.filter 陣列");
+        assert_eq!(filters.len(), 2);
+    }
+
+    #[test]
+    fn knn_rejects_empty_field_vector_or_zero_k() {
+        let mut q = knn_query(Vec::new());
+        q.field.clear();
+        assert!(build_knn_body(&q).is_err());
+        q = knn_query(Vec::new());
+        q.vector.clear();
+        assert!(build_knn_body(&q).is_err());
+        q = knn_query(Vec::new());
+        q.k = 0;
+        assert!(build_knn_body(&q).is_err());
+    }
+
+    #[test]
+    fn knn_k_is_clamped() {
+        let mut q = knn_query(Vec::new());
+        q.k = 100_000;
+        let body = build_knn_body(&q).unwrap();
+        assert_eq!(
+            body.pointer("/query/knn/embedding_en/k")
+                .and_then(Value::as_u64),
+            Some(200)
+        );
     }
 }
