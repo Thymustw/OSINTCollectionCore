@@ -249,10 +249,79 @@ curl -s $API/search/semantic \
    title 還是 body」，只能告訴你這份文件目前那個欄位裡放的是哪一種內容。
 3. **不要拿這裡的 `score` 跟 `POST /search` 的 `score` 比大小。**
    一個是 cosine／l2 最近鄰，一個是 Lucene BM25，尺度不同。
-   融合是之後 hybrid search 的事。
+   融合請用下面的 hybrid search。
 
 沒接上 OpenSearch 或 ml-commons 模型未部署時，**只有這條路由**回 503，
 全文搜尋不受影響。viewer 即可。目前只查文件（`osint-documents`），不查實體。
+
+**混合搜尋**用 `POST /search/hybrid`（SPEC_V0.2 §15）。同時跑 BM25 全文與
+語意 k-NN，再用 **RRF（Reciprocal Rank Fusion）** 融合排名，不是把兩種分數
+加權相加——尺度不同，硬加沒意義。公式是
+`fused_score = Σ weight_i / (60 + rank_i)`；`60` 是 RRF 論文與
+Elasticsearch／OpenSearch 內建 RRF 的預設 k。文件沒出現在某條訊號裡就不計
+那一項（不是給一個很差的排名）。
+
+```bash
+curl -s $API/search/hybrid \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"query": "ransomware campaign against hospitals", "language": "en", "limit": 10}'
+```
+
+```jsonc
+{
+  "hits": [
+    {
+      "document_id": "…",
+      "title": "…",
+      "object_type": "article",
+      "source_id": "…",
+      "published_at": "2026-09-10T12:00:00Z",
+      "fused_score": 0.0325,
+      "bm25_rank": 1,          // 從 1 開始；沒出現在該訊號就是 null
+      "vector_rank": 2
+    }
+  ]
+}
+```
+
+`language` 只影響向量那條訊號要嵌入哪個模型（規則與語意搜尋相同），BM25
+那條跟語言無關。兩條訊號各自先抓 `limit × 3` 筆再融合、截斷到 `limit`。
+
+V0.2 **只有兩個訊號真的有算**：`[search_hybrid].bm25_weight` 與
+`vector_weight`（預設都是 1.0）。另外四個
+（`entity_match_weight`／`recency_weight`／`source_score_weight`／
+`confidence_weight`）**完全沒有對應的排名清單**——不是「權重設 0 但其實有算」。
+設成非 0 時 osint-api 啟動會打 warning，排序不會變。
+
+`search` 或 `semantic_search` 任一沒接上，這條整條回 503，訊息會講是哪一個。
+viewer 即可。
+
+**相似文件**用 `GET /objects/{id}/similar`（SPEC_V0.2 §16）。拿這份文件自己的
+向量找最近鄰，不需要再 embed 一次查詢文字：
+
+```bash
+curl -s "$API/objects/$DOC_ID/similar?limit=10" -H "Authorization: Bearer $TOKEN"
+```
+
+```jsonc
+{
+  "hits": [
+    {
+      "document_id": "…",
+      "score": 0.88,            // k-NN 分數，不是 BM25
+      "object_type": "article",
+      "title": "…",
+      "source_id": "…",
+      "published_at": "2026-09-10T12:00:00Z"
+    }
+  ]
+}
+```
+
+自己不會出現在清單裡。還沒被 embedding-worker 處理（沒有向量）時回 200、
+`hits: []`，不是錯誤。文件不存在回 404。已被判為重複的文件回 **409**——
+請改打 canonical id（`GET /objects/{id}` 對 duplicate 仍是 200，所以不是
+404）。沒接上 ml-commons 時回 503（跟語意搜尋同一組依賴）。viewer 即可。
 
 ### 翻頁
 

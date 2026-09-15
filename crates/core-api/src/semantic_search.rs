@@ -17,7 +17,7 @@
 //!    是哪一種內容」：有 body 就回 `"body"`，沒有 body 才回 `"title"`。
 //! 3. **k-NN 分數不是 BM25 分數。** 這裡的 `score` 是 cosine／l2 空間的
 //!    最近鄰分數（約 0~1 附近，看 `space_type`），不能跟 `POST /search`
-//!    的 Lucene TF-IDF 分數直接比大小。hybrid search（Step 5）才處理融合。
+//!    的 Lucene TF-IDF 分數直接比大小。融合見 [`crate::search_hybrid`]。
 //!
 //! # 查詢向量與哪個欄位比對
 //!
@@ -93,7 +93,7 @@ pub struct SemanticSearchResponse {
     pub model_version: String,
 }
 
-fn semantic_or_unavailable(
+pub(crate) fn semantic_or_unavailable(
     state: &AppState,
 ) -> Result<&crate::state::SharedSemanticSearchState, ApiError> {
     state.semantic_search.as_ref().ok_or_else(|| {
@@ -108,7 +108,7 @@ fn semantic_or_unavailable(
     })
 }
 
-fn reject_empty_query(query: &str) -> Result<(), ApiError> {
+pub(crate) fn reject_empty_query(query: &str) -> Result<(), ApiError> {
     if query.trim().is_empty() {
         return Err(ApiError::bad_request(
             "query 不可為空。請提供要找的文字，例如 \
@@ -123,7 +123,7 @@ fn reject_empty_query(query: &str) -> Result<(), ApiError> {
 /// MiniLM 名稱必須與 [`MINILM_MODEL_NAME`] **精確相等**才走 `embedding_en`。
 /// 不相等（含未知模型）走 `embedding_multi`——那是多語／未知語言的既定後備，
 /// 不要自己猜。
-fn vector_field_for(model: &EmbeddingModelRef) -> &'static str {
+pub(crate) fn vector_field_for(model: &EmbeddingModelRef) -> &'static str {
     if model.model == MINILM_MODEL_NAME {
         schema::F_EMBEDDING_EN
     } else {
@@ -157,19 +157,56 @@ fn to_hit(hit: &SearchHit) -> SemanticSearchHit {
     }
 }
 
-fn text(source: &Value, field: &str) -> Option<String> {
+pub(crate) fn source_text(source: &Value, field: &str) -> Option<String> {
     source
         .get(field)
         .and_then(Value::as_str)
         .map(str::to_string)
 }
 
-fn date(source: &Value, field: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn source_date(source: &Value, field: &str) -> Option<DateTime<Utc>> {
     source
         .get(field)
         .and_then(Value::as_str)
         .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn text(source: &Value, field: &str) -> Option<String> {
+    source_text(source, field)
+}
+
+fn date(source: &Value, field: &str) -> Option<DateTime<Utc>> {
+    source_date(source, field)
+}
+
+/// 從一份文件的 `_source` 取出要用來找鄰居的向量。
+///
+/// 兩個欄位都有值時優先 `embedding_en`：英文文件幾乎一定寫 MiniLM，
+/// 兩個都寫的情況很少見（語言標成 en 之後又被多語路徑補寫）。優先英文
+/// 空間比較穩，因為那是這份文件「被當成英文處理」時的主向量。兩個都沒有
+/// （還沒被 embedding-worker 處理、或沒有 title／body）回 `None`。
+///
+/// 空陣列當成沒有向量：寫入失敗或部分更新殘缺時，拿空向量去做 k-NN
+/// 會得到無意義鄰居而且不會報錯。
+pub(crate) fn embedding_from_source(source: &Value) -> Option<(&'static str, Vec<f32>)> {
+    read_vector(source, schema::F_EMBEDDING_EN)
+        .map(|v| (schema::F_EMBEDDING_EN, v))
+        .or_else(|| {
+            read_vector(source, schema::F_EMBEDDING_MULTI).map(|v| (schema::F_EMBEDDING_MULTI, v))
+        })
+}
+
+fn read_vector(source: &Value, field: &str) -> Option<Vec<f32>> {
+    let values = source.get(field)?.as_array()?;
+    if values.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        out.push(value.as_f64()? as f32);
+    }
+    Some(out)
 }
 
 /// `POST /api/v1/search/semantic`。viewer 以上可用（唯讀）。
@@ -392,5 +429,30 @@ mod tests {
             limit: None,
         };
         assert_eq!(default.effective_limit(), DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn embedding_from_source_prefers_en_when_both_present() {
+        let source = json!({
+            "embedding_en": [0.1, 0.2],
+            "embedding_multi": [0.3, 0.4],
+        });
+        let (field, vector) = embedding_from_source(&source).expect("vector");
+        assert_eq!(field, schema::F_EMBEDDING_EN);
+        assert_eq!(vector, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn embedding_from_source_falls_back_to_multi() {
+        let source = json!({ "embedding_multi": [0.5, 0.6] });
+        let (field, vector) = embedding_from_source(&source).expect("vector");
+        assert_eq!(field, schema::F_EMBEDDING_MULTI);
+        assert_eq!(vector, vec![0.5, 0.6]);
+    }
+
+    #[test]
+    fn embedding_from_source_treats_empty_array_as_missing() {
+        assert!(embedding_from_source(&json!({ "embedding_en": [] })).is_none());
+        assert!(embedding_from_source(&json!({})).is_none());
     }
 }

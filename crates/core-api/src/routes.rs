@@ -24,6 +24,7 @@ use crate::ops;
 use crate::rate_limit;
 use crate::resources;
 use crate::search;
+use crate::search_hybrid;
 use crate::semantic_search;
 use crate::state::AppState;
 use crate::tokens;
@@ -120,6 +121,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/objects", get(resources::objects::list_objects))
         .route("/api/v1/objects/{id}", get(resources::objects::get_object))
+        .route(
+            "/api/v1/objects/{id}/similar",
+            get(resources::similar::similar_objects),
+        )
         .route("/api/v1/entities", get(resources::entities::list_entities))
         .route(
             "/api/v1/entities/{id}",
@@ -177,6 +182,9 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/search/semantic",
             post(semantic_search::semantic_search),
         )
+        // hybrid 同樣唯讀、同樣用 POST。兩條訊號都要接上：`search` 或
+        // `semantic_search` 任一是 None 就整條回 503，訊息會講是哪一個。
+        .route("/api/v1/search/hybrid", post(search_hybrid::hybrid_search))
         // 圖查詢是唯讀的（viewer 以上），但用 POST：body 是結構化 GraphQuery，
         // 塞進 query string 不划算。權限與 POST /search 同一級，不掛 require_write。
         .route("/api/v1/graph/query", post(resources::graph::query))

@@ -27,6 +27,7 @@ mod ready;
 mod resources;
 mod routes;
 mod search;
+mod search_hybrid;
 mod semantic_search;
 mod state;
 mod tokens;
@@ -55,6 +56,10 @@ pub use resources::{
 };
 pub use routes::router;
 pub use search::{EntitySummary, SearchHitBody, SearchResponse};
+pub use search_hybrid::{
+    HybridSearchHit, HybridSearchRequest, HybridSearchResponse, RRF_K, fuse_ranks,
+    unimplemented_hybrid_signals, warn_unimplemented_hybrid_weights,
+};
 pub use semantic_search::{SemanticSearchHit, SemanticSearchRequest, SemanticSearchResponse};
 pub use state::{
     AppState, AuthState, GraphProjectionState, ImportState, SearchState, SemanticSearchState,

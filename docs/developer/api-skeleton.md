@@ -42,6 +42,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | POST | `/api/v1/collections` | operator | 201 | 可一併 link source／connector |
 | GET | `/api/v1/objects` | viewer | 200 | `?object_type=`、`?include_duplicates=` |
 | GET | `/api/v1/objects/{id}` | viewer | 200 | 含 provenance 鏈、去重、entity |
+| GET | `/api/v1/objects/{id}/similar` | viewer | 200／404／409／503 | 相似文件。duplicate 409；沒向量 200 空清單 |
 | POST | `/api/v1/objects` | operator | — | **一律 501**（ADR-006） |
 | GET | `/api/v1/entities` | viewer | 200 | `?entity_type=` |
 | GET | `/api/v1/entities/{id}` | viewer | 200 | 含關聯數與抽取紀錄 |
@@ -71,6 +72,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | POST | `/api/v1/import` | operator | 201 | multipart |
 | POST | `/api/v1/search` | viewer | 200 | |
 | POST | `/api/v1/search/semantic` | viewer | 200／503 | 語意搜尋。沒接 ml-commons 回 503，不影響全文搜尋 |
+| POST | `/api/v1/search/hybrid` | viewer | 200／503 | RRF 融合 BM25＋向量。`search` 或 `semantic_search` 缺一條整條 503 |
 | GET | `/api/v1/graph/entities/{id}/neighbors` | viewer | 200 | 圖鄰居。沒有這個節點回空陣列，不是 404 |
 | GET | `/api/v1/graph/entities/{id}/relationships` | viewer | 200 | 圖邊。語意同上 |
 | GET | `/api/v1/graph/path` | viewer | 200 | `from`／`to` 必填。找不到路徑回 `null`，永遠 200 |
@@ -97,6 +99,14 @@ POST `/api/v1/search/semantic`（SPEC_V0.2 §13）同樣唯讀、同樣用 POST�
 語言由呼叫端提供（不做偵測）、`matched_section` 是 overlay 近似值、k-NN 分數
 不能跟 BM25 分數比——三件已知限制寫在 `docs/user/api.md` 與
 `crates/core-api/src/semantic_search.rs` 模組說明。目前只查 `osint-documents`。
+
+POST `/api/v1/search/hybrid`（SPEC_V0.2 §15）用 RRF 融合 BM25 與向量排名。
+兩個 state 都要有，缺一條整條 503。V0.2 只有 `bm25_weight`／`vector_weight`
+真的有算；另外四個權重設非 0 時啟動打 warning。request／response 見
+`docs/user/api.md`。
+
+GET `/api/v1/objects/{id}/similar`（SPEC_V0.2 §16）重用語意搜尋的
+`SemanticSearchState`。duplicate 回 409；沒有向量回 200 空清單。
 
 POST `/api/v1/import`（Manual／JSON／CSV 上傳）是 `multipart/form-data`，
 上傳大小上限與其他路由分開（`[import].max_upload_bytes`，預設 10 MiB；
@@ -689,7 +699,9 @@ Phase 6b 另外加了三個欄位：
 掛掉不該讓 BM25 全文搜尋也回 503。`semantic_search` 的型別是
 `SemanticSearchState`（`OpenSearchStore` + `MlCommonsEmbeddingProvider` +
 Document index 名），由 `osint-api` 的 `connect_semantic_search` 組裝；
-連不上時欄位是 `None`，只有 `POST /api/v1/search/semantic` 回 503。
+連不上時欄位是 `None`，`POST /api/v1/search/semantic`、
+`GET /api/v1/objects/{id}/similar` 與 `POST /api/v1/search/hybrid` 回 503。
+`hybrid_weights` 永遠有值（`HybridSearchSection::default()`），不是 `Option`。
 
 ## 錯誤格式
 

@@ -126,6 +126,7 @@ fn build_api(stack: &Stack, index: &str, role: Role) -> TestApi {
             index: index.to_string(),
         })),
         semantic_search: None,
+        hybrid_weights: core_config::HybridSearchSection::default(),
         ready: ready_always(),
         // 這支 e2e 不驗 ops health，給空清單。
         backends: core_api::ReadyProbe::new(Vec::new()),

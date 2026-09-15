@@ -67,7 +67,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `search()` | `StructuredSearch`（後端中立的語法樹 + 過濾 + 排序 + `search_after` + highlight） | **面向使用者的路徑**。任何使用者字串都只可能落在 `QueryExpr::Term`／`Phrase` 的值裡，不可能變成查詢語言的結構 |
 | `update_fields()` | index + id + 部分欄位 JSON | OpenSearch `_update`，**不** `doc_as_upsert`。疊加欄位、不覆寫整個 `_source`。給 embedding-worker 事後補寫 `embedding_en` 等向量欄位用——用 `index()` 會把 title／body／entities 清空。文件不存在回 `NotFound`，不憑空建立一份殘缺文件 |
 | `bulk_upsert_fields()` | `Vec<SearchDocument>` → `BulkIndexResult` | OpenSearch bulk `"update"` + `doc_as_upsert=true`。跟 `bulk_index` 一樣回逐筆失敗，但**只合併 `body` 裡列出的欄位**，其餘既有欄位維持原樣。給 indexer 用：它本來就要負責建立文件（所以允許 upsert），但不能把 embedding-worker 疊加的向量欄位整份取代掉。跟 `update_fields` 的差異是文件不存在時會建立，而不是回 `NotFound` |
-| `vector_search()` | `VectorSearch`（欄位 + 向量 + k + filters） | k-NN 最近鄰。filter 放 knn 子句**內**（lucene engine 的 native filtered knn）；外層 bool post-filter 在 k 很小且最近鄰不符合條件時會回空。呼叫端自己選 `embedding_en`／`embedding_multi`，trait 不做語言判斷。面向使用者的入口是 `POST /api/v1/search/semantic`（`crates/core-api/src/semantic_search.rs`）：它先問 `EmbeddingProvider::model_for` 再精確比對 `MINILM_MODEL_NAME`／`E5_MODEL_NAME` 決定欄位 |
+| `vector_search()` | `VectorSearch`（欄位 + 向量 + k + filters） | k-NN 最近鄰。filter 放 knn 子句**內**（lucene engine 的 native filtered knn）；外層 bool post-filter 在 k 很小且最近鄰不符合條件時會回空。呼叫端自己選 `embedding_en`／`embedding_multi`，trait 不做語言判斷。面向使用者的入口：`POST /api/v1/search/semantic`（查詢文字 → embed → k-NN）、`POST /api/v1/search/hybrid`（BM25 + 向量，RRF 融合）、`GET /api/v1/objects/{id}/similar`（文件自己的向量找鄰居） |
 
 `MockSearchStore`（V0.2 Phase 3 Step 3）給 embedding-worker 單元測試用：
 `index()`／`bulk_index()` 整份覆寫 `_source`；`bulk_upsert_fields()` 已存在就合併

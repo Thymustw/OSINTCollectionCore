@@ -48,6 +48,7 @@ pub mod merge;
 pub mod objects;
 pub mod raw;
 pub mod relationships;
+pub mod similar;
 pub mod sources;
 
 use axum::http::{HeaderMap, StatusCode, header};

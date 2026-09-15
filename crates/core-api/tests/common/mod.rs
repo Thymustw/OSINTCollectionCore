@@ -94,6 +94,7 @@ pub fn test_app_with_backends(
         // `POST /api/v1/search/semantic` 回 503。
         search: None,
         semantic_search: None,
+        hybrid_weights: core_config::HybridSearchSection::default(),
         ready: ready_always(),
         backends: ReadyProbe::new(checks),
         // 這支測試不驗 /ops/queues。

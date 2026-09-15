@@ -459,9 +459,9 @@ impl Default for EmbeddingSection {
 /// 把 BM25 分數與 cosine 分數強行對齊到同一個範圍。權重是「這個訊號在
 /// RRF 公式裡的比重」，不是原始分數的乘數。
 ///
-/// `entity_match`／`recency`／`source_score`／`confidence` 預設 0.0
-/// （等於停用，只留 BM25＋vector）：Step 5 才會真的接上這些訊號的計算
-/// 邏輯，現在把它們的權重設非零會誤導看設定檔的人以為已經生效。
+/// `entity_match`／`recency`／`source_score`／`confidence` 預設 0.0。
+/// V0.2 **沒有實作這四個訊號**（沒有對應的排名清單），不是「權重設 0
+/// 但其實有算」。設非零時 `osint-api` 啟動會打 warning，排序不會變。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HybridSearchSection {
     pub bm25_weight: f64,

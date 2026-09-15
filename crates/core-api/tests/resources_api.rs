@@ -38,6 +38,7 @@ fn read_paths() -> Vec<String> {
         format!("/api/v1/collections/{id}"),
         "/api/v1/objects".into(),
         format!("/api/v1/objects/{id}"),
+        format!("/api/v1/objects/{id}/similar"),
         "/api/v1/entities".into(),
         format!("/api/v1/entities/{id}"),
         format!("/api/v1/entities/{id}/resolution-candidates"),

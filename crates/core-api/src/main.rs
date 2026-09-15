@@ -9,6 +9,7 @@ use core_api::{
     AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, GraphProjectionState, ImportState,
     PostgresReady, QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SemanticSearchState,
     SharedGraphStore, SharedObjects, SharedStore, SharedTokenStore, router,
+    warn_unimplemented_hybrid_weights,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -223,7 +224,8 @@ async fn run() -> Result<(), String> {
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "語意搜尋未接上（OpenSearch 或 ml-commons）；POST /api/v1/search/semantic 會回 503"
+                "語意搜尋未接上（OpenSearch 或 ml-commons）；POST /api/v1/search/semantic、\
+                 GET /api/v1/objects/{{id}}/similar 與 POST /api/v1/search/hybrid 會回 503"
             );
             None
         }
@@ -287,6 +289,8 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    warn_unimplemented_hybrid_weights(&cfg.search_hybrid);
+
     let state = AppState {
         metrics: MetricsRegistry::new(),
         auth: AuthState {
@@ -305,6 +309,7 @@ async fn run() -> Result<(), String> {
         import,
         search,
         semantic_search,
+        hybrid_weights: cfg.search_hybrid.clone(),
         ready,
         // 沒接上的後端不會變成「壞掉」，而是列進 `backends_missing`——
         // 「沒設定」與「壞了」的下一步完全不同。
@@ -500,7 +505,8 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
                  /api/v1/tokens（admin）、/api/v1/ops/health、/api/v1/ops/metrics、\
                  /api/v1/ops/connectors、/api/v1/ops/queues、/api/v1/ops/dlq 與 /api/v1/ops/graph、\
                  sources／connectors／collections／objects／entities／relationships／events／raw、\
-                 /api/v1/graph/*、POST /api/v1/import、POST /api/v1/search 與 POST /api/v1/search/semantic"
+                 /api/v1/graph/*、POST /api/v1/import、POST /api/v1/search、POST /api/v1/search/semantic、\
+                 POST /api/v1/search/hybrid 與 GET /api/v1/objects/{id}/similar"
                 .into(),
         }),
     )

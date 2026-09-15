@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use connector_sdk::EvidenceSink;
-use core_config::ImportSection;
+use core_config::{HybridSearchSection, ImportSection};
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::MetricsRegistry;
@@ -85,7 +85,8 @@ pub struct SearchState {
     pub index: String,
 }
 
-/// `POST /api/v1/search/semantic` 要用到的下游。沒接上時只有這條路由回 503。
+/// `POST /api/v1/search/semantic` 與 `GET /objects/{id}/similar` 要用到的下游。
+/// 沒接上時這兩條與 `POST /search/hybrid` 回 503。
 ///
 /// 跟 [`SearchState`] 刻意分開：這條路由多需要一個 `EmbeddingProvider`
 /// （ml-commons），ml-commons 掛掉不該連帶讓 `POST /api/v1/search`
@@ -160,8 +161,12 @@ pub struct AppState {
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
     /// 語意搜尋。`None` 代表沒接上 OpenSearch 或 ml-commons 模型未部署，
-    /// **只有** `POST /api/v1/search/semantic` 回 503；全文搜尋不受影響。
+    /// `POST /api/v1/search/semantic` 與 `GET /objects/{id}/similar` 回 503；
+    /// 全文搜尋不受影響。hybrid 另外還要 [`AppState::search`]。
     pub semantic_search: Option<SharedSemanticSearchState>,
+    /// hybrid 的 RRF 權重。永遠有值（`HybridSearchSection` 有 `Default`），
+    /// 不是 `Option`。V0.2 只有 `bm25_weight`／`vector_weight` 真的有算。
+    pub hybrid_weights: HybridSearchSection,
     pub ready: ReadyProbe,
     /// `GET /api/v1/ops/health` 要敲的後端。與 [`AppState::ready`] **刻意分開**：
     /// `/ready` 只檢查 API 自己非有不可的依賴（給 orchestrator 判斷要不要送流量），

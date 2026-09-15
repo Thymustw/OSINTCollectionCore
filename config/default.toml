@@ -161,8 +161,8 @@ similarity_threshold = 0.90
 
 # Hybrid search（POST /search/hybrid，SPEC §15）的 RRF 權重。
 # 權重是「這個訊號在 RRF 公式裡的比重」，不是原始分數的乘數。
-# entity_match／recency／source_score／confidence 預設 0.0（停用）——
-# Step 5 才會接上這些訊號，現在設非零會讓人以為已經生效。
+# entity_match／recency／source_score／confidence 預設 0.0。
+# V0.2 沒有實作這四個訊號（沒有排名清單），設非零只會在啟動時打 warning。
 [search_hybrid]
 bm25_weight = 1.0
 vector_weight = 1.0

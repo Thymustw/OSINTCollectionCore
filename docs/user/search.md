@@ -16,8 +16,8 @@ curl -s http://127.0.0.1:18080/api/v1/search \
 ```
 
 語意搜尋是另一條路由（`POST /api/v1/search/semantic`），不是這份文件講的
-關鍵字語法。它比的是向量鄰居，不是詞。request／response 形狀與三個已知限制
-見 `docs/user/api.md`「語意搜尋」。
+關鍵字語法。它比的是向量鄰居，不是詞。混合搜尋（`POST /api/v1/search/hybrid`）
+把兩條路徑用 RRF 融合。request／response 形狀見 `docs/user/api.md`。
 
 > 搜尋到的東西來自**搜尋投影**，不是資料庫本身。投影由 `osint-indexer` 建立；
 > 它沒在跑的話，新採集的文件不會出現在搜尋結果裡（資料本身還在，沒有遺失）。

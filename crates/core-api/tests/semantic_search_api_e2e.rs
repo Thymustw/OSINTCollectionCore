@@ -88,6 +88,7 @@ fn build_api(stack: &Stack, index: &str) -> TestApi {
         graph_projection: None,
         import: None,
         search: None,
+        hybrid_weights: core_config::HybridSearchSection::default(),
         semantic_search: Some(Arc::new(SemanticSearchState {
             store: OpenSearchStore::connect(&stack.url)
                 .expect("semantic search 自己的連線")

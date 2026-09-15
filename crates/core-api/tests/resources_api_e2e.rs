@@ -131,6 +131,7 @@ fn build_api_with_backends(
         import: None,
         search: None,
         semantic_search: None,
+        hybrid_weights: core_config::HybridSearchSection::default(),
         ready: ready_always(),
         backends: ReadyProbe::new(checks),
         // 真的接本機 Redpanda：`/ops/queues` 要驗的正是「查得到 group lag」，
@@ -854,6 +855,75 @@ async fn objects_exclude_duplicates_by_default() {
         .await
         .is_none(),
         "object_type 過濾要真的濾掉別的型別"
+    );
+}
+
+/// `GET /objects/{id}/similar`：id 不存在 404；duplicate 409（不是 404）。
+///
+/// 這支 e2e 不接 OpenSearch，所以 canonical 文件過了 409 檢查後會卡在
+/// `semantic_search` 的 503——那是預期。404／409 必須在打到投影之前就回。
+#[tokio::test]
+async fn similar_objects_404_and_duplicate_409() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+
+    let missing = Uuid::now_v7();
+    let (status, body, _) = send(
+        &api.app,
+        get(&format!("/api/v1/objects/{missing}/similar"), &api.viewer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("找不到 object")),
+        "404 訊息要講下一步：{body}"
+    );
+
+    let canonical = new_document(DocumentType::Article, None);
+    stack.pg.put_document(&canonical).await.expect("seed");
+    let duplicate = new_document(DocumentType::Article, Some(canonical.id));
+    stack.pg.put_document(&duplicate).await.expect("seed");
+
+    let (status, body, _) = send(
+        &api.app,
+        get(
+            &format!("/api/v1/objects/{}/similar", duplicate.id),
+            &api.viewer,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "duplicate 必須 409 不是 404（GET /objects/{{id}} 對同一份是 200）：{body}"
+    );
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("duplicate_of") && message.contains(&canonical.id.to_string()),
+        "409 要指出 canonical 是誰、下一步打哪：{body}"
+    );
+
+    // canonical 過了 store 檢查後，這支測試沒接 ml-commons，應 503 不是 404。
+    let (status, body, _) = send(
+        &api.app,
+        get(
+            &format!("/api/v1/objects/{}/similar", canonical.id),
+            &api.viewer,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "canonical 存在但沒接語意搜尋應 503：{body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("ml-commons") || m.contains("opensearch-ml-setup")),
+        "503 訊息要講怎麼接上：{body}"
     );
 }
 

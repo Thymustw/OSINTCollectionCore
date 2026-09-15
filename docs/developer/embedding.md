@@ -652,6 +652,17 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
   回 503，BM25 全文搜尋不受影響。
 - 三個已知限制（語言不做偵測、`matched_section` 是 overlay 近似值、
   k-NN 分數不能跟 BM25 比）寫在 `docs/user/api.md` 與模組說明，不要藏。
+  融合見 Phase 3 Step 5 的 `POST /search/hybrid`。
+
+### 已由 Phase 3 Step 5 接住（`POST /search/hybrid`、`GET /objects/{id}/similar`）
+
+- hybrid 同時跑既有 BM25（`SearchState`）與語意 k-NN（`SemanticSearchState`），
+  用 RRF（k=60）融合。權重讀 `[search_hybrid]`，**不是**加權分數和。
+  兩條訊號都要接上，缺一條整條 503。
+- similar 重用 `SemanticSearchState`，不另連 ml-commons。duplicate 回 409；
+  沒有向量回 200 空清單。自己不會出現在相似清單裡。
+- 程式：`crates/core-api/src/search_hybrid.rs`、
+  `crates/core-api/src/resources/similar.rs`。
 
 ### 已由 Phase 3 Step 3 接住（embedding-worker）
 
@@ -673,7 +684,9 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
   hybrid RRF 權重。OpenSearch URL **不**另開一份，沿用 `[storage.search].url`。
   `similarity_threshold` 預設 0.90 是**暫定值**（e5-small 不相關文字也有
   ~0.83，見 §5），Step 6 要用真實 OSINT 語料重校。hybrid 的
-  entity_match／recency／source_score／confidence 權重預設 0.0（Step 5 才接）。
+  entity_match／recency／source_score／confidence 權重預設 0.0，V0.2 **沒有
+  實作這四個訊號**（不是權重設 0 但其實有算）；設非 0 時 osint-api 啟動打
+  warning。BM25＋vector 的 RRF 融合已由 Phase 3 Step 5 接上。
 - **Semantic Dedup 的 model 欄位**：`duplicate_groups.model`（migration `0011`）。
   Stage 1-4 是 `NULL`；Stage 5 才填模型名稱。
 
