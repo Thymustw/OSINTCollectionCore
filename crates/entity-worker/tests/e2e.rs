@@ -68,9 +68,20 @@ impl Fixture {
             cve: format!("CVE-2026-{serial:07}"),
             domain: format!("{label}.example.com"),
             email: format!("soc@{label}.example.com"),
-            // 203.0.113.0/24 是 RFC 5737 的文件用網段。只有 254 個值，跨 run 會重複——
-            // 所以關於 IP 的斷言一律限縮在本次的 document 範圍內，不做全域計數。
-            ip: format!("203.0.113.{}", (run.as_u128() % 254) + 1),
+            // 擴大成 256^3 種組合，跟 cve／domain／email 同一個量級。
+            // 舊寫法用 RFC 5737 的 203.0.113.0/24，只有 254 個值；CI 高併發時兩個
+            // 測試會撞同一個自然鍵，後寫的 put_entity_identifier 會蓋掉 source_id。
+            // 10.0.0.0/8 是私有位址範圍，純測試假資料不會真的送出去。
+            // 值域約 1670 萬，碰撞機率壓到與其他欄位同一個量級（不是絕不碰撞）。
+            ip: {
+                let ip_seed = run.as_u128() % 16_777_216;
+                format!(
+                    "10.{}.{}.{}",
+                    ip_seed / 65536 % 256,
+                    ip_seed / 256 % 256,
+                    ip_seed % 256
+                )
+            },
             // 64 個十六進位字元 = SHA256 的形狀。
             sha256: format!("{}{}", run.simple(), run.simple()),
             run,
