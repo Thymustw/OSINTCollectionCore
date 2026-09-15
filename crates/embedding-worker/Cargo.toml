@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 storage-core = { workspace = true }
 storage-opensearch = { path = "../storage-opensearch" }
 storage-postgres = { path = "../storage-postgres" }
+storage-redis = { path = "../storage-redis" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

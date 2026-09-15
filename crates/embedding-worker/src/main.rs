@@ -23,11 +23,15 @@ use core_observability::{MetricsRegistry, init_tracing};
 use embedding_worker::schema as entity_schema;
 use embedding_worker::service::RebuildOptions;
 use embedding_worker::{EmbeddingWorker, serve_health};
+use std::sync::Arc;
+
+use storage_core::HealthProvider;
 use storage_core::conformance::{
     assert_opensearch_identity, load_workspace_dotenv, verify_not_opencti_search,
 };
 use storage_opensearch::{MlCommonsEmbeddingProvider, OpenSearchStore};
 use storage_postgres::PostgresCanonicalStore;
+use storage_redis::RedisKeyValueStore;
 
 /// 一次 poll 等多久。沒有批次，逾時只是為了能回應 SIGINT 與量 lag。
 const IDLE_POLL: Duration = Duration::from_secs(30);
@@ -128,7 +132,7 @@ async fn run() -> Result<(), String> {
     let documents_index = cfg.indexer.index.clone();
     let entities_index = cfg.embedding_worker.entities_index.clone();
 
-    let service = EmbeddingWorker::new(
+    let mut service = EmbeddingWorker::new(
         store.clone(),
         embeddings,
         search.clone(),
@@ -140,6 +144,19 @@ async fn run() -> Result<(), String> {
             cfg.embedding.concurrent_inferences,
         ),
     );
+    match connect_embedding_cache(&cfg).await {
+        Ok(redis) => {
+            tracing::info!("embedding Redis 快取已接上（Stage 5 寫入的向量可在這裡撿）");
+            service = service.with_embedding_cache(Arc::new(redis));
+        }
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                "embedding Redis 快取這次沒接上，永遠 miss，改打 ml-commons。\
+                 不影響正確性；修好 REDIS_URL 後重啟即可"
+            );
+        }
+    }
 
     if args.rebuild {
         if args.drop_entities {
@@ -257,6 +274,27 @@ async fn connect_search(url: &str) -> Result<OpenSearchStore, String> {
         "OpenSearch 身分驗證通過"
     );
     Ok(store)
+}
+
+/// 連 Redis 當 Stage 5 向量暫存。連不上**不**讓服務啟動失敗。
+async fn connect_embedding_cache(
+    cfg: &core_config::AppConfig,
+) -> Result<RedisKeyValueStore, String> {
+    let url = cfg
+        .storage
+        .cache
+        .url_secret_ref
+        .resolve()
+        .map_err(|err| format!("解析 [storage.cache].url_secret_ref：{err}"))?;
+    let redis = RedisKeyValueStore::connect(&url).map_err(|err| format!("Redis client：{err}"))?;
+    let health = redis
+        .health()
+        .await
+        .map_err(|err| format!("Redis PING 失敗：{err}"))?;
+    if !health.healthy {
+        return Err(format!("Redis 不健康：{}", health.message));
+    }
+    Ok(redis)
 }
 
 /// 消費迴圈。逐則處理，沒有批次。

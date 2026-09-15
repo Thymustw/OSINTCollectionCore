@@ -683,12 +683,32 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
 - **`[embedding]`／`[search_hybrid]` config**：batch／併發／cosine 門檻與
   hybrid RRF 權重。OpenSearch URL **不**另開一份，沿用 `[storage.search].url`。
   `similarity_threshold` 預設 0.90 是**暫定值**（e5-small 不相關文字也有
-  ~0.83，見 §5），Step 6 要用真實 OSINT 語料重校。hybrid 的
+  ~0.83，見 §5.1）。**Step 6 已把它接到 Stage 5**：超過門檻就寫
+  `DuplicateGroup`、把 `documents.duplicate_of` 指過去，誤判的代價是下游
+  跳過那份文件。數字本身**還沒**用真實 OSINT 語料重校；`osint-deduplicator`
+  啟用 Stage 5 時會打 `tracing::warn!`。要改這個值，先量 false-positive／
+  false-negative，不要靠感覺微調。hybrid 的
   entity_match／recency／source_score／confidence 權重預設 0.0，V0.2 **沒有
   實作這四個訊號**（不是權重設 0 但其實有算）；設非 0 時 osint-api 啟動打
   warning。BM25＋vector 的 RRF 融合已由 Phase 3 Step 5 接上。
 - **Semantic Dedup 的 model 欄位**：`duplicate_groups.model`（migration `0011`）。
-  Stage 1-4 是 `NULL`；Stage 5 才填模型名稱。
+  Stage 1-4 是 `NULL`；Stage 5 才填模型名稱。`write_group` 走 `group_model`，
+  非 Semantic stage 即使 hit 帶了模型名也寫 `None`。
+
+### 已由 Phase 3 Step 6 接住（Stage 5 語意去重）
+
+- **觸發**：仍在 `object.normalized` 同步跑完 Stage 1–5。embedding-worker
+  還沒寫向量，所以 Stage 5 **當場** `embed(Passage)` 一次（body 優先，否則
+  title），結果不寫 `embeddings` 表、不 overlay `osint-documents`。
+- **k-NN**：查 `osint-documents`，k=8，濾掉自己。相似度從 `_source` 重算
+  cosine——`embedding_en` 是 L2，`_score = 1/(1+l2)` 不能跟 0.90 比。
+- **降級**：ml-commons／OpenSearch／Redis 任一連不上 → 整份
+  `UnsupportedSemanticDetector`。推論／搜尋失敗回 `Unsupported` 不是 `Err`。
+- **Redis 暫存**：`embedding-cache:v1:{content_hash}`，TTL 900s（夾
+  300..=3600）。embedding-worker 先查再 embed。連不上不讓
+  embedding-worker 啟動失敗。
+- 服務文件：`docs/developer/deduplicator.md` Stage 5、
+  `docs/developer/embedding-worker.md`「Redis 向量暫存」。
 
 ### 維持未決
 

@@ -434,12 +434,44 @@ pub struct EmbeddingSection {
     pub concurrent_inferences: usize,
     /// Semantic dedup／resolver 語意比對的 cosine 門檻。
     ///
-    /// ⚠️ **這個預設值是暫定的，不是校準過的。** e5-small 的 baseline cosine
-    /// 很高（不相關文字也有 ~0.83，見 docs/developer/embedding.md §5），
-    /// resolver 舊的 0.85 常數離這個 baseline 太近，容易誤判。Phase 3 Step 6
-    /// （Semantic Dedup）要用真實 OSINT 語料重新校準，這裡先給一個保守值，
-    /// 不要在 Step 6 之前假設這個數字是對的。
+    /// # ⚠️ 這不是校準過的數字，現在會真的把文件標成 duplicate
+    ///
+    /// `0.90` 是 Phase 0 用一小組句子**推論**出來的暫定值，**從來沒有用真實
+    /// OSINT 語料驗證過**。e5-small 的向量各向異性很強：完全不相關的文字
+    /// baseline cosine 就有 ~0.83（見 `docs/developer/embedding.md` §5.1），
+    /// 跟 0.90 只差 0.07。Stage 5 會用這個數字自動寫 `DuplicateGroup`、
+    /// 把 `documents.duplicate_of` 指過去——誤判的代價不再是「紙上談兵」，
+    /// 是下游 entity／search 直接跳過那份文件。
+    ///
+    /// 不要因為「設定檔裡寫了 0.90」就當成已驗證。要改這個值，先用真實
+    /// 語料量 false-positive／false-negative，不要靠感覺微調。
+    /// `osint-deduplicator` 啟用 Stage 5 時會再打一行 `tracing::warn!`。
     pub similarity_threshold: f64,
+    /// Stage 5 把當場算出的向量寫進 Redis 的 TTL（秒）。
+    ///
+    /// 給 `object.normalized` → Stage 5 → `entity.extracted` →
+    /// embedding-worker 這段路徑用：embedding-worker 先查這把 key，
+    /// 命中就不必再打 ml-commons。預設 15 分鐘——短於 5 分鐘時正常
+    /// consumer lag 就會讓快取過期，長於 1 小時會讓 Redis 堆不會再被
+    /// 讀到的向量。實際使用時會夾在 300..=3600。
+    ///
+    /// `#[serde(default)]`：舊設定檔沒有這個鍵時仍能載入。
+    #[serde(default = "default_dedup_cache_ttl_secs")]
+    pub dedup_cache_ttl_secs: u64,
+}
+
+fn default_dedup_cache_ttl_secs() -> u64 {
+    900
+}
+
+impl EmbeddingSection {
+    /// Stage 5 Redis 快取 TTL。設定值會夾在 300..=3600 秒：
+    /// 短於 5 分鐘，正常 consumer lag 就會讓快取過期；長於 1 小時會讓
+    /// Redis 堆不會再被讀到的向量。
+    #[must_use]
+    pub fn dedup_cache_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.dedup_cache_ttl_secs.clamp(300, 3600))
+    }
 }
 
 impl Default for EmbeddingSection {
@@ -448,6 +480,7 @@ impl Default for EmbeddingSection {
             batch_size: 32,
             concurrent_inferences: 4,
             similarity_threshold: 0.90,
+            dedup_cache_ttl_secs: default_dedup_cache_ttl_secs(),
         }
     }
 }
@@ -648,6 +681,7 @@ mod tests {
         assert_eq!(cfg.embedding.batch_size, 32);
         assert_eq!(cfg.embedding.concurrent_inferences, 4);
         assert_eq!(cfg.embedding.similarity_threshold, 0.90);
+        assert_eq!(cfg.embedding.dedup_cache_ttl_secs, 900);
         assert_eq!(cfg.search_hybrid.bm25_weight, 1.0);
         assert_eq!(cfg.search_hybrid.vector_weight, 1.0);
         assert_eq!(cfg.search_hybrid.entity_match_weight, 0.0);
@@ -773,5 +807,39 @@ mod tests {
         assert_eq!(parsed.embedding, EmbeddingSection::default());
         assert_eq!(parsed.search_hybrid, HybridSearchSection::default());
         assert_eq!(parsed.embedding_worker, EmbeddingWorkerSection::default());
+    }
+
+    #[test]
+    fn missing_dedup_cache_ttl_secs_uses_serde_default() {
+        // 舊設定檔沒有這個鍵時仍能載入，不可讓整份 [embedding] 解析失敗。
+        let section: EmbeddingSection = serde_json::from_str(
+            r#"{"batch_size":32,"concurrent_inferences":4,"similarity_threshold":0.9}"#,
+        )
+        .unwrap();
+        assert_eq!(section.dedup_cache_ttl_secs, 900);
+        assert_eq!(
+            section.dedup_cache_ttl(),
+            std::time::Duration::from_secs(900)
+        );
+    }
+
+    #[test]
+    fn dedup_cache_ttl_clamps_to_five_minutes_and_one_hour() {
+        let too_small = EmbeddingSection {
+            dedup_cache_ttl_secs: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            too_small.dedup_cache_ttl(),
+            std::time::Duration::from_secs(300)
+        );
+        let too_large = EmbeddingSection {
+            dedup_cache_ttl_secs: 99_999,
+            ..Default::default()
+        };
+        assert_eq!(
+            too_large.dedup_cache_ttl(),
+            std::time::Duration::from_secs(3600)
+        );
     }
 }

@@ -1,11 +1,13 @@
-//! SPEC §15 Stage 5：semantic duplicate。
+//! SPEC §15／§17 Stage 5：semantic duplicate。
 //!
-//! **V0.1 只定義介面，不實作。** 規格原文就是「只定義 interface，V0.2 才做」。
+//! 介面與降級路徑在這裡；生產實作是 [`crate::semantic_real::VectorSemanticDetector`]。
+//! `UnsupportedSemanticDetector` 永遠回 [`SemanticOutcome::Unsupported`]——
+//! ml-commons／OpenSearch／Redis 連不上時 `osint-deduplicator` 退回這條。
 //!
-//! 這裡刻意留一條明確的 `Unsupported` 路徑，而不是「什麼都不做就往下走」：
-//! pipeline 要能回答「Stage 5 跑過沒有」，`Unsupported` 是答案，沉默不是。
-//! `dedup.completed` 事件與 provenance metadata 都會帶上這個結果，
-//! 之後接上真實實作時，可以從歷史資料看出哪些 Document 是在沒有 Stage 5 的年代處理的。
+//! 刻意留明確的 `Unsupported`，而不是「什麼都不做就往下走」：pipeline 要能
+//! 回答「Stage 5 跑過沒有」。`dedup.completed` 與 provenance 都會帶上
+//! `semantic_detector`，之後才能從歷史資料看出哪些 Document 是在沒有
+//! Stage 5 的年代處理的。
 
 use async_trait::async_trait;
 use core_model::Document;
@@ -23,10 +25,13 @@ pub enum SemanticOutcome {
     Hit {
         canonical_object_id: uuid::Uuid,
         similarity: f64,
+        /// 這次判定實際用的模型名稱（MiniLM／e5 的穩定字串）。
+        /// 寫進 `DuplicateGroup.model`，之後要審查或回滾誤判時才看得出是哪套模型。
+        model: String,
     },
 }
 
-/// Stage 5 介面。V0.2 接上本機 Qwen embedding 時實作這個 trait。
+/// Stage 5 介面。V0.2 生產實作是 [`crate::VectorSemanticDetector`]。
 ///
 /// 實作者注意：這裡不可以做「AI 失敗就讓整條 pipeline 失敗」的事。
 /// CLAUDE.md §5 的硬性規則是 AI failure must not block base ingestion——

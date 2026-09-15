@@ -61,6 +61,38 @@ re-generate 的唯一 gate 是 `RelationalStore::find_embedding`（同一目標�
 
 Postgres `embeddings` 表只存 metadata，沒有向量本體。`--rebuild` 因此 **force=true** 略過 cache：indexer `--rebuild --drop` 之後 `osint-documents` 是空的，cache hit 會讓向量永遠回不去 OpenSearch。force 時 `put_embedding` 撞 UNIQUE 仍當 Conflict=ok。
 
+## Redis 向量暫存（與 Stage 5 共用）
+
+這是 Redis 在本專案的**第一個應用資料用途**（之前只做 health／conformance）。
+key 定義在 `storage_core::embedding_cache_key`：
+
+```text
+embedding-cache:v1:{content_hash}
+```
+
+value 是整份 `EmbeddingVector` JSON（含 `model`／`model_version`／`vector`）。
+TTL 讀 `[embedding].dedup_cache_ttl_secs`（預設 900，夾 300..=3600）。
+
+寫入端是 `osint-deduplicator` Stage 5：它在 `object.normalized` 上當場 embed，
+結果不寫 `embeddings` 表、不 overlay `osint-documents`，只 best-effort
+`set_ex` 進 Redis。讀取端是本服務：`embed_document_fields` 在打
+`embed_bounded` **之前**先 `lookup_embedding_cache`。命中條件：
+
+1. key 存在且 JSON 解得開
+2. `content_hash` 對得上這段文字
+3. `model` 對得上這次 `model_for(language)` 會用的那個
+
+任一失敗當 miss，再打 ml-commons。model mismatch 不可默默用錯向量——
+MiniLM 與 e5 空間不相通。
+
+連線是 `Option`：`REDIS_URL` 解不出或 PING 失敗時 `osint-embedding-worker`
+**照常啟動**，永遠 miss。這與 deduplicator 不同——那邊 embeddings／search／redis
+任一連不上就整份停用 Stage 5。本服務沒有 Redis 只是多打推論，正確性不變。
+
+單元測試：`redis_cache_hit_skips_embed`、`redis_cache_miss_embeds_as_before`、
+`redis_model_mismatch_is_treated_as_miss`。真 Redis + ml-commons 的路徑在
+`tests/e2e.rs` 的 `stage5_cache_is_reused_by_embedding_worker`，標 `#[ignore]`。
+
 ## indexer race：`update_fields` NotFound
 
 合計 4 次嘗試（1 次立即 + 3 次退避 200／500／1000 ms）。測試可把 backoff 設成 0 ms。
@@ -129,6 +161,7 @@ make rebuild-embeddings-drop
 | `osint_embedding_worker_update_fields_retry_total` | indexer lag 重試 |
 | `osint_embedding_worker_update_fields_exhausted_total` | 重試耗盡仍 NotFound（仍 commit） |
 | `osint_embedding_worker_conflict_total` | `put_embedding` UNIQUE |
+| `osint_embedding_worker_redis_cache_hit_total` | Stage 5 Redis 暫存命中（沒打 ml-commons） |
 | `osint_embedding_worker_errors_total` | 真正的失敗（不提交 offset） |
 
 設定在 `[embedding_worker]`（`config/default.toml`）：
@@ -160,6 +193,7 @@ make rebuild-embeddings-drop
 6. **沒有 DLQ topic**。真正的失敗不提交 offset、靠 broker 重送；永久性錯誤（payload 缺 `document_id`）目前也走同一條。
 7. **跨服務 backpressure 仍未接**。consumer lag 寫進 `osint_queue_depth`，本服務自己不降速。
 8. **Document 同一語言空間只有一個向量**。title 與 body 互蓋，沒有分開存。
+9. **Redis 快取是效能優化，不是正確性路徑。** 沒接上／過期／model 對不上都只是多打推論。key 不含模型名，讀取端必須核對 `EmbeddingVector.model`。
 
 ## 相關文件
 

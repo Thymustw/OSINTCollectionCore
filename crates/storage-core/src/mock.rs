@@ -1,11 +1,13 @@
-//! GraphStore／EmbeddingProvider／SearchStore 的確定性 mock。
+//! GraphStore／EmbeddingProvider／SearchStore／KeyValueStore 的確定性 mock。
 //!
 //! 給 Phase 1 的 semantic similarity、圖 API，以及 Phase 3 embedding-worker
 //! 上層測試用，**不**打真實後端。Neo4j adapter 是 Phase 2 的 `storage-neo4j`，
 //! OpenSearch adapter 是 `storage-opensearch`，不要把這裡當成它們的雛形。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -18,9 +20,9 @@ use crate::health::{HealthProvider, StorageHealth};
 use crate::traits::{
     BulkIndexResult, EmbeddingKind, EmbeddingModelRef, EmbeddingProvider, EmbeddingRequest,
     EmbeddingVector, GraphEdge, GraphNode, GraphPath, GraphPattern, GraphQuery, GraphStore,
-    GraphTraversalOptions, ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
-    RebuildStatus, SearchDocument, SearchFilter, SearchHit, SearchHits, SearchQuery, SearchStore,
-    StructuredSearch, VectorSearch, embedding_content_hash,
+    GraphTraversalOptions, KeyValueStore, ProjectionCheckpoint, ProjectionLag, ProjectionStore,
+    QueryExpr, RebuildStatus, SearchDocument, SearchFilter, SearchHit, SearchHits, SearchQuery,
+    SearchStore, StructuredSearch, VectorSearch, embedding_content_hash,
 };
 
 /// mock 拒絕超過這個跳數的遍歷。無界查詢會掃完整張圖。
@@ -631,6 +633,9 @@ fn collect_bounded_walks(
 pub struct MockEmbeddingProvider {
     dimensions: usize,
     unsupported: bool,
+    /// `embed`／`embed_batch` 實際打過幾次。給 embedding-worker Redis 快取
+    /// 測試證明「命中時沒有再推論」。
+    embed_calls: Arc<AtomicU64>,
 }
 
 impl MockEmbeddingProvider {
@@ -640,6 +645,7 @@ impl MockEmbeddingProvider {
         Self {
             dimensions: MOCK_DEFAULT_DIM,
             unsupported: false,
+            embed_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -649,6 +655,7 @@ impl MockEmbeddingProvider {
         Self {
             dimensions,
             unsupported: false,
+            embed_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -659,7 +666,14 @@ impl MockEmbeddingProvider {
         Self {
             dimensions: MOCK_DEFAULT_DIM,
             unsupported: true,
+            embed_calls: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// `embed`／`embed_batch` 累計呼叫次數（含 `embed_batch` 裡每一筆 `embed`）。
+    #[must_use]
+    pub fn embed_calls(&self) -> u64 {
+        self.embed_calls.load(Ordering::Relaxed)
     }
 
     fn route(language: Option<&str>) -> (bool /*english*/, &'static str, &'static str) {
@@ -768,6 +782,7 @@ impl EmbeddingProvider for MockEmbeddingProvider {
     }
 
     async fn embed(&self, request: &EmbeddingRequest) -> Result<EmbeddingVector, StorageError> {
+        self.embed_calls.fetch_add(1, Ordering::Relaxed);
         if self.unsupported {
             return Err(StorageError::UnsupportedCapability {
                 backend: "mock-embedding",
@@ -810,6 +825,9 @@ struct SearchInner {
     /// 還沒被 indexer 寫進 `osint-documents`。即使文件已經在 store 裡也照樣
     /// 回 NotFound，直到計數耗盡。
     not_found_remaining: HashMap<(String, String), u32>,
+    /// 下一次 `vector_search` 回這個錯誤。測 Stage 5 基礎設施失敗必須回
+    /// `Unsupported` 而不是 `Err`。
+    vector_search_error: Option<String>,
 }
 
 /// 記憶體 SearchStore。CRUD 與 brute-force k-NN 足夠讓 embedding-worker
@@ -869,6 +887,13 @@ impl MockSearchStore {
         inner
             .not_found_remaining
             .insert((index.to_string(), id.to_string()), n);
+        Ok(())
+    }
+
+    /// 下一次 `vector_search` 回 [`StorageError::Unavailable`]。測完自動清掉。
+    pub fn fail_next_vector_search(&self, message: impl Into<String>) -> Result<(), StorageError> {
+        let mut inner = self.lock()?;
+        inner.vector_search_error = Some(message.into());
         Ok(())
     }
 }
@@ -1130,7 +1155,13 @@ impl SearchStore for MockSearchStore {
     }
 
     async fn vector_search(&self, query: VectorSearch) -> Result<SearchHits, StorageError> {
-        let inner = self.lock()?;
+        let mut inner = self.lock()?;
+        if let Some(message) = inner.vector_search_error.take() {
+            return Err(StorageError::Unavailable {
+                backend: "mock-search",
+                message,
+            });
+        }
         let mut scored: Vec<(f32, SearchHit)> = inner
             .docs
             .iter()
@@ -1157,6 +1188,115 @@ impl SearchStore for MockSearchStore {
         let hits: Vec<SearchHit> = scored.into_iter().map(|(_, h)| h).collect();
         let total = hits.len() as u64;
         Ok(SearchHits { total, hits })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockKeyValueStore
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct KvInner {
+    entries: HashMap<String, (Vec<u8>, Option<Instant>)>,
+}
+
+/// 記憶體 [`KeyValueStore`]。TTL 用 [`Instant`]，過期後 `get` 當 miss。
+///
+/// 給 Stage 5／embedding-worker 的 Redis 快取路徑測，不打真實 Redis。
+/// `Clone` 共用同一份記憶體。
+#[derive(Clone)]
+pub struct MockKeyValueStore {
+    inner: Arc<Mutex<KvInner>>,
+}
+
+impl MockKeyValueStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(KvInner::default())),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, KvInner>, StorageError> {
+        self.inner.lock().map_err(|_| StorageError::Unknown {
+            backend: "mock-kv",
+            message: "MockKeyValueStore mutex 已中毒（先前有 panic 持有鎖）。請重開測試行程".into(),
+        })
+    }
+
+    fn live_value(inner: &mut KvInner, key: &str) -> Option<Vec<u8>> {
+        match inner.entries.get(key) {
+            Some((_, Some(expires))) if *expires <= Instant::now() => {
+                inner.entries.remove(key);
+                None
+            }
+            Some((value, _)) => Some(value.clone()),
+            None => None,
+        }
+    }
+}
+
+impl Default for MockKeyValueStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl HealthProvider for MockKeyValueStore {
+    async fn health(&self) -> Result<StorageHealth, StorageError> {
+        Ok(StorageHealth::ok("mock-kv", "記憶體 KeyValueStore 可用"))
+    }
+}
+
+#[async_trait]
+impl KeyValueStore for MockKeyValueStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let mut inner = self.lock()?;
+        Ok(Self::live_value(&mut inner, key))
+    }
+
+    async fn set(&self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        let mut inner = self.lock()?;
+        inner
+            .entries
+            .insert(key.to_string(), (value.to_vec(), None));
+        Ok(())
+    }
+
+    async fn set_ex(&self, key: &str, value: &[u8], ttl: Duration) -> Result<(), StorageError> {
+        if ttl.is_zero() {
+            return Err(StorageError::Configuration {
+                message: "KeyValueStore TTL 不可為 0。請傳正的 Duration".into(),
+            });
+        }
+        let mut inner = self.lock()?;
+        inner.entries.insert(
+            key.to_string(),
+            (value.to_vec(), Some(Instant::now() + ttl)),
+        );
+        Ok(())
+    }
+
+    async fn del(&self, key: &str) -> Result<bool, StorageError> {
+        let mut inner = self.lock()?;
+        Ok(inner.entries.remove(key).is_some())
+    }
+
+    async fn expire(&self, key: &str, ttl: Duration) -> Result<bool, StorageError> {
+        if ttl.is_zero() {
+            return Err(StorageError::Configuration {
+                message: "KeyValueStore TTL 不可為 0。請傳正的 Duration".into(),
+            });
+        }
+        let mut inner = self.lock()?;
+        match inner.entries.get_mut(key) {
+            Some((_, expires)) => {
+                *expires = Some(Instant::now() + ttl);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
 

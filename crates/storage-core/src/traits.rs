@@ -1455,6 +1455,20 @@ pub fn embedding_content_hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
+/// Stage 5 與 embedding-worker 共用的 Redis key 前綴。帶版本號，改 JSON
+/// 格式時換 `v2`，不要覆寫舊資料。
+pub const EMBEDDING_CACHE_KEY_PREFIX: &str = "embedding-cache:v1:";
+
+/// Stage 5 寫入、embedding-worker 讀取的 Redis key。
+///
+/// 兩邊各自用 [`embedding_content_hash`] 算出同一把 key，不互相傳遞。
+/// key **不含模型名**：同一段文字在同一語言路由下兩個服務會用同一個模型；
+/// 讀取端仍必須核對 `EmbeddingVector.model`，對不上就當 miss。
+#[must_use]
+pub fn embedding_cache_key(content_hash: &str) -> String {
+    format!("{EMBEDDING_CACHE_KEY_PREFIX}{content_hash}")
+}
+
 /// 「文字 → 向量」的能力（SPEC_V0.2 §11–§14）。
 ///
 /// 這不是資料庫 port。生產實作會包 OpenSearch ml-commons 的 `_predict`
@@ -1619,5 +1633,15 @@ mod tests {
             serde_json::from_value::<RebuildState>(Value::String("running".into())).unwrap(),
             RebuildState::Running
         );
+    }
+
+    #[test]
+    fn embedding_cache_key_is_versioned_prefix_plus_hash() {
+        let hash = embedding_content_hash("hello");
+        assert_eq!(
+            embedding_cache_key(&hash),
+            format!("{EMBEDDING_CACHE_KEY_PREFIX}{hash}")
+        );
+        assert!(embedding_cache_key(&hash).starts_with("embedding-cache:v1:"));
     }
 }

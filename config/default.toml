@@ -155,9 +155,15 @@ batch_size = 32
 # 同時進行中的推論請求數上限（bounded semaphore，CLAUDE.md §6）。
 concurrent_inferences = 4
 # Semantic dedup／resolver 語意比對的 cosine 門檻。
-# ⚠️ 暫定值，不是校準過的。e5-small 不相關文字也有 ~0.83（embedding.md §5），
-# Phase 3 Step 6 要用真實 OSINT 語料重校，不要在那之前假設 0.90 是對的。
+# ⚠️ 這不是校準過的數字。0.90 是 Phase 0 用一小組句子推論的暫定值，
+# 從來沒有用真實 OSINT 語料驗證過。e5-small 不相關文字 baseline cosine
+# 就有 ~0.83（embedding.md §5.1），跟 0.90 只差 0.07。
+# Stage 5 現在會用這個數字自動把文件標成 duplicate——誤判的代價是下游
+# 跳過那份文件。要改這個值，先用量測，不要靠感覺微調。
 similarity_threshold = 0.90
+# Stage 5 把當場算出的向量寫進 Redis 的 TTL（秒）。embedding-worker
+# 在打 ml-commons 之前會先查這把 key。預設 15 分鐘；實際使用夾在 300..=3600。
+dedup_cache_ttl_secs = 900
 
 # Hybrid search（POST /search/hybrid，SPEC §15）的 RRF 權重。
 # 權重是「這個訊號在 RRF 公式裡的比重」，不是原始分數的乘數。

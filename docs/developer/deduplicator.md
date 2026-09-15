@@ -1,9 +1,10 @@
-# Deduplicator（V0.1 Phase 4a）
+# Deduplicator（V0.1 Phase 4a + V0.2 Phase 3 Step 6 Stage 5）
 
-對應內部規格 V0.1 §15（五階段去重）、§16（Duplicate Group）、§20（topic）、§26 Acceptance B／C（規格文件本身未隨原始碼公開，章節號留著方便查找對應決策）。
+對應內部規格 V0.1 §15（五階段去重）、§16（Duplicate Group）、§20（topic）、§26 Acceptance B／C；V0.2 §17 語意重複（規格文件本身未隨原始碼公開，章節號留著方便查找對應決策）。
 
 這是 V0.1 第一個「情報處理」元件：`object.normalized` → 判斷重複 → `DuplicateGroup` → `dedup.completed`。
 Entity extraction 在下一段（`docs/developer/entity-worker.md`），search indexing 不在這裡。
+Stage 5（語意重複）在 V0.2 Phase 3 Step 6 接上 OpenSearch k-NN，見下方。
 
 > ⚠️ **`url_norm` 已搬到 `crates/core-model/src/url_norm.rs`**（Phase 4b）。
 > entity-worker 抽 URL Entity 時要用同一套正規化規則，兩份實作分岔不會報錯，
@@ -37,7 +38,7 @@ Acceptance B 會在去重後**逐筆數** 10 筆 RawEvidence 是否都還讀得�
 | 2 | 正規化後的 canonical URL 完全相同 | `Document.source_url` → `url_norm::canonicalize` | `canonical_url` | 1.0 |
 | 3 | `SHA256(normalized content)` 完全相同 | `Document.normalized_content_hash` | `content_sha256` | 1.0 |
 | 4 | 64-bit SimHash 的 Hamming 距離 ≤ 門檻 | `Document.simhash` | `simhash` | `1 - d/64` |
-| 5 | 語意重複 | — | `semantic` | 由實作決定 |
+| 5 | 語意重複 | 當場 embed + OpenSearch k-NN（body 優先，否則 title） | `semantic` | `_source` 向量重算的 cosine |
 
 `method` 字串會寫進 `duplicate_groups.method`、provenance metadata 與 `dedup.completed`。
 **改字串等於讓既有資料無法對照**，`service.rs` 的 `stage_names_are_stable` 測試把它們釘住了。
@@ -150,9 +151,13 @@ Tokio executor thread。`derive_keys` 把它丟進 `tokio::task::spawn_blocking`
 `scan_limit` 在 adapter 內夾在 1..=5000。這是**有界**的代價：
 比 `scan_limit` 更舊的近似文件會漏掉（見「已知限制」）。
 
-### Stage 5：語意重複
+### Stage 5：語意重複（V0.2 Phase 3 Step 6）
 
-**V0.1 只有介面**（`src/semantic.rs`）。規格原文就是「只定義 interface，V0.2 才做」。
+介面仍在 `src/semantic.rs`。生產實作是 `src/semantic_real.rs` 的
+`VectorSemanticDetector`（`detector_id = "vector-knn"`）。
+連不上 ml-commons／OpenSearch／Redis 時，`osint-deduplicator` **整份**退回
+`UnsupportedSemanticDetector`——半套（有 Redis 沒有模型）會讓判定 silently
+永遠 `NoMatch`，比明確停用更糟。
 
 ```rust
 trait SemanticDuplicateDetector {
@@ -161,13 +166,53 @@ trait SemanticDuplicateDetector {
 }
 ```
 
-`SemanticOutcome` 刻意區分 `Unsupported`（沒實作）與 `NoMatch`（查過但沒有）。
-兩者對流程的效果相同，差別在寫進 provenance 的 `semantic_detector` 字串——
-那是「這份資料是在有沒有 Stage 5 的年代處理的」唯一的判斷依據。
-預設實作 `UnsupportedSemanticDetector` 永遠回 `Unsupported`。
+`SemanticOutcome` 刻意區分 `Unsupported`（沒實作／基礎設施失敗）與 `NoMatch`
+（查過但沒有）。兩者對流程的效果相同，差別在寫進 provenance 的
+`semantic_detector` 字串——那是「這份資料是在有沒有 Stage 5 的年代處理的」
+唯一的判斷依據。
 
-接上真實實作時要記得：**AI 失敗不可阻斷 base ingestion**（CLAUDE.md §5）。
-判斷不出來要回 `NoMatch`／`Unsupported`，不要回 `Err`。
+**AI 失敗不可阻斷 base ingestion**（CLAUDE.md §5）。推論／k-NN／Redis 失敗
+都回 `Unsupported`，不是 `Err`。空 title／body 回 `NoMatch`（沒文字可嵌，
+不是基礎設施掛了）。
+
+#### 為什麼要當場算向量
+
+deduplicator 在 `object.normalized` 上**同步**跑完 Stage 1–5。這時候
+embedding-worker 還沒動過（它訂 `entity.extracted`，那則事件是
+`dedup.completed` 之後才發的），`osint-documents` 裡也還沒有**這份**文件
+的向量。等 embedding-worker 寫完再回來比，等於把去重延遲到下一條管線。
+
+所以 Stage 5 自己呼叫 `EmbeddingProvider::embed` **一次**（`EmbeddingKind::Passage`；
+body 非空用 body，否則 title，跟 embedding-worker overlay 的 last-write-wins
+同一套「body 優先」）。結果**不**寫進 `embeddings` 表、也**不** overlay
+`osint-documents`。那兩件事仍是 embedding-worker 的職責。
+
+算完的向量另外以 `embedding-cache:v1:{content_hash}` 寫進 Redis
+（`KeyValueStore::set_ex`，TTL 見 `[embedding].dedup_cache_ttl_secs`，
+實際夾在 300..=3600 秒，預設 900）。embedding-worker 打 ml-commons 之前
+會先查同一把 key。快取是 best-effort：寫失敗不影響判定。
+
+#### k-NN 與門檻
+
+- 查 `[indexer].index`（預設 `osint-documents`），`k = 8`。k=1 在
+  「第一筆是自己」時會變成空集合——這份文件理論上還沒被 indexer 寫進去，
+  但時序不是契約，濾掉自己之後必須還有候選。
+- 欄位由 `model_for(language)` 回傳的名稱與 `MINILM_MODEL_NAME`
+  **精確相等**決定（MiniLM → `embedding_en`，否則 `embedding_multi`）。
+  不要用 `contains("MiniLM")`。
+- 相似度**不是**直接用 OpenSearch `_score`。`embedding_en` 的 knn
+  `space_type` 是 `l2`，`_score` 是 `1/(1+l2)`，跟
+  `[embedding].similarity_threshold`（cosine 0.90）不是同一個尺度。
+  兩個欄位都從 hit `_source` 重算 cosine，門檻才對兩種模型有同一意義。
+- ⚠️ **0.90 不是校準過的數字。** e5-small 不相關文字 baseline cosine
+  就有 ~0.83（`docs/developer/embedding.md` §5.1）。`osint-deduplicator`
+  啟用 Stage 5 時會打 `tracing::warn!`。誤判的 group 可依
+  `DuplicateGroup.model` 過濾後人工審查。
+- `DuplicateGroup.model`：Stage 1–4 必須是 `NULL`；Stage 5 才填實際模型名。
+  `write_group` 走 `group_model(hit)`，即使 hit 意外帶了模型名，非 Semantic
+  stage 也寫 `None`。
+
+注入點是既有的 `Deduplicator::with_semantic_detector`，沒有改 struct。
 
 ## Duplicate 的標記方式
 
@@ -285,6 +330,8 @@ partition key = `document_id`。
 | Stage 4 掃描筆數 | 500 | `[deduplicator].simhash_scan_limit`（adapter 再夾 1..=5000） |
 | `duplicate_of` 追鏈層數 | 8 | 常數 `MAX_CHAIN_DEPTH` |
 | consumer 併發 | 循序（單 consumer group） | — |
+| Stage 5 最近鄰 k | 8（常數 `NEIGHBOR_K`） | — |
+| Stage 5 Redis 向量暫存 TTL | 900 秒（夾 300..=3600） | `[embedding].dedup_cache_ttl_secs` |
 
 consumer **刻意循序**：dedup 的正確性依賴「先到先成為 canonical」，
 同一份 Document 的處理不可互相交錯。要提高吞吐是增加 partition 與 consumer 實例，
@@ -304,6 +351,11 @@ candidate_limit = 20
 simhash_scan_limit = 500
 simhash_max_distance = 3
 ```
+
+Stage 5 另外讀 `[embedding].similarity_threshold`（預設 0.90）與
+`[embedding].dedup_cache_ttl_secs`（預設 900），OpenSearch／Redis 連線沿用
+`[storage.search].url`／`[storage.cache].url_secret_ref`。不要在
+`[deduplicator]` 再放一份 URL。
 
 本機常見情境：8080 可能被其他本機服務占用（例如另一套安全/情資平台），health 不要綁 8080。18081／18082 已被 collector／normalizer 佔用。
 
@@ -359,7 +411,10 @@ e2e（對本機 Docker，不連外網）：
    10 筆 RawEvidence 逐筆確認都還在
 2. **Acceptance C**：兩個 Source（不同 URL、不同 platform）提供改了三個詞的同一篇文章
    → Stage 1／2／3 全不命中 → Stage 4 命中 → 同一個 group，兩筆 RawEvidence 與兩個 Source 各自保留
-3. Stage 1～5 各自命中（用精確控制的 fixture 隔離，確保命中的是目標 stage）
+3. Stage 1～5 各自命中（用精確控制的 fixture 隔離，確保命中的是目標 stage）。
+   Stage 5 預設路徑仍是 `Unsupported`；介面命中用假 detector，並斷言
+   `DuplicateGroup.model` 有值。真打 ml-commons + k-NN 的路徑在
+   `tests/semantic_e2e.rs`，標 `#[ignore]`
 4. 未命中 → canonical，且 `duplicate_of` 為空、鍵有寫回
 5. 同一事件消費兩次 → 全部 `AlreadyDone`，group 仍只有一列，claim 只有一列
 6. 並發處理同一份 → unique index 只留一列 claim
@@ -403,3 +458,13 @@ Stage 4 一定不適用，就不可能被別的 run 干擾。
 8. **跨表寫入仍非原子。** 與 normalizer 同一個限制：`storage-core` 沒有跨表交易能力。
    對 dedup 的實際影響被 v5 group id 抵銷掉大半，但 claim 與 group 寫入之間
    仍有 crash window。正式解法是幫 `storage-core` 補上交易能力，留給後續版本。
+9. **Stage 5 只能比對「已經有向量 overlay 的舊文件」。** 當下這份還在
+   `object.normalized`，自己不在 `osint-documents` 裡。兩篇語意相同的文章若
+   幾乎同時進管線，第二篇可能在第一篇的 embedding-worker overlay 之前就跑完
+   Stage 5，因而漏判。漏判可以等向量寫進去之後重跑補；錯指 canonical 不行。
+10. **`similarity_threshold = 0.90` 未經真實 OSINT 語料校準。** 見
+    `docs/developer/embedding.md` §5.1。Stage 5 誤判會讓下游跳過那份文件。
+11. **Redis 快取不含模型名、不影響正確性。** key 是
+    `embedding-cache:v1:{content_hash}`。讀取端必須核對
+    `EmbeddingVector.model`／`content_hash`，對不上當 miss。TTL 過期或 Redis
+    沒接上都只是多打一次 ml-commons。

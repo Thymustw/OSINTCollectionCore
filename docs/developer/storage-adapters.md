@@ -52,7 +52,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
 | `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |
 | `EmbeddingProvider` | `storage-opensearch`（`MlCommonsEmbeddingProvider`）；mock：`storage_core::mock::MockEmbeddingProvider` | 文字→向量（V0.2 Phase 3）。見下方「`EmbeddingProvider`」 |
-| `KeyValueStore` | `storage-redis` | get/set/set_ex/del/expire |
+| `KeyValueStore` | `storage-redis`；mock：`storage_core::mock::MockKeyValueStore` | get/set/set_ex/del/expire。**第一個應用資料用途**是 Stage 5／embedding-worker 共用的向量暫存（`embedding-cache:v1:{content_hash}`，見下方） |
 | `ObjectStore` | `storage-s3` | MinIO put/get/delete/exists |
 | `HealthProvider` | 全部 | `health()` |
 | `StorageAdapter` | 全部 | `CapabilityDescriptor` |
@@ -628,6 +628,30 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
 - 換模型（重新註冊）必須重啟吃新的 `model_id`。
 - 尚未接到 Resource Guard 的 embedding 併發上限。
 - 尚未把推論延遲／429 次數接到 Operations Center metrics。
+
+### `KeyValueStore` 的第一個應用資料用途（V0.2 Phase 3 Step 6）
+
+在這之前 Redis 只做 health／conformance。Stage 5 語意去重是第一個
+**真正寫應用資料**的呼叫端。
+
+| 項目 | 值 |
+|---|---|
+| key | `storage_core::embedding_cache_key(content_hash)` → `embedding-cache:v1:{hash}` |
+| value | `EmbeddingVector` 的 JSON（含 `model`／`vector`） |
+| TTL | `[embedding].dedup_cache_ttl_secs`，`dedup_cache_ttl()` 夾 300..=3600，預設 900 |
+| 寫 | `osint-deduplicator` Stage 5，`set_ex`，best-effort |
+| 讀 | `osint-embedding-worker` 打 ml-commons 之前；model／hash 對不上當 miss |
+
+常數 `EMBEDDING_CACHE_KEY_PREFIX` 帶版本號：改 JSON 格式時換 `v2`，不要覆寫舊資料。
+key **不含模型名**——同一段文字在同一語言路由下兩個服務會用同一個模型；
+讀取端仍必須核對 `EmbeddingVector.model`。
+
+`MockKeyValueStore`（記憶體 + `Instant` TTL）給單元測試用。生產路徑是
+`storage_redis::RedisKeyValueStore`。deduplicator 組裝時 Redis 是 all-or-nothing
+的一環（連不上就整份停用 Stage 5）；embedding-worker 是 `Option`（連不上永遠
+miss，服務照常啟動）。
+
+conformance 的 Redis key 前綴仍是 `osint-core-conformance:`，跟應用 key 分開。
 
 ## 尚未做（不要當成已完成）
 

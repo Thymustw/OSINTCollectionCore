@@ -6,9 +6,16 @@ use std::time::Duration;
 use core_config::AppConfig;
 use core_events::{EventConsumer, EventProducer, EventTopic};
 use core_observability::{MetricsRegistry, init_tracing};
-use deduplicator::{DedupBounds, Deduplicator, serve_health};
-use storage_core::conformance::load_workspace_dotenv;
+use deduplicator::{
+    DedupBounds, Deduplicator, UnsupportedSemanticDetector, VectorSemanticDetector, serve_health,
+};
+use storage_core::HealthProvider;
+use storage_core::conformance::{
+    assert_opensearch_identity, load_workspace_dotenv, verify_not_opencti_search,
+};
+use storage_opensearch::{MlCommonsEmbeddingProvider, OpenSearchStore};
 use storage_postgres::PostgresCanonicalStore;
+use storage_redis::RedisKeyValueStore;
 
 /// 每處理幾則事件量一次 consumer lag。
 ///
@@ -67,12 +74,34 @@ async fn run() -> Result<(), String> {
         simhash_scan_limit: cfg.deduplicator.simhash_scan_limit,
         simhash_max_distance: cfg.deduplicator.simhash_max_distance,
     };
-    let service = Deduplicator::new(
+    let mut service = Deduplicator::new(
         store.clone(),
         Some(Arc::new(producer)),
         metrics.clone(),
         bounds,
     );
+    service = match assemble_semantic_detector(&cfg).await {
+        Ok(detector) => {
+            tracing::warn!(
+                threshold = cfg.embedding.similarity_threshold,
+                cache_ttl_secs = cfg.embedding.dedup_cache_ttl().as_secs(),
+                "Stage 5 語意去重已啟用。\
+                 [embedding].similarity_threshold 目前是 Phase 0 推論出來的暫定值，\
+                 沒有用真實 OSINT 語料驗證過；e5 對不相關文字的 baseline cosine \
+                 就有 ~0.83，存在誤判風險。誤判的 group 可依 DuplicateGroup.model \
+                 過濾後人工審查／回滾"
+            );
+            service.with_semantic_detector(detector)
+        }
+        Err(reason) => {
+            tracing::warn!(
+                %reason,
+                "Stage 5 這次停用，退回 UnsupportedSemanticDetector。\
+                 Stage 1-4 不受影響；修好連線後重啟 osint-deduplicator 即會接上"
+            );
+            service.with_semantic_detector(Arc::new(UnsupportedSemanticDetector))
+        }
+    };
 
     let bind = cfg.deduplicator.bind.clone();
     let health_store = store.clone();
@@ -144,4 +173,55 @@ async fn run() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// 組裝真實 Stage 5。embeddings／search／redis **任一連不上**就整份退回
+/// `Unsupported`——半套（例如有 Redis 沒有 ml-commons）會讓判定 silently 永遠
+/// NoMatch，比明確停用更糟。
+async fn assemble_semantic_detector(
+    cfg: &AppConfig,
+) -> Result<Arc<dyn deduplicator::SemanticDuplicateDetector>, String> {
+    let url = &cfg.storage.search.url;
+    verify_not_opencti_search(url).map_err(|err| format!("OpenSearch URL 被埠隔離擋下：{err}"))?;
+    let search =
+        OpenSearchStore::connect(url).map_err(|err| format!("OpenSearch client：{err}"))?;
+    let info = search.cluster_info().await.map_err(|err| {
+        format!("連不上 OpenSearch（{url}）：{err}。請先 `make compose-up` 並確認 OPENSEARCH_URL")
+    })?;
+    assert_opensearch_identity(&info).map_err(|err| err.to_string())?;
+
+    let embeddings = MlCommonsEmbeddingProvider::connect(url)
+        .await
+        .map_err(|err| {
+            format!(
+                "連不上 OpenSearch ml-commons 或模型不是 DEPLOYED（{url}）：{err}。\
+                 請跑 `bash scripts/opensearch-ml-setup.sh` 與 \
+                 `bash scripts/opensearch-ml-setup-e5.sh` 後重啟 osint-deduplicator"
+            )
+        })?;
+
+    let redis_url = cfg
+        .storage
+        .cache
+        .url_secret_ref
+        .resolve()
+        .map_err(|err| format!("解析 [storage.cache].url_secret_ref：{err}"))?;
+    let redis =
+        RedisKeyValueStore::connect(&redis_url).map_err(|err| format!("Redis client：{err}"))?;
+    let redis_health = redis
+        .health()
+        .await
+        .map_err(|err| format!("Redis PING 失敗：{err}"))?;
+    if !redis_health.healthy {
+        return Err(format!("Redis 不健康：{}", redis_health.message));
+    }
+
+    Ok(Arc::new(VectorSemanticDetector::new(
+        embeddings,
+        search,
+        Some(Arc::new(redis)),
+        cfg.indexer.index.clone(),
+        cfg.embedding.similarity_threshold,
+        cfg.embedding.dedup_cache_ttl(),
+    )))
 }

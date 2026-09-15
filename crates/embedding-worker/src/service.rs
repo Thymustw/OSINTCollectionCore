@@ -32,8 +32,9 @@ use indexer::schema as doc_schema;
 use serde_json::{Value, json};
 use storage_core::codec::encode_enum;
 use storage_core::{
-    EmbeddingKind, EmbeddingProvider, EmbeddingRequest, EmbeddingVector, RelationalStore,
-    SearchDocument, SearchStore, StorageError, embedding_content_hash,
+    EmbeddingKind, EmbeddingProvider, EmbeddingRequest, EmbeddingVector, KeyValueStore,
+    RelationalStore, SearchDocument, SearchStore, StorageError, embedding_cache_key,
+    embedding_content_hash,
 };
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -69,6 +70,8 @@ pub struct ProcessReport {
     pub update_fields_retries: u64,
     pub update_fields_exhausted: u64,
     pub conflicts: u64,
+    /// Redis 快取命中、因此沒打 ml-commons 的欄位數（title／body 各算一次）。
+    pub redis_cache_hits: u64,
 }
 
 /// `--rebuild` 的選項。
@@ -146,6 +149,8 @@ pub struct EmbeddingWorker<R, E, S> {
     concurrent_inferences: usize,
     /// `update_fields` NotFound 的退避。測試可設成空（只試一次）或全 0ms。
     update_fields_backoffs: Vec<Duration>,
+    /// Stage 5 寫入的向量暫存。`None` = Redis 沒接上，永遠 miss。
+    embedding_cache: Option<Arc<dyn KeyValueStore>>,
 }
 
 impl<R, E, S> EmbeddingWorker<R, E, S> {
@@ -167,6 +172,7 @@ impl<R, E, S> EmbeddingWorker<R, E, S> {
             batch_size: bounds.batch_size,
             concurrent_inferences: bounds.concurrent_inferences,
             update_fields_backoffs: DEFAULT_UPDATE_FIELDS_RETRY_BACKOFFS.to_vec(),
+            embedding_cache: None,
         }
     }
 
@@ -174,6 +180,14 @@ impl<R, E, S> EmbeddingWorker<R, E, S> {
     #[must_use]
     pub fn with_update_fields_backoffs(mut self, backoffs: Vec<Duration>) -> Self {
         self.update_fields_backoffs = backoffs;
+        self
+    }
+
+    /// 接上 Stage 5 寫入的 Redis 向量暫存。連不上就不要呼叫——保持 `None`
+    /// 等價於快取永遠 miss，既有行為不變。
+    #[must_use]
+    pub fn with_embedding_cache(mut self, cache: Arc<dyn KeyValueStore>) -> Self {
+        self.embedding_cache = Some(cache);
         self
     }
 
@@ -359,24 +373,53 @@ where
             return Ok(());
         }
 
-        let requests: Vec<EmbeddingRequest> = pending
-            .iter()
-            .map(|(_, text)| EmbeddingRequest {
-                text: text.clone(),
-                kind: EmbeddingKind::Passage,
-                language: doc.language.clone(),
-            })
-            .collect();
-        let vectors = self.embed_bounded(&requests).await?;
-        if vectors.len() != pending.len() {
-            return Err(EmbeddingWorkerError::Configuration {
-                message: format!(
-                    "embed_batch 回了 {} 筆、送出 {} 筆。請檢查 EmbeddingProvider 實作有沒有丟項目",
-                    vectors.len(),
-                    pending.len()
-                ),
-            });
+        let expected_model = model.model.as_str();
+        let mut vectors: Vec<Option<EmbeddingVector>> = vec![None; pending.len()];
+        let mut to_embed: Vec<(usize, EmbeddingRequest)> = Vec::new();
+        for (i, (_, text)) in pending.iter().enumerate() {
+            match self.lookup_embedding_cache(text, expected_model).await {
+                Some(cached) => {
+                    report.redis_cache_hits += 1;
+                    self.metrics
+                        .inc("osint_embedding_worker_redis_cache_hit_total", 1);
+                    vectors[i] = Some(cached);
+                }
+                None => to_embed.push((
+                    i,
+                    EmbeddingRequest {
+                        text: text.clone(),
+                        kind: EmbeddingKind::Passage,
+                        language: doc.language.clone(),
+                    },
+                )),
+            }
         }
+        if !to_embed.is_empty() {
+            let requests: Vec<EmbeddingRequest> =
+                to_embed.iter().map(|(_, req)| req.clone()).collect();
+            let computed = self.embed_bounded(&requests).await?;
+            if computed.len() != to_embed.len() {
+                return Err(EmbeddingWorkerError::Configuration {
+                    message: format!(
+                        "embed_batch 回了 {} 筆、送出 {} 筆。請檢查 EmbeddingProvider 實作有沒有丟項目",
+                        computed.len(),
+                        to_embed.len()
+                    ),
+                });
+            }
+            for ((i, _), vector) in to_embed.into_iter().zip(computed) {
+                vectors[i] = Some(vector);
+            }
+        }
+        let vectors: Vec<EmbeddingVector> = vectors
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.ok_or_else(|| EmbeddingWorkerError::Configuration {
+                    message: format!("內部錯誤：第 {i} 筆向量既沒有快取也沒有推論結果"),
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         let mut overlay = serde_json::Map::new();
         for ((target, _), vector) in pending.iter().zip(vectors.iter()) {
@@ -615,6 +658,47 @@ where
         Ok(())
     }
 
+    /// 查 Stage 5 寫入的 Redis 暫存。任何失敗（沒接上、過期、JSON 壞掉、
+    /// 模型對不上）都當 miss——快取是效能優化，不可影響正確性。
+    async fn lookup_embedding_cache(
+        &self,
+        text: &str,
+        expected_model: &str,
+    ) -> Option<EmbeddingVector> {
+        let cache = self.embedding_cache.as_ref()?;
+        let hash = embedding_content_hash(text);
+        let key = embedding_cache_key(&hash);
+        let bytes = match cache.get(&key).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::warn!(%key, error = %err, "讀 embedding Redis 快取失敗，當 miss");
+                return None;
+            }
+        };
+        match serde_json::from_slice::<EmbeddingVector>(&bytes) {
+            Ok(vector) if vector.content_hash == hash && vector.model == expected_model => {
+                tracing::debug!(%key, model = %vector.model, "embedding Redis 快取命中");
+                Some(vector)
+            }
+            Ok(vector) => {
+                tracing::warn!(
+                    %key,
+                    cached_model = %vector.model,
+                    expected_model,
+                    cached_hash = %vector.content_hash,
+                    expected_hash = %hash,
+                    "embedding Redis 快取的 model／content_hash 對不上，當 miss"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(%key, error = %err, "embedding Redis 快取 JSON 解不開，當 miss");
+                None
+            }
+        }
+    }
+
     async fn embed_bounded(
         &self,
         requests: &[EmbeddingRequest],
@@ -747,9 +831,9 @@ mod tests {
     use core_model::{Document, DocumentType, Entity, EntityType};
     use storage_core::conformance::find_workspace_root;
     use storage_core::mock::{
-        MOCK_E5_MODEL, MOCK_MINILM_MODEL, MockEmbeddingProvider, MockSearchStore,
+        MOCK_E5_MODEL, MOCK_MINILM_MODEL, MockEmbeddingProvider, MockKeyValueStore, MockSearchStore,
     };
-    use storage_core::{RelationalStore, SearchStore};
+    use storage_core::{KeyValueStore, RelationalStore, SearchStore};
     use storage_sqlite::SqliteEmbeddedStore;
 
     use super::*;
@@ -801,6 +885,7 @@ mod tests {
 
     struct Harness {
         worker: EmbeddingWorker<SqliteEmbeddedStore, MockEmbeddingProvider, MockSearchStore>,
+        embeddings: MockEmbeddingProvider,
         db: SqliteEmbeddedStore,
         search: MockSearchStore,
         path: PathBuf,
@@ -835,9 +920,10 @@ mod tests {
             .await
             .expect("開 SQLite reader");
         let search = MockSearchStore::new();
+        let embeddings = MockEmbeddingProvider::new();
         let worker = EmbeddingWorker::new(
             writer,
-            MockEmbeddingProvider::new(),
+            embeddings.clone(),
             search,
             MetricsRegistry::new(),
             EmbeddingBounds::new("osint-documents", "osint-entities", 32, 4),
@@ -846,6 +932,7 @@ mod tests {
         let search = worker.search().clone();
         Harness {
             worker,
+            embeddings,
             db,
             search,
             path,
@@ -1160,5 +1247,143 @@ mod tests {
         // 編譯期契約：V0.2 沒有 Event 抽取管線。這個測試存在是為了讓
         // 之後有人在 process 路徑加上 EventDescription 時，會先看到這段說明。
         let _ = EmbeddingTarget::EventDescription;
+    }
+
+    #[tokio::test]
+    async fn redis_cache_hit_skips_embed() {
+        let cache = MockKeyValueStore::new();
+        let h = open_harness().await;
+        let worker = h
+            .worker
+            .clone()
+            .with_embedding_cache(Arc::new(cache.clone()) as Arc<dyn KeyValueStore>);
+        let doc = document(Some("cached title"), Some("cached body"), Some("en"));
+        h.db.put_document(&doc).await.unwrap();
+        h.search
+            .index(SearchDocument {
+                index: "osint-documents".into(),
+                id: doc.id.to_string(),
+                body: json!({"title": "cached title"}),
+            })
+            .await
+            .unwrap();
+
+        let title_vec = h
+            .embeddings
+            .embed(&EmbeddingRequest {
+                text: "cached title".into(),
+                kind: EmbeddingKind::Passage,
+                language: Some("en".into()),
+            })
+            .await
+            .unwrap();
+        let body_vec = h
+            .embeddings
+            .embed(&EmbeddingRequest {
+                text: "cached body".into(),
+                kind: EmbeddingKind::Passage,
+                language: Some("en".into()),
+            })
+            .await
+            .unwrap();
+        for v in [&title_vec, &body_vec] {
+            cache
+                .set_ex(
+                    &embedding_cache_key(&v.content_hash),
+                    &serde_json::to_vec(v).unwrap(),
+                    Duration::from_secs(900),
+                )
+                .await
+                .unwrap();
+        }
+        let before = h.embeddings.embed_calls();
+
+        let report = worker
+            .process_extracted(&payload(doc.id, &[]))
+            .await
+            .unwrap();
+        assert_eq!(report.redis_cache_hits, 2, "title + body 都該命中 Redis");
+        assert!(report.title_applied);
+        assert!(report.body_applied);
+        assert_eq!(
+            h.embeddings.embed_calls(),
+            before,
+            "快取命中時不可再打 EmbeddingProvider::embed"
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_cache_miss_embeds_as_before() {
+        let h = open_harness().await;
+        let doc = document(Some("fresh title"), None, Some("en"));
+        h.db.put_document(&doc).await.unwrap();
+        h.search
+            .index(SearchDocument {
+                index: "osint-documents".into(),
+                id: doc.id.to_string(),
+                body: json!({"title": "fresh title"}),
+            })
+            .await
+            .unwrap();
+        let before = h.embeddings.embed_calls();
+        let report = h
+            .worker
+            .process_extracted(&payload(doc.id, &[]))
+            .await
+            .unwrap();
+        assert_eq!(report.redis_cache_hits, 0);
+        assert!(report.title_applied);
+        assert!(h.embeddings.embed_calls() > before, "沒有快取時必須打推論");
+    }
+
+    #[tokio::test]
+    async fn redis_model_mismatch_is_treated_as_miss() {
+        let cache = MockKeyValueStore::new();
+        let h = open_harness().await;
+        let worker = h
+            .worker
+            .clone()
+            .with_embedding_cache(Arc::new(cache.clone()) as Arc<dyn KeyValueStore>);
+        let doc = document(Some("mismatch"), None, Some("en"));
+        h.db.put_document(&doc).await.unwrap();
+        h.search
+            .index(SearchDocument {
+                index: "osint-documents".into(),
+                id: doc.id.to_string(),
+                body: json!({"title": "mismatch"}),
+            })
+            .await
+            .unwrap();
+
+        let mut wrong = h
+            .embeddings
+            .embed(&EmbeddingRequest {
+                text: "mismatch".into(),
+                kind: EmbeddingKind::Passage,
+                language: Some("en".into()),
+            })
+            .await
+            .unwrap();
+        wrong.model = "some-other-model".into();
+        cache
+            .set_ex(
+                &embedding_cache_key(&wrong.content_hash),
+                &serde_json::to_vec(&wrong).unwrap(),
+                Duration::from_secs(900),
+            )
+            .await
+            .unwrap();
+        let before = h.embeddings.embed_calls();
+
+        let report = worker
+            .process_extracted(&payload(doc.id, &[]))
+            .await
+            .unwrap();
+        assert_eq!(report.redis_cache_hits, 0);
+        assert!(report.title_applied);
+        assert!(
+            h.embeddings.embed_calls() > before,
+            "model 對不上必須重算，不可默默用錯向量"
+        );
     }
 }

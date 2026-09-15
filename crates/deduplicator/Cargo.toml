@@ -19,12 +19,15 @@ core-config = { workspace = true }
 core-events = { workspace = true }
 core-model = { workspace = true }
 core-observability = { workspace = true }
+indexer = { path = "../indexer" }
 serde_json = { workspace = true }
 # SimHash 的 token 雜湊。自己實作 SimHash（見 src/simhash.rs 的說明），
 # 只借用 SHA256 當分布均勻的 64-bit 雜湊來源。
 sha2 = { workspace = true }
 storage-core = { workspace = true }
+storage-opensearch = { path = "../storage-opensearch" }
 storage-postgres = { path = "../storage-postgres" }
+storage-redis = { path = "../storage-redis" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

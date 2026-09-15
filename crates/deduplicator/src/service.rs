@@ -62,7 +62,7 @@ pub enum DedupStage {
     ContentHash,
     /// Stage 4：SimHash 近似重複。
     Simhash,
-    /// Stage 5：語意重複（V0.1 不實作，見 `semantic.rs`）。
+    /// Stage 5：語意重複（見 `semantic_real.rs`）。
     Semantic,
 }
 
@@ -180,7 +180,7 @@ impl Deduplicator {
         }
     }
 
-    /// 換掉 Stage 5 的實作。V0.2 接上語意判斷時用。
+    /// 換掉 Stage 5 的實作。生產路徑注入 [`crate::VectorSemanticDetector`]。
     #[must_use]
     pub fn with_semantic_detector(mut self, detector: Arc<dyn SemanticDuplicateDetector>) -> Self {
         self.semantic = detector;
@@ -464,6 +464,7 @@ impl Deduplicator {
                     stage: DedupStage::PlatformExternalId,
                     // 同一個平台的同一個 external_id 就是同一筆，沒有程度問題。
                     similarity: 1.0,
+                    model: None,
                 }));
             }
         }
@@ -478,6 +479,7 @@ impl Deduplicator {
                     canonical_object_id: canonical,
                     stage: DedupStage::CanonicalUrl,
                     similarity: 1.0,
+                    model: None,
                 }));
             }
         }
@@ -492,6 +494,7 @@ impl Deduplicator {
                     canonical_object_id: canonical,
                     stage: DedupStage::ContentHash,
                     similarity: 1.0,
+                    model: None,
                 }));
             }
         }
@@ -520,6 +523,7 @@ impl Deduplicator {
                         canonical_object_id: canonical,
                         stage: DedupStage::Simhash,
                         similarity: simhash::similarity(distance),
+                        model: None,
                     }));
                 }
             }
@@ -529,14 +533,16 @@ impl Deduplicator {
             SemanticOutcome::Hit {
                 canonical_object_id,
                 similarity,
+                model,
             } => Ok(Some(DuplicateHit {
                 canonical_object_id,
                 stage: DedupStage::Semantic,
                 similarity,
+                model: Some(model),
             })),
-            // V0.1 的實作永遠走這裡。Unsupported 與 NoMatch 對流程的效果相同，
-            // 差別只在寫進 provenance 的字串——那是「這份資料是在有沒有 Stage 5 的年代處理的」
-            // 唯一的判斷依據。
+            // Unsupported 與 NoMatch 對流程的效果相同，
+            // 差別只在寫進 provenance 的 `semantic_detector` 字串——
+            // 那是「這份資料是在有沒有 Stage 5 的年代處理的」唯一的判斷依據。
             SemanticOutcome::Unsupported | SemanticOutcome::NoMatch => Ok(None),
         }
     }
@@ -615,8 +621,8 @@ impl Deduplicator {
             method: hit.stage.as_str().into(),
             similarity: hit.similarity,
             first_seen,
-            // Stage 1-4 不靠模型；Stage 5（語意判定）才填。SPEC §17。
-            model: None,
+            // Stage 1-4 不靠模型；Stage 5 才填實際用的模型名稱。SPEC §17。
+            model: group_model(hit),
         };
         self.store.put_duplicate_group(&group).await?;
         Ok(id)
@@ -722,6 +728,20 @@ struct DuplicateHit {
     canonical_object_id: Uuid,
     stage: DedupStage,
     similarity: f64,
+    /// Stage 5 才有值。Stage 1-4 永遠是 `None`。
+    model: Option<String>,
+}
+
+/// `DuplicateGroup.model`：只有語意判定才填模型名。
+///
+/// 即使 `hit.model` 意外有值，Stage 1-4 也必須寫 `None`——那是「這批
+/// 不是模型判的」的契約，之後審查／回滾 Stage 5 誤判時靠這個欄位過濾。
+fn group_model(hit: &DuplicateHit) -> Option<String> {
+    if hit.stage == DedupStage::Semantic {
+        hit.model.clone()
+    } else {
+        None
+    }
 }
 
 /// `DuplicateGroup.id` = UUID v5(namespace, member document id)。
@@ -863,5 +883,34 @@ mod tests {
         assert_eq!(bounds.candidate_limit, 20);
         assert_eq!(bounds.simhash_scan_limit, 500);
         assert_eq!(bounds.simhash_max_distance, simhash::DEFAULT_MAX_DISTANCE);
+    }
+
+    #[test]
+    fn group_model_only_fills_on_semantic_stage() {
+        // 這條就是 write_group 的 model 欄位 bug 的回歸測試：
+        // Stage 1-4 即使 hit.model 意外有值，寫進 DuplicateGroup 也必須是 None。
+        let mut hit = DuplicateHit {
+            canonical_object_id: Uuid::now_v7(),
+            stage: DedupStage::Simhash,
+            similarity: 0.95,
+            model: Some("intfloat/multilingual-e5-small-int8".into()),
+        };
+        assert_eq!(group_model(&hit), None);
+
+        hit.stage = DedupStage::PlatformExternalId;
+        assert_eq!(group_model(&hit), None);
+        hit.stage = DedupStage::CanonicalUrl;
+        assert_eq!(group_model(&hit), None);
+        hit.stage = DedupStage::ContentHash;
+        assert_eq!(group_model(&hit), None);
+
+        hit.stage = DedupStage::Semantic;
+        assert_eq!(
+            group_model(&hit).as_deref(),
+            Some("intfloat/multilingual-e5-small-int8")
+        );
+
+        hit.model = None;
+        assert_eq!(group_model(&hit), None);
     }
 }

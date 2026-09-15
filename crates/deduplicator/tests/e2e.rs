@@ -450,6 +450,10 @@ async fn acceptance_b_same_article_ten_times_keeps_one_canonical_and_all_evidenc
             group.member_raw_evidence_id.is_some(),
             "group 必須記得 member 的 RawEvidence，才能回查證據"
         );
+        assert_eq!(
+            group.model, None,
+            "Stage 1-4 不靠模型，DuplicateGroup.model 必須是 NULL"
+        );
     }
 
     // SPEC §16 的硬性規則：不得刪掉 duplicate evidence。逐筆數，不看有沒有報錯。
@@ -566,6 +570,7 @@ async fn acceptance_c_reprint_from_two_sources_shares_one_duplicate_group() {
     assert_eq!(group.canonical_object_id, doc_a);
     assert_eq!(group.method, DedupStage::Simhash.as_str());
     assert_eq!(group.member_raw_evidence_id, Some(raw_b));
+    assert_eq!(group.model, None, "Stage 4 不靠模型");
 
     for raw_id in [raw_a, raw_b] {
         assert!(
@@ -795,6 +800,7 @@ async fn stage_5_semantic_interface_is_wired_but_unsupported_by_default() {
             Ok(SemanticOutcome::Hit {
                 canonical_object_id: self.canonical,
                 similarity: 0.87,
+                model: "intfloat/multilingual-e5-small-int8".into(),
             })
         }
     }
@@ -854,6 +860,11 @@ async fn stage_5_semantic_interface_is_wired_but_unsupported_by_default() {
         .expect("group");
     assert_eq!(group.method, "semantic");
     assert!((group.similarity - 0.87).abs() < 1e-9);
+    assert_eq!(
+        group.model.as_deref(),
+        Some("intfloat/multilingual-e5-small-int8"),
+        "Stage 5 命中必須把實際模型名寫進 DuplicateGroup.model"
+    );
 }
 
 // ---------------------------------------------------------------------------

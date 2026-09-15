@@ -15,11 +15,11 @@ pub use capability::{CapabilityDescriptor, StorageAdapter};
 pub use error::StorageError;
 pub use health::{HealthProvider, StorageHealth};
 pub use traits::{
-    BulkFailure, BulkIndexResult, CanonicalStore, EmbeddedStore, EmbeddingKind, EmbeddingModelRef,
-    EmbeddingProvider, EmbeddingRequest, EmbeddingVector, GraphEdge, GraphNode, GraphPath,
-    GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, KeyValueStore, ObjectStore,
-    ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr, RebuildState, RebuildStatus,
-    RelationalStore, SearchDocument, SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery,
-    SearchStore, SimhashCandidate, SortField, StructuredSearch, Transaction, TransactionalStore,
-    VectorSearch, embedding_content_hash,
+    BulkFailure, BulkIndexResult, CanonicalStore, EMBEDDING_CACHE_KEY_PREFIX, EmbeddedStore,
+    EmbeddingKind, EmbeddingModelRef, EmbeddingProvider, EmbeddingRequest, EmbeddingVector,
+    GraphEdge, GraphNode, GraphPath, GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions,
+    KeyValueStore, ObjectStore, ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
+    RebuildState, RebuildStatus, RelationalStore, SearchDocument, SearchField, SearchFilter,
+    SearchHit, SearchHits, SearchQuery, SearchStore, SimhashCandidate, SortField, StructuredSearch,
+    Transaction, TransactionalStore, VectorSearch, embedding_cache_key, embedding_content_hash,
 };
