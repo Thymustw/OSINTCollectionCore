@@ -3499,11 +3499,17 @@ dependencies = [
 name = "resolver"
 version = "0.1.0"
 dependencies = [
+ "ai-gateway",
  "async-trait",
  "chrono",
+ "core-events",
  "core-model",
+ "hex",
+ "merge",
  "serde_json",
+ "sha2 0.10.9",
  "storage-core",
+ "storage-sqlite",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

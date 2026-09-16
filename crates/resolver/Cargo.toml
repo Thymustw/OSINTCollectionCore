@@ -8,14 +8,20 @@ publish.workspace = true
 description = "給 Entity 跑 resolution method，產出 ResolutionCandidate（SPEC_V0.2 §5／§6）"
 
 [dependencies]
+ai-gateway = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+core-events = { workspace = true }
 core-model = { workspace = true }
+hex = { workspace = true }
+merge = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 storage-core = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+storage-sqlite = { path = "../storage-sqlite" }
 tokio = { workspace = true }

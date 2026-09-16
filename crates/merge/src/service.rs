@@ -80,15 +80,15 @@ impl<S: TransactionalStore> MergeService<S> {
         Self { store, producer }
     }
 
-    /// 把 `merged_id` 併進 `survivor_id`。成功回這次的 [`MergeHistory`]。
-    ///
-    /// 前置檢查在交易外；通過後開交易寫入。任何一步 `Err` 都讓交易 drop 回滾。
-    pub async fn execute_merge(
+    /// 同 [`Self::execute_merge`]，多一個 `audit` 參數——ADR-012 自動核准會用到，
+    /// 人工 merge 一律傳 `None`（[`Self::execute_merge`] 就是這樣呼叫的）。
+    pub async fn execute_merge_with_audit(
         &self,
         survivor_id: EntityId,
         merged_id: EntityId,
         reason: String,
         operator: String,
+        audit: Option<serde_json::Value>,
     ) -> Result<MergeHistory, MergeError> {
         if survivor_id == merged_id {
             return Err(MergeError::SelfMerge {
@@ -121,7 +121,7 @@ impl<S: TransactionalStore> MergeService<S> {
         let tx = self.store.begin().await?;
         let (history, changes) = {
             let db = tx.store();
-            execute_in_tx(db, survivor, merged, reason, operator).await?
+            execute_in_tx(db, survivor, merged, reason, operator, audit).await?
         };
         tx.commit().await?;
         // commit 已成功，merge 本身落地。事件發送失敗只代表 graph-worker 這次
@@ -131,6 +131,22 @@ impl<S: TransactionalStore> MergeService<S> {
         // store 已經改完了。
         self.publish_relationship_changes(&changes).await;
         Ok(history)
+    }
+
+    /// 把 `merged_id` 併進 `survivor_id`。成功回這次的 [`MergeHistory`]。
+    ///
+    /// 前置檢查在交易外；通過後開交易寫入。任何一步 `Err` 都讓交易 drop 回滾。
+    /// 人工 merge 不帶稽核 JSON，內部轉呼叫 [`Self::execute_merge_with_audit`]
+    /// 並傳 `audit = None`。
+    pub async fn execute_merge(
+        &self,
+        survivor_id: EntityId,
+        merged_id: EntityId,
+        reason: String,
+        operator: String,
+    ) -> Result<MergeHistory, MergeError> {
+        self.execute_merge_with_audit(survivor_id, merged_id, reason, operator, None)
+            .await
     }
 
     /// 依 [`MergeHistory`] 還原一次 merge。
@@ -224,6 +240,7 @@ async fn execute_in_tx(
     mut merged: Entity,
     reason: String,
     operator: String,
+    audit: Option<serde_json::Value>,
 ) -> Result<(MergeHistory, Vec<RelationshipChange>), MergeError> {
     let survivor_id = survivor.id;
     let merged_id = merged.id;
@@ -413,7 +430,7 @@ async fn execute_in_tx(
         repointed_references,
         merged_relationships,
         undone_at: None,
-        auto_approval_audit: None,
+        auto_approval_audit: audit,
     };
     db.put_merge_history(&history).await?;
     Ok((history, changes))
