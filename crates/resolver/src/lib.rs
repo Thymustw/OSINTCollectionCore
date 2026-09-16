@@ -64,7 +64,10 @@ mod persist;
 mod semantic;
 mod service;
 
-pub use auto_approval::{AutoApprovalConfig, AutoApprovalEvaluator, AutoApprovalOutcome};
+pub use auto_approval::{
+    AutoApprovalConfig, AutoApprovalEvaluator, AutoApprovalOutcome,
+    group_candidates_for_auto_approval,
+};
 pub use conflict::resolution_candidate_from_identifier_conflict;
 pub use error::ResolverError;
 pub use graph_context::check_graph_context;

@@ -1,11 +1,14 @@
-//! 單一一對 Entity 的自動核准評估（ADR-012 Step 3）。
+//! 單一一對 Entity 的自動核准評估（ADR-012 Step 3），以及依另一端 id 分組候選。
 //!
-//! 這個模組**不管**跨多對候選的分組、也不管 `max_auto_merges_per_resolve`——
-//! 那些是呼叫端（Step 4）的狀態。這裡只評估一對、必要時執行一次 merge。
+//! [`AutoApprovalEvaluator`] 只評估一對、必要時執行一次 merge；跨多對的計數上限
+//! `max_auto_merges_per_resolve` 仍是呼叫端的狀態。分組規則抽成
+//! [`group_candidates_for_auto_approval`]，讓 `core-api` 與 `stix-worker` 共用同一份，
+//! 避免兩邊各寫一份之後行為分岔。
 //!
 //! 任何失敗（LLM、merge、讀不到 Entity）都收斂成 [`AutoApprovalOutcome::Pending`]，
 //! 不往上拋錯誤：CLAUDE.md §5「AI failure must not block base ingestion」。
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -547,6 +550,41 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// 把候選依「另一端 Entity id」分組（`entity_id` 一律是 survivor，另一端是 merged），
+/// 去重（同 id 的候選只留一筆），依「另一端 id」排序讓分組順序是決定性的
+/// （否則 `max_auto_merges_per_resolve` 上限在同一批候選里砍到哪幾對會不確定）。
+///
+/// 兩端都不是目標 Entity 的候選會被跳過並記 warn，不讓整批失敗。
+#[must_use]
+pub fn group_candidates_for_auto_approval(
+    entity_id: EntityId,
+    candidates: &[ResolutionCandidate],
+) -> Vec<(EntityId, Vec<ResolutionCandidate>)> {
+    let mut groups: BTreeMap<EntityId, Vec<ResolutionCandidate>> = BTreeMap::new();
+    let mut seen: HashSet<EntityId> = HashSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.id) {
+            continue;
+        }
+        let other = if candidate.entity_a_id == entity_id {
+            candidate.entity_b_id
+        } else if candidate.entity_b_id == entity_id {
+            candidate.entity_a_id
+        } else {
+            warn!(
+                candidate_id = %candidate.id,
+                %entity_id,
+                entity_a_id = %candidate.entity_a_id,
+                entity_b_id = %candidate.entity_b_id,
+                "自動核准分組遇到兩端都不是目標 Entity 的候選，已跳過"
+            );
+            continue;
+        };
+        groups.entry(other).or_default().push(candidate.clone());
+    }
+    groups.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,5 +992,100 @@ mod tests {
         assert_eq!(got_alias.status, ResolutionStatus::AutoConfirmed);
         assert!(got_id.reviewed_at.is_some());
         assert!(got_alias.reviewed_at.is_some());
+    }
+
+    fn grouping_candidate(id: Uuid, a: Uuid, b: Uuid, method: &str) -> ResolutionCandidate {
+        let (entity_a_id, entity_b_id) = ResolutionCandidate::ordered_pair(a, b);
+        ResolutionCandidate {
+            id,
+            entity_a_id,
+            entity_b_id,
+            score: 0.5,
+            method: method.into(),
+            evidence: json!({}),
+            status: ResolutionStatus::Pending,
+            created_at: ts(),
+            reviewed_at: None,
+        }
+    }
+
+    #[test]
+    fn groups_by_other_end_regardless_of_a_or_b_direction() {
+        let entity = Uuid::from_u128(10);
+        // 比 entity 小：entity 會落在 b；比 entity 大：entity 會落在 a。
+        let smaller = Uuid::from_u128(1);
+        let larger = Uuid::from_u128(20);
+        let c_small = grouping_candidate(Uuid::from_u128(100), entity, smaller, "alias");
+        let c_large = grouping_candidate(Uuid::from_u128(101), entity, larger, "domain");
+
+        let groups =
+            group_candidates_for_auto_approval(entity, &[c_small.clone(), c_large.clone()]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, smaller);
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[0].1[0].id, c_small.id);
+        assert_eq!(groups[1].0, larger);
+        assert_eq!(groups[1].1.len(), 1);
+        assert_eq!(groups[1].1[0].id, c_large.id);
+    }
+
+    #[test]
+    fn same_pair_multiple_methods_share_one_group() {
+        let entity = Uuid::from_u128(10);
+        let other = Uuid::from_u128(20);
+        let a = grouping_candidate(Uuid::from_u128(1), entity, other, "exact_identifier");
+        let b = grouping_candidate(Uuid::from_u128(2), entity, other, "alias");
+        let groups = group_candidates_for_auto_approval(entity, &[a, b]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, other);
+        assert_eq!(groups[0].1.len(), 2);
+    }
+
+    #[test]
+    fn skips_candidates_that_do_not_involve_entity() {
+        let entity = Uuid::from_u128(10);
+        let unrelated_a = Uuid::from_u128(1);
+        let unrelated_b = Uuid::from_u128(2);
+        let stray = grouping_candidate(Uuid::from_u128(9), unrelated_a, unrelated_b, "alias");
+        let groups = group_candidates_for_auto_approval(entity, &[stray]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn grouping_order_is_deterministic() {
+        let entity = Uuid::from_u128(50);
+        let others = [
+            Uuid::from_u128(3),
+            Uuid::from_u128(1),
+            Uuid::from_u128(9),
+            Uuid::from_u128(2),
+        ];
+        let input: Vec<_> = others
+            .iter()
+            .enumerate()
+            .map(|(i, other)| {
+                grouping_candidate(
+                    Uuid::from_u128(100 + i as u128),
+                    entity,
+                    *other,
+                    "normalized_name",
+                )
+            })
+            .collect();
+        let first = group_candidates_for_auto_approval(entity, &input);
+        let second = group_candidates_for_auto_approval(entity, &input);
+        let keys: Vec<_> = first.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![others[1], others[3], others[0], others[2]]);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn duplicate_candidate_ids_are_kept_once() {
+        let entity = Uuid::from_u128(10);
+        let other = Uuid::from_u128(20);
+        let c = grouping_candidate(Uuid::from_u128(1), entity, other, "alias");
+        let groups = group_candidates_for_auto_approval(entity, &[c.clone(), c]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 1);
     }
 }

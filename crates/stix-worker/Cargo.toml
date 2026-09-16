@@ -1,0 +1,48 @@
+[package]
+name = "stix-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "job.dispatched → STIX 2.1 bundle 匯入 Entity／Relationship／Provenance（只做 stix_import；stix_export 忽略）"
+
+[[bin]]
+name = "osint-stix-worker"
+path = "src/main.rs"
+
+[dependencies]
+ai-gateway = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+core-config = { workspace = true }
+core-events = { workspace = true }
+core-jobs = { workspace = true }
+core-model = { workspace = true }
+core-observability = { workspace = true }
+entity-worker = { path = "../entity-worker" }
+resolver = { workspace = true }
+serde_json = { workspace = true }
+storage-core = { workspace = true }
+storage-postgres = { path = "../storage-postgres" }
+storage-s3 = { path = "../storage-s3" }
+stix-adapter = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+ai-gateway = { workspace = true }
+chrono = { workspace = true }
+core-jobs = { workspace = true }
+core-model = { workspace = true }
+core-observability = { workspace = true }
+entity-worker = { path = "../entity-worker" }
+resolver = { workspace = true }
+serde_json = { workspace = true }
+storage-core = { workspace = true }
+storage-postgres = { path = "../storage-postgres" }
+storage-s3 = { path = "../storage-s3" }
+tokio = { workspace = true }
+uuid = { workspace = true }

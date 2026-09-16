@@ -137,6 +137,15 @@ entities_index = "osint-entities"
 # rebuild 掃 canonical store 時每頁筆數。硬上限，沒有「不限」。
 page_size = 100
 
+[stix_worker]
+# 18080–18087 已分別是 api／collector／normalizer／deduplicator／
+# entity-worker／indexer／graph-worker／embedding-worker 的 health 埠。
+bind = "127.0.0.1:18088"
+consumer_group = "osint-stix-worker"
+# 單次 stix_import 交易最多寫入幾筆已對應的 Entity。與 [stix].max_objects 對齊；
+# 超過整批 Failed，不拆交易。硬上限，沒有「不限」。
+max_objects_per_tx = 10000
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

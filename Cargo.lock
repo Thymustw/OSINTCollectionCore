@@ -4333,6 +4333,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "stix-worker"
+version = "0.1.0"
+dependencies = [
+ "ai-gateway",
+ "axum",
+ "chrono",
+ "core-config",
+ "core-events",
+ "core-jobs",
+ "core-model",
+ "core-observability",
+ "entity-worker",
+ "resolver",
+ "serde_json",
+ "stix-adapter",
+ "storage-core",
+ "storage-postgres",
+ "storage-s3",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "storage-core"
 version = "0.1.0"
 dependencies = [

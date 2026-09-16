@@ -38,6 +38,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub embedding_worker: EmbeddingWorkerSection,
     #[serde(default)]
+    pub stix_worker: StixWorkerSection,
+    #[serde(default)]
     pub import: ImportSection,
     #[serde(default)]
     pub embedding: EmbeddingSection,
@@ -389,6 +391,30 @@ impl Default for EmbeddingWorkerSection {
             consumer_group: "osint-embedding-worker".into(),
             entities_index: "osint-entities".into(),
             page_size: 100,
+        }
+    }
+}
+
+/// stix-worker（`osint-stix-worker`）的 health 與匯入交易上限。
+///
+/// 真正的 STIX 物件數量上限仍是 [`StixSection::max_objects`]（API 入口先擋）；
+/// `max_objects_per_tx` 是 worker 端的第二道硬上限，超過就整批失敗、不拆交易。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StixWorkerSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// 單次 `stix_import` 交易最多寫入幾筆已對應的 Entity。超過整批 Failed。
+    pub max_objects_per_tx: usize,
+}
+
+impl Default for StixWorkerSection {
+    fn default() -> Self {
+        Self {
+            // 18080–18087 已分別是 api／collector／normalizer／deduplicator／
+            // entity-worker／indexer／graph-worker／embedding-worker 的 health 埠。
+            bind: "127.0.0.1:18088".into(),
+            consumer_group: "osint-stix-worker".into(),
+            max_objects_per_tx: 10_000,
         }
     }
 }
@@ -845,6 +871,9 @@ mod tests {
         );
         assert_eq!(cfg.embedding_worker.entities_index, "osint-entities");
         assert_eq!(cfg.embedding_worker.page_size, 100);
+        assert_eq!(cfg.stix_worker.bind, "127.0.0.1:18088");
+        assert_eq!(cfg.stix_worker.consumer_group, "osint-stix-worker");
+        assert_eq!(cfg.stix_worker.max_objects_per_tx, 10_000);
         assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);
         assert_eq!(cfg.import.max_records, 10_000);
         assert_eq!(cfg.import.max_record_bytes, 262_144);
@@ -934,6 +963,27 @@ mod tests {
         assert_eq!(section.consumer_group, "osint-embedding-worker");
         assert_eq!(section.entities_index, "osint-entities");
         assert_eq!(section.page_size, 100);
+    }
+
+    #[test]
+    fn stix_worker_section_default_values() {
+        let section = StixWorkerSection::default();
+        assert_eq!(section.bind, "127.0.0.1:18088");
+        assert_eq!(section.consumer_group, "osint-stix-worker");
+        assert_eq!(section.max_objects_per_tx, 10_000);
+    }
+
+    #[test]
+    fn missing_stix_worker_section_does_not_fail_load() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        let parsed: AppConfig = {
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            value.as_object_mut().unwrap().remove("stix_worker");
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(parsed.stix_worker, StixWorkerSection::default());
     }
 
     #[test]
