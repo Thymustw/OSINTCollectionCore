@@ -263,6 +263,7 @@ pub fn job(row: &PgRow) -> Result<Job, StorageError> {
         completed_at: get(row, "completed_at")?,
         retry_count: get(row, "retry_count")?,
         error: get(row, "error")?,
+        parameters: get(row, "parameters")?,
     })
 }
 

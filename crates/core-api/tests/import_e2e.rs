@@ -132,6 +132,7 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, import_config: ImportS
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,
         import_config,
+        stix_config: core_config::StixSection::default(),
         object_bucket: String::new(),
         rate_limiter: RateLimiter::new(1_000),
     };

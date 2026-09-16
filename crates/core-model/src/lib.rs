@@ -231,10 +231,12 @@ mod tests {
             completed_at: None,
             retry_count: 0,
             error: None,
+            parameters: Some(json!({"source_id": id()})),
         };
         let v = serde_json::to_value(&job).unwrap();
         assert_eq!(v["type"], "collect");
         assert_eq!(v["status"], "queued");
+        assert_eq!(v["parameters"]["source_id"], json!(job.correlation_id));
         assert_eq!(round_trip(&job), job);
     }
 

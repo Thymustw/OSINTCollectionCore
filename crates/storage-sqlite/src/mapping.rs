@@ -343,6 +343,7 @@ pub fn job(row: &SqliteRow) -> Result<Job, StorageError> {
         completed_at: opt_ts(row, "completed_at")?,
         retry_count: i32_from(row, "retry_count")?,
         error: get_opt_str(row, "error")?,
+        parameters: opt_json(row, "parameters")?,
     })
 }
 

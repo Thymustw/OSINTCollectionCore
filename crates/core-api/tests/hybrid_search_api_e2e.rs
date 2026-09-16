@@ -121,6 +121,7 @@ fn build_api_with_store(
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,
         import_config: core_config::ImportSection::default(),
+        stix_config: core_config::StixSection::default(),
         object_bucket: String::new(),
         rate_limiter: RateLimiter::new(1_000),
     };

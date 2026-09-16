@@ -6,8 +6,8 @@
 //!
 //! # `POST /graph/rebuild` 不會 drop
 //!
-//! Job model 沒有參數欄位，沒有安全的方式讓呼叫端傳「要不要 drop」。
-//! drop 是破壞性操作，不該只憑一個字串 job_type 就觸發。全清重建請用 CLI：
+//! Job 已有 `parameters` 欄位，但這條 API **仍然不接受 drop 旗標**。
+//! drop 是破壞性操作，不該只憑一個 HTTP 請求就觸發。全清重建請用 CLI：
 //! `osint-graph-worker --rebuild --drop`。
 
 use axum::Json;
@@ -209,7 +209,7 @@ pub async fn rebuild(
     principal.role.require(Permission::Write)?;
     let result = async {
         let jobs = jobs_or_unavailable(&state)?;
-        jobs.create_and_dispatch("graph_rebuild", None)
+        jobs.create_and_dispatch("graph_rebuild", None, None)
             .await
             .map_err(ApiError::from)
     }

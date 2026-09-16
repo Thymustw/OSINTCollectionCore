@@ -19,7 +19,22 @@ async fn create_transition_list() {
     store.migrate().await.expect("migrate");
     let jobs = JobService::new(store, None);
 
-    let created = jobs.create("collect", None).await.expect("create job");
+    let created = jobs
+        .create("collect", None, None)
+        .await
+        .expect("create job");
+    assert!(created.parameters.is_none());
+
+    let with_params = jobs
+        .create(
+            "stix_import",
+            None,
+            Some(serde_json::json!({"source_id": created.id})),
+        )
+        .await
+        .expect("create job with parameters");
+    let loaded = jobs.get(with_params.id).await.expect("reload");
+    assert_eq!(loaded.parameters, with_params.parameters);
     assert_eq!(created.status, JobStatus::Queued);
 
     let listed = jobs.list(None, 20).await.expect("list");

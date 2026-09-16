@@ -41,6 +41,7 @@ resolver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+stix-adapter = { workspace = true }
 storage-core = { workspace = true }
 storage-neo4j = { path = "../storage-neo4j" }
 storage-opensearch = { path = "../storage-opensearch" }

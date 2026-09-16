@@ -578,6 +578,10 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         completed_at: None,
         retry_count: 0,
         error: None,
+        parameters: Some(json!({
+            "source_id": document.id,
+            "raw_evidence_id": evidence.id,
+        })),
     };
     store.put_job(&job).await?;
     assert_eq_debug("job", &job, &store.get_job(job.id).await?.expect("job"));

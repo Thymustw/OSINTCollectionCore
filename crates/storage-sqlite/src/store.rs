@@ -1421,8 +1421,8 @@ impl RelationalStore for SqliteEmbeddedStore {
             r#"
             INSERT INTO jobs (
                 id, "type", status, correlation_id, created_at, started_at, completed_at,
-                retry_count, error
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+                retry_count, error, parameters
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (id) DO UPDATE SET
                 "type" = excluded."type",
                 status = excluded.status,
@@ -1431,7 +1431,8 @@ impl RelationalStore for SqliteEmbeddedStore {
                 started_at = excluded.started_at,
                 completed_at = excluded.completed_at,
                 retry_count = excluded.retry_count,
-                error = excluded.error
+                error = excluded.error,
+                parameters = excluded.parameters
             "#,
         )
         .bind(uuid_text(job.id))
@@ -1443,6 +1444,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(opt_rfc3339(job.completed_at))
         .bind(i64::from(job.retry_count))
         .bind(&job.error)
+        .bind(opt_json_text(&job.parameters))
         .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;

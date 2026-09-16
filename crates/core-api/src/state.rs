@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ai_gateway::OpenAiCompatibleLlmProvider;
 use connector_sdk::EvidenceSink;
-use core_config::{HybridSearchSection, ImportSection};
+use core_config::{HybridSearchSection, ImportSection, StixSection};
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::MetricsRegistry;
@@ -207,6 +207,8 @@ pub struct AppState {
     pub rate_limit_per_second: u32,
     pub request_body_limit_bytes: u32,
     pub import_config: ImportSection,
+    /// STIX 匯入／匯出上限。永遠有值（`StixSection` 有 `Default`），不是 `Option`。
+    pub stix_config: StixSection,
     /// 物件儲存的 bucket 名稱。`GET /raw/{id}?body=true` 用它把
     /// `s3://{bucket}/{key}` 形式的 `storage_path` 還原成物件 key。
     /// 沒接物件儲存時是空字串（那時 `?body=true` 本來就會回 503）。

@@ -325,6 +325,7 @@ async fn run() -> Result<(), String> {
         rate_limit_per_second: cfg.http.rate_limit_per_second,
         request_body_limit_bytes: cfg.http.request_body_limit_bytes,
         import_config: cfg.import.clone(),
+        stix_config: cfg.stix.clone(),
         object_bucket: cfg.storage.object.bucket.clone(),
         rate_limiter: core_api::RateLimiter::new(cfg.http.rate_limit_per_second),
     };

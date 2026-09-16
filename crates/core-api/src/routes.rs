@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
             post(resources::merge::undo_merge),
         )
         .route("/api/v1/graph/rebuild", post(resources::graph::rebuild))
+        .route("/api/v1/export/stix", post(resources::stix::export_stix))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_mw::require_write,
@@ -170,6 +171,7 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/api/v1/jobs", get(jobs::list_jobs))
         .route("/api/v1/jobs/{id}", get(jobs::get_job))
+        .route("/api/v1/jobs/{id}/result", get(resources::stix::job_result))
         .route("/api/v1/whoami", get(whoami))
         .merge(read)
         // 搜尋是唯讀的（viewer 以上），但用 POST：查詢條件有巢狀結構
@@ -220,11 +222,28 @@ pub fn router(state: AppState) -> Router {
         // MultipartError::status() 認得，我們才能回正確的 413。
         .layer(DefaultBodyLimit::max(upload_envelope));
 
+    let stix_limit = usize::try_from(state.stix_config.max_bundle_bytes).unwrap_or(usize::MAX);
+    // 比 max_bundle_bytes 稍寬：讓 handler 自己量長度後回「是 [stix].max_bundle_bytes 擋的」，
+    // 而不是 axum DefaultBodyLimit 先回一個沒有 JSON 本體的 413。
+    let stix_envelope = stix_limit.saturating_add(64 * 1024);
+    let stix_import_routes = Router::new()
+        .route("/api/v1/import/stix", post(resources::stix::import_stix))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_mw::require_write,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_mw::authenticate,
+        ))
+        .layer(DefaultBodyLimit::max(stix_envelope));
+
     public
         .merge(protected)
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(DefaultBodyLimit::max(body_limit))
         .merge(import_routes)
+        .merge(stix_import_routes)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             rate_limit::rate_limit,

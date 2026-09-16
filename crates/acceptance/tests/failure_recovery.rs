@@ -261,6 +261,7 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, search: Option<SearchS
         rate_limit_per_second: 1_000,
         request_body_limit_bytes: 1_048_576,
         import_config: ImportSection::default(),
+        stix_config: core_config::StixSection::default(),
         object_bucket: stack.bucket.clone(),
         rate_limiter: RateLimiter::new(1_000),
     };

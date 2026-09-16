@@ -109,6 +109,11 @@ pub fn test_app_with_backends(
             max_upload_bytes: 4_096,
             ..core_config::ImportSection::default()
         },
+        // 測試用小上限：不需要為了驗證 413 真的傳 50 MiB／一萬個物件進來。
+        stix_config: core_config::StixSection {
+            max_bundle_bytes: 4_096,
+            max_objects: 2,
+        },
         rate_limiter: RateLimiter::new(100),
     };
     (router(state), audit, tokens)

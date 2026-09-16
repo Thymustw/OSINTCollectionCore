@@ -200,6 +200,7 @@ fn build_api_with_backends(
             max_upload_bytes: MAX_BODY_BYTES,
             ..ImportSection::default()
         },
+        stix_config: core_config::StixSection::default(),
         object_bucket: stack.bucket.clone(),
         rate_limiter: RateLimiter::new(1_000),
     };

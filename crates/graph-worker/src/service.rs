@@ -1000,7 +1000,10 @@ mod tests {
         h.db.put_relationship(&rel).await.unwrap();
 
         let jobs = JobService::new(h.db.clone(), None);
-        let job = jobs.create(GRAPH_REBUILD_JOB_TYPE, None).await.unwrap();
+        let job = jobs
+            .create(GRAPH_REBUILD_JOB_TYPE, None, None)
+            .await
+            .unwrap();
         assert_eq!(job.status, JobStatus::Queued);
 
         let outcome = h
@@ -1031,7 +1034,10 @@ mod tests {
         // 才能斷言狀態真的走到 Failed 而不是卡在 Running。
         let jobs_harness = open_harness().await;
         let jobs = JobService::new(jobs_harness.db.clone(), None);
-        let job = jobs.create(GRAPH_REBUILD_JOB_TYPE, None).await.unwrap();
+        let job = jobs
+            .create(GRAPH_REBUILD_JOB_TYPE, None, None)
+            .await
+            .unwrap();
 
         let root = find_workspace_root().expect("workspace root");
         let broken_path: PathBuf = root.join(format!(

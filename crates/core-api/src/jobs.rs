@@ -148,10 +148,11 @@ async fn create_job_inner(state: &AppState, body: CreateJobBody) -> Result<Job, 
     }
     let jobs = jobs_or_unavailable(state)?;
     let job = if body.dispatch {
-        jobs.create_and_dispatch(body.job_type, body.correlation_id)
+        jobs.create_and_dispatch(body.job_type, body.correlation_id, None)
             .await?
     } else {
-        jobs.create(body.job_type, body.correlation_id).await?
+        jobs.create(body.job_type, body.correlation_id, None)
+            .await?
     };
     Ok(job)
 }

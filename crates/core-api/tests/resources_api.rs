@@ -54,6 +54,7 @@ fn read_paths() -> Vec<String> {
         format!("/api/v1/graph/entities/{id}/neighbors"),
         format!("/api/v1/graph/entities/{id}/relationships"),
         format!("/api/v1/graph/path?from={id}&to={id}&max_hops=2"),
+        format!("/api/v1/jobs/{id}/result"),
     ]
 }
 
@@ -105,6 +106,12 @@ fn write_requests() -> Vec<(&'static str, String, Value)> {
             json!({}),
         ),
         ("POST", "/api/v1/graph/rebuild".into(), json!({})),
+        (
+            "POST",
+            "/api/v1/import/stix".into(),
+            json!({"source_id": id, "bundle": {"type": "bundle"}}),
+        ),
+        ("POST", "/api/v1/export/stix".into(), json!({"filter": {}})),
     ]
 }
 

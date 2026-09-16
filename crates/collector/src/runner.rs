@@ -178,7 +178,10 @@ impl CollectorRunner {
         let domain = domain_of(&source);
         let _permit = self.bounds.acquire(&domain).await;
 
-        let job = self.jobs.create("collect", Some(connector.id)).await?;
+        let job = self
+            .jobs
+            .create("collect", Some(connector.id), None)
+            .await?;
         if let Err(err) = self.jobs.transition(job.id, JobStatus::Running, None).await {
             tracing::warn!(error = %err, job_id = %job.id, "job 轉 running 失敗，仍繼續收集");
         }

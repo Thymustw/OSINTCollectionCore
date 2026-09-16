@@ -147,6 +147,13 @@ max_field_bytes = 65536
 max_depth = 32
 max_columns = 512
 
+# STIX 2.1 匯入／匯出上限（POST /api/v1/import/stix、POST /api/v1/export/stix）。
+# 跟 [http].request_body_limit_bytes 是兩條獨立界線：一般 API body 維持 1 MiB，
+# STIX bundle 另外給 50 MiB，不放寬其他路由。
+[stix]
+max_bundle_bytes = 52428800
+max_objects = 10000
+
 # Embedding 產生參數（V0.2 Phase 3）。OpenSearch 連線沿用 [storage.search].url，
 # 不要在這裡再放一份 URL。
 [embedding]

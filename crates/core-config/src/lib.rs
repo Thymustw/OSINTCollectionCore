@@ -45,6 +45,8 @@ pub struct AppConfig {
     pub search_hybrid: HybridSearchSection,
     #[serde(default)]
     pub auto_approval: AutoApprovalSection,
+    #[serde(default)]
+    pub stix: StixSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +423,27 @@ impl Default for ImportSection {
             max_field_bytes: 65_536,
             max_depth: 32,
             max_columns: 512,
+        }
+    }
+}
+
+/// STIX 2.1 Adapter（SPEC_V0.2 §18-19）的匯入／匯出限制。
+///
+/// 跟 `[http].request_body_limit_bytes` 是兩條獨立界線：一般 API 的 JSON
+/// body 維持 1 MiB，STIX bundle 另外給 50 MiB，不放寬其他路由。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StixSection {
+    /// STIX bundle 上傳大小上限（bytes）。超過回 413。
+    pub max_bundle_bytes: u64,
+    /// bundle 裡 `objects` 陣列的數量上限。超過回 413。
+    pub max_objects: usize,
+}
+
+impl Default for StixSection {
+    fn default() -> Self {
+        Self {
+            max_bundle_bytes: 50 * 1024 * 1024,
+            max_objects: 10_000,
         }
     }
 }
@@ -855,6 +878,8 @@ mod tests {
         assert_eq!(cfg.auto_approval.llm.max_tokens, 512);
         assert_eq!(cfg.auto_approval.llm.temperature, 0.0);
         assert!(cfg.auto_approval.thresholds_are_sane());
+        assert_eq!(cfg.stix.max_bundle_bytes, 50 * 1024 * 1024);
+        assert_eq!(cfg.stix.max_objects, 10_000);
     }
 
     #[test]

@@ -1396,8 +1396,8 @@ impl RelationalStore for PostgresCanonicalStore {
             r#"
             INSERT INTO jobs (
                 id, "type", status, correlation_id, created_at, started_at, completed_at,
-                retry_count, error
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                retry_count, error, parameters
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (id) DO UPDATE SET
                 "type" = EXCLUDED."type",
                 status = EXCLUDED.status,
@@ -1406,7 +1406,8 @@ impl RelationalStore for PostgresCanonicalStore {
                 started_at = EXCLUDED.started_at,
                 completed_at = EXCLUDED.completed_at,
                 retry_count = EXCLUDED.retry_count,
-                error = EXCLUDED.error
+                error = EXCLUDED.error,
+                parameters = EXCLUDED.parameters
             "#,
         )
         .bind(job.id)
@@ -1418,6 +1419,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(job.completed_at)
         .bind(job.retry_count)
         .bind(&job.error)
+        .bind(job.parameters.clone())
         .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;

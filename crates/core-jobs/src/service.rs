@@ -33,6 +33,7 @@ impl<S: RelationalStore> JobService<S> {
         &self,
         job_type: impl Into<String>,
         correlation_id: Option<Uuid>,
+        parameters: Option<serde_json::Value>,
     ) -> Result<Job, JobError> {
         let now = Utc::now();
         let job = Job {
@@ -45,6 +46,7 @@ impl<S: RelationalStore> JobService<S> {
             completed_at: None,
             retry_count: 0,
             error: None,
+            parameters,
         };
         self.store.put_job(&job).await?;
         Ok(job)
@@ -152,6 +154,7 @@ impl<S: RelationalStore> JobService<S> {
                         "job_type": job.job_type,
                         "status": job.status,
                         "retry_count": job.retry_count,
+                        "parameters": job.parameters,
                     }),
                 )
                 .await?;
@@ -163,8 +166,9 @@ impl<S: RelationalStore> JobService<S> {
         &self,
         job_type: impl Into<String>,
         correlation_id: Option<Uuid>,
+        parameters: Option<serde_json::Value>,
     ) -> Result<Job, JobError> {
-        let job = self.create(job_type, correlation_id).await?;
+        let job = self.create(job_type, correlation_id, parameters).await?;
         self.dispatch(job.id).await
     }
 }

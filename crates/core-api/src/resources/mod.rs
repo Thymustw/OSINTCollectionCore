@@ -50,6 +50,7 @@ pub mod raw;
 pub mod relationships;
 pub mod similar;
 pub mod sources;
+pub mod stix;
 
 use axum::http::{HeaderMap, StatusCode, header};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -82,6 +83,7 @@ pub use graph::AUDIT_GRAPH_REBUILD;
 pub use merge::{
     AUDIT_ENTITY_MERGE, AUDIT_ENTITY_RESOLVE, AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT, AUDIT_MERGE_UNDO,
 };
+pub use stix::{AUDIT_STIX_EXPORT, AUDIT_STIX_IMPORT};
 
 /// canonical store handle。沒接上 Postgres 時回 503。
 pub(crate) fn store(state: &AppState) -> Result<&SharedStore, ApiError> {
