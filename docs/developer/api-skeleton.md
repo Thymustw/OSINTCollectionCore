@@ -48,7 +48,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/entities/{id}` | viewer | 200 | 含關聯數與抽取紀錄 |
 | GET | `/api/v1/entities/{id}/resolution-candidates` | viewer | 200 | cursor 分頁；`?status=` |
 | GET | `/api/v1/entities/{id}/merge-history` | viewer | 200 | 含已撤銷的 merge |
-| POST | `/api/v1/entities/{id}/resolve` | operator | 200 | 跑只需要 Postgres 的掃描方法，回這次新寫入的候選 |
+| POST | `/api/v1/entities/{id}/resolve` | operator | 200 | 跑只需要 Postgres 的掃描方法，回這次新寫入的候選；若 `auto_approval.enabled=true`，成功後額外評估全部 Pending 候選並可能自動 merge（ADR-012） |
 | POST | `/api/v1/entities/{id}/resolve/graph-context` | operator | 200 | graph_context；Neo4j 沒接上回 503，不影響上一條 |
 | POST | `/api/v1/entities/merge` | operator | 200 | body：`survivor_id`／`merged_id`／`reason` |
 | POST | `/api/v1/merge-history/{id}/undo` | operator | 204 | 重複 undo 回 409 |
@@ -313,6 +313,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 路由 `POST /entities/{id}/resolve/graph-context`（接 `storage-neo4j`；沒接上
 回 503，不影響上一條）。完整理由見 `docs/developer/resolver.md`。
 merge 行為見 `docs/developer/merge.md`。
+
+若 `auto_approval.enabled=true`，`POST /entities/{id}/resolve` 成功後還會評估
+這個 Entity 所有 Pending 候選（含之前由 entity-worker 寫入的 `exact_identifier` 候選），
+高信心的直接自動 merge，中間帶的送 LLM 判斷。稽核 `metadata` 含
+`auto_merged_pairs` 與 `auto_merged_history_ids`。
+完整說明見 `docs/developer/auto-approval.md`（ADR-012）。
 
 ### Graph
 

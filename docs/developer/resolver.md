@@ -380,8 +380,10 @@ resolution_candidate_from_identifier_conflict(
 見 `docs/developer/schema-v0.2.md`）。
 
 - `score = 0.95`、`method = "exact_identifier"`、`trigger = "write_conflict"`。
-- 0.95 高到值得進 Review，但不到自動合併：SPEC 禁止只因同 username 就判定
-  同一真實人物，namespace 衝突同樣可能是帳號共用或資料髒了。
+- 0.95 正好等於 ADR-012 的預設 `auto_confirm_score`。當 `auto_approval.enabled=true`
+  時，`POST /api/v1/entities/{id}/resolve` 的 handler 會額外撈這個 Entity 全部
+  Pending 候選——包含 entity-worker 之前寫入的 `exact_identifier` 候選——然後觸發
+  高信心自動核准並 merge。功能預設關閉，啟用與操作方式見 `docs/developer/auto-approval.md`。
 
 **entity-worker 是第一個呼叫端。** `upsert_entity` 對 Domain／Ip／Url／Email／CVE
 以及 Account（per-platform `{platform}_handle`）寫 `entity_identifiers`，

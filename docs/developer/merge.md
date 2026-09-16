@@ -14,8 +14,13 @@ crates/merge    函式庫；HTTP 入口在 osint-api
 MergeService<S: TransactionalStore>
   new(store, producer: Option<Arc<EventProducer>>)
   execute_merge(survivor_id, merged_id, reason, operator) -> Result<MergeHistory, MergeError>
+  execute_merge_with_audit(survivor_id, merged_id, reason, operator, audit) -> Result<MergeHistory, MergeError>
   undo_merge(merge_history_id) -> Result<(), MergeError>
 ```
+
+`execute_merge` 是人工 merge 的入口（`audit = None`），內部轉呼叫 `execute_merge_with_audit`。
+`execute_merge_with_audit` 是 ADR-012 自動核准的入口，`audit` 帶 `auto_approval_audit` JSON。
+兩條路徑的 merge 邏輯完全相同，差別只在 `merge_history.auto_approval_audit` 是否為 `NULL`。
 
 用具體型別參數，不包 `Arc<dyn TransactionalStore>`：`TransactionalStore::begin` 已經回 `Box<dyn Transaction>`，再包一層 dyn 沒有 object-safety 收益。
 
@@ -57,6 +62,25 @@ tx.commit()
 時整段跳過。發送失敗只記 error，不讓 merge／undo 本身失敗——canonical store
 已經改完，重跑 `execute_merge` 會被 `AlreadyMerged` 擋住。
 
+## 自動核准 merge 與人工 merge 的差異
+
+兩者的資料改寫邏輯完全一樣（都走 `execute_merge_with_audit`），差別在以下三點：
+
+| 面向 | 人工 merge | 自動核准 merge（ADR-012） |
+|---|---|---|
+| 入口 | `POST /api/v1/entities/merge` | `POST /api/v1/entities/{id}/resolve` 後自動觸發 |
+| `merge_history.operator` | JWT subject（例如 `"alice@example.com"`） | `"resolver:auto_confirm"`（或 `"stix_import:auto_confirm"`） |
+| `merge_history.auto_approval_audit` | `NULL` | 非 `NULL`：含決策路徑、分數、門檻快照、LLM 記錄 |
+
+`operator` 不是 JWT subject 代表：查「這次 merge 是誰決定的」時，
+答案是「系統依 `auto_approval.auto_confirm_score`／`llm_review_score` 自動判定」。
+稽核查詢 `WHERE operator = 'resolver:auto_confirm'` 可列出所有自動核准 merge。
+
+自動核准的 merge 完全支援 `undo_merge`（`POST /api/v1/merge-history/{id}/undo`）——
+沒有為它另做一套復原機制。
+
+完整操作指南見 `docs/developer/auto-approval.md`。
+
 ## `execute_merge` 做什麼
 
 1. 收集 merged Entity 的 relationship／alias／identifier／extraction，以及 survivor 的 relationship（用來判斷撞號）。
@@ -67,8 +91,8 @@ tx.commit()
 6. alias／identifier／extraction 的 `entity_id` 改成 survivor。
 7. `merged.merged_into = Some(survivor_id)`（**不刪** merged 那一列）。
 8. 寫 `MergeHistory`（含 `repointed_references` 與 `merged_relationships`）。
-   人工 merge 的 `auto_approval_audit` 是 `None`（ADR-012 Step 0 已認得這個欄位，
-   自動核准寫入者還沒接上）。
+   人工 merge 的 `auto_approval_audit` 是 `NULL`；自動核准 merge（ADR-012）的欄位
+   包含決策路徑、分數、門檻快照，以及 LLM 路徑的完整 prompt 與回應。
 
 ## 碰撞分類
 

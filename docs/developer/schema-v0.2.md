@@ -243,21 +243,25 @@ Stage 1-4 的方法不靠模型，欄位是 `NULL`；Stage 5 才填。
 |---|---|---|
 | `merge_history.auto_approval_audit` | `JSONB NULL` / `TEXT NULL` | AI 輔助自動核准的完整稽核記錄。`NULL` = 人工 merge（向下相容） |
 
-JSON schema 由之後的 `resolver::auto_approval` 定義（`core-model` 不 import
+JSON schema 由 `resolver::auto_approval` 定義（`core-model` 不 import
 那個 crate，避免循環相依，所以 `MergeHistory.auto_approval_audit` 的型別是
-`Option<serde_json::Value>`）。Step 0 **只認得這個欄位**，還沒有任何寫入者
-會填非 `NULL` 的值——自動核准邏輯是後面的 Step。
+`Option<serde_json::Value>`）。完整 schema 見 `docs/developer/auto-approval.md`。
+
+`NULL` = 人工 merge（向下相容）。自動核准 merge 的 `auto_approval_audit` 非 `NULL`，
+包含觸發方法、分數、當時門檻快照，以及（若走 LLM 路徑）完整 prompt 與回應。
 
 對應 `RelationalStore::update_resolution_candidate_status`：更新一筆
-resolution candidate 的 `status` 與 `reviewed_at`，回 `true`／`false`
-（比照 `mark_replayed`，id 不存在不是 `NotFound`）。這支方法現在也還沒有
-生產呼叫端。
+resolution candidate 的 `status`（`Pending` → `AutoConfirmed`）與 `reviewed_at`，
+回 `true`／`false`（比照 `mark_replayed`，id 不存在不是 `NotFound`）。
+生產呼叫端是 `resolver::auto_approval::AutoApprovalEvaluator::mark_candidates_auto_confirmed`，
+在 merge 成功後批次更新這對 Entity 的所有 Pending 候選。
 
 設定在 `config/default.toml` 的 `[auto_approval]`（`AutoApprovalSection`，
 巢狀 `[auto_approval.llm]` 對應 `AutoApprovalLlmSection`），
 **預設 `enabled = false`**。門檻是否自洽（`auto_confirm_score >= llm_review_score`）
-由 `AutoApprovalSection::thresholds_are_sane()` 判斷；這個 crate 不依賴
-`tracing`，真正的警告／強制關閉留給組裝端（Step 4）處理。
+由 `AutoApprovalSection::thresholds_are_sane()` 判斷；不自洽時 `core-api` 組裝端
+記 `tracing::error!` 並強制停用，所有候選維持 Pending。
+完整欄位說明與啟用方式見 `docs/developer/auto-approval.md`。
 
 ## 對照 V0.1 的 `/ops/dlq`
 

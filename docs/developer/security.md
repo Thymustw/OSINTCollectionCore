@@ -128,7 +128,7 @@ Cargo.toml 與 deny/audit 面，而且要各自維護一份連線池與 `map_sql
 | `connector.create` / `connector.update` | `connector` | 成功與失敗都寫 |
 | `collection.create` | `collection` | 成功與失敗都寫 |
 | `object.create` | `object` | 每次（V0.1 一律是 `rejected` + 501，見 ADR-006） |
-| `entity.resolve` | `entity` | 成功與失敗都寫 |
+| `entity.resolve` | `entity` | 成功與失敗都寫；`metadata` 含 `auto_merged_pairs`、`auto_merged_history_ids`（ADR-012） |
 | `entity.resolve_graph_context` | `entity` | 成功與失敗都寫 |
 | `entity.merge` | `entity` | 成功與失敗都寫（含空 `reason` 被拒） |
 | `merge.undo` | `merge_history` | 成功與失敗都寫 |
@@ -140,6 +140,12 @@ Cargo.toml 與 deny/audit 面，而且要各自維護一份連線池與 `map_sql
 
 **失敗也寫**：只記成功的話，「誰一直試圖把已完成的 job 轉回 running」「有人拿撤銷的
 token 敲了三千次」這類訊號完全看不到。
+
+**稽核查詢注意：`merge_history.operator` 不一定是 JWT subject。**
+ADR-012 自動核准的 merge，`operator` 是 `"resolver:auto_confirm"` 或
+`"stix_import:auto_confirm"`（非人工），不是發出 API 請求的使用者 JWT subject。
+查「哪些 merge 沒有人看過」可用：`WHERE operator LIKE '%:auto_confirm'`。
+完整說明見 `docs/developer/auto-approval.md`。
 
 **成功的唯讀請求不寫**（`crates/core-api/tests/audit_api.rs` 有斷言擋住）：
 每次輪詢 `GET /api/v1/jobs` 都長一列的話，稽核表會被正常流量灌爆，

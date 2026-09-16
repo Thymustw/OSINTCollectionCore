@@ -211,7 +211,7 @@ DLQ 重放仍沒有生產呼叫端。graph-worker（`osint-graph-worker`）是 `
 | `put_resolution_candidate` / `get_resolution_candidate` | 依主鍵 upsert；CHECK `a < b` + UNIQUE `(a, b, method)` |
 | `list_resolution_candidates(status, after, limit)` | `id DESC`，cursor；`status` **在 SQL 裡**過濾，`None` = 不過濾 |
 | `list_resolution_candidates_by_entity(entity_id, status, after, limit)` | `id DESC`，cursor；`entity_a_id` **或** `entity_b_id` 命中都算；`status` 在 SQL 裡過濾 |
-| `update_resolution_candidate_status(id, status, reviewed_at)` | 更新 `status` 與 `reviewed_at`；回 `true`／`false`（比照 `mark_replayed`）。ADR-012 Step 0 先建 port，還沒有生產呼叫端 |
+| `update_resolution_candidate_status(id, status, reviewed_at)` | 更新 `status` 與 `reviewed_at`；回 `true`／`false`（比照 `mark_replayed`）。生產呼叫端是 `resolver::auto_approval`，merge 成功後批次把這對 Entity 的 Pending 候選標為 `AutoConfirmed` |
 | `put_merge_history` / `get_merge_history` | 依主鍵 upsert；含 `auto_approval_audit`（`NULL` = 人工 merge） |
 | `list_merge_history_by_entity(entity_id, limit)` | `id DESC`；`survivor_id` **或** `merged_id` 命中都算 |
 | `put_failed_event(event) -> FailedEvent` | 自然鍵 `(topic, partition, offset)` upsert，**回傳實際存下來的那一列** |
