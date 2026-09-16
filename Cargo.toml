@@ -15,6 +15,7 @@ members = [
     "crates/storage-redis",
     "crates/storage-s3",
     "crates/storage-neo4j",
+    "crates/stix-adapter",
     "crates/connector-sdk",
     "crates/connector-rss",
     "crates/connector-static-web",
@@ -120,6 +121,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "json",
 ] }
 storage-core = { path = "crates/storage-core" }
+stix-adapter = { path = "crates/stix-adapter" }
 ai-gateway = { path = "crates/ai-gateway" }
 # 穩定版。不要用 0.9.0-rc*：RC 的 API／MSRV 會漂，workspace 鎖 1.85。
 neo4rs = "0.8.0"

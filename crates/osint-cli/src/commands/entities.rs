@@ -37,7 +37,7 @@ async fn list(ctx: &Context, args: ListArgs, entity_type: Option<String>) -> Res
                     message: format!(
                         "`{raw}` 不是有效的 entity type。可用值：person, organization, account, \
                      domain, hostname, ip, url, email, vulnerability, software, repository, \
-                     hash, location"
+                     hash, location, threat_actor, malware, indicator"
                     ),
                 }
             })?,

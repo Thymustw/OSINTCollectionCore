@@ -13,6 +13,7 @@ pub enum SourceType {
     ManualUpload,
     JsonImport,
     CsvImport,
+    StixImport,
 }
 
 /// Canonical document 種類（SPEC §9）。
@@ -45,6 +46,9 @@ pub enum EntityType {
     Repository,
     Hash,
     Location,
+    ThreatActor,
+    Malware,
+    Indicator,
 }
 
 /// Relationship 種類（SPEC §11）。
@@ -64,6 +68,10 @@ pub enum RelationshipType {
     LocatedAt,
     AssociatedWith,
     DerivedFrom,
+    Indicates,
+    AttributedTo,
+    Targets,
+    Mitigates,
 }
 
 /// Job 狀態（SPEC §21）。

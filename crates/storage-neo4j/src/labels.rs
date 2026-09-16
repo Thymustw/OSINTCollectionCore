@@ -8,7 +8,7 @@ use core_model::RelationshipType;
 use storage_core::StorageError;
 
 /// Neo4j 5.26 Community 對 relationship uniqueness constraint 必須綁
-/// **特定關聯型別**。只對 `core_model::RelationshipType` 的 13 個變體建
+/// **特定關聯型別**。只對 `core_model::RelationshipType` 的 17 個變體建
 /// constraint；執行期才出現的未知型別靠 MERGE pattern 保證冪等。
 pub const KNOWN_RELATIONSHIP_TYPES: &[&str] = &[
     "MENTIONS",
@@ -24,6 +24,10 @@ pub const KNOWN_RELATIONSHIP_TYPES: &[&str] = &[
     "LOCATED_AT",
     "ASSOCIATED_WITH",
     "DERIVED_FROM",
+    "INDICATES",
+    "ATTRIBUTED_TO",
+    "TARGETS",
+    "MITIGATES",
 ];
 
 /// 讓 `RelationshipType` 新增變體時這裡編譯失敗，才不會漏建 constraint。
@@ -43,6 +47,10 @@ pub(crate) fn relationship_type_cypher_name(t: RelationshipType) -> &'static str
         RelationshipType::LocatedAt => "LOCATED_AT",
         RelationshipType::AssociatedWith => "ASSOCIATED_WITH",
         RelationshipType::DerivedFrom => "DERIVED_FROM",
+        RelationshipType::Indicates => "INDICATES",
+        RelationshipType::AttributedTo => "ATTRIBUTED_TO",
+        RelationshipType::Targets => "TARGETS",
+        RelationshipType::Mitigates => "MITIGATES",
     }
 }
 
@@ -199,6 +207,10 @@ mod tests {
             LocatedAt,
             AssociatedWith,
             DerivedFrom,
+            Indicates,
+            AttributedTo,
+            Targets,
+            Mitigates,
         ]
         .into_iter()
         .map(relationship_type_cypher_name)

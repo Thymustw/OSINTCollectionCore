@@ -152,7 +152,11 @@ fn is_identity_type(entity_type: EntityType) -> bool {
         | EntityType::Vulnerability
         | EntityType::Software
         | EntityType::Repository
-        | EntityType::Location => false,
+        | EntityType::Location
+        // STIX 對應的三種：名字是顯示名稱，不是識別碼本身，語意相近仍有意義。
+        | EntityType::ThreatActor
+        | EntityType::Malware
+        | EntityType::Indicator => false,
     }
 }
 

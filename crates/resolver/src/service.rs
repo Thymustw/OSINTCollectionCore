@@ -13,9 +13,10 @@ use crate::identifier_methods::{check_account_handle, check_alias, check_domain}
 use crate::persist::persist_candidate;
 use crate::semantic::check_semantic_similarity;
 
-/// SPEC §10 的 13 種 EntityType。新增變體時下面的 match 會編譯失敗，
-/// 強迫 resolver 決定要不要把新型別納入 `normalized_name` 掃描。
-pub const ALL_ENTITY_TYPES: [EntityType; 13] = [
+/// SPEC §10 的既有型別加上 STIX 對應的 ThreatActor／Malware／Indicator。
+/// 新增變體時下面的 match 會編譯失敗，強迫 resolver 決定要不要把新型別
+/// 納入 `normalized_name` 掃描。
+pub const ALL_ENTITY_TYPES: [EntityType; 16] = [
     EntityType::Person,
     EntityType::Organization,
     EntityType::Account,
@@ -29,6 +30,9 @@ pub const ALL_ENTITY_TYPES: [EntityType; 13] = [
     EntityType::Repository,
     EntityType::Hash,
     EntityType::Location,
+    EntityType::ThreatActor,
+    EntityType::Malware,
+    EntityType::Indicator,
 ];
 
 /// 新增 [`EntityType`] 變體時這個 match 會編譯失敗，強迫更新 [`ALL_ENTITY_TYPES`]。
@@ -46,7 +50,10 @@ const fn assert_entity_type_known(t: EntityType) {
         | EntityType::Software
         | EntityType::Repository
         | EntityType::Hash
-        | EntityType::Location => {}
+        | EntityType::Location
+        | EntityType::ThreatActor
+        | EntityType::Malware
+        | EntityType::Indicator => {}
     }
 }
 
@@ -1053,7 +1060,7 @@ mod tests {
         assert_eq!(
             queried.len(),
             ALL_ENTITY_TYPES.len() - 1,
-            "應掃過其餘 12 種 type，實際 {queried:?}"
+            "應掃過其餘 type，實際 {queried:?}"
         );
     }
 

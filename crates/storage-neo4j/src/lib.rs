@@ -18,7 +18,7 @@
 //! - 動態 label：Neo4j 5.26 支援 `n:$($label)`／`SET n:$($label)`／`REMOVE n:$($old)`
 //!   （與關聯型別 `$($relType)` 同一組擴充）。本機 Community 無 APOC，不走
 //!   `apoc.create.addLabels`。label 字串經過 [`sanitize_label`] 才進 query。
-//! - relationship unique constraint 只對 [`KNOWN_RELATIONSHIP_TYPES`] 13 種建；
+//! - relationship unique constraint 只對 [`KNOWN_RELATIONSHIP_TYPES`] 17 種建；
 //!   執行期未知型別靠 `MERGE (s)-[r:$($relType)]->(t)` 保證同一對同一型別只有一條。
 //!
 //! # ProjectionStore
@@ -97,7 +97,7 @@ impl Neo4jStore {
         Ok(store)
     }
 
-    /// `CREATE CONSTRAINT IF NOT EXISTS`：`:Entity.entity_id` 與 13 種已知
+    /// `CREATE CONSTRAINT IF NOT EXISTS`：`:Entity.entity_id` 與 17 種已知
     /// 關聯型別的 `relationship_id` uniqueness。重複呼叫安全。
     pub async fn ensure_constraints(&self) -> Result<(), StorageError> {
         self.run(
@@ -121,10 +121,14 @@ impl Neo4jStore {
             LocatedAt,
             AssociatedWith,
             DerivedFrom,
+            Indicates,
+            AttributedTo,
+            Targets,
+            Mitigates,
         ]
         .map(relationship_type_cypher_name);
         for rel in known {
-            // constraint 名稱含型別，避免 13 條撞名。
+            // constraint 名稱含型別，避免 17 條撞名。
             let cypher = format!(
                 "CREATE CONSTRAINT rel_id_unique_{rel} IF NOT EXISTS \
                  FOR ()-[r:{rel}]-() REQUIRE r.relationship_id IS UNIQUE"

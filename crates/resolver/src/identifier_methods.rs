@@ -201,6 +201,10 @@ const fn relationship_type_str(t: RelationshipType) -> &'static str {
         RelationshipType::LocatedAt => "located_at",
         RelationshipType::AssociatedWith => "associated_with",
         RelationshipType::DerivedFrom => "derived_from",
+        RelationshipType::Indicates => "indicates",
+        RelationshipType::AttributedTo => "attributed_to",
+        RelationshipType::Targets => "targets",
+        RelationshipType::Mitigates => "mitigates",
     }
 }
 

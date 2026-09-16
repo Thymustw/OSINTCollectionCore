@@ -962,6 +962,10 @@ pub fn identifier_namespace_for(entity_type: EntityType) -> Option<&'static str>
         EntityType::Url => Some("url"),
         EntityType::Email => Some("email"),
         EntityType::Vulnerability => Some("cve"),
+        // Person／Organization／Account／Hash／Hostname／Software／Repository／
+        // Location，以及 STIX 對應的 ThreatActor／Malware／Indicator：name
+        // 是顯示名稱，不是命名空間內唯一鍵。這一步沒有 STIX 匯入寫入者，
+        // 不發明 identifier namespace。
         _ => None,
     }
 }
@@ -1212,6 +1216,9 @@ mod tests {
         assert_eq!(identifier_namespace_for(EntityType::Software), None);
         assert_eq!(identifier_namespace_for(EntityType::Repository), None);
         assert_eq!(identifier_namespace_for(EntityType::Location), None);
+        assert_eq!(identifier_namespace_for(EntityType::ThreatActor), None);
+        assert_eq!(identifier_namespace_for(EntityType::Malware), None);
+        assert_eq!(identifier_namespace_for(EntityType::Indicator), None);
     }
 
     fn account_entity(

@@ -1,0 +1,15 @@
+[package]
+name = "stix-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "STIX 2.1 型別定義、驗證、與 Core Object 的雙向映射（SPEC_V0.2 §18-19）。手刻型別，不依賴外部 STIX crate。"
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
