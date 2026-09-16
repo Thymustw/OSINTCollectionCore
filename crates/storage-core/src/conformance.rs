@@ -1013,6 +1013,10 @@ async fn assert_dedup_queries<S: RelationalStore>(
 ///    少一筆就少還原一個參照（SPEC Acceptance C）。
 /// 5. `merged_into` 與 `merged_relationships` 原樣讀得回來（Phase 1e）。
 ///    漏掉的話下一棒 merge 實作寫進去、讀出來卻永遠是空，而且不會報錯。
+/// 6. `update_resolution_candidate_status` 真的改到列、不存在的 id 回 false
+///    （ADR-012 Step 0）。漏掉的話下一棒自動核准寫進去、讀出來卻永遠是 Pending。
+/// 7. `auto_approval_audit` 原樣讀得回來（ADR-012 Step 0）。漏掉的話稽核 JSON
+///    寫進去讀出來永遠是 None，出事時分不出哪些合併沒有人類看過。
 async fn assert_v0_2_resolution_queries<S: RelationalStore>(
     store: &S,
     entity: &Entity,
@@ -1080,12 +1084,18 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
 
     // --- §4 identifier ----------------------------------------------------
     let namespace = format!("conformance-ns-{run}");
+    // `normalized_value` 必須帶 run id：conformance 不 TRUNCATE 共用表，
+    // `find_entity_identifiers_by_normalized_value` 的 limit 夾在 1..=100，
+    // 固定用 `example.com` 時舊列累積超過 100 筆，新列就被 ASC LIMIT 擠掉，
+    // 看起來像「剛寫入的識別碼查不到」。2026-09-16 本機 Postgres 實測
+    // `normalized_value = 'example.com'` 已有 102 列。
+    let normalized_value = format!("example.com-{run}");
     let identifier = EntityIdentifier {
         id: Uuid::now_v7(),
         entity_id: entity.id,
         namespace: namespace.clone(),
-        value: "Example.COM".into(),
-        normalized_value: "example.com".into(),
+        value: format!("Example.COM-{run}"),
+        normalized_value: normalized_value.clone(),
         confidence: 0.95,
         source_id: None,
         first_seen: fixture_ts(),
@@ -1142,7 +1152,7 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
     // 反查既有 owner：UNIQUE (namespace, normalized_value) 保證最多一筆。
     // 兩個欄位都要比到——只比其中一個會讓 resolver 把別人的識別碼當成自己的。
     let owner = store
-        .find_entity_identifier_owner(&namespace, "example.com")
+        .find_entity_identifier_owner(&namespace, &normalized_value)
         .await?
         .ok_or_else(|| StorageError::NotFound {
             message: "find_entity_identifier_owner 查不到剛寫入的識別碼".into(),
@@ -1159,7 +1169,7 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
         });
     }
     if store
-        .find_entity_identifier_owner(&format!("{namespace}-absent"), "example.com")
+        .find_entity_identifier_owner(&format!("{namespace}-absent"), &normalized_value)
         .await?
         .is_some()
     {
@@ -1173,7 +1183,7 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
     // 不限 namespace：同一個 normalized_value 掛在兩個 namespace 下都要回。
     // 這是 account_handle 的查詢形狀，不是 exact_identifier 的精確 owner 查詢。
     let by_value = store
-        .find_entity_identifiers_by_normalized_value("example.com", 100)
+        .find_entity_identifiers_by_normalized_value(&normalized_value, 100)
         .await?;
     if !by_value.iter().any(|i| i.id == identifier.id) {
         return Err(StorageError::NotFound {
@@ -1540,6 +1550,51 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
         });
     }
 
+    // ADR-012 Step 0：`update_resolution_candidate_status` 必須真的改到列，
+    // 不存在的 id 回 false（比照 mark_replayed）。這支方法現在還沒有生產呼叫端，
+    // 漏掉的話下一棒自動核准會寫進去、讀出來卻永遠是 Pending，而且不會報錯。
+    let reviewed_at = fixture_ts() + chrono::Duration::seconds(30);
+    if !store
+        .update_resolution_candidate_status(
+            hit_as_a.id,
+            ResolutionStatus::AutoConfirmed,
+            reviewed_at,
+        )
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_resolution_candidate_status 對既有列應回 true".into(),
+        });
+    }
+    let after_status = store
+        .get_resolution_candidate(hit_as_a.id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "剛更新 status 的 resolution_candidate 讀不到".into(),
+        })?;
+    if after_status.status != ResolutionStatus::AutoConfirmed
+        || after_status.reviewed_at != Some(reviewed_at)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "update_resolution_candidate_status 之後 status 應為 auto_confirmed、\
+                 reviewed_at 應為呼叫端傳入的時間，實際是 status={:?} reviewed_at={:?}",
+                after_status.status, after_status.reviewed_at
+            ),
+        });
+    }
+    if store
+        .update_resolution_candidate_status(Uuid::now_v7(), ResolutionStatus::Rejected, reviewed_at)
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_resolution_candidate_status 對不存在的 id 應回 false".into(),
+        });
+    }
+
     // --- §7 merge history -------------------------------------------------
     let history = MergeHistory {
         id: Uuid::now_v7(),
@@ -1564,6 +1619,7 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
         ],
         merged_relationships: Vec::new(),
         undone_at: None,
+        auto_approval_audit: None,
     };
     store.put_merge_history(&history).await?;
     // repointed_references 是 undo 的全部依據：少一筆或順序錯掉都會少還原一個參照。
@@ -1688,6 +1744,29 @@ async fn assert_v0_2_resolution_queries<S: RelationalStore>(
             .await?
             .ok_or_else(|| StorageError::NotFound {
                 message: "剛寫入 merged_relationships 的 merge_history 讀不到".into(),
+            })?,
+    );
+
+    // ADR-012 Step 0：`auto_approval_audit` 必須能寫進去讀出來。
+    // 漏掉的話下一棒自動核准會把稽核 JSON 寫進去、讀出來卻永遠是 None，
+    // 而且不會報錯——出事時分不出哪些合併沒有人類看過。
+    let with_audit = MergeHistory {
+        auto_approval_audit: Some(json!({
+            "decision_path": "score",
+            "score": 0.95,
+            "method": "exact_identifier",
+        })),
+        ..with_merged_rels.clone()
+    };
+    store.put_merge_history(&with_audit).await?;
+    assert_eq_debug(
+        "merge_history_auto_approval_audit",
+        &with_audit,
+        &store
+            .get_merge_history(history.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入 auto_approval_audit 的 merge_history 讀不到".into(),
             })?,
     );
 

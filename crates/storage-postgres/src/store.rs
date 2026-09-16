@@ -1990,6 +1990,24 @@ impl RelationalStore for PostgresCanonicalStore {
         rows.iter().map(mapping::resolution_candidate).collect()
     }
 
+    async fn update_resolution_candidate_status(
+        &self,
+        id: ResolutionCandidateId,
+        status: ResolutionStatus,
+        reviewed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE resolution_candidates SET status = $2, reviewed_at = $3 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(encode_enum(&status)?)
+        .bind(reviewed_at)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn put_merge_history(&self, history: &MergeHistory) -> Result<(), StorageError> {
         let repointed = serde_json::to_value(&history.repointed_references).map_err(|err| {
             StorageError::Unknown {
@@ -2008,8 +2026,9 @@ impl RelationalStore for PostgresCanonicalStore {
             r#"
             INSERT INTO merge_history (
                 id, survivor_id, merged_id, reason, operator, timestamp,
-                repointed_references, merged_relationships, undone_at
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                repointed_references, merged_relationships, undone_at,
+                auto_approval_audit
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (id) DO UPDATE SET
                 survivor_id = EXCLUDED.survivor_id,
                 merged_id = EXCLUDED.merged_id,
@@ -2018,7 +2037,8 @@ impl RelationalStore for PostgresCanonicalStore {
                 timestamp = EXCLUDED.timestamp,
                 repointed_references = EXCLUDED.repointed_references,
                 merged_relationships = EXCLUDED.merged_relationships,
-                undone_at = EXCLUDED.undone_at
+                undone_at = EXCLUDED.undone_at,
+                auto_approval_audit = EXCLUDED.auto_approval_audit
             "#,
         )
         .bind(history.id)
@@ -2030,6 +2050,7 @@ impl RelationalStore for PostgresCanonicalStore {
         .bind(repointed)
         .bind(merged_relationships)
         .bind(history.undone_at)
+        .bind(history.auto_approval_audit.clone())
         .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;

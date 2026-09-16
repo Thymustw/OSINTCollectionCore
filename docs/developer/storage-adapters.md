@@ -47,7 +47,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `CanonicalStore` | `storage-postgres` | PostgreSQL 17（Core 真實來源） |
 | `EmbeddedStore` | `storage-sqlite` | SQLite（本機／App／投影，不是高併發 canonical） |
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
-| `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`）；Phase 3 Step 1 再加 `0010`（`embeddings` metadata，`put_embedding` **不是** upsert）與 `0011`（`duplicate_groups.model`）。見 `schema-v0.2.md` |
+| `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`）；Phase 3 Step 1 再加 `0010`（`embeddings` metadata，`put_embedding` **不是** upsert）與 `0011`（`duplicate_groups.model`）；ADR-012 Step 0 再加 `0012`（`merge_history.auto_approval_audit`）。見 `schema-v0.2.md` |
 | `SearchStore` | `storage-opensearch`；mock：`storage_core::mock::MockSearchStore` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`bulk_upsert_fields`／`query`／`search`／`delete`／`update_fields`／`vector_search`） |
 | `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
 | `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |
@@ -187,6 +187,7 @@ SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / 
 
 `traits.rs` 裡以 `// ===== V0.2 =====` 分隔。表在 migration `0007`；`entities.merged_into` 與 `merge_history.merged_relationships` 在 `0008`；
 `idx_entity_identifiers_normalized_value` 在 `0009`。
+`merge_history.auto_approval_audit` 在 `0012`（ADR-012 Step 0）。
 `crates/resolver`（Phase 1c）掃描式聚合會呼叫 `get_entity`、
 `find_entity_by_normalized_name`、`list_entity_aliases_by_entity`、
 `find_entity_aliases_by_text`、`list_relationships_by_object`、
@@ -210,7 +211,8 @@ DLQ 重放仍沒有生產呼叫端。graph-worker（`osint-graph-worker`）是 `
 | `put_resolution_candidate` / `get_resolution_candidate` | 依主鍵 upsert；CHECK `a < b` + UNIQUE `(a, b, method)` |
 | `list_resolution_candidates(status, after, limit)` | `id DESC`，cursor；`status` **在 SQL 裡**過濾，`None` = 不過濾 |
 | `list_resolution_candidates_by_entity(entity_id, status, after, limit)` | `id DESC`，cursor；`entity_a_id` **或** `entity_b_id` 命中都算；`status` 在 SQL 裡過濾 |
-| `put_merge_history` / `get_merge_history` | 依主鍵 upsert |
+| `update_resolution_candidate_status(id, status, reviewed_at)` | 更新 `status` 與 `reviewed_at`；回 `true`／`false`（比照 `mark_replayed`）。ADR-012 Step 0 先建 port，還沒有生產呼叫端 |
+| `put_merge_history` / `get_merge_history` | 依主鍵 upsert；含 `auto_approval_audit`（`NULL` = 人工 merge） |
 | `list_merge_history_by_entity(entity_id, limit)` | `id DESC`；`survivor_id` **或** `merged_id` 命中都算 |
 | `put_failed_event(event) -> FailedEvent` | 自然鍵 `(topic, partition, offset)` upsert，**回傳實際存下來的那一列** |
 | `get_failed_event` / `list_failed_events(after, limit)` | `id DESC`，cursor；**含已重放的列** |

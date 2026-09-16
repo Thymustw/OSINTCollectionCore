@@ -359,6 +359,7 @@ pub fn merge_history(row: &PgRow) -> Result<MergeHistory, StorageError> {
         repointed_references: decode_repointed(get(row, "repointed_references")?)?,
         merged_relationships: decode_merged_relationships(get(row, "merged_relationships")?)?,
         undone_at: get(row, "undone_at")?,
+        auto_approval_audit: get(row, "auto_approval_audit")?,
     })
 }
 

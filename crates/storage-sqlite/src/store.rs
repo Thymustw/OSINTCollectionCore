@@ -67,6 +67,10 @@ fn json_text(value: &Value) -> String {
     value.to_string()
 }
 
+fn opt_json_text(value: &Option<Value>) -> Option<String> {
+    value.as_ref().map(json_text)
+}
+
 fn uuid_text(id: Uuid) -> String {
     id.to_string()
 }
@@ -2016,6 +2020,24 @@ impl RelationalStore for SqliteEmbeddedStore {
         rows.iter().map(mapping::resolution_candidate).collect()
     }
 
+    async fn update_resolution_candidate_status(
+        &self,
+        id: ResolutionCandidateId,
+        status: ResolutionStatus,
+        reviewed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE resolution_candidates SET status = ?2, reviewed_at = ?3 WHERE id = ?1",
+        )
+        .bind(uuid_text(id))
+        .bind(encode_enum(&status)?)
+        .bind(rfc3339(reviewed_at))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn put_merge_history(&self, history: &MergeHistory) -> Result<(), StorageError> {
         let repointed = serde_json::to_string(&history.repointed_references).map_err(|err| {
             StorageError::Unknown {
@@ -2034,8 +2056,9 @@ impl RelationalStore for SqliteEmbeddedStore {
             r#"
             INSERT INTO merge_history (
                 id, survivor_id, merged_id, reason, operator, timestamp,
-                repointed_references, merged_relationships, undone_at
-            ) VALUES (?,?,?,?,?,?,?,?,?)
+                repointed_references, merged_relationships, undone_at,
+                auto_approval_audit
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (id) DO UPDATE SET
                 survivor_id = excluded.survivor_id,
                 merged_id = excluded.merged_id,
@@ -2044,7 +2067,8 @@ impl RelationalStore for SqliteEmbeddedStore {
                 timestamp = excluded.timestamp,
                 repointed_references = excluded.repointed_references,
                 merged_relationships = excluded.merged_relationships,
-                undone_at = excluded.undone_at
+                undone_at = excluded.undone_at,
+                auto_approval_audit = excluded.auto_approval_audit
             "#,
         )
         .bind(uuid_text(history.id))
@@ -2056,6 +2080,7 @@ impl RelationalStore for SqliteEmbeddedStore {
         .bind(repointed)
         .bind(merged_relationships)
         .bind(opt_rfc3339(history.undone_at))
+        .bind(opt_json_text(&history.auto_approval_audit))
         .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;

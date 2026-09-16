@@ -432,6 +432,7 @@ mod tests {
                 moved_evidence_ids: vec![id()],
             }],
             undone_at: None,
+            auto_approval_audit: None,
         };
         assert_eq!(round_trip(&history), history);
 

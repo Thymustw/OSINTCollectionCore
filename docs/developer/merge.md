@@ -67,6 +67,8 @@ tx.commit()
 6. alias／identifier／extraction 的 `entity_id` 改成 survivor。
 7. `merged.merged_into = Some(survivor_id)`（**不刪** merged 那一列）。
 8. 寫 `MergeHistory`（含 `repointed_references` 與 `merged_relationships`）。
+   人工 merge 的 `auto_approval_audit` 是 `None`（ADR-012 Step 0 已認得這個欄位，
+   自動核准寫入者還沒接上）。
 
 ## 碰撞分類
 

@@ -83,6 +83,13 @@ fn json(row: &SqliteRow, col: &str) -> Result<Value, StorageError> {
     decode_json(&get_str(row, col)?, col)
 }
 
+fn opt_json(row: &SqliteRow, col: &str) -> Result<Option<Value>, StorageError> {
+    match get_opt_str(row, col)? {
+        None => Ok(None),
+        Some(raw) => decode_json(&raw, col).map(Some),
+    }
+}
+
 pub fn source(row: &SqliteRow) -> Result<Source, StorageError> {
     Ok(Source {
         id: uuid_from(row, "id")?,
@@ -419,6 +426,7 @@ pub fn merge_history(row: &SqliteRow) -> Result<MergeHistory, StorageError> {
         repointed_references: decode_repointed(&get_str(row, "repointed_references")?)?,
         merged_relationships: decode_merged_relationships(&get_str(row, "merged_relationships")?)?,
         undone_at: opt_ts(row, "undone_at")?,
+        auto_approval_audit: opt_json(row, "auto_approval_audit")?,
     })
 }
 

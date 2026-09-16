@@ -77,6 +77,11 @@ pub struct MergeHistory {
     pub merged_relationships: Vec<MergedRelationship>,
     /// 這次 merge 被撤銷的時間。`None` = 仍然生效。
     pub undone_at: Option<DateTime<Utc>>,
+    /// ADR-012 自動核准的完整稽核記錄。`None` = 人工 merge（既有資料全部是
+    /// `None`，向下相容）。非 `None` 時的 JSON schema 由 `resolver::auto_approval`
+    /// 定義（這個 crate 不 import 那個 crate，避免循環相依，所以型別是
+    /// `serde_json::Value` 而不是強型別 struct）。
+    pub auto_approval_audit: Option<serde_json::Value>,
 }
 
 /// merge 時因 relationship 的 `(source, type, target)` UNIQUE 撞號而被吸收合併時，

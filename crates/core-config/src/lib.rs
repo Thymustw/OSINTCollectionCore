@@ -43,6 +43,8 @@ pub struct AppConfig {
     pub embedding: EmbeddingSection,
     #[serde(default)]
     pub search_hybrid: HybridSearchSection,
+    #[serde(default)]
+    pub auto_approval: AutoApprovalSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,7 +434,13 @@ pub struct EmbeddingSection {
     pub batch_size: usize,
     /// 同時進行中的推論請求數上限（bounded semaphore，CLAUDE.md §6）。
     pub concurrent_inferences: usize,
-    /// Semantic dedup／resolver 語意比對的 cosine 門檻。
+    /// Semantic dedup（deduplicator Stage 5）的 cosine 門檻。
+    ///
+    /// ⚠️ **這個值目前只有 deduplicator 在用**。resolver 的
+    /// `semantic_similarity` 方法目前是獨立硬編碼的
+    /// `SEMANTIC_SIMILARITY_THRESHOLD`（見 `crates/resolver/src/service.rs`），
+    /// 沒有讀這個 config 欄位——兩者是兩個不同的數字，不要假設改這裡
+    /// resolver 的行為會跟著變。這是已知的技術債，不在這次改動範圍內。
     ///
     /// # ⚠️ 這不是校準過的數字，現在會真的把文件標成 duplicate
     ///
@@ -514,6 +522,148 @@ impl Default for HybridSearchSection {
             recency_weight: 0.0,
             source_score_weight: 0.0,
             confidence_weight: 0.0,
+        }
+    }
+}
+
+/// AI 輔助自動核准（ADR-012）。**預設完全關閉**——`enabled = false` 時，
+/// 這個 section 的其他欄位都不會被讀取，resolver 行為跟 ADR-012 之前完全一樣。
+///
+/// 這是對 `.claude/CLAUDE.md` §5「AI output ... cannot directly override
+/// policy/identity decisions」的刻意例外，細節見 ADR-012。門檻數字**沒有用真實
+/// OSINT 語料驗證過**，比照 [`EmbeddingSection::similarity_threshold`] 的警告寫法。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoApprovalSection {
+    /// 主開關。`false` = 所有 resolution candidate 維持 `Pending`，
+    /// 與 ADR-012 之前的行為完全相同。
+    #[serde(default)]
+    pub enabled: bool,
+    /// score >= 這個值的候選直接自動核准並執行 merge，不經 LLM。
+    /// 設超過 1.0 等同「純分數路徑永不觸發」。
+    ///
+    /// ⚠️ 未經真實語料驗證。目前只有 `exact_identifier`（固定 0.95 分）能達到。
+    #[serde(default = "default_auto_confirm_score")]
+    pub auto_confirm_score: f64,
+    /// `[llm_review_score, auto_confirm_score)` 區間的候選送 LLM 審查
+    /// （前提是 `llm.enabled = true`；未啟用時這個區間的候選維持 Pending）。
+    ///
+    /// ⚠️ 未經真實語料驗證。
+    #[serde(default = "default_llm_review_score")]
+    pub llm_review_score: f64,
+    /// 單次 `resolve_entity` 呼叫最多觸發幾筆自動 merge，防止連環效應。
+    #[serde(default = "default_max_auto_merges_per_resolve")]
+    pub max_auto_merges_per_resolve: u32,
+    /// 自動核准後 merge 的 survivor 選擇策略。V0.2 只有 `"source"`
+    /// （呼叫 `resolve_entity` 的目標 Entity 存活）。
+    #[serde(default = "default_survivor_strategy")]
+    pub survivor_strategy: String,
+    #[serde(default)]
+    pub llm: AutoApprovalLlmSection,
+}
+
+/// 本地 Qwen LLM（或任何 OpenAI 相容 endpoint）的連線設定。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoApprovalLlmSection {
+    /// LLM 中間帶審查開關。`false` 時中間帶候選一律維持 Pending
+    /// （即使 `auto_approval.enabled = true`）。
+    #[serde(default)]
+    pub enabled: bool,
+    /// OpenAI 相容 endpoint base URL，例如 vLLM 的 `http://ai-inference:8000/v1`。
+    #[serde(default = "default_llm_base_url")]
+    pub base_url: String,
+    /// 模型名稱（對應 `docs/architecture/LOCAL_AI.md` 的 alias `qwen-primary`）。
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    /// 單次推論逾時（秒）。
+    #[serde(default = "default_llm_timeout_secs")]
+    pub timeout_secs: u64,
+    /// 逾時後重試次數。`0` = 不重試，直接退回 Pending
+    /// （LLM 推論是非必要路徑，重試只是讓使用者多等，比照
+    /// CLAUDE.md「暫時性錯誤可退避重試；永久性錯誤立刻拋出」的分類，
+    /// 但這裡連暫時性錯誤預設都不重試，因為降級路徑本來就安全）。
+    #[serde(default)]
+    pub max_retries: u32,
+    /// 同時進行的 LLM 推論上限（bounded semaphore，CLAUDE.md §6）。
+    #[serde(default = "default_llm_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+    /// 0.0 = 確定性輸出，適合判斷任務而非生成任務。
+    #[serde(default)]
+    pub temperature: f64,
+}
+
+fn default_auto_confirm_score() -> f64 {
+    0.95
+}
+
+fn default_llm_review_score() -> f64 {
+    0.70
+}
+
+fn default_max_auto_merges_per_resolve() -> u32 {
+    3
+}
+
+fn default_survivor_strategy() -> String {
+    "source".to_string()
+}
+
+fn default_llm_base_url() -> String {
+    "http://ai-inference:8000/v1".to_string()
+}
+
+fn default_llm_model() -> String {
+    "qwen-primary".to_string()
+}
+
+fn default_llm_timeout_secs() -> u64 {
+    30
+}
+
+fn default_llm_max_concurrent() -> usize {
+    2
+}
+
+fn default_llm_max_tokens() -> u32 {
+    512
+}
+
+impl AutoApprovalSection {
+    /// 門檻設定是否自洽（`auto_confirm_score >= llm_review_score`）。
+    /// 不自洽時呼叫端應該視為設定錯誤、記警告並停用自動核准——但記警告
+    /// 需要 `tracing`，這個 crate 不依賴 `tracing`，所以只回傳布林值，
+    /// 由組裝端（`core-api` 或未來的 resolver 組裝點）決定怎麼處理。
+    #[must_use]
+    pub fn thresholds_are_sane(&self) -> bool {
+        self.auto_confirm_score >= self.llm_review_score
+    }
+}
+
+impl Default for AutoApprovalSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_confirm_score: default_auto_confirm_score(),
+            llm_review_score: default_llm_review_score(),
+            max_auto_merges_per_resolve: default_max_auto_merges_per_resolve(),
+            survivor_strategy: default_survivor_strategy(),
+            llm: AutoApprovalLlmSection::default(),
+        }
+    }
+}
+
+impl Default for AutoApprovalLlmSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_llm_base_url(),
+            model: default_llm_model(),
+            timeout_secs: default_llm_timeout_secs(),
+            max_retries: 0,
+            max_concurrent: default_llm_max_concurrent(),
+            max_tokens: default_llm_max_tokens(),
+            temperature: 0.0,
         }
     }
 }
@@ -688,6 +838,23 @@ mod tests {
         assert_eq!(cfg.search_hybrid.recency_weight, 0.0);
         assert_eq!(cfg.search_hybrid.source_score_weight, 0.0);
         assert_eq!(cfg.search_hybrid.confidence_weight, 0.0);
+        assert!(!cfg.auto_approval.enabled);
+        assert_eq!(cfg.auto_approval.auto_confirm_score, 0.95);
+        assert_eq!(cfg.auto_approval.llm_review_score, 0.70);
+        assert_eq!(cfg.auto_approval.max_auto_merges_per_resolve, 3);
+        assert_eq!(cfg.auto_approval.survivor_strategy, "source");
+        assert!(!cfg.auto_approval.llm.enabled);
+        assert_eq!(
+            cfg.auto_approval.llm.base_url,
+            "http://ai-inference:8000/v1"
+        );
+        assert_eq!(cfg.auto_approval.llm.model, "qwen-primary");
+        assert_eq!(cfg.auto_approval.llm.timeout_secs, 30);
+        assert_eq!(cfg.auto_approval.llm.max_retries, 0);
+        assert_eq!(cfg.auto_approval.llm.max_concurrent, 2);
+        assert_eq!(cfg.auto_approval.llm.max_tokens, 512);
+        assert_eq!(cfg.auto_approval.llm.temperature, 0.0);
+        assert!(cfg.auto_approval.thresholds_are_sane());
     }
 
     #[test]
@@ -821,6 +988,45 @@ mod tests {
             section.dedup_cache_ttl(),
             std::time::Duration::from_secs(900)
         );
+    }
+
+    #[test]
+    fn missing_auto_approval_section_does_not_fail_load() {
+        // 舊設定檔沒有 [auto_approval] 時，#[serde(default)] 必須讓載入成功，
+        // 而且主開關維持關閉——否則升級就會意外打開自動核准。
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        let parsed: AppConfig = {
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            value.as_object_mut().unwrap().remove("auto_approval");
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(parsed.auto_approval, AutoApprovalSection::default());
+        assert!(!parsed.auto_approval.enabled);
+    }
+
+    #[test]
+    fn partial_auto_approval_section_uses_remaining_defaults() {
+        let section: AutoApprovalSection = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(section.enabled);
+        assert_eq!(section.auto_confirm_score, 0.95);
+        assert_eq!(section.llm_review_score, 0.70);
+        assert_eq!(section.max_auto_merges_per_resolve, 3);
+        assert_eq!(section.survivor_strategy, "source");
+        assert_eq!(section.llm, AutoApprovalLlmSection::default());
+        assert!(!section.llm.enabled);
+    }
+
+    #[test]
+    fn auto_approval_thresholds_are_sane_rejects_inverted_range() {
+        assert!(AutoApprovalSection::default().thresholds_are_sane());
+        let inverted = AutoApprovalSection {
+            auto_confirm_score: 0.50,
+            llm_review_score: 0.80,
+            ..Default::default()
+        };
+        assert!(!inverted.thresholds_are_sane());
     }
 
     #[test]

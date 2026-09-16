@@ -542,6 +542,23 @@ pub trait RelationalStore: HealthProvider {
         limit: u32,
     ) -> Result<Vec<ResolutionCandidate>, StorageError>;
 
+    /// 更新一筆 resolution candidate 的審核狀態與 `reviewed_at`。
+    ///
+    /// 這個方法同時服務兩種呼叫端：ADR-012 的自動核准（`Pending` → `AutoConfirmed`）、
+    /// 以及未來人工 Review API（`Pending` → `Confirmed`/`Rejected`，目前還沒有這支
+    /// API，但方法先做成通用的）。
+    ///
+    /// 回傳 `true` 代表真的更新到一列；`false` 代表 `id` 不存在——比照
+    /// [`RelationalStore::mark_replayed`] 的慣例回布林值而不是 `NotFound` 錯誤，
+    /// 因為呼叫端（自動核准流程）在呼叫這個方法之前一定已經讀過這筆候選，
+    /// `false` 只會發生在真正異常的競爭情況，讓呼叫端自己決定要不要當錯誤處理。
+    async fn update_resolution_candidate_status(
+        &self,
+        id: ResolutionCandidateId,
+        status: ResolutionStatus,
+        reviewed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError>;
+
     /// 依主鍵 upsert 一筆 merge 紀錄。
     ///
     /// `repointed_references` 空陣列代表「當時沒有任何列需要 repoint」。

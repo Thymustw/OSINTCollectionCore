@@ -234,6 +234,31 @@ OpenSearch k-NN index（Step 2）。這張表回答「這個目標、這個模�
 Semantic Dedup（SPEC §17「method/model」）的模型名稱寫在 `DuplicateGroup.model`。
 Stage 1-4 的方法不靠模型，欄位是 `NULL`；Stage 5 才填。
 
+## Migration 0012：`merge_history.auto_approval_audit`（ADR-012 Step 0）
+
+`migrations/postgres/0012_v0_2_merge_history_auto_approval_audit.sql` 與
+`migrations/sqlite/0012_v0_2_merge_history_auto_approval_audit.sql`。
+
+| 欄位 | 型別（PG / SQLite） | 用途 |
+|---|---|---|
+| `merge_history.auto_approval_audit` | `JSONB NULL` / `TEXT NULL` | AI 輔助自動核准的完整稽核記錄。`NULL` = 人工 merge（向下相容） |
+
+JSON schema 由之後的 `resolver::auto_approval` 定義（`core-model` 不 import
+那個 crate，避免循環相依，所以 `MergeHistory.auto_approval_audit` 的型別是
+`Option<serde_json::Value>`）。Step 0 **只認得這個欄位**，還沒有任何寫入者
+會填非 `NULL` 的值——自動核准邏輯是後面的 Step。
+
+對應 `RelationalStore::update_resolution_candidate_status`：更新一筆
+resolution candidate 的 `status` 與 `reviewed_at`，回 `true`／`false`
+（比照 `mark_replayed`，id 不存在不是 `NotFound`）。這支方法現在也還沒有
+生產呼叫端。
+
+設定在 `config/default.toml` 的 `[auto_approval]`（`AutoApprovalSection`，
+巢狀 `[auto_approval.llm]` 對應 `AutoApprovalLlmSection`），
+**預設 `enabled = false`**。門檻是否自洽（`auto_confirm_score >= llm_review_score`）
+由 `AutoApprovalSection::thresholds_are_sane()` 判斷；這個 crate 不依賴
+`tracing`，真正的警告／強制關閉留給組裝端（Step 4）處理。
+
 ## 對照 V0.1 的 `/ops/dlq`
 
 ADR-008 的 `GET /api/v1/ops/dlq` 目前仍回 `dlq_topic: null` + 失敗的 **Job** 清單。

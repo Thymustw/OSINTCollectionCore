@@ -413,6 +413,7 @@ async fn execute_in_tx(
         repointed_references,
         merged_relationships,
         undone_at: None,
+        auto_approval_audit: None,
     };
     db.put_merge_history(&history).await?;
     Ok((history, changes))

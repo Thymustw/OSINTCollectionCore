@@ -683,7 +683,10 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
 - **`[embedding]`／`[search_hybrid]` config**：batch／併發／cosine 門檻與
   hybrid RRF 權重。OpenSearch URL **不**另開一份，沿用 `[storage.search].url`。
   `similarity_threshold` 預設 0.90 是**暫定值**（e5-small 不相關文字也有
-  ~0.83，見 §5.1）。**Step 6 已把它接到 Stage 5**：超過門檻就寫
+  ~0.83，見 §5.1）。**目前只有 deduplicator Stage 5 在讀這個欄位**——
+  resolver 的 `semantic_similarity` 方法是獨立硬編碼的
+  `SEMANTIC_SIMILARITY_THRESHOLD`（0.85，見 `crates/resolver/src/service.rs`），
+  兩者是兩個不同的數字。**Step 6 已把它接到 Stage 5**：超過門檻就寫
   `DuplicateGroup`、把 `documents.duplicate_of` 指過去，誤判的代價是下游
   跳過那份文件。數字本身**還沒**用真實 OSINT 語料重校；`osint-deduplicator`
   啟用 Stage 5 時會打 `tracing::warn!`。要改這個值，先量 false-positive／

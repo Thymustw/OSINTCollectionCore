@@ -154,7 +154,11 @@ max_columns = 512
 batch_size = 32
 # 同時進行中的推論請求數上限（bounded semaphore，CLAUDE.md §6）。
 concurrent_inferences = 4
-# Semantic dedup／resolver 語意比對的 cosine 門檻。
+# Semantic dedup（deduplicator Stage 5）的 cosine 門檻。
+# ⚠️ 這個值目前只有 deduplicator 在用。resolver 的 semantic_similarity
+# 方法是獨立硬編碼的 SEMANTIC_SIMILARITY_THRESHOLD（0.85，見
+# crates/resolver/src/service.rs），沒有讀這個欄位——兩者是兩個不同的
+# 數字，不要假設改這裡 resolver 的行為會跟著變。
 # ⚠️ 這不是校準過的數字。0.90 是 Phase 0 用一小組句子推論的暫定值，
 # 從來沒有用真實 OSINT 語料驗證過。e5-small 不相關文字 baseline cosine
 # 就有 ~0.83（embedding.md §5.1），跟 0.90 只差 0.07。
@@ -176,3 +180,25 @@ entity_match_weight = 0.0
 recency_weight = 0.0
 source_score_weight = 0.0
 confidence_weight = 0.0
+
+# AI 輔助自動核准（ADR-012）。預設完全關閉：enabled = false 時，
+# resolver 行為與 ADR-012 之前完全一樣，所有候選維持 Pending。
+# 這是對 CLAUDE.md §5「AI output cannot directly override policy/identity
+# decisions」的刻意例外，細節見 docs/adr/ADR-012-ai-assisted-auto-approval.md。
+# 門檻數字沒有用真實 OSINT 語料驗證過，生產環境打開前請先校準。
+[auto_approval]
+enabled = false
+auto_confirm_score = 0.95
+llm_review_score = 0.70
+max_auto_merges_per_resolve = 3
+survivor_strategy = "source"
+
+[auto_approval.llm]
+enabled = false
+base_url = "http://ai-inference:8000/v1"
+model = "qwen-primary"
+timeout_secs = 30
+max_retries = 0
+max_concurrent = 2
+max_tokens = 512
+temperature = 0.0

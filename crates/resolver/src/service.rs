@@ -925,6 +925,14 @@ mod tests {
         ) -> Result<Vec<ResolutionCandidate>, StorageError> {
             Self::unsupported("list_resolution_candidates_by_entity")
         }
+        async fn update_resolution_candidate_status(
+            &self,
+            _: ResolutionCandidateId,
+            _: ResolutionStatus,
+            _: chrono::DateTime<Utc>,
+        ) -> Result<bool, StorageError> {
+            Self::unsupported("update_resolution_candidate_status")
+        }
         async fn put_merge_history(&self, _: &MergeHistory) -> Result<(), StorageError> {
             Self::unsupported("put_merge_history")
         }

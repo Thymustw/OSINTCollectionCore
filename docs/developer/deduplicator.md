@@ -355,7 +355,8 @@ simhash_max_distance = 3
 Stage 5 另外讀 `[embedding].similarity_threshold`（預設 0.90）與
 `[embedding].dedup_cache_ttl_secs`（預設 900），OpenSearch／Redis 連線沿用
 `[storage.search].url`／`[storage.cache].url_secret_ref`。不要在
-`[deduplicator]` 再放一份 URL。
+`[deduplicator]` 再放一份 URL。resolver 的 `semantic_similarity` 方法
+**沒有**讀這個欄位（獨立硬編碼 0.85），兩者是兩個不同的數字。
 
 本機常見情境：8080 可能被其他本機服務占用（例如另一套安全/情資平台），health 不要綁 8080。18081／18082 已被 collector／normalizer 佔用。
 
