@@ -5,8 +5,10 @@
 //! 見 ADR-012「借用 V0.3 AI Gateway 的範圍界線」。
 
 mod mock;
+mod openai;
 
 pub use mock::{MockLlmProvider, UnsupportedLlmProvider};
+pub use openai::{OpenAiCompatibleLlmProvider, OpenAiCompatibleLlmProviderConfig};
 
 /// LLM 生成式推論的統一介面。呼叫端用泛型 `<L: LlmProvider>`，不用 `dyn`
 /// （比照 `storage_core::EmbeddingProvider` 的用法）。
