@@ -9,6 +9,7 @@ description = "STIX 2.1 型別定義、驗證、與 Core Object 的雙向映射�
 
 [dependencies]
 chrono = { workspace = true }
+core-model = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
