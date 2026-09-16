@@ -1,0 +1,17 @@
+[package]
+name = "ai-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "LLM 生成式推論的抽象層（ADR-012）。定義 trait + mock/unsupported；真正的 HTTP client 在 Step 2 加。"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }

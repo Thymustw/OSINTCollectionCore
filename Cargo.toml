@@ -25,6 +25,7 @@ members = [
     "crates/deduplicator",
     "crates/entity-worker",
     "crates/resolver",
+    "crates/ai-gateway",
     "crates/merge",
     "crates/indexer",
     "crates/graph-worker",
