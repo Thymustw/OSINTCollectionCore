@@ -86,6 +86,7 @@ pub fn test_app_with_backends(
         jobs: None,
         merge: None,
         resolver: None,
+        auto_approval: None,
         graph_resolver: None,
         graph: None,
         graph_projection: None,

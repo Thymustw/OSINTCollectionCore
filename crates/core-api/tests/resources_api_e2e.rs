@@ -26,7 +26,7 @@ use core_jobs::JobService;
 use core_model::{
     Connector, Document, DocumentType, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
     EntityIdentifier, EntityType, Provenance, RawEvidence, Relationship, RelationshipEvidence,
-    RelationshipType, Source, SourceType,
+    RelationshipType, ResolutionCandidate, Source, SourceType,
 };
 use core_observability::MetricsRegistry;
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
@@ -91,7 +91,46 @@ struct TestApi {
 }
 
 fn build_api(stack: &Stack, producer: Option<Arc<EventProducer>>) -> TestApi {
-    build_api_with_backends(stack, producer, Vec::new(), Vec::new(), None)
+    build_api_with_backends(stack, producer, Vec::new(), Vec::new(), None, false)
+}
+
+fn build_api_with_auto_approval(stack: &Stack) -> TestApi {
+    build_api_with_backends(stack, None, Vec::new(), Vec::new(), None, true)
+}
+
+fn assemble_test_auto_approval(
+    store: storage_postgres::PostgresCanonicalStore,
+    enabled: bool,
+) -> core_api::AutoApprovalState {
+    let section = core_config::AutoApprovalSection {
+        enabled,
+        ..core_config::AutoApprovalSection::default()
+    };
+    // LLM 維持預設關閉：高信心路徑（exact_identifier 0.95）不需要真的打模型。
+    let llm_provider = ai_gateway::OpenAiCompatibleLlmProvider::new(
+        &ai_gateway::OpenAiCompatibleLlmProviderConfig {
+            enabled: false,
+            base_url: section.llm.base_url.clone(),
+            timeout: std::time::Duration::from_secs(section.llm.timeout_secs),
+            max_concurrent: section.llm.max_concurrent,
+        },
+    );
+    core_api::AutoApprovalState {
+        evaluator: Arc::new(resolver::AutoApprovalEvaluator::new(
+            store,
+            None,
+            llm_provider,
+            resolver::AutoApprovalConfig {
+                enabled,
+                auto_confirm_score: section.auto_confirm_score,
+                llm_review_score: section.llm_review_score,
+                llm_model: section.llm.model.clone(),
+                llm_temperature: section.llm.temperature,
+                llm_max_tokens: section.llm.max_tokens,
+            },
+        )),
+        max_auto_merges_per_resolve: section.max_auto_merges_per_resolve,
+    }
 }
 
 fn build_api_with_backends(
@@ -100,11 +139,16 @@ fn build_api_with_backends(
     checks: Vec<Arc<dyn core_api::ReadyCheck>>,
     missing: Vec<&'static str>,
     graph_projection: Option<core_api::SharedGraphProjection>,
+    auto_approval_enabled: bool,
 ) -> TestApi {
     let jwt = JwtService::new(&[b't'; 32], "osint-core", chrono::Duration::hours(1)).expect("jwt");
     let viewer = jwt.issue("e2e-viewer", Role::Viewer).expect("issue");
     let operator = jwt.issue("e2e-operator", Role::Operator).expect("issue");
     let audit = MemoryAuditLog::new();
+    let auto_approval = Some(Arc::new(assemble_test_auto_approval(
+        stack.pg.clone(),
+        auto_approval_enabled,
+    )));
     let state = AppState {
         metrics: MetricsRegistry::new(),
         auth: AuthState {
@@ -125,6 +169,7 @@ fn build_api_with_backends(
             stack.pg.clone(),
             storage_core::mock::MockEmbeddingProvider::unsupported(),
         ))),
+        auto_approval,
         graph_resolver: None,
         graph: None,
         graph_projection,
@@ -1540,6 +1585,7 @@ async fn ops_health_reports_a_broken_redis() {
         ],
         Vec::new(),
         None,
+        false,
     );
     let (status, body, _) = send(&api_ok.app, get("/api/v1/ops/health", &api_ok.viewer)).await;
     assert_eq!(status, StatusCode::OK, "全部活著時要 200：{body}");
@@ -1557,6 +1603,7 @@ async fn ops_health_reports_a_broken_redis() {
         ],
         Vec::new(),
         None,
+        false,
     );
     let (status, body, _) = send(&api_bad.app, get("/api/v1/ops/health", &api_bad.viewer)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -1616,7 +1663,14 @@ async fn ops_graph_reports_projection_status_from_neo4j() {
     });
 
     let stack = connect_stack().await;
-    let api = build_api_with_backends(&stack, None, Vec::new(), Vec::new(), Some(graph_projection));
+    let api = build_api_with_backends(
+        &stack,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Some(graph_projection),
+        false,
+    );
     let (status, body, _) = send(&api.app, get("/api/v1/ops/graph", &api.viewer)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["projection"], projection, "{body}");
@@ -1976,4 +2030,240 @@ async fn viewer_cannot_resolve_or_merge() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+fn seed_exact_identifier_candidate(
+    owner: Uuid,
+    conflicting: Uuid,
+    run: &str,
+) -> (EntityIdentifier, ResolutionCandidate) {
+    let now = Utc::now();
+    let identifier = EntityIdentifier {
+        id: Uuid::now_v7(),
+        entity_id: owner,
+        namespace: format!("e2e-auto-{run}"),
+        value: format!("id-{run}"),
+        normalized_value: format!("id-{run}"),
+        confidence: 0.9,
+        source_id: None,
+        first_seen: now,
+        last_seen: now,
+    };
+    let candidate =
+        resolver::resolution_candidate_from_identifier_conflict(&identifier, conflicting);
+    (identifier, candidate)
+}
+
+/// ADR-012：預先寫入 `exact_identifier` Pending 候選後，`POST /resolve`
+/// 在 `auto_approval.enabled=true` 時走高信心路徑自動 merge。
+///
+/// `resolve_entity` 自己的掃描方法分數上限 0.55，永遠碰不到預設
+/// `auto_confirm_score=0.95`。這支測的是 handler 另外撈完整 Pending
+/// 集合那一步——沒撈到的話自動核准永遠不會觸發。
+#[tokio::test]
+async fn resolve_auto_confirms_preseeded_exact_identifier() {
+    let stack = connect_stack().await;
+    let api = build_api_with_auto_approval(&stack);
+
+    let run = Uuid::now_v7().simple().to_string();
+    let survivor = new_entity(
+        EntityType::Person,
+        &format!("auto-surv-{run}"),
+        &format!("auto-surv-{run}"),
+    );
+    let merged = new_entity(
+        EntityType::Person,
+        &format!("auto-merged-{run}"),
+        &format!("auto-merged-{run}"),
+    );
+    stack.pg.put_entity(&survivor).await.expect("seed survivor");
+    stack.pg.put_entity(&merged).await.expect("seed merged");
+
+    let (identifier, candidate) = seed_exact_identifier_candidate(survivor.id, merged.id, &run);
+    stack
+        .pg
+        .put_entity_identifier(&identifier)
+        .await
+        .expect("seed identifier");
+    stack
+        .pg
+        .put_resolution_candidate(&candidate)
+        .await
+        .expect("seed exact_identifier candidate");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/entities/{}/resolve", survivor.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let got_merged = stack
+        .pg
+        .get_entity(merged.id)
+        .await
+        .expect("get merged")
+        .expect("merged 仍存在");
+    assert_eq!(
+        got_merged.merged_into,
+        Some(survivor.id),
+        "高信心自動核准應把 merged 指回 survivor"
+    );
+
+    let history = stack
+        .pg
+        .list_merge_history_by_entity(survivor.id, 100)
+        .await
+        .expect("list merge history");
+    let auto = history
+        .iter()
+        .find(|h| h.operator == "resolver:auto_confirm")
+        .unwrap_or_else(|| {
+            panic!("應有 resolver:auto_confirm 的 merge_history，實際：{history:?}")
+        });
+    assert_eq!(auto.survivor_id, survivor.id);
+    assert_eq!(auto.merged_id, merged.id);
+
+    let listed = find_by_cursor(
+        &api.app,
+        &api.viewer,
+        &format!("/api/v1/entities/{}/resolution-candidates", survivor.id),
+        candidate.id,
+    )
+    .await
+    .expect("GET resolution-candidates 應查得到預先寫入的候選");
+    assert_eq!(
+        listed["status"], "auto_confirmed",
+        "自動核准後候選應標 AutoConfirmed：{listed}"
+    );
+
+    let entry = api
+        .audit
+        .entries()
+        .into_iter()
+        .find(|e| {
+            e.action == core_api::AUDIT_ENTITY_RESOLVE
+                && e.resource_id == Some(survivor.id.to_string())
+                && e.outcome == "success"
+        })
+        .expect("entity.resolve 成功稽核");
+    let pairs = entry.metadata["auto_merged_pairs"]
+        .as_u64()
+        .expect("稽核 metadata 應含 auto_merged_pairs");
+    assert!(
+        pairs >= 1,
+        "高信心路徑應至少自動 merge 一對，實際 metadata={}",
+        entry.metadata
+    );
+    let history_ids = entry.metadata["auto_merged_history_ids"]
+        .as_array()
+        .expect("稽核 metadata 應含 auto_merged_history_ids");
+    assert!(
+        history_ids
+            .iter()
+            .any(|id| id.as_str() == Some(&auto.id.to_string())),
+        "稽核應帶上剛寫入的 merge_history id：{}",
+        entry.metadata
+    );
+}
+
+/// ADR-012：功能關閉時行為與 Step 4 之前完全一致——預先寫入的高信心
+/// 候選維持 Pending，沒有 merge。
+#[tokio::test]
+async fn resolve_leaves_preseeded_candidate_pending_when_auto_approval_disabled() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+
+    let run = Uuid::now_v7().simple().to_string();
+    let survivor = new_entity(
+        EntityType::Person,
+        &format!("off-surv-{run}"),
+        &format!("off-surv-{run}"),
+    );
+    let merged = new_entity(
+        EntityType::Person,
+        &format!("off-merged-{run}"),
+        &format!("off-merged-{run}"),
+    );
+    stack.pg.put_entity(&survivor).await.expect("seed survivor");
+    stack.pg.put_entity(&merged).await.expect("seed merged");
+
+    let (identifier, candidate) = seed_exact_identifier_candidate(survivor.id, merged.id, &run);
+    stack
+        .pg
+        .put_entity_identifier(&identifier)
+        .await
+        .expect("seed identifier");
+    stack
+        .pg
+        .put_resolution_candidate(&candidate)
+        .await
+        .expect("seed exact_identifier candidate");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/entities/{}/resolve", survivor.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let still = stack
+        .pg
+        .get_entity(merged.id)
+        .await
+        .expect("get merged")
+        .expect("merged 仍存在");
+    assert!(still.merged_into.is_none(), "關閉自動核准時不該 merge");
+
+    let history = stack
+        .pg
+        .list_merge_history_by_entity(survivor.id, 100)
+        .await
+        .expect("list merge history");
+    assert!(
+        history
+            .iter()
+            .all(|h| h.operator != "resolver:auto_confirm"),
+        "關閉時不該出現自動核准的 merge_history：{history:?}"
+    );
+
+    let listed = find_by_cursor(
+        &api.app,
+        &api.viewer,
+        &format!("/api/v1/entities/{}/resolution-candidates", survivor.id),
+        candidate.id,
+    )
+    .await
+    .expect("GET resolution-candidates 應查得到預先寫入的候選");
+    assert_eq!(
+        listed["status"], "pending",
+        "關閉自動核准時候選應維持 Pending：{listed}"
+    );
+
+    let entry = api
+        .audit
+        .entries()
+        .into_iter()
+        .find(|e| {
+            e.action == core_api::AUDIT_ENTITY_RESOLVE
+                && e.resource_id == Some(survivor.id.to_string())
+                && e.outcome == "success"
+        })
+        .expect("entity.resolve 成功稽核");
+    assert_eq!(
+        entry.metadata["auto_merged_pairs"].as_u64(),
+        Some(0),
+        "關閉路徑的稽核 auto_merged_pairs 應為 0：{}",
+        entry.metadata
+    );
 }

@@ -12,6 +12,7 @@ name = "osint-api"
 path = "src/main.rs"
 
 [dependencies]
+ai-gateway = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }

@@ -19,6 +19,8 @@
 //! [`GraphContextResolver`]: resolver::GraphContextResolver
 //! [`MockEmbeddingProvider::unsupported`]: storage_core::mock::MockEmbeddingProvider::unsupported
 
+use std::collections::{BTreeMap, HashSet};
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -36,7 +38,8 @@ use crate::extractors::ClientIp;
 use crate::pagination::{CursorPage, Pagination};
 use crate::resources::{AuditEvent, audit, rejected_metadata, storage_error, store};
 use crate::state::{
-    AppState, SharedGraphContextResolver, SharedMergeService, SharedResolverService,
+    AppState, SharedAutoApprovalState, SharedGraphContextResolver, SharedMergeService,
+    SharedResolverService,
 };
 
 const RESOURCE_ENTITY: &str = "entity";
@@ -128,6 +131,12 @@ fn resolver_error(err: ResolverError) -> ApiError {
 ///
 /// 對這個 Entity 跑目前已實作的掃描方法，回傳**這次新寫入**的候選。
 /// 已存在的候選（同一對同一方法）不會再出現在回應裡。
+///
+/// 回應型別維持 `Vec<ResolutionCandidate>`：自動核准若真的 merge 了某一對，
+/// 屬於該對、且原本就在這次新寫入集合裡的項目會被同步成 `AutoConfirmed`。
+/// 自動核准本身評估的是「這個 Entity 目前全部 Pending 候選」（含 entity-worker
+/// 預先寫入的 `exact_identifier`），不是只有這次新寫入的那幾筆——否則預設
+/// 門檻下永遠碰不到高信心路徑。見 ADR-012 Step 4。
 pub async fn resolve_entity(
     State(state): State<AppState>,
     principal: Principal,
@@ -137,7 +146,9 @@ pub async fn resolve_entity(
     principal.role.require(Permission::Write)?;
     let resolver = resolver_service(&state)?;
     match resolver.resolve_entity(id).await {
-        Ok(candidates) => {
+        Ok(mut candidates) => {
+            let (auto_merged_pairs, auto_merged_history_ids) =
+                maybe_evaluate_auto_approval(&state, id, &mut candidates).await;
             audit(
                 &state,
                 &principal,
@@ -147,7 +158,11 @@ pub async fn resolve_entity(
                     resource_type: RESOURCE_ENTITY,
                     resource_id: Some(id.to_string()),
                     outcome: "success",
-                    metadata: json!({ "candidate_count": candidates.len() }),
+                    metadata: json!({
+                        "candidate_count": candidates.len(),
+                        "auto_merged_pairs": auto_merged_pairs,
+                        "auto_merged_history_ids": auto_merged_history_ids,
+                    }),
                 },
             )
             .await;
@@ -171,6 +186,126 @@ pub async fn resolve_entity(
             Err(api_err)
         }
     }
+}
+
+/// 評估這個 Entity 目前全部 Pending 候選，必要時自動核准並 merge。
+///
+/// `state.auto_approval` 是 `None`（沒接 Postgres）時直接回 0。
+/// `state.store` 是 `None` 但 `auto_approval` 是 `Some` 是組裝矛盾：記 error
+/// 並跳過，不要讓整個 resolve 請求失敗。list Pending 失敗同樣跳過——
+/// 自動核准是加值路徑，不能擋住 `resolve_entity` 已經寫進去的候選回應。
+async fn maybe_evaluate_auto_approval(
+    state: &AppState,
+    entity_id: Uuid,
+    candidates: &mut [ResolutionCandidate],
+) -> (u32, Vec<Uuid>) {
+    let Some(auto_approval) = state.auto_approval.as_ref() else {
+        return (0, Vec::new());
+    };
+    let Some(store) = state.store.as_ref() else {
+        tracing::error!(
+            %entity_id,
+            "AppState.auto_approval 有值但 AppState.store 是 None（組裝矛盾），\
+             跳過自動核准評估"
+        );
+        return (0, Vec::new());
+    };
+
+    let existing_pending = match store
+        .list_resolution_candidates_by_entity(entity_id, Some(ResolutionStatus::Pending), None, 100)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                %entity_id,
+                "列出 Pending 候選失敗，跳過自動核准評估"
+            );
+            return (0, Vec::new());
+        }
+    };
+
+    evaluate_auto_approval_groups(auto_approval, entity_id, candidates, existing_pending).await
+}
+
+async fn evaluate_auto_approval_groups(
+    auto_approval: &SharedAutoApprovalState,
+    entity_id: Uuid,
+    candidates: &mut [ResolutionCandidate],
+    existing_pending: Vec<ResolutionCandidate>,
+) -> (u32, Vec<Uuid>) {
+    let mut by_id = std::collections::HashMap::new();
+    for c in candidates.iter().cloned() {
+        by_id.insert(c.id, c);
+    }
+    for c in existing_pending {
+        by_id.entry(c.id).or_insert(c);
+    }
+    let all_pending: Vec<ResolutionCandidate> = by_id.into_values().collect();
+
+    let groups = group_candidates_for_auto_approval(entity_id, &all_pending);
+    let mut auto_merged_pairs = 0u32;
+    let mut auto_merged_history_ids: Vec<Uuid> = Vec::new();
+
+    for (other_id, group) in groups {
+        if auto_merged_pairs >= auto_approval.max_auto_merges_per_resolve {
+            break;
+        }
+        let outcome = auto_approval
+            .evaluator
+            .evaluate_pair(entity_id, other_id, &group, "resolver")
+            .await;
+        match outcome {
+            resolver::AutoApprovalOutcome::Merged { merge_history_id } => {
+                auto_merged_pairs += 1;
+                auto_merged_history_ids.push(merge_history_id);
+                let now = chrono::Utc::now();
+                for c in candidates.iter_mut() {
+                    if group.iter().any(|g| g.id == c.id) {
+                        c.status = ResolutionStatus::AutoConfirmed;
+                        c.reviewed_at = Some(now);
+                    }
+                }
+            }
+            resolver::AutoApprovalOutcome::Pending { .. }
+            | resolver::AutoApprovalOutcome::Disabled => {}
+        }
+    }
+
+    (auto_merged_pairs, auto_merged_history_ids)
+}
+
+/// 把候選依「另一端 Entity id」分組（`entity_id` 一律是 survivor，另一端是 merged），
+/// 去重（同 id 的候選只留一筆），依「另一端 id」排序讓分組順序是決定性的
+/// （否則 `max_auto_merges_per_resolve` 上限在同一批候選里砍到哪幾對會不確定）。
+fn group_candidates_for_auto_approval(
+    entity_id: Uuid,
+    candidates: &[ResolutionCandidate],
+) -> Vec<(Uuid, Vec<ResolutionCandidate>)> {
+    let mut groups: BTreeMap<Uuid, Vec<ResolutionCandidate>> = BTreeMap::new();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.id) {
+            continue;
+        }
+        let other = if candidate.entity_a_id == entity_id {
+            candidate.entity_b_id
+        } else if candidate.entity_b_id == entity_id {
+            candidate.entity_a_id
+        } else {
+            tracing::warn!(
+                candidate_id = %candidate.id,
+                %entity_id,
+                entity_a_id = %candidate.entity_a_id,
+                entity_b_id = %candidate.entity_b_id,
+                "自動核准分組遇到兩端都不是目標 Entity 的候選，已跳過"
+            );
+            continue;
+        };
+        groups.entry(other).or_default().push(candidate.clone());
+    }
+    groups.into_iter().collect()
 }
 
 /// `POST /api/v1/entities/{id}/resolve/graph-context`。operator 以上。
@@ -395,4 +530,106 @@ pub async fn list_merge_history(
         .await
         .map_err(storage_error)?;
     Ok(Json(history))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn candidate(id: Uuid, a: Uuid, b: Uuid, method: &str) -> ResolutionCandidate {
+        let (entity_a_id, entity_b_id) = ResolutionCandidate::ordered_pair(a, b);
+        ResolutionCandidate {
+            id,
+            entity_a_id,
+            entity_b_id,
+            score: 0.5,
+            method: method.into(),
+            evidence: json!({}),
+            status: ResolutionStatus::Pending,
+            created_at: Utc::now(),
+            reviewed_at: None,
+        }
+    }
+
+    #[test]
+    fn groups_by_other_end_regardless_of_a_or_b_direction() {
+        let entity = Uuid::from_u128(10);
+        // 比 entity 小：entity 會落在 b；比 entity 大：entity 會落在 a。
+        let smaller = Uuid::from_u128(1);
+        let larger = Uuid::from_u128(20);
+        let c_small = candidate(Uuid::from_u128(100), entity, smaller, "alias");
+        let c_large = candidate(Uuid::from_u128(101), entity, larger, "domain");
+
+        let groups =
+            group_candidates_for_auto_approval(entity, &[c_small.clone(), c_large.clone()]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, smaller);
+        assert_eq!(groups[0].1.len(), 1);
+        assert_eq!(groups[0].1[0].id, c_small.id);
+        assert_eq!(groups[1].0, larger);
+        assert_eq!(groups[1].1.len(), 1);
+        assert_eq!(groups[1].1[0].id, c_large.id);
+    }
+
+    #[test]
+    fn same_pair_multiple_methods_share_one_group() {
+        let entity = Uuid::from_u128(10);
+        let other = Uuid::from_u128(20);
+        let a = candidate(Uuid::from_u128(1), entity, other, "exact_identifier");
+        let b = candidate(Uuid::from_u128(2), entity, other, "alias");
+        let groups = group_candidates_for_auto_approval(entity, &[a, b]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, other);
+        assert_eq!(groups[0].1.len(), 2);
+    }
+
+    #[test]
+    fn skips_candidates_that_do_not_involve_entity() {
+        let entity = Uuid::from_u128(10);
+        let unrelated_a = Uuid::from_u128(1);
+        let unrelated_b = Uuid::from_u128(2);
+        let stray = candidate(Uuid::from_u128(9), unrelated_a, unrelated_b, "alias");
+        let groups = group_candidates_for_auto_approval(entity, &[stray]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn grouping_order_is_deterministic() {
+        let entity = Uuid::from_u128(50);
+        let others = [
+            Uuid::from_u128(3),
+            Uuid::from_u128(1),
+            Uuid::from_u128(9),
+            Uuid::from_u128(2),
+        ];
+        let input: Vec<_> = others
+            .iter()
+            .enumerate()
+            .map(|(i, other)| {
+                candidate(
+                    Uuid::from_u128(100 + i as u128),
+                    entity,
+                    *other,
+                    "normalized_name",
+                )
+            })
+            .collect();
+        let first = group_candidates_for_auto_approval(entity, &input);
+        let second = group_candidates_for_auto_approval(entity, &input);
+        let keys: Vec<_> = first.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![others[1], others[3], others[0], others[2]]);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn duplicate_candidate_ids_are_kept_once() {
+        let entity = Uuid::from_u128(10);
+        let other = Uuid::from_u128(20);
+        let c = candidate(Uuid::from_u128(1), entity, other, "alias");
+        let groups = group_candidates_for_auto_approval(entity, &[c.clone(), c]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 1);
+    }
 }

@@ -241,6 +241,7 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, search: Option<SearchS
         jobs: None,
         merge: None,
         resolver: None,
+        auto_approval: None,
         graph_resolver: None,
         graph: None,
         graph_projection: None,

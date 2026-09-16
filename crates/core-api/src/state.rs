@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use ai_gateway::OpenAiCompatibleLlmProvider;
 use connector_sdk::EvidenceSink;
 use core_config::{HybridSearchSection, ImportSection};
 use core_events::EventProducer;
@@ -9,7 +10,7 @@ use core_jobs::JobService;
 use core_observability::MetricsRegistry;
 use core_security::{ApiTokenStore, AuditLog, JwtService};
 use merge::MergeService;
-use resolver::{GraphContextResolver, ResolverService};
+use resolver::{AutoApprovalEvaluator, GraphContextResolver, ResolverService};
 use storage_core::mock::MockEmbeddingProvider;
 use storage_core::{ObjectStore, RelationalStore};
 use storage_opensearch::OpenSearchStore;
@@ -30,6 +31,23 @@ pub type SharedResolverService =
     Arc<ResolverService<PostgresCanonicalStore, MockEmbeddingProvider>>;
 pub type SharedGraphContextResolver =
     Arc<GraphContextResolver<PostgresCanonicalStore, storage_neo4j::Neo4jStore>>;
+
+/// ADR-012 AI 輔助自動核准。`None`（見 [`AppState::auto_approval`]）代表沒接上
+/// Postgres——跟 [`SharedResolverService`] 同一個可用性：沒有 canonical store
+/// 就沒有候選可評估。
+///
+/// LLM 是否真的會被呼叫由 `evaluator` 內部的 [`OpenAiCompatibleLlmProvider`]
+/// 決定（`enabled=false` 時該 provider 已經會直接短路回 `Unsupported`），這裡
+/// 不重複一份判斷。`max_auto_merges_per_resolve` 是跨多對候選才有意義的上限，
+/// [`AutoApprovalEvaluator::evaluate_pair`] 本身只管一對，所以放在這個包裝
+/// struct，由呼叫端（`resources/merge.rs`）在迴圈裡自己數。
+#[derive(Clone)]
+pub struct AutoApprovalState {
+    pub evaluator: Arc<AutoApprovalEvaluator<PostgresCanonicalStore, OpenAiCompatibleLlmProvider>>,
+    pub max_auto_merges_per_resolve: u32,
+}
+
+pub type SharedAutoApprovalState = Arc<AutoApprovalState>;
 pub type SharedSearchState = Arc<SearchState>;
 pub type SharedSemanticSearchState = Arc<SemanticSearchState>;
 
@@ -144,6 +162,8 @@ pub struct AppState {
     /// 會產出 `semantic_similarity` 候選。`graph_context` 走獨立欄位
     /// [`AppState::graph_resolver`]。
     pub resolver: Option<SharedResolverService>,
+    /// ADR-012 自動核准。`None` 代表沒接上 Postgres。見 [`AutoApprovalState`]。
+    pub auto_approval: Option<SharedAutoApprovalState>,
     /// graph_context resolution。`None` 代表沒接上 Neo4j——**跟 [`AppState::resolver`]
     /// 完全獨立**，Neo4j 斷線只影響 `POST /entities/{id}/resolve/graph-context`
     /// 這一條路由，不影響 resolve_entity 的另外幾個方法。這正是拆成獨立 endpoint

@@ -6,10 +6,10 @@ use std::sync::Arc;
 use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
-    AppState, AuthState, BackendCheck, BrokerCheck, ErrorBody, GraphProjectionState, ImportState,
-    PostgresReady, QueueBinding, QueueInspector, ReadyCheck, ReadyProbe, SemanticSearchState,
-    SharedGraphStore, SharedObjects, SharedStore, SharedTokenStore, router,
-    warn_unimplemented_hybrid_weights,
+    AppState, AuthState, AutoApprovalState, BackendCheck, BrokerCheck, ErrorBody,
+    GraphProjectionState, ImportState, PostgresReady, QueueBinding, QueueInspector, ReadyCheck,
+    ReadyProbe, SemanticSearchState, SharedGraphStore, SharedObjects, SharedStore,
+    SharedTokenStore, router, warn_unimplemented_hybrid_weights,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -85,7 +85,7 @@ async fn run() -> Result<(), String> {
     let mut audit: Arc<dyn AuditLog> = Arc::new(MemoryAuditLog::new());
     let mut tokens: SharedTokenStore = Arc::new(MemoryApiTokenStore::new());
 
-    let (jobs, merge, resolver, import, ready) = match connect_postgres(&cfg).await {
+    let (jobs, merge, resolver, auto_approval, import, ready) = match connect_postgres(&cfg).await {
         Ok(store) => {
             let ready = ReadyProbe::new(vec![Arc::new(PostgresReady {
                 store: store.clone(),
@@ -137,8 +137,13 @@ async fn run() -> Result<(), String> {
                 store.clone(),
                 MockEmbeddingProvider::unsupported(),
             )));
+            let auto_approval = Some(Arc::new(assemble_auto_approval(
+                store.clone(),
+                producer.clone(),
+                &cfg.auto_approval,
+            )));
             pg_store = Some(store);
-            (jobs, merge, resolver, import, ready)
+            (jobs, merge, resolver, auto_approval, import, ready)
         }
         Err(err) => {
             tracing::warn!(
@@ -148,7 +153,7 @@ async fn run() -> Result<(), String> {
             );
             missing.push("postgres");
             missing.push("object_store");
-            (None, None, None, None, ReadyProbe::always_ready())
+            (None, None, None, None, None, ReadyProbe::always_ready())
         }
     };
 
@@ -303,6 +308,7 @@ async fn run() -> Result<(), String> {
         jobs,
         merge,
         resolver,
+        auto_approval,
         graph_resolver,
         graph,
         graph_projection,
@@ -376,6 +382,63 @@ fn queue_bindings(cfg: &AppConfig) -> Vec<QueueBinding> {
             topic: core_events::EventTopic::EntityExtracted.as_str(),
         },
     ]
+}
+
+/// 從 `[auto_approval]` 組 [`AutoApprovalState`]。
+///
+/// 門檻不自洽時強制停用（`core-config` 沒有 `tracing`，警告只能在這裡發）。
+/// 不論 `enabled` 是不是 true 都會組出 evaluator：關閉路徑是
+/// [`resolver::AutoApprovalEvaluator::evaluate_pair`] 立刻回 `Disabled`，
+/// 組裝成本幾乎為零，handler 也不用再分「沒組」與「組了但關著」兩種 `None`。
+fn assemble_auto_approval(
+    store: PostgresCanonicalStore,
+    producer: Option<Arc<EventProducer>>,
+    section: &core_config::AutoApprovalSection,
+) -> AutoApprovalState {
+    let effectively_enabled = section.enabled && section.thresholds_are_sane();
+    if section.enabled && !section.thresholds_are_sane() {
+        tracing::error!(
+            auto_confirm_score = section.auto_confirm_score,
+            llm_review_score = section.llm_review_score,
+            "auto_approval.enabled=true 但門檻不自洽（auto_confirm_score 應該 \
+             >= llm_review_score），已強制停用自動核准，所有候選維持 Pending"
+        );
+    }
+    if effectively_enabled {
+        tracing::warn!(
+            auto_confirm_score = section.auto_confirm_score,
+            llm_review_score = section.llm_review_score,
+            llm_enabled = section.llm.enabled,
+            "AI 輔助自動核准已啟用（ADR-012）。門檻未經真實 OSINT 語料驗證，\
+             見 docs/adr/ADR-012-ai-assisted-auto-approval.md。建議上線初期定期 \
+             抽查 merge_history WHERE auto_approval_audit IS NOT NULL"
+        );
+    }
+    let llm_provider = ai_gateway::OpenAiCompatibleLlmProvider::new(
+        &ai_gateway::OpenAiCompatibleLlmProviderConfig {
+            enabled: effectively_enabled && section.llm.enabled,
+            base_url: section.llm.base_url.clone(),
+            timeout: std::time::Duration::from_secs(section.llm.timeout_secs),
+            max_concurrent: section.llm.max_concurrent,
+        },
+    );
+    let evaluator_config = resolver::AutoApprovalConfig {
+        enabled: effectively_enabled,
+        auto_confirm_score: section.auto_confirm_score,
+        llm_review_score: section.llm_review_score,
+        llm_model: section.llm.model.clone(),
+        llm_temperature: section.llm.temperature,
+        llm_max_tokens: section.llm.max_tokens,
+    };
+    AutoApprovalState {
+        evaluator: Arc::new(resolver::AutoApprovalEvaluator::new(
+            store,
+            producer,
+            llm_provider,
+            evaluator_config,
+        )),
+        max_auto_merges_per_resolve: section.max_auto_merges_per_resolve,
+    }
 }
 
 async fn connect_postgres(cfg: &AppConfig) -> Result<PostgresCanonicalStore, String> {

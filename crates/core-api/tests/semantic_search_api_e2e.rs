@@ -83,6 +83,7 @@ fn build_api(stack: &Stack, index: &str) -> TestApi {
         jobs: None,
         merge: None,
         resolver: None,
+        auto_approval: None,
         graph_resolver: None,
         graph: None,
         graph_projection: None,
