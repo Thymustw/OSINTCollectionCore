@@ -109,7 +109,7 @@ redis = { version = "=1.2.2", default-features = false, features = ["tokio-comp"
 # aws feature 內建 reqwest/rustls + aws-lc-rs，不開 native-tls。default-features
 # 關掉是因為 crate 預設帶 `fs`（本機檔案系統），我們只接 MinIO。
 object_store = { version = "0.14.1", default-features = false, features = ["aws"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
 sqlx = { version = "0.9.0", default-features = false, features = [
