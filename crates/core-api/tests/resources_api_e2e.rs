@@ -1554,6 +1554,46 @@ async fn job_retry_only_from_failed_and_is_audited() {
     );
 }
 
+/// `POST /api/v1/graph/rebuild` 成功時要留稽核——`AUDIT_GRAPH_REBUILD` 在
+/// `resources/graph.rs` 的成功與失敗分支都有發，但先前沒有任何測試斷言過
+/// 成功那一分支真的寫進稽核表（`viewer_cannot_write_anything` 只驗到 403
+/// 那條 rejected 分支）。
+#[tokio::test]
+async fn graph_rebuild_writes_success_audit() {
+    let stack = connect_stack().await;
+    let producer = Arc::new(
+        EventProducer::connect(&stack.brokers, "core-api-e2e-graph-rebuild")
+            .expect("Redpanda producer"),
+    );
+    let api = build_api(&stack, Some(producer));
+
+    let (status, job, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/graph/rebuild",
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{job}");
+    assert_eq!(job["type"], "graph_rebuild");
+    assert_eq!(job["status"], "queued");
+    let job_id = job["id"].as_str().unwrap();
+
+    let entry = api
+        .audit
+        .entries()
+        .into_iter()
+        .find(|e| {
+            e.action == core_api::AUDIT_GRAPH_REBUILD && e.resource_id == Some(job_id.to_string())
+        })
+        .expect("graph.rebuild 稽核");
+    assert_eq!(entry.outcome, "success");
+    assert_eq!(entry.ip.as_deref(), Some("203.0.113.9"));
+}
+
 // ---------------------------------------------------------------- ops health
 
 /// 把 Redis 指到一個沒有人在聽的埠：`/ops/health` 要回 503 並指出是 redis。

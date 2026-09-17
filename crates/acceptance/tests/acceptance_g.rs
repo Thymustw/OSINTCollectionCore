@@ -1,4 +1,6 @@
-//! SPEC §26 Acceptance G：**Import → Core → Export 不遺失主要 semantic relationship**。
+//! SPEC_V0.2 §23 Acceptance G：**Import → Core → Export 不遺失主要 semantic relationship**。
+//! （SPEC_V0.1 §26 只有 A-F，沒有 G——這裡標的一直是 V0.2 §23 的驗收項目，
+//! 早先的檔頭寫成「SPEC §26」是筆誤。）
 //!
 //! 這支測試把 STIX 2.1 匯出／匯入**完整走一遍真正的 HTTP**：
 //!

@@ -51,6 +51,7 @@ pub mod relationships;
 pub mod similar;
 pub mod sources;
 pub mod stix;
+pub mod timeline;
 
 use axum::http::{HeaderMap, StatusCode, header};
 use chrono::{DateTime, SecondsFormat, Utc};

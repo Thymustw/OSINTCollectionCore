@@ -1,7 +1,7 @@
-# API 參考（V0.1）
+# API 參考
 
-Base path：`/api/v1`（SPEC §19）。**這份是 V0.1 的 API 參考文件**
-（SPEC §27 Exit Criteria「API docs 可查看」指的就是它）。
+Base path：`/api/v1`（SPEC §19）。**這份涵蓋 V0.1 與 V0.2 的 REST API**
+（SPEC §27／SPEC_V0.2 §24 Exit Criteria「API docs 可查看／updated」指的就是它）。
 
 SPEC §19 的 endpoint 在 Phase 6b 全部落地，唯一的例外是 `POST /objects`——
 它一律回 501（V0.1 的決定：直接 POST 建立的物件沒有 Raw Evidence 祖先，provenance 鏈會靜默地不完整——物件在所有 list 與搜尋回應裡看起來完全正常，只有分析師追查「這則資訊從哪來」時才會發現 `raw_evidence: []`；push 式匯入請改用 `POST /api/v1/import`，讓上傳的 bytes 本身成為 Raw Evidence）。
@@ -48,6 +48,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/entities/{id}` | viewer | 200 | 含關聯數與抽取紀錄 |
 | GET | `/api/v1/entities/{id}/resolution-candidates` | viewer | 200 | cursor 分頁；`?status=` |
 | GET | `/api/v1/entities/{id}/merge-history` | viewer | 200 | 含已撤銷的 merge |
+| GET | `/api/v1/entities/{id}/timeline` | viewer | 200／404 | Entity 的文件時間軸（`published_at` fallback `observed_at`）；不查 `events` 表 |
 | POST | `/api/v1/entities/{id}/resolve` | operator | 200 | 跑只需要 Postgres 的掃描方法，回這次新寫入的候選；若 `auto_approval.enabled=true`，成功後額外評估全部 Pending 候選並可能自動 merge（ADR-012） |
 | POST | `/api/v1/entities/{id}/resolve/graph-context` | operator | 200 | graph_context；Neo4j 沒接上回 503，不影響上一條 |
 | POST | `/api/v1/entities/merge` | operator | 200 | body：`survivor_id`／`merged_id`／`reason` |
@@ -472,7 +473,42 @@ curl -s http://127.0.0.1:18080/api/v1/jobs/$JOB_ID/result \
 
 使用者導向說明見 `docs/user/stix.md`。
 
-## Operations Center（`/api/v1/ops/*`，SPEC §31）
+## Entity Timeline
+
+`GET /api/v1/entities/{id}/timeline`（SPEC_V0.2 §10，viewer 以上）。回這個
+Entity 被哪些 Document 提到、依時間排序——資料來源是既有的
+`entity_extractions` 反查 Document，時間戳優先 `published_at`，缺值 fallback
+`observed_at`（**不用 `collected_at`**——SPEC §10 明文禁止把採集時間當事件
+時間）。
+
+```bash
+curl -s "http://127.0.0.1:18080/api/v1/entities/$ENTITY_ID/timeline?limit=20" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "entity_id": "...",
+  "entries": [
+    {"document_id": "...", "title": "...", "time": "2026-05-01T00:00:00Z", "time_source": "published_at"}
+  ],
+  "truncated": false
+}
+```
+
+- `limit`：夾在 1..=100，預設 20。沒有 cursor 分頁——範圍是單一 Entity 的
+  extraction 數量，`truncated: true` 代表命中 `limit`，可能還有更多。
+- `time_source` 是 `"published_at"` 或 `"observed_at"`，讓呼叫端看得出這筆
+  時間的可信度（來源自己宣稱的時間，還是系統觀察到的時間）。
+- 只有這一個 Timeline 端點。`GET /timeline`（全域）與
+  `GET /collections/{id}/timeline` 在 V0.2 **完全不存在**（連 501 stub 都
+  沒有，打了是一般的 404）——collection→物件關聯在生產路徑上沒被寫入、
+  「topic」查詢維度在資料模型裡不存在，兩者都需要先解決各自獨立的前置問題。
+  完整理由見 `docs/adr/ADR-013-timeline-entity-only-v0.2-scope.md`。
+- 空清單是正常行為：Entity 沒有 extraction，或 extraction 指到的物件已刪除／
+  是別份的 duplicate，都會回 `entries: []`，不是錯誤。
+
+## Operations Center（`/api/v1/ops/*`，SPEC §31／SPEC_V0.2 §27）
 
 `GET /ops/health` 聚合七個後端名稱：`postgres`／`object_store`／`redis`／
 `opensearch`／`redpanda`／`neo4j`／`neo4j_bolt`。

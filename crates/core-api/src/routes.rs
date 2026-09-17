@@ -140,6 +140,10 @@ pub fn router(state: AppState) -> Router {
             get(resources::merge::list_merge_history),
         )
         .route(
+            "/api/v1/entities/{id}/timeline",
+            get(resources::timeline::entity_timeline),
+        )
+        .route(
             "/api/v1/relationships",
             get(resources::relationships::list_relationships),
         )
