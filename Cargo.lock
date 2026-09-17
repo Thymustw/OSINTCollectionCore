@@ -1325,6 +1325,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "discovery-worker"
+version = "0.1.0"
+dependencies = [
+ "core-config",
+ "core-events",
+ "core-jobs",
+ "core-model",
+ "core-observability",
+ "serde_json",
+ "storage-core",
+ "storage-postgres",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "worker-skeleton",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5408,6 +5427,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "worker-skeleton"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "core-observability",
+ "storage-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

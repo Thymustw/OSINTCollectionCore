@@ -29,10 +29,12 @@ members = [
     "crates/ai-gateway",
     "crates/merge",
     "crates/indexer",
+    "crates/discovery-worker",
     "crates/graph-worker",
     "crates/embedding-worker",
     "crates/stix-worker",
     "crates/osint-cli",
+    "crates/worker-skeleton",
     # 跨服務驗收測試（SPEC §26 Acceptance F、TEST_STRATEGY §6）。沒有生產程式碼。
     "crates/acceptance",
 ]

@@ -146,6 +146,11 @@ consumer_group = "osint-stix-worker"
 # 超過整批 Failed，不拆交易。硬上限，沒有「不限」。
 max_objects_per_tx = 10000
 
+[discovery_worker]
+# 18080-18088 已分別是既有服務的 health 埠。
+bind = "127.0.0.1:18089"
+consumer_group = "osint-discovery-worker"
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

@@ -1,0 +1,27 @@
+[package]
+name = "discovery-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "V0.3 Discovery Engine worker（osint-discovery-worker）。Phase 3 Step A：骨架，尚無 Discovery method 執行邏輯。"
+
+[[bin]]
+name = "osint-discovery-worker"
+path = "src/main.rs"
+
+[dependencies]
+core-config = { workspace = true }
+core-events = { workspace = true }
+core-jobs = { workspace = true }
+core-model = { workspace = true }
+core-observability = { workspace = true }
+serde_json = { workspace = true }
+storage-core = { workspace = true }
+storage-postgres = { path = "../storage-postgres" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+worker-skeleton = { path = "../worker-skeleton" }

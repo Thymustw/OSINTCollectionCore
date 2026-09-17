@@ -40,6 +40,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub stix_worker: StixWorkerSection,
     #[serde(default)]
+    pub discovery_worker: DiscoveryWorkerSection,
+    #[serde(default)]
     pub import: ImportSection,
     #[serde(default)]
     pub embedding: EmbeddingSection,
@@ -415,6 +417,28 @@ impl Default for StixWorkerSection {
             bind: "127.0.0.1:18088".into(),
             consumer_group: "osint-stix-worker".into(),
             max_objects_per_tx: 10_000,
+        }
+    }
+}
+
+/// discovery-worker（`osint-discovery-worker`）的 health 與 consumer 設定。
+///
+/// Phase 3 Step A 骨架階段只用得到 `bind`／`consumer_group`——沒有
+/// Discovery method 執行邏輯，自然也還沒有任何「per-run 上限」之類的設定
+/// 需要放在這裡（那些是 `CollectionBudget` 的職責，per-collection，不是
+/// per-worker 的全域設定）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryWorkerSection {
+    pub bind: String,
+    pub consumer_group: String,
+}
+
+impl Default for DiscoveryWorkerSection {
+    fn default() -> Self {
+        Self {
+            // 18080-18088 已分別是既有服務的 health 埠，18089 是下一個。
+            bind: "127.0.0.1:18089".into(),
+            consumer_group: "osint-discovery-worker".into(),
         }
     }
 }
@@ -1042,6 +1066,9 @@ mod tests {
             serde_json::from_value(value).unwrap()
         };
         assert_eq!(parsed.graph_worker, GraphWorkerSection::default());
+        // discovery_worker 同樣依賴 #[serde(default)]：既有設定檔沒有
+        // [discovery_worker] 時載入仍要成功。
+        assert_eq!(parsed.discovery_worker, DiscoveryWorkerSection::default());
     }
 
     #[test]
