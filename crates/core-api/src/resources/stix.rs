@@ -1,8 +1,9 @@
 //! STIX 2.1 匯入／匯出 HTTP 入口（SPEC_V0.2 §18-19）。
 //!
-//! 這一步只做到「建立並派工 Job」。真正消費 `job.dispatched`、把 bundle
-//! 映成 Core Object 的是 Step 3／4 的 stix-worker——在那之前，
-//! `stix_import`／`stix_export` Job 會一直停在 `queued`，這是預期的。
+//! `stix_import`／`stix_export` 這一步只做到「建立並派工 Job」。真正消費
+//! `job.dispatched`、把 bundle 映成 Core Object（import）或把 Core Object
+//! 組回 bundle（export）的是 Step 3／4 的 stix-worker——在那之前，Job 會一直
+//! 停在 `queued`，這是預期的。
 //!
 //! # 為什麼 STIX import 不發 `raw.collected`
 //!
@@ -12,36 +13,37 @@
 //! 當成一般文件去抽取，語意完全不對。這裡存 RawEvidence 只為了
 //! provenance／稽核，存完之後建 `stix_import` Job，**不**發 `raw.collected`。
 //!
-//! # `GET /jobs/{id}/result` 目前只有骨架
+//! # `GET /jobs/{id}/result` 讀取匯出結果
 //!
-//! Step 4 的 worker 會把匯出結果寫進物件儲存，key 慣例是
-//! [`export_result_object_key`]（`stix-exports/{job_id}.json`），並把同一個
-//! key 寫進 `job.parameters.result_object_key`。這一步**不**接 ObjectStore
-//! 讀檔——沒有 worker 就沒有結果可讀。handler 的行為：
+//! worker 把匯出結果寫進物件儲存，key 慣例是 [`export_result_object_key`]
+//! （`stix-exports/{job_id}.json`），並把同一個 key 寫進
+//! `job.parameters.result_object_key`。這個 handler 依 `job.parameters` 裡的
+//! key 真的去物件儲存讀擋回傳。handler 的行為：
 //!
 //! | 狀況 | 回應 |
 //! |---|---|
 //! | Job 不存在，或 `job_type` 不是 `stix_export` | 404 |
 //! | 狀態不是 `completed` | 409（訊息帶目前狀態） |
-//! | `completed` 但缺少 `result_object_key` | 500（worker 還沒接上，或不該發生的寫壞） |
+//! | `completed` 但缺少 `result_object_key` | 500（worker 寫壞，或不該發生的狀態） |
+//! | `completed` 有 key 但物件儲存讀不到內容，或內容不是合法 JSON | 500 |
 
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use connector_sdk::NewRawEvidence;
 use core_model::{Connector, Job, JobStatus, Source, SourceType};
 use core_security::{Permission, Principal};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use stix_adapter::StixError;
+use stix_adapter::{StixError, StixExportFilter, export_result_object_key};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::extractors::ClientIp;
 use crate::jobs::jobs_or_unavailable;
-use crate::resources::{AuditEvent, audit, rejected_metadata};
+use crate::resources::{AuditEvent, audit, objects, rejected_metadata};
 use crate::state::{AppState, ImportState};
 
 /// 稽核 action。字串會進 `audit_log.action`；STIX 文件收尾時再寫進
@@ -70,44 +72,11 @@ pub struct StixImportRequest {
     pub bundle: Value,
 }
 
-/// `POST /api/v1/export/stix` 的過濾條件。全部 optional，缺省代表不限。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StixExportFilter {
-    #[serde(default)]
-    pub entity_types: Option<Vec<String>>,
-    #[serde(default)]
-    pub entity_ids: Option<Vec<Uuid>>,
-    #[serde(default)]
-    pub time_range: Option<StixTimeRange>,
-    #[serde(default)]
-    pub depth: Option<u32>,
-}
-
-/// 匯出時間窗。兩個端點都可省略。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StixTimeRange {
-    #[serde(default)]
-    pub from: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub to: Option<DateTime<Utc>>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StixExportRequest {
     #[serde(default)]
     pub filter: StixExportFilter,
-}
-
-/// Step 4 worker 寫入匯出結果時用的物件儲存 key。
-///
-/// 這一步的 `GET /jobs/{id}/result` **不會**真的去讀這個 key——沒有 worker
-/// 產出過檔案。慣例先定下來，兩邊才不會各寫各的。
-#[must_use]
-pub fn export_result_object_key(job_id: Uuid) -> String {
-    format!("stix-exports/{job_id}.json")
 }
 
 /// `POST /api/v1/import/stix`。operator 以上。成功回 202 + Job。
@@ -259,7 +228,8 @@ pub async fn export_stix(
 
 /// `GET /api/v1/jobs/{id}/result`。viewer 以上。
 ///
-/// **目前只有骨架**：真正串接物件儲存留給 Step 4。見模組說明。
+/// worker 把結果寫進 `job.parameters.result_object_key` 指的物件儲存 key；
+/// 這裡依 key 真的讀檔回傳 STIX bundle JSON。見模組說明。
 pub async fn job_result(
     State(state): State<AppState>,
     principal: Principal,
@@ -286,21 +256,33 @@ pub async fn job_result(
         .and_then(|p| p.get(RESULT_OBJECT_KEY))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
-    let Some(_key) = key else {
-        // Step 4 接上 ObjectStore 之前，completed 但沒有 key 代表 worker 寫壞了，
-        // 或（現在）根本還沒有 worker。回 500 而不是 404：呼叫端不該重試同一個
-        // 已完成的 Job 期待它長出結果。
+    let Some(key) = key else {
+        // completed 但缺 key 代表 worker 寫壞了。回 500 而不是 404：呼叫端不該
+        // 重試同一個已完成的 Job 期待它長出結果。
         return Err(ApiError::internal(format!(
             "STIX 匯出 Job `{id}` 已完成，但 parameters 缺少 `{RESULT_OBJECT_KEY}`。\
              這不該發生：stix-worker 寫完物件儲存後必須把 key（慣例 {}）寫回 Job。\
-             請看 worker 記錄檔；這個 endpoint 目前是骨架，真正讀檔留給 Step 4",
+             請看 worker 記錄檔",
             export_result_object_key(id)
         )));
     };
-    Err(ApiError::internal(format!(
-        "STIX 匯出 Job `{id}` 已完成且有結果 key，但這個 endpoint 目前是骨架、\
-         還沒串接物件儲存。真正讀檔留給 Step 4"
-    )))
+    let objects = objects(&state)?;
+    let bytes = objects
+        .get(key)
+        .await
+        .map_err(crate::resources::storage_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "STIX 匯出 Job `{id}` 的 parameters 有 result_object_key=`{key}`，\
+                 但物件儲存裡讀不到這個檔案。請查 stix-worker 記錄檔，這不該發生"
+            ))
+        })?;
+    let bundle: Value = serde_json::from_slice(&bytes).map_err(|err| {
+        ApiError::internal(format!(
+            "STIX 匯出 Job `{id}` 的結果檔案不是合法 JSON：{err}。請查 stix-worker 記錄檔"
+        ))
+    })?;
+    Ok(Json(bundle))
 }
 
 fn import_or_unavailable(state: &AppState) -> Result<&ImportState, ApiError> {

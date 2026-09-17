@@ -171,6 +171,37 @@ impl<S: RelationalStore> JobService<S> {
         let job = self.create(job_type, correlation_id, parameters).await?;
         self.dispatch(job.id).await
     }
+
+    /// 把 `patch`（必須是 JSON object）的欄位合併進既有 `parameters`
+    /// （`parameters` 是 `None` 時視為空物件開始合併）。既有 key 保留，
+    /// `patch` 裡的同名 key 覆寫——語意同 entity-worker 對 `attributes` 的合併慣例。
+    ///
+    /// 用於 worker 執行完之後回填結果（例如 `stix_export` 寫回 `result_object_key`，
+    /// 不能動到 `filter` 等 API 建立 Job 時就寫入的欄位）。
+    ///
+    /// # Panics
+    /// `patch` 不是 JSON object 時 panic——這是呼叫端的程式錯誤，不是執行期可能發生的
+    /// 狀況（呼叫端永遠自己組 `json!({...})`），沒有必要做成 `Result`。
+    pub async fn merge_parameters(
+        &self,
+        id: JobId,
+        patch: serde_json::Value,
+    ) -> Result<Job, JobError> {
+        let patch = patch
+            .as_object()
+            .unwrap_or_else(|| panic!("merge_parameters 的 patch 必須是 JSON object，收到 {patch}"))
+            .clone();
+        let mut job = self.get(id).await?;
+        let mut merged = job
+            .parameters
+            .take()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        merged.extend(patch);
+        job.parameters = Some(serde_json::Value::Object(merged));
+        self.store.put_job(&job).await?;
+        Ok(job)
+    }
 }
 
 #[cfg(test)]

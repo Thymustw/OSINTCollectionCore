@@ -48,6 +48,18 @@ pub enum ImportError {
          本次不會拆交易、整批已標記 Failed"
     )]
     TooManyObjects { mapped: usize, max: usize },
+    #[error(
+        "stix_export Job 的 filter 參數解析失敗：{message}。\
+         請確認 entity_types 是合法的 EntityType（snake_case，例如 person／threat_actor）、\
+         entity_ids 是 UUID 陣列"
+    )]
+    InvalidFilter { message: String },
+    #[error(
+        "這次匯出符合 {matched} 個 Entity，超過 [stix].max_objects={max}。\
+         請縮小 filter（entity_ids／entity_types／depth）或請管理者調高該上限。\
+         這個 Job 已標記 Failed，不會自動重試"
+    )]
+    TooManyExportObjects { matched: usize, max: usize },
     #[error(transparent)]
     Storage(#[from] StorageError),
 }

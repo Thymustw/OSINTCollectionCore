@@ -6,14 +6,14 @@
 //! 每個測試的 Entity 名稱含 run-specific UUID，避免與前幾次跑的資料共用列。
 //! 測完刪掉這次寫進 MinIO 的 key。
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use core_jobs::JobService;
 use core_model::{
     Connector, Entity, EntityAlias, EntityType, Job, JobStatus, Provenance, RawEvidence,
-    RelationshipType, Source, SourceType,
+    Relationship, RelationshipType, Source, SourceType,
 };
 use core_observability::MetricsRegistry;
-use entity_worker::entity_id;
+use entity_worker::{entity_id, relationship_id};
 use resolver::AutoApprovalConfig;
 use serde_json::{Value, json};
 use stix_worker::service::StixWorkerOptions;
@@ -85,10 +85,19 @@ type TestWorker = StixWorker<
 >;
 
 fn worker(stack: &Stack) -> TestWorker {
-    worker_with(stack, disabled_auto(), 3)
+    worker_with(stack, disabled_auto(), 3, 10_000)
 }
 
-fn worker_with(stack: &Stack, auto: AutoApprovalConfig, max_merges: u32) -> TestWorker {
+fn worker_with_max_export(stack: &Stack, max_export_objects: usize) -> TestWorker {
+    worker_with(stack, disabled_auto(), 3, max_export_objects)
+}
+
+fn worker_with(
+    stack: &Stack,
+    auto: AutoApprovalConfig,
+    max_merges: u32,
+    max_export_objects: usize,
+) -> TestWorker {
     StixWorker::new(
         stack.pg.clone(),
         stack.s3.clone(),
@@ -98,6 +107,7 @@ fn worker_with(stack: &Stack, auto: AutoApprovalConfig, max_merges: u32) -> Test
         MetricsRegistry::new(),
         StixWorkerOptions {
             max_objects_per_tx: 10_000,
+            max_export_objects,
             max_auto_merges_per_resolve: max_merges,
             auto_approval: auto,
         },
@@ -288,6 +298,70 @@ async fn require_entity(
 fn has_stix_imported(rows: &[Provenance]) -> bool {
     rows.iter()
         .any(|p| p.action == ACTION_STIX_IMPORTED && p.processor == PROCESSOR)
+}
+
+fn make_entity(
+    entity_type: EntityType,
+    name: &str,
+    first_seen: chrono::DateTime<chrono::Utc>,
+) -> Entity {
+    let normalized = name.to_lowercase();
+    Entity {
+        id: entity_id(entity_type, &normalized),
+        entity_type,
+        name: name.into(),
+        normalized_name: normalized,
+        description: None,
+        confidence: 0.8,
+        first_seen,
+        last_seen: first_seen,
+        merged_into: None,
+        attributes: json!({}),
+    }
+}
+
+fn make_relationship(
+    source: &Uuid,
+    rel_type: RelationshipType,
+    target: &Uuid,
+    first_seen: chrono::DateTime<chrono::Utc>,
+) -> Relationship {
+    Relationship {
+        id: relationship_id(*source, rel_type, *target),
+        source_object_id: *source,
+        relationship_type: rel_type,
+        target_object_id: *target,
+        confidence: 0.8,
+        first_seen,
+        last_seen: first_seen,
+        evidence_count: 1,
+        created_at: first_seen,
+        updated_at: first_seen,
+    }
+}
+
+/// 從物件儲存讀回匯出結果 bundle，解析成 Value 供斷言。
+async fn fetch_export_bundle(stack: &Stack, job_id: Uuid) -> Value {
+    let key = stix_adapter::export_result_object_key(job_id);
+    let bytes = stack
+        .s3
+        .get(&key)
+        .await
+        .expect("s3 get")
+        .unwrap_or_else(|| panic!("找不到匯出 key `{key}`"));
+    serde_json::from_slice(&bytes).expect("bundle json")
+}
+
+fn bundle_objects(bundle: &Value) -> &Vec<Value> {
+    bundle["objects"].as_array().expect("objects array")
+}
+
+/// 建立一個 `stix_export` Job 並回傳。
+async fn create_export_job(stack: &Stack, filter: Value) -> Job {
+    let jobs = jobs(stack);
+    jobs.create("stix_export", None, Some(json!({ "filter": filter })))
+        .await
+        .expect("job")
 }
 
 #[tokio::test]
@@ -493,11 +567,11 @@ async fn graph_rebuild_job_is_ignored() {
 }
 
 #[tokio::test]
-async fn stix_export_job_is_ignored() {
+async fn unknown_job_type_is_ignored() {
     let stack = connect_stack().await;
     let jobs = jobs(&stack);
     let job = jobs
-        .create("stix_export", None, Some(json!({ "filter": {} })))
+        .create("unknown_job_type", None, Some(json!({})))
         .await
         .expect("job");
     let service = worker(&stack);
@@ -507,7 +581,7 @@ async fn stix_export_job_is_ignored() {
     assert_eq!(
         outcome,
         JobDispatchOutcome::Ignored {
-            job_type: "stix_export".into()
+            job_type: "unknown_job_type".into()
         }
     );
 }
@@ -603,7 +677,7 @@ async fn alias_auto_approval_merges_preseeded_pair() {
         }]
     });
     let seeded = seed_import(&stack, &source, &connector, &bundle).await;
-    let service = worker_with(&stack, alias_auto(), 3);
+    let service = worker_with(&stack, alias_auto(), 3, 10_000);
     let jobs = jobs(&stack);
     let outcome = service
         .process_dispatched_job(&jobs, &dispatch_payload(&seeded.job))
@@ -647,4 +721,350 @@ async fn alias_auto_approval_merges_preseeded_pair() {
     );
 
     cleanup_s3(&stack, &seeded.storage_path).await;
+}
+
+#[tokio::test]
+async fn export_entity_ids_precise() {
+    let stack = connect_stack().await;
+    let now = Utc::now();
+    let a = make_entity(
+        EntityType::Organization,
+        &format!("Export Org A {}", Uuid::now_v7()),
+        now,
+    );
+    let b = make_entity(
+        EntityType::Person,
+        &format!("Export Person B {}", Uuid::now_v7()),
+        now,
+    );
+    stack.pg.put_entity(&a).await.expect("entity a");
+    stack.pg.put_entity(&b).await.expect("entity b");
+    let rel = make_relationship(&b.id, RelationshipType::MemberOf, &a.id, now);
+    stack.pg.put_relationship(&rel).await.expect("relationship");
+
+    let job = create_export_job(&stack, json!({ "entity_ids": [a.id, b.id] })).await;
+    let service = worker(&stack);
+    let outcome = service
+        .process_dispatched_job(&jobs(&stack), &dispatch_payload(&job))
+        .await;
+    assert_eq!(outcome, JobDispatchOutcome::Completed { job_id: job.id });
+
+    let bundle = fetch_export_bundle(&stack, job.id).await;
+    assert_eq!(bundle["type"], "bundle");
+    let objects = bundle_objects(&bundle);
+    let kinds: Vec<&str> = objects
+        .iter()
+        .map(|o| o["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(objects.len(), 3, "應含兩物件一關係：{objects:#?}");
+    assert!(
+        kinds.contains(&"identity"),
+        "Organization → identity：{kinds:?}"
+    );
+    assert!(kinds.contains(&"relationship"), "{kinds:?}");
+
+    // parameters 應保留 filter 並新增 result_object_key
+    let after = jobs(&stack).get(job.id).await.expect("job");
+    let params = after.parameters.expect("parameters");
+    assert!(params.get("filter").is_some(), "filter 應保留：{params}");
+    assert_eq!(
+        params["result_object_key"],
+        json!(stix_adapter::export_result_object_key(job.id))
+    );
+
+    cleanup_s3(&stack, &stix_adapter::export_result_object_key(job.id)).await;
+}
+
+#[tokio::test]
+async fn export_entity_types_filters_output() {
+    let stack = connect_stack().await;
+    let now = Utc::now();
+    let org = make_entity(
+        EntityType::Organization,
+        &format!("Filter Org {}", Uuid::now_v7()),
+        now,
+    );
+    let actor = make_entity(
+        EntityType::ThreatActor,
+        &format!("Filter Actor {}", Uuid::now_v7()),
+        now,
+    );
+    let domain = make_entity(
+        EntityType::Domain,
+        &format!("Filter Domain {}.example", Uuid::now_v7()),
+        now,
+    );
+    for e in [&org, &actor, &domain] {
+        stack.pg.put_entity(e).await.expect("put entity");
+    }
+
+    let job = create_export_job(&stack, json!({ "entity_types": ["threat_actor"] })).await;
+    let service = worker(&stack);
+    service
+        .process_dispatched_job(&jobs(&stack), &dispatch_payload(&job))
+        .await;
+    let bundle = fetch_export_bundle(&stack, job.id).await;
+    let objects = bundle_objects(&bundle);
+    // 這個情境沒有 entity_ids，走全表掃描，共用的開發用 Postgres 上可能還有
+    // 其他測試留下的 threat_actor——不能斷言總數，只能斷言「型別只有
+    // threat-actor」且「這次造的 actor 有進去、org／domain 沒有」。
+    assert!(
+        objects.iter().all(|o| o["type"] == "threat-actor"),
+        "entity_types 過濾後不該有其他型別：{objects:#?}"
+    );
+    let names: Vec<&str> = objects.iter().filter_map(|o| o["name"].as_str()).collect();
+    assert!(
+        names.contains(&actor.name.as_str()),
+        "應含這次造的 actor：{names:?}"
+    );
+    assert!(!names.contains(&org.name.as_str()), "不該含 org：{names:?}");
+    assert!(
+        !names.contains(&domain.name.as_str()),
+        "不該含 domain：{names:?}"
+    );
+
+    cleanup_s3(&stack, &stix_adapter::export_result_object_key(job.id)).await;
+}
+
+#[tokio::test]
+async fn export_depth_expands_one_level_then_two() {
+    let stack = connect_stack().await;
+    let now = Utc::now();
+    let a = make_entity(
+        EntityType::Person,
+        &format!("Depth A {}", Uuid::now_v7()),
+        now,
+    );
+    let b = make_entity(
+        EntityType::Person,
+        &format!("Depth B {}", Uuid::now_v7()),
+        now,
+    );
+    let c = make_entity(
+        EntityType::Person,
+        &format!("Depth C {}", Uuid::now_v7()),
+        now,
+    );
+    for e in [&a, &b, &c] {
+        stack.pg.put_entity(e).await.expect("put entity");
+    }
+    // A→B→C 鏈
+    stack
+        .pg
+        .put_relationship(&make_relationship(
+            &a.id,
+            RelationshipType::Mentions,
+            &b.id,
+            now,
+        ))
+        .await
+        .expect("rel a-b");
+    stack
+        .pg
+        .put_relationship(&make_relationship(
+            &b.id,
+            RelationshipType::Mentions,
+            &c.id,
+            now,
+        ))
+        .await
+        .expect("rel b-c");
+
+    // depth=1：只有 A、B 與 A-B 的關係，不含 C
+    let job1 = create_export_job(&stack, json!({ "entity_ids": [a.id], "depth": 1 })).await;
+    service_process(&stack, &job1).await;
+    let bundle1 = fetch_export_bundle(&stack, job1.id).await;
+    let names1: Vec<String> = bundle_objects(&bundle1)
+        .iter()
+        .filter(|o| o["type"] != "relationship")
+        .map(|o| o["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(names1.contains(&a.name), "深度1含 A：{names1:?}");
+    assert!(names1.contains(&b.name), "深度1含 B：{names1:?}");
+    assert!(!names1.contains(&c.name), "深度1不含 C：{names1:?}");
+    assert!(
+        bundle_objects(&bundle1)
+            .iter()
+            .any(|o| o["type"] == "relationship"),
+        "深度1含 A-B 關係：{bundle1:#?}"
+    );
+
+    // depth=2：含 C
+    let job2 = create_export_job(&stack, json!({ "entity_ids": [a.id], "depth": 2 })).await;
+    service_process(&stack, &job2).await;
+    let bundle2 = fetch_export_bundle(&stack, job2.id).await;
+    let names2: Vec<String> = bundle_objects(&bundle2)
+        .iter()
+        .filter(|o| o["type"] != "relationship")
+        .map(|o| o["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(names2.contains(&c.name), "深度2含 C：{names2:?}");
+
+    cleanup_s3(&stack, &stix_adapter::export_result_object_key(job1.id)).await;
+    cleanup_s3(&stack, &stix_adapter::export_result_object_key(job2.id)).await;
+}
+
+#[tokio::test]
+async fn export_excludes_merged_entities() {
+    let stack = connect_stack().await;
+    let now = Utc::now();
+    let a = make_entity(
+        EntityType::Organization,
+        &format!("Merged Survivor {}", Uuid::now_v7()),
+        now,
+    );
+    let b = make_entity(
+        EntityType::Organization,
+        &format!("Merged Away {}", Uuid::now_v7()),
+        now,
+    );
+    // 把 B 標記成被 A 併掉
+    let mut b = b;
+    b.merged_into = Some(a.id);
+    stack.pg.put_entity(&a).await.expect("entity a");
+    stack.pg.put_entity(&b).await.expect("entity b");
+
+    let job = create_export_job(&stack, json!({ "entity_ids": [a.id, b.id] })).await;
+    service_process(&stack, &job).await;
+    let bundle = fetch_export_bundle(&stack, job.id).await;
+    let names: Vec<String> = bundle_objects(&bundle)
+        .iter()
+        .map(|o| o["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(names.contains(&a.name), "survivor 要匯出：{names:?}");
+    assert!(!names.contains(&b.name), "被併掉的 B 不該匯出：{names:?}");
+
+    cleanup_s3(&stack, &stix_adapter::export_result_object_key(job.id)).await;
+}
+
+#[tokio::test]
+async fn export_missing_entity_id_is_skipped_and_job_completes() {
+    let stack = connect_stack().await;
+    let now = Utc::now();
+    let a = make_entity(
+        EntityType::Domain,
+        &format!("Real Domain {}.example", Uuid::now_v7()),
+        now,
+    );
+    stack.pg.put_entity(&a).await.expect("entity a");
+    let ghost = Uuid::now_v7();
+
+    let job = create_export_job(&stack, json!({ "entity_ids": [a.id, ghost] })).await;
+    let service = worker(&stack);
+    let outcome = service
+        .process_dispatched_job(&jobs(&stack), &dispatch_payload(&job))
+        .await;
+    assert_eq!(outcome, JobDispatchOutcome::Completed { job_id: job.id });
+    let bundle = fetch_export_bundle(&stack, job.id).await;
+    let objects = bundle_objects(&bundle);
+    assert_eq!(objects.len(), 1, "只有真實的 A：{objects:#?}");
+    assert_eq!(objects[0]["type"], "domain-name");
+
+    cleanup_s3(&stack, &stix_adapter::export_result_object_key(job.id)).await;
+}
+
+#[tokio::test]
+async fn export_time_range_filters_relationship() {
+    let stack = connect_stack().await;
+    let dawn = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let a = make_entity(
+        EntityType::Person,
+        &format!("TR A {}", Uuid::now_v7()),
+        dawn,
+    );
+    let b = make_entity(
+        EntityType::Organization,
+        &format!("TR B {}", Uuid::now_v7()),
+        dawn,
+    );
+    for e in [&a, &b] {
+        stack.pg.put_entity(e).await.expect("put entity");
+    }
+    // 窗內（2 月）與窗外（12 月）各一條
+    let in_rel = make_relationship(
+        &a.id,
+        RelationshipType::BelongsTo,
+        &b.id,
+        Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap(),
+    );
+    let out_rel = make_relationship(
+        &a.id,
+        RelationshipType::Targets,
+        &b.id,
+        Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap(),
+    );
+    stack.pg.put_relationship(&in_rel).await.expect("in rel");
+    stack.pg.put_relationship(&out_rel).await.expect("out rel");
+
+    // entity_ids 指定兩端，time_range 只罩 2026-01-15..2026-03-15
+    let job = create_export_job(
+        &stack,
+        json!({
+            "entity_ids": [a.id, b.id],
+            "time_range": {
+                "from": "2026-01-15T00:00:00Z",
+                "to": "2026-03-15T00:00:00Z"
+            }
+        }),
+    )
+    .await;
+    service_process(&stack, &job).await;
+    let bundle = fetch_export_bundle(&stack, job.id).await;
+    let rels: Vec<&Value> = bundle_objects(&bundle)
+        .iter()
+        .filter(|o| o["type"] == "relationship")
+        .collect();
+    assert_eq!(rels.len(), 1, "只該有窗內的關係：{rels:#?}");
+    assert_eq!(rels[0]["relationship_type"], "belongs-to");
+
+    cleanup_s3(&stack, &stix_adapter::export_result_object_key(job.id)).await;
+}
+
+#[tokio::test]
+async fn export_exceeds_max_export_objects_is_failed() {
+    let stack = connect_stack().await;
+    let now = Utc::now();
+    let a = make_entity(
+        EntityType::Organization,
+        &format!("MO A {}", Uuid::now_v7()),
+        now,
+    );
+    let b = make_entity(
+        EntityType::Organization,
+        &format!("MO B {}", Uuid::now_v7()),
+        now,
+    );
+    let c = make_entity(
+        EntityType::Organization,
+        &format!("MO C {}", Uuid::now_v7()),
+        now,
+    );
+    for e in [&a, &b, &c] {
+        stack.pg.put_entity(e).await.expect("put entity");
+    }
+    // max_export_objects = 1，掃描會命中 3 個
+    let service = worker_with_max_export(&stack, 1);
+    let job = create_export_job(&stack, json!({})).await;
+    let outcome = service
+        .process_dispatched_job(&jobs(&stack), &dispatch_payload(&job))
+        .await;
+    assert_eq!(outcome, JobDispatchOutcome::Failed { job_id: job.id });
+    let failed = jobs(&stack).get(job.id).await.expect("job");
+    assert_eq!(failed.status, JobStatus::Failed);
+    let err = failed.error.expect("error");
+    assert!(
+        err.contains("max_objects") || err.contains("上限"),
+        "錯誤訊息應指出 max_objects：{err}"
+    );
+}
+
+async fn service_process(stack: &Stack, job: &Job) {
+    let service = worker(stack);
+    let outcome = service
+        .process_dispatched_job(&jobs(stack), &dispatch_payload(job))
+        .await;
+    assert!(
+        matches!(outcome, JobDispatchOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
 }

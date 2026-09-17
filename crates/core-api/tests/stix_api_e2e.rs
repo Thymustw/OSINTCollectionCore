@@ -22,8 +22,8 @@ use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use storage_core::RelationalStore;
 use storage_core::conformance::{load_workspace_dotenv, required_env, verify_not_opencti_s3};
+use storage_core::{ObjectStore, RelationalStore};
 use storage_postgres::PostgresCanonicalStore;
 use storage_s3::S3ObjectStore;
 use tower::ServiceExt;
@@ -450,4 +450,93 @@ async fn job_result_completed_without_key_is_500() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("result_object_key"), "{message}");
+}
+
+/// 這個 e2e 測試環境沒有真的 stix-worker 在跑，所以要模擬 worker 做完的狀態：
+/// 直接把一份合法 bundle 寫進物件儲存，直接改 `Job.parameters` 補
+/// `result_object_key`（沒有 HTTP 端點能改 `parameters`，比照其他測試直接用
+/// store handle），走 HTTP 轉成 `completed`，驗證 `GET /jobs/{id}/result`
+/// 真的把物件儲存裡的 bundle 讀回來，而不是 500 骨架。
+#[tokio::test]
+async fn job_result_completed_with_object_returns_bundle() {
+    let stack = connect_stack().await;
+    let producer = Arc::new(
+        EventProducer::connect(&stack.brokers, "core-api-stix-result-ok").expect("producer"),
+    );
+    let api = build_api(&stack, producer);
+    let (status, job) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/export/stix",
+            &api.operator,
+            &json!({"filter": {}}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+    let id: Uuid = job["id"].as_str().unwrap().parse().unwrap();
+
+    // 模擬 worker：把 bundle 寫進物件儲存。
+    let key = stix_adapter::export_result_object_key(id);
+    let bundle = ok_bundle();
+    stack
+        .s3
+        .put(
+            &key,
+            &serde_json::to_vec(&bundle).expect("serialize bundle"),
+            Some("application/stix+json"),
+        )
+        .await
+        .expect("s3 put");
+
+    // 模擬 worker：把 result_object_key 補進 Job.parameters（保留既有的 filter）。
+    let mut stored = stack
+        .pg
+        .get_job(id)
+        .await
+        .expect("get job")
+        .expect("job exists");
+    let mut params = stored
+        .parameters
+        .take()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    params.insert("result_object_key".into(), json!(key));
+    stored.parameters = Some(Value::Object(params));
+    stack.pg.put_job(&stored).await.expect("put job");
+
+    let (status, _) = send(
+        &api.app,
+        json_request(
+            "POST",
+            &format!("/api/v1/jobs/{id}/transition"),
+            &api.operator,
+            &json!({"status": "running"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &api.app,
+        json_request(
+            "POST",
+            &format!("/api/v1/jobs/{id}/transition"),
+            &api.operator,
+            &json!({"status": "completed"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &api.app,
+        get(&format!("/api/v1/jobs/{id}/result"), &api.viewer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["type"], "bundle");
+    assert_eq!(body, bundle);
+
+    let _ = stack.s3.delete(&key).await;
 }

@@ -1,9 +1,13 @@
-//! `job.dispatched` → 只執行 `stix_import`。
+//! `job.dispatched` → `stix_import` / `stix_export` 的執行調度。
+//!
+//! `stix_import` 與 `stix_export` 的執行本體是這裡的 `run_import`（本檔）與
+//! `export.rs` 的 `run_export`。這個模組負責 job 狀態轉移（Running →
+//! Completed/Failed）與 metrics。
 //!
 //! # 為什麼 JobService 不塞進 [`StixWorker`]
 //!
-//! 與 graph-worker 同一理由：這個 struct 的職責是「把一份 STIX bundle 寫進
-//! Postgres」，job 狀態轉移是呼叫端的事。方法放在這裡是為了讓 e2e 能直接呼叫
+//! 與 graph-worker 同一理由：這個 struct 的職責是「處理一份 STIX job」，
+//! job 狀態轉移是呼叫端的事。方法放在這裡是為了讓 e2e 能直接呼叫
 //! [`StixWorker::process_dispatched_job`]，不必接 Kafka。
 //!
 //! # offset 一律由呼叫端提交
@@ -36,9 +40,11 @@ use uuid::Uuid;
 
 use crate::error::ImportError;
 
-/// `job.dispatched` 上 stix-worker 認得的唯一 job type。
-/// `stix_export`／`graph_rebuild` 一律 [`JobDispatchOutcome::Ignored`]。
+/// `job.dispatched` 上 stix-worker 認得的 `stix_import` job type。
 pub const JOB_TYPE_IMPORT: &str = "stix_import";
+
+/// `job.dispatched` 上 stix-worker 認得的 `stix_export` job type。
+pub const JOB_TYPE_EXPORT: &str = "stix_export";
 
 pub const PROCESSOR: &str = "stix-worker";
 
@@ -89,6 +95,10 @@ impl JobDispatchOutcome {
 pub struct StixWorkerOptions {
     /// 單次交易最多寫入幾個**去重後**的 Entity。超過整批 Failed，不拆交易。
     pub max_objects_per_tx: usize,
+    /// `stix_export` 匯出符合條件的 Entity 數量上限，來自 `[stix].max_objects`
+    /// （跟 import 驗證 bundle 物件數共用同一個設定值，語意對稱：
+    /// 一邊擋「進來太多」，一邊擋「一次要撈出去太多」）。
+    pub max_export_objects: usize,
     /// 整個 bundle 共用的自動合併上限，來自 `[auto_approval].max_auto_merges_per_resolve`。
     pub max_auto_merges_per_resolve: u32,
     pub auto_approval: AutoApprovalConfig,
@@ -102,13 +112,14 @@ where
     L: LlmProvider,
     O: ObjectStore + Clone,
 {
-    store: S,
-    objects: O,
+    pub(crate) store: S,
+    pub(crate) objects: O,
     resolver: ResolverService<S, E>,
     auto_approval: AutoApprovalEvaluator<S, L>,
     producer: Option<Arc<EventProducer>>,
     metrics: MetricsRegistry,
     max_objects_per_tx: usize,
+    pub(crate) max_export_objects: usize,
     max_auto_merges_per_resolve: u32,
 }
 
@@ -140,6 +151,7 @@ where
             producer,
             metrics,
             max_objects_per_tx: options.max_objects_per_tx,
+            max_export_objects: options.max_export_objects,
             max_auto_merges_per_resolve: options.max_auto_merges_per_resolve,
         }
     }
@@ -179,16 +191,103 @@ where
             .get("job_type")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if job_type != JOB_TYPE_IMPORT {
-            tracing::debug!(
-                job_type,
-                "job.dispatched 的 job_type 不是 stix_import，stix-worker 忽略"
-            );
-            return JobDispatchOutcome::Ignored {
-                job_type: job_type.to_string(),
-            };
-        }
+        match job_type {
+            JOB_TYPE_IMPORT => {
+                let Some(job_id) = payload
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                else {
+                    tracing::error!(
+                        payload = %payload,
+                        "stix_import job.dispatched 缺少合法 job_id。重送也不會讓它出現在 Postgres，提交 offset"
+                    );
+                    return JobDispatchOutcome::TransitionFailed { job_id: None };
+                };
 
+                tracing::info!(%job_id, "收到 stix_import job，開始讀 bundle");
+
+                if let Err(err) = jobs.transition(job_id, JobStatus::Running, None).await {
+                    log_job_transition_error(job_id, "Running", &err);
+                    return JobDispatchOutcome::TransitionFailed {
+                        job_id: Some(job_id),
+                    };
+                }
+
+                match self.run_import(jobs, job_id).await {
+                    Ok(report) => {
+                        if let Err(err) = jobs.transition(job_id, JobStatus::Completed, None).await
+                        {
+                            log_job_transition_error(job_id, "Completed", &err);
+                            return JobDispatchOutcome::TransitionFailed {
+                                job_id: Some(job_id),
+                            };
+                        }
+                        self.metrics.inc(
+                            "osint_stix_worker_entities_total",
+                            report.entity_count as u64,
+                        );
+                        self.metrics.inc(
+                            "osint_stix_worker_relationships_total",
+                            report.relationship_count as u64,
+                        );
+                        self.metrics.inc(
+                            "osint_stix_worker_skipped_total",
+                            (report.skipped_objects + report.skipped_relationships) as u64,
+                        );
+                        self.metrics.inc(
+                            "osint_stix_worker_auto_merges_total",
+                            u64::from(report.auto_merges),
+                        );
+                        tracing::info!(
+                            %job_id,
+                            entity_count = report.entity_count,
+                            relationship_count = report.relationship_count,
+                            skipped_objects = report.skipped_objects,
+                            skipped_relationships = report.skipped_relationships,
+                            auto_merges = report.auto_merges,
+                            "stix_import job 完成"
+                        );
+                        JobDispatchOutcome::Completed { job_id }
+                    }
+                    Err(err) => {
+                        if let Err(trans_err) = jobs
+                            .transition(job_id, JobStatus::Failed, Some(err.to_string()))
+                            .await
+                        {
+                            tracing::error!(
+                                error = %trans_err,
+                                import_error = %err,
+                                %job_id,
+                                "stix_import 失敗，且標記 Failed 也失敗。重送不會讓 already-failed 的 job 重跑，提交 offset"
+                            );
+                            return JobDispatchOutcome::TransitionFailed {
+                                job_id: Some(job_id),
+                            };
+                        }
+                        tracing::error!(error = %err, %job_id, "stix_import job 失敗，已標記 Failed");
+                        JobDispatchOutcome::Failed { job_id }
+                    }
+                }
+            }
+            JOB_TYPE_EXPORT => self.process_export(jobs, payload).await,
+            _ => {
+                tracing::debug!(
+                    job_type,
+                    "job.dispatched 的 job_type 既不是 stix_import 也不是 stix_export，stix-worker 忽略"
+                );
+                JobDispatchOutcome::Ignored {
+                    job_type: job_type.to_string(),
+                }
+            }
+        }
+    }
+
+    /// `stix_export` Job 的執行流程：Running → `run_export` → 成功時先
+    /// `merge_parameters` 把 `result_object_key` 寫回 `job.parameters` 才
+    /// `Completed`；失敗 `Failed`。metrics 沿用 [`JobDispatchOutcome::metric_name`]
+    /// （依 outcome 計算，不只依 job_type），另加 export 專屬計數器。
+    async fn process_export(&self, jobs: &JobService<S>, payload: &Value) -> JobDispatchOutcome {
         let Some(job_id) = payload
             .get("job_id")
             .and_then(Value::as_str)
@@ -196,12 +295,12 @@ where
         else {
             tracing::error!(
                 payload = %payload,
-                "stix_import job.dispatched 缺少合法 job_id。重送也不會讓它出現在 Postgres，提交 offset"
+                "stix_export job.dispatched 缺少合法 job_id。重送也不會讓它出現在 Postgres，提交 offset"
             );
             return JobDispatchOutcome::TransitionFailed { job_id: None };
         };
 
-        tracing::info!(%job_id, "收到 stix_import job，開始讀 bundle");
+        tracing::info!(%job_id, "收到 stix_export job，開始組 bundle");
 
         if let Err(err) = jobs.transition(job_id, JobStatus::Running, None).await {
             log_job_transition_error(job_id, "Running", &err);
@@ -210,38 +309,65 @@ where
             };
         }
 
-        match self.run_import(jobs, job_id).await {
+        match self.run_export(jobs, job_id).await {
             Ok(report) => {
-                if let Err(err) = jobs.transition(job_id, JobStatus::Completed, None).await {
-                    log_job_transition_error(job_id, "Completed", &err);
+                // 先回填 result_object_key 再 Completed：`GET /jobs/{id}/result` 判斷
+                // 「completed 但缺 key」是 500——順序反過來中間會有一個時間窗使用者
+                // 查到 completed 卻拿到「缺 key」的 500。
+                if let Err(err) = jobs
+                    .merge_parameters(
+                        job_id,
+                        json!({
+                            "result_object_key": report.result_object_key,
+                        }),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        %job_id,
+                        object_key = %report.result_object_key,
+                        "stix_export bundle 已寫進物件儲存，但回填 Job parameters 失敗，整個 Job 標記 Failed"
+                    );
+                    if let Err(trans_err) = jobs
+                        .transition(job_id, JobStatus::Failed, Some(err.to_string()))
+                        .await
+                    {
+                        tracing::error!(
+                            error = %trans_err,
+                            %job_id,
+                            "stix_export 回填 parameters 失敗後標記 Failed 又失敗"
+                        );
+                        return JobDispatchOutcome::TransitionFailed {
+                            job_id: Some(job_id),
+                        };
+                    }
+                    return JobDispatchOutcome::Failed { job_id };
+                }
+                if let Err(trans_err) = jobs.transition(job_id, JobStatus::Completed, None).await {
+                    tracing::error!(
+                        error = %trans_err,
+                        %job_id,
+                        "stix_export 完成但狀態轉 Completed 失敗"
+                    );
                     return JobDispatchOutcome::TransitionFailed {
                         job_id: Some(job_id),
                     };
                 }
                 self.metrics.inc(
-                    "osint_stix_worker_entities_total",
+                    "osint_stix_worker_export_entities_total",
                     report.entity_count as u64,
                 );
                 self.metrics.inc(
-                    "osint_stix_worker_relationships_total",
+                    "osint_stix_worker_export_relationships_total",
                     report.relationship_count as u64,
-                );
-                self.metrics.inc(
-                    "osint_stix_worker_skipped_total",
-                    (report.skipped_objects + report.skipped_relationships) as u64,
-                );
-                self.metrics.inc(
-                    "osint_stix_worker_auto_merges_total",
-                    u64::from(report.auto_merges),
                 );
                 tracing::info!(
                     %job_id,
                     entity_count = report.entity_count,
                     relationship_count = report.relationship_count,
-                    skipped_objects = report.skipped_objects,
-                    skipped_relationships = report.skipped_relationships,
-                    auto_merges = report.auto_merges,
-                    "stix_import job 完成"
+                    result_object_key = %report.result_object_key,
+                    "stix_export job 完成"
                 );
                 JobDispatchOutcome::Completed { job_id }
             }
@@ -254,13 +380,13 @@ where
                         error = %trans_err,
                         import_error = %err,
                         %job_id,
-                        "stix_import 失敗，且標記 Failed 也失敗。重送不會讓 already-failed 的 job 重跑，提交 offset"
+                        "stix_export 失敗，且標記 Failed 也失敗。提交 offset"
                     );
                     return JobDispatchOutcome::TransitionFailed {
                         job_id: Some(job_id),
                     };
                 }
-                tracing::error!(error = %err, %job_id, "stix_import job 失敗，已標記 Failed");
+                tracing::error!(error = %err, %job_id, "stix_export job 失敗，已標記 Failed");
                 JobDispatchOutcome::Failed { job_id }
             }
         }

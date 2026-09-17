@@ -9,12 +9,14 @@
 //! 不得為追求 STIX 相容而丟失欄位。
 
 mod error;
+mod export_filter;
 mod id;
 mod mapping;
 mod types;
 mod validate;
 
 pub use error::StixError;
+pub use export_filter::{StixExportFilter, StixTimeRange, export_result_object_key};
 pub use id::StixId;
 pub use mapping::{
     MappedEntity, MappedRelationship, StixIdentifierFields, entity_to_stix_object,

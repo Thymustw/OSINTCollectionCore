@@ -849,6 +849,17 @@ mod tests {
     }
 
     #[test]
+    fn entity_to_stix_object_id_exposes_stix_id() {
+        // STIX export 要用 `entity_to_stix_object(&entity).id()` 拿剛組出物件的
+        // STIX id 去建 Relationship 的 source_ref／target_ref，不自己重算 id。
+        let entity = sample_entity(EntityType::Domain, "example.com", None, json!({}));
+        let stix = entity_to_stix_object(&entity);
+        let id = stix.id().expect("已知型別必帶 STIX id");
+        assert_eq!(id.type_prefix(), "domain-name");
+        assert_eq!(id.uuid_part(), entity.id.to_string());
+    }
+
+    #[test]
     fn round_trip_preserves_type_name_description() {
         round_trip_core_fields(EntityType::Person, "Alice", Some("分析師"));
         round_trip_core_fields(EntityType::Organization, "Acme", Some("廠商"));

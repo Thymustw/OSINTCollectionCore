@@ -214,6 +214,27 @@ impl StixObject {
             Self::Unknown(value) => value.get("type").and_then(Value::as_str).unwrap_or(""),
         }
     }
+
+    /// 這個物件的 STIX id。`Unknown` 從原始 JSON 讀不到就回 `None`——
+    /// 這種物件本來就不會進 `entity_to_stix_object`／`stix_object_to_entity` 的對映，
+    /// 呼叫端不該假設它一定有合法 id。
+    #[must_use]
+    pub fn id(&self) -> Option<&StixId> {
+        match self {
+            Self::Identity(v) => Some(&v.id),
+            Self::ThreatActor(v) => Some(&v.id),
+            Self::Malware(v) => Some(&v.id),
+            Self::Vulnerability(v) => Some(&v.id),
+            Self::Indicator(v) => Some(&v.id),
+            Self::Relationship(v) => Some(&v.id),
+            Self::DomainName(v) => Some(&v.id),
+            Self::Ipv4Addr(v) => Some(&v.id),
+            Self::Url(v) => Some(&v.id),
+            Self::EmailAddr(v) => Some(&v.id),
+            Self::Custom(v) => Some(&v.id),
+            Self::Unknown(_) => None,
+        }
+    }
 }
 
 impl Serialize for StixObject {
@@ -481,6 +502,26 @@ mod tests {
         assert_eq!(back["x_osint_core_type"], "account");
         assert_eq!(back["x_osint_core_provenance"], json!({"source": "manual"}));
         assert_eq!(round_trip(&obj), obj);
+    }
+
+    #[test]
+    fn known_entity_object_id_returns_stix_id() {
+        // 對已知 Entity（Domain）組出 STIX 物件，`.id()` 應回帶合法 STIX id 的物件。
+        let json = json!({
+            "type": "domain-name",
+            "id": format!("domain-name--{UUID}"),
+            "value": "example.com"
+        });
+        let obj: StixObject = serde_json::from_value(json).unwrap();
+        let id = obj.id().expect("已知型別必有 id");
+        assert_eq!(id.type_prefix(), "domain-name");
+        assert_eq!(id.uuid_part(), UUID);
+    }
+
+    #[test]
+    fn unknown_object_id_is_none() {
+        let obj = StixObject::Unknown(json!({"type": "campaign", "name": "Op-X"}));
+        assert!(obj.id().is_none());
     }
 
     #[test]

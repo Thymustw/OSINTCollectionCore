@@ -1,12 +1,12 @@
-//! `osint-stix-worker`：訂閱 `job.dispatched`，只執行 `stix_import`。
+//! `osint-stix-worker`：訂閱 `job.dispatched`，執行 `stix_import` 與 `stix_export`。
 //!
 //! ```text
 //! osint-stix-worker          常駐消費（唯一模式）
 //! osint-stix-worker --help   印用法後結束
 //! ```
 //!
-//! `stix_export` 與其他 job_type 一律忽略並 commit。沒有 `--rebuild`：
-//! 匯入不是可重建的投影。
+//! 除了 `stix_import`／`stix_export` 之外的 job_type 一律忽略並 commit。
+//! 沒有 `--rebuild`：匯入不是可重建的投影。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,7 +75,7 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<ParsedArgs, Str
 }
 
 const HELP: &str = "用法：
-  osint-stix-worker        訂閱 job.dispatched，執行 stix_import（stix_export 忽略）
+  osint-stix-worker        訂閱 job.dispatched，執行 stix_import 與 stix_export
   osint-stix-worker --help 印這段說明後結束
 設定來源：config/default.toml → OSINT_CONFIG_FILE → OSINT__* 環境變數。";
 
@@ -146,6 +146,7 @@ async fn run() -> Result<(), String> {
         metrics.clone(),
         StixWorkerOptions {
             max_objects_per_tx: cfg.stix_worker.max_objects_per_tx,
+            max_export_objects: cfg.stix.max_objects,
             max_auto_merges_per_resolve: auto_section.max_auto_merges_per_resolve,
             auto_approval: auto_config,
         },
