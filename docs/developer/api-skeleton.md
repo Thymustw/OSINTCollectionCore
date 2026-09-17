@@ -70,6 +70,9 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`。沒接 Postgres 回 503 |
 | GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
 | POST | `/api/v1/import` | operator | 201 | multipart |
+| POST | `/api/v1/import/stix` | operator | 202 | STIX 2.1 bundle 匯入，回 `stix_import` Job；不發 `raw.collected` |
+| POST | `/api/v1/export/stix` | operator | 202 | 回 `stix_export` Job；`filter` 可省略 |
+| GET | `/api/v1/jobs/{id}/result` | viewer | 200／404／409／500 | 讀 `stix_export` 完成後的 bundle |
 | POST | `/api/v1/search` | viewer | 200 | |
 | POST | `/api/v1/search/semantic` | viewer | 200／503 | 語意搜尋。沒接 ml-commons 回 503，不影響全文搜尋 |
 | POST | `/api/v1/search/hybrid` | viewer | 200／503 | RRF 融合 BM25＋向量。`search` 或 `semantic_search` 缺一條整條 503 |
@@ -394,6 +397,80 @@ curl -s "http://127.0.0.1:18080/api/v1/raw/$ID?body=true" -H "Authorization: Bea
 > 累加的。若把失敗的 job 直接丟回 `queued`，它看起來會跟一個從沒跑過的新 job
 > 一模一樣——「重試過幾次」會在每次重試時被抹掉，無限重試的迴圈也就沒有任何地方
 > 看得出來。轉成 `retrying` 之後會立刻 dispatch，所以對呼叫端而言效果就是「它會再跑一次」。
+
+## STIX 2.1 匯入／匯出
+
+### `POST /api/v1/import/stix`
+
+body 是 `{"source_id": "<uuid>", "bundle": {...}}`。`source_id` 必須指到 `source_type=stix_import` 的 Source，否則 **400**。bundle 大小上限 50 MiB（`[stix].max_bundle_bytes`），物件數上限 10000（`[stix].max_objects`），超過 **413**。通過驗證後落地 RawEvidence + 建立 `stix_import` Job，回 **202** + Job body。
+
+**刻意不 publish `raw.collected`**：STIX bundle 已是結構化物件圖，觸發 normalizer 語意完全不對。
+
+```bash
+curl -s -X POST http://127.0.0.1:18080/api/v1/import/stix \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_id": "'$SOURCE_ID'",
+    "bundle": {
+      "type": "bundle",
+      "id": "bundle--a1b2c3d4-0000-0000-0000-000000000001",
+      "objects": [
+        {
+          "type": "threat-actor",
+          "id": "threat-actor--a1b2c3d4-0000-0000-0000-000000000002",
+          "name": "APT-Example"
+        }
+      ]
+    }
+  }'
+```
+
+### `POST /api/v1/export/stix`
+
+body 是 `{"filter": {"entity_types": [...], "entity_ids": [...], "time_range": {"from": "...", "to": "..."}, "depth": N}}`。全部欄位可省略（省略等同「不限」，整表匯出）。只建立 `stix_export` Job，回 **202** + Job body。
+
+`entity_types` 使用 snake_case（`threat_actor`、`ip` 等）。`depth` 需搭配 `entity_ids` 使用，無 `entity_ids` 時忽略並記 warn。
+
+```bash
+# 匯出特定實體及其一跳鄰居（在指定時間窗內）
+curl -s -X POST http://127.0.0.1:18080/api/v1/export/stix \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "filter": {
+      "entity_ids": ["'$ENTITY_ID'"],
+      "depth": 1,
+      "time_range": {"from": "2026-01-01T00:00:00Z", "to": "2026-12-31T23:59:59Z"}
+    }
+  }'
+
+# 匯出全部 ThreatActor 與 Malware（無過濾）
+curl -s -X POST http://127.0.0.1:18080/api/v1/export/stix \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"filter": {"entity_types": ["threat_actor", "malware"]}}'
+```
+
+### `GET /api/v1/jobs/{id}/result`
+
+`stix_export` Job 完成後，用這個端點取得 bundle JSON。viewer 以上可讀。
+
+```bash
+curl -s http://127.0.0.1:18080/api/v1/jobs/$JOB_ID/result \
+  -H "Authorization: Bearer $TOKEN" > export.json
+```
+
+| 狀態碼 | 意思 |
+|---|---|
+| 200 | 成功，body 是 STIX bundle JSON |
+| 404 | Job 不存在，或 `job_type` 不是 `stix_export` |
+| 409 | Job 尚未完成，訊息帶目前狀態（例如 `"status": "running"`） |
+| 500 | Job 標記 completed 但結果檔案遺失或非合法 JSON |
+
+其他錯誤碼（400／401／403／413／503）沿用上方「錯誤碼對照」表的共用語意。409 與 500 的訊息內容是 STIX 專屬的，上面已列明。
+
+使用者導向說明見 `docs/user/stix.md`。
 
 ## Operations Center（`/api/v1/ops/*`，SPEC §31）
 

@@ -1,4 +1,4 @@
-# Repository layout（V0.2 Phase 4 準備工作：31 個 crate；resolver／merge／ai-gateway 目前是函式庫；八個服務 binary 都在 compose 的 `app` profile）
+# Repository layout（V0.2 Phase 4：33 個 crate；resolver／merge／ai-gateway／stix-adapter 目前是函式庫；九個服務 binary 都在 compose 的 `app` profile）
 
 Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.85.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 stable channel。
 
@@ -36,6 +36,8 @@ crates/
   resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／account_handle；graph_context 走獨立 GraphContextResolver；auto_approval.rs 為 ADR-012 自動核准評估器；無獨立 binary
   merge/                 Entity merge／undo（SPEC_V0.2 §7）：execute_merge／execute_merge_with_audit（ADR-012）／undo_merge；無獨立 binary
   ai-gateway/            LLM 生成式推論抽象層（ADR-012 AI 輔助自動核准）：LlmProvider trait、OpenAiCompatibleLlmProvider、MockLlmProvider、UnsupportedLlmProvider；非 V0.3 完整 AI Gateway，僅借用最小的 OpenAI 相容 chat completion 能力
+  stix-adapter/          STIX 2.1 型別、bundle 驗證、雙向映射（SPEC_V0.2 §18-19）：手刻型別不依賴外部 crate；無獨立 binary
+  stix-worker/           STIX 匯入／匯出服務（osint-stix-worker）：job.dispatched → stix_import／stix_export；不可重建（沒有 --rebuild）
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   graph-worker/          圖投影（osint-graph-worker）：relationship.changed → Neo4j（SPEC_V0.2 §8）；常駐模式也消費 job.dispatched 執行 graph_rebuild；只有 Entity→Entity 的邊才進圖
   embedding-worker/      向量投影（osint-embedding-worker）：entity.extracted → osint-documents overlay + osint-entities（SPEC_V0.2 §11–§14）；不訂 embedding.requested

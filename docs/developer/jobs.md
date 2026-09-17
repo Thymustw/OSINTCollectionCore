@@ -39,7 +39,15 @@ queued ──► running ──► completed
 ## 派工
 
 `JobService::dispatch` 對 Redpanda produce `job.dispatched`（envelope v1）。
-目前真正消費這個 topic 去執行工作的只有 `osint-graph-worker`，而且只認 `job_type=graph_rebuild`（`POST /api/v1/graph/rebuild` 建立）。其他 type 在那個 consumer 上會被忽略並 commit，不是錯誤。collector 的 `collect` job **不**走這條路徑。
+
+目前消費這個 topic 去執行工作的 worker 有兩個：
+
+- **`osint-graph-worker`**：只認 `job_type=graph_rebuild`（`POST /api/v1/graph/rebuild` 建立）。
+- **`osint-stix-worker`**：只認 `job_type=stix_import`（`POST /api/v1/import/stix` 建立）與 `job_type=stix_export`（`POST /api/v1/export/stix` 建立）。
+
+兩個 worker 各自是獨立的 consumer group，各自只認識自己的 job type，其他 type 會被忽略並 commit，不是錯誤。collector 的 `collect` job **不**走這條路徑。
+
+`stix_export` 完成後，stix-worker 透過 `JobService::merge_parameters` 把 `result_object_key` 回填到 `Job.parameters`。這是**部分合併**（既有欄位保留，只有同名 key 才被 patch 覆寫），用途是讓 worker 回寫結果而不動到 API 建立 Job 時就寫入的 `filter`。完整實作見 `crates/core-jobs/src/service.rs`。
 
 collector 每次收集會建立 `job_type=collect`（`correlation_id=connector.id`），自己把狀態轉 `running`／`completed`／`failed`，**不**走 `job.dispatched`。Job 轉態失敗只記 warn，不中止收集。`graph_rebuild` 才是第一個由 worker 消費 `job.dispatched` 執行的 job type。
 

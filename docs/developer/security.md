@@ -136,6 +136,8 @@ Cargo.toml 與 deny/audit 面，而且要各自維護一份連線池與 `map_sql
 | `token.issue` / `token.list` / `token.revoke` | `api_token` | 每次 |
 | `auth.failed` | `auth` | 每一次 401 |
 | `authz.denied` | `auth` | 每一次 403 |
+| `stix.import` | `stix` | 成功與失敗都寫 |
+| `stix.export` | `stix` | 成功與失敗都寫 |
 | `connector.ssrf.allowlist` | `source` | 每次因白名單放行的請求 |
 
 **失敗也寫**：只記成功的話，「誰一直試圖把已完成的 job 轉回 running」「有人拿撤銷的

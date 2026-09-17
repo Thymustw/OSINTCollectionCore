@@ -51,8 +51,8 @@ storage conformance 對非 19200 / 19000 的 URL **硬失敗**。
 
 ## 全容器化：`make compose-up-full`
 
-上面那套是「基礎建設在容器裡、八個服務在本機 `cargo run`」。Phase 7a 之後也可以
-把八個服務一起放進容器：
+上面那套是「基礎建設在容器裡、九個服務在本機 `cargo run`」。Phase 7a 之後也可以
+把九個服務一起放進容器：
 
 ```bash
 make compose-up-full      # 含 --build --wait，全部 healthy 才返回
@@ -60,7 +60,7 @@ make compose-ps-full      # 看狀態
 make compose-down-full    # 停掉
 ```
 
-八個應用服務在 compose 裡標了 `profiles: ["app"]`，**預設不啟動**。
+九個應用服務在 compose 裡標了 `profiles: ["app"]`，**預設不啟動**。
 `make compose-up`／`make compose-down`／CI 的 integration-test 行為完全不變
 （它們不帶 `--profile app`，所以不會被迫先 build image）。
 
@@ -74,8 +74,9 @@ make compose-down-full    # 停掉
 | osint-indexer | `osint-core/osint-indexer:0.1.0` | 18085 | 同上 |
 | osint-graph-worker | `osint-core/osint-graph-worker:0.1.0` | 18086 | 同上 |
 | osint-embedding-worker | `osint-core/osint-embedding-worker:0.1.0` | 18087 | 同上 |
+| osint-stix-worker | `osint-core/osint-stix-worker:0.1.0` | 18088 | 同上 |
 
-⚠️ 容器版與 `cargo run` 版**不能同時跑**，兩者搶同一組 18080–18087。
+⚠️ 容器版與 `cargo run` 版**不能同時跑**，兩者搶同一組 18080–18088。
 
 ### 本機跑 vs 容器內跑：設定完全不一樣
 
@@ -224,8 +225,8 @@ DJL 的 PyTorch native libs 507 MB），OpenSearch volume 會從 2 MB 長到約 
 ```bash
 make compose-up-full
 
-# 八個 health 埠
-for p in 18080 18081 18082 18083 18084 18085 18086 18087; do curl -s localhost:$p/health; echo; done
+# 九個 health 埠
+for p in 18080 18081 18082 18083 18084 18085 18086 18087 18088; do curl -s localhost:$p/health; echo; done
 
 # 後端連通性（需要 JWT；role 至少 viewer）
 curl -s -H "Authorization: Bearer $JWT" localhost:18080/api/v1/ops/health
@@ -452,6 +453,23 @@ schema／k-NN 路徑沒有 `#[ignore]`。打 `_predict` 的那條才 ignore。
 細節：`docs/developer/embedding-worker.md`、`docs/developer/embedding.md`。
 
 細節：`docs/developer/deduplicator.md`、`docs/developer/entity-worker.md`。
+
+## STIX Worker
+
+```bash
+make run-stix-worker      # 訂閱 job.dispatched，執行 stix_import／stix_export
+curl -s http://127.0.0.1:18088/health
+```
+
+設定在 `config/default.toml` 的 `[stix_worker]`，health 埠 18088。
+
+```bash
+cargo test -p stix-adapter
+cargo test -p stix-worker --all-targets   # 含 tests/e2e.rs，需要本機 Postgres/MinIO
+cargo test -p acceptance --test acceptance_g   # HTTP 匯入→Core→匯出 全程驗收
+```
+
+細節：`docs/developer/stix-adapter.md`、`docs/user/stix.md`。
 
 ## Failure／recovery 測試（會真的停掉 Docker 服務）
 

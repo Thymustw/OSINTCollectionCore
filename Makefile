@@ -8,6 +8,7 @@
 	run-indexer rebuild-index rebuild-index-drop run-cli \
 	run-graph-worker rebuild-graph rebuild-graph-drop \
 	run-embedding-worker rebuild-embeddings rebuild-embeddings-drop \
+	run-stix-worker \
 	image-build image-scan image-prune image-ls \
 	compose-up-full compose-down-full compose-ps-full \
 	disk clean
@@ -49,12 +50,13 @@ help:
 	@echo "  make run-embedding-worker 啟動 osint-embedding-worker（需 compose、.env、ml-commons 模型）"
 	@echo "  make rebuild-embeddings 從 PostgreSQL 補齊 Document／Entity 向量後結束"
 	@echo "  make rebuild-embeddings-drop 先刪 osint-entities 再從零重建（永不刪 osint-documents）"
+	@echo "  make run-stix-worker   啟動 osint-stix-worker（需 compose 與 .env；沒有 --rebuild）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
-	@echo "  make image-build       建八個服務的容器 image（不 push）"
-	@echo "  make image-scan        trivy image 掃八個 image（需已安裝 trivy）"
+	@echo "  make image-build       建九個服務的容器 image（不 push）"
+	@echo "  make image-scan        trivy image 掃九個 image（需已安裝 trivy）"
 	@echo "  make image-ls          列出本專案的 image 與大小"
 	@echo "  make image-prune       清掉 dangling layer 與 builder 快取"
-	@echo "  make compose-up-full   基礎建設 + 八個應用服務（會先 build）"
+	@echo "  make compose-up-full   基礎建設 + 九個應用服務（會先 build）"
 	@echo "  make compose-down-full 停掉含應用服務的整套"
 	@echo "  make compose-ps-full   含應用服務的狀態"
 	@echo "  make disk              顯示 target/、.git、docker volume 的磁碟用量"
@@ -114,7 +116,7 @@ compose-ps:
 	$(COMPOSE) $(COMPOSE_FILES) ps
 
 # --- 容器化（Phase 7a）--------------------------------------------------
-# 八個應用服務在 compose 的 `app` profile 底下，預設不啟動。
+# 九個應用服務在 compose 的 `app` profile 底下，預設不啟動。
 # 沒有 --profile app 的目標（compose-up / compose-down / compose-ps）行為不變。
 
 IMAGE_TAG ?= 0.1.0
@@ -253,6 +255,13 @@ rebuild-embeddings:
 # **永不**刪 osint-documents——那個 index 是 indexer 的，本服務只疊加向量欄位。
 rebuild-embeddings-drop:
 	$(CARGO) run -p embedding-worker --bin osint-embedding-worker -- --rebuild --drop
+
+# V0.2 Phase 4 §18-19 STIX 2.1 匯入／匯出。訂閱 job.dispatched，只執行
+# job_type=stix_import／stix_export，其餘一律忽略並 commit。
+# 沒有 --rebuild：匯入不是可重建的投影，匯出是唯讀查詢，兩者都不需要。
+# 細節見 docs/developer/stix-adapter.md。
+run-stix-worker:
+	$(CARGO) run -p stix-worker --bin osint-stix-worker
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。
