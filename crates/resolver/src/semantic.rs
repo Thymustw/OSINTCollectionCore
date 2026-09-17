@@ -923,6 +923,43 @@ mod tests {
         ) -> Result<Vec<AiRun>, StorageError> {
             Self::unsupported("list_ai_runs")
         }
+        async fn put_collection_budget(
+            &self,
+            _: &core_model::CollectionBudget,
+        ) -> Result<(), StorageError> {
+            Self::unsupported("put_collection_budget")
+        }
+        async fn get_collection_budget(
+            &self,
+            _: CollectionId,
+        ) -> Result<Option<core_model::CollectionBudget>, StorageError> {
+            Self::unsupported("get_collection_budget")
+        }
+        async fn try_consume_daily_request_budget(
+            &self,
+            _: CollectionId,
+            _: chrono::NaiveDate,
+            _: i64,
+            _: i64,
+        ) -> Result<storage_core::BudgetConsumption, StorageError> {
+            Self::unsupported("try_consume_daily_request_budget")
+        }
+        async fn try_consume_daily_ai_budget(
+            &self,
+            _: CollectionId,
+            _: chrono::NaiveDate,
+            _: i64,
+            _: i64,
+        ) -> Result<storage_core::BudgetConsumption, StorageError> {
+            Self::unsupported("try_consume_daily_ai_budget")
+        }
+        async fn get_daily_usage(
+            &self,
+            _: CollectionId,
+            _: chrono::NaiveDate,
+        ) -> Result<storage_core::DailyUsage, StorageError> {
+            Self::unsupported("get_daily_usage")
+        }
         async fn put_merge_history(&self, _: &MergeHistory) -> Result<(), StorageError> {
             Self::unsupported("put_merge_history")
         }

@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use core_model::{
     AiRun, AiRunId, Candidate, CandidateEvidence, CandidateEvidenceId, CandidateId,
-    CandidateStatus, Collection, CollectionId, Connector, ConnectorId, Document, DocumentId,
-    DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
+    CandidateStatus, Collection, CollectionBudget, CollectionId, Connector, ConnectorId, Document,
+    DocumentId, DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
     EntityAlias, EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
     EntityIdentifierId, EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId,
     JobStatus, MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
@@ -15,11 +15,13 @@ use core_model::{
 };
 use serde_json::Value;
 use sqlx::PgPool;
+use sqlx::Row;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
-    CanonicalStore, CapabilityDescriptor, HealthProvider, RelationalStore, SimhashCandidate,
-    StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
+    BudgetConsumption, CanonicalStore, CapabilityDescriptor, DailyUsage, HealthProvider,
+    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
+    TransactionalStore,
 };
 
 use crate::error::map_sqlx;
@@ -211,6 +213,71 @@ impl PostgresCanonicalStore {
             .await
             .map_err(map_sqlx)?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// `column` 只會是 `"requests_used"` 或 `"ai_calls_used"`（呼叫端寫死的
+    /// 字面量，不是外部輸入），用 `format!` 組欄位名是安全的——沒有使用者
+    /// 能控制這個值，這不是 SQL injection 風險，只是避免兩份幾乎一樣的
+    /// SQL 各寫一次。
+    async fn try_consume_daily_usage(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+        column: &str,
+    ) -> Result<BudgetConsumption, StorageError> {
+        sqlx::query(
+            "INSERT INTO discovery_daily_usage (collection_id, usage_date, requests_used, ai_calls_used) \
+             VALUES ($1, $2, 0, 0) \
+             ON CONFLICT (collection_id, usage_date) DO NOTHING",
+        )
+        .bind(collection_id)
+        .bind(date)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+
+        // `column` 只會是兩個寫死的字面量，`AssertSqlSafe` 是 sqlx 0.9 對
+        // runtime 組 SQL 要求的顯式稽核閘——組法與上面 doc comment 一致，
+        // 不是把使用者輸入直接拼進去。
+        let update_sql = format!(
+            "UPDATE discovery_daily_usage \
+             SET {column} = {column} + $3 \
+             WHERE collection_id = $1 AND usage_date = $2 AND {column} + $3 <= $4 \
+             RETURNING {column}"
+        );
+        let updated: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(update_sql))
+            .bind(collection_id)
+            .bind(date)
+            .bind(by)
+            .bind(budget)
+            .fetch_optional(self.conn().await?.as_mut())
+            .await
+            .map_err(map_sqlx)?;
+
+        match updated {
+            Some((used_after,)) => Ok(BudgetConsumption {
+                allowed: true,
+                used_after,
+            }),
+            None => {
+                let select_sql = format!(
+                    "SELECT {column} FROM discovery_daily_usage \
+                     WHERE collection_id = $1 AND usage_date = $2"
+                );
+                let (used_after,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
+                    .bind(collection_id)
+                    .bind(date)
+                    .fetch_one(self.conn().await?.as_mut())
+                    .await
+                    .map_err(map_sqlx)?;
+                Ok(BudgetConsumption {
+                    allowed: false,
+                    used_after,
+                })
+            }
+        }
     }
 }
 
@@ -2606,5 +2673,99 @@ impl RelationalStore for PostgresCanonicalStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::ai_run).collect()
+    }
+
+    async fn put_collection_budget(&self, budget: &CollectionBudget) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO collection_budgets (
+                collection_id, max_candidates_per_run, max_requests_per_run,
+                max_ai_calls_per_run, max_depth, daily_request_budget, daily_ai_budget,
+                created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            ON CONFLICT (collection_id) DO UPDATE SET
+                max_candidates_per_run = EXCLUDED.max_candidates_per_run,
+                max_requests_per_run = EXCLUDED.max_requests_per_run,
+                max_ai_calls_per_run = EXCLUDED.max_ai_calls_per_run,
+                max_depth = EXCLUDED.max_depth,
+                daily_request_budget = EXCLUDED.daily_request_budget,
+                daily_ai_budget = EXCLUDED.daily_ai_budget,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(budget.collection_id)
+        .bind(budget.max_candidates_per_run)
+        .bind(budget.max_requests_per_run)
+        .bind(budget.max_ai_calls_per_run)
+        .bind(budget.max_depth)
+        .bind(budget.daily_request_budget)
+        .bind(budget.daily_ai_budget)
+        .bind(budget.created_at)
+        .bind(budget.updated_at)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_collection_budget(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<CollectionBudget>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM collection_budgets WHERE collection_id = $1",
+            collection_id,
+            mapping::collection_budget,
+        )
+        .await
+    }
+
+    async fn try_consume_daily_request_budget(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+    ) -> Result<BudgetConsumption, StorageError> {
+        self.try_consume_daily_usage(collection_id, date, by, budget, "requests_used")
+            .await
+    }
+
+    async fn try_consume_daily_ai_budget(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+    ) -> Result<BudgetConsumption, StorageError> {
+        self.try_consume_daily_usage(collection_id, date, by, budget, "ai_calls_used")
+            .await
+    }
+
+    async fn get_daily_usage(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+    ) -> Result<DailyUsage, StorageError> {
+        let row = sqlx::query(
+            "SELECT requests_used, ai_calls_used FROM discovery_daily_usage \
+             WHERE collection_id = $1 AND usage_date = $2",
+        )
+        .bind(collection_id)
+        .bind(date)
+        .fetch_optional(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(match row {
+            Some(row) => DailyUsage {
+                requests_used: row.try_get("requests_used").map_err(map_sqlx)?,
+                ai_calls_used: row.try_get("ai_calls_used").map_err(map_sqlx)?,
+            },
+            None => DailyUsage {
+                requests_used: 0,
+                ai_calls_used: 0,
+            },
+        })
     }
 }

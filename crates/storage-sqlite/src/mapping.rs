@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use core_model::{
-    AiRun, Candidate, CandidateEvidence, Collection, Connector, Document, DuplicateGroup,
-    Embedding, Entity, EntityAlias, EntityExtraction, EntityIdentifier, Event, FailedEvent, Job,
-    MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence, Relationship,
-    RelationshipEvidence, RepointedReference, ResolutionCandidate, Seed, Source,
+    AiRun, Candidate, CandidateEvidence, Collection, CollectionBudget, Connector, Document,
+    DuplicateGroup, Embedding, Entity, EntityAlias, EntityExtraction, EntityIdentifier, Event,
+    FailedEvent, Job, MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence,
+    Relationship, RelationshipEvidence, RepointedReference, ResolutionCandidate, Seed, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -494,6 +494,20 @@ pub fn merge_history(row: &SqliteRow) -> Result<MergeHistory, StorageError> {
         merged_relationships: decode_merged_relationships(&get_str(row, "merged_relationships")?)?,
         undone_at: opt_ts(row, "undone_at")?,
         auto_approval_audit: opt_json(row, "auto_approval_audit")?,
+    })
+}
+
+pub fn collection_budget(row: &SqliteRow) -> Result<CollectionBudget, StorageError> {
+    Ok(CollectionBudget {
+        collection_id: uuid_from(row, "collection_id")?,
+        max_candidates_per_run: i32_from(row, "max_candidates_per_run")?,
+        max_requests_per_run: i32_from(row, "max_requests_per_run")?,
+        max_ai_calls_per_run: i32_from(row, "max_ai_calls_per_run")?,
+        max_depth: i32_from(row, "max_depth")?,
+        daily_request_budget: get_i64(row, "daily_request_budget")?,
+        daily_ai_budget: get_i64(row, "daily_ai_budget")?,
+        created_at: ts(row, "created_at")?,
+        updated_at: ts(row, "updated_at")?,
     })
 }
 

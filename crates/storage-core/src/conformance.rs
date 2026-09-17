@@ -7,14 +7,14 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::{TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 use core_model::{
     AbsorberSnapshot, AiRun, Candidate, CandidateEvidence, CandidateStatus, CandidateType,
-    Collection, Connector, Document, DocumentType, DuplicateGroup, Embedding, EmbeddingTarget,
-    Entity, EntityAlias, EntityExtraction, EntityIdentifier, EntityType, Event, FailedEvent, Job,
-    JobStatus, MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence,
-    Relationship, RelationshipEvidence, RelationshipType, RepointedReference, ResolutionCandidate,
-    ResolutionStatus, Seed, SeedOrigin, SeedType, Source, SourceType,
+    Collection, CollectionBudget, Connector, Document, DocumentType, DuplicateGroup, Embedding,
+    EmbeddingTarget, Entity, EntityAlias, EntityExtraction, EntityIdentifier, EntityType, Event,
+    FailedEvent, Job, JobStatus, MergeHistory, MergedRelationship, NetworkRule, Provenance,
+    RawEvidence, Relationship, RelationshipEvidence, RelationshipType, RepointedReference,
+    ResolutionCandidate, ResolutionStatus, Seed, SeedOrigin, SeedType, Source, SourceType,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -634,6 +634,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
 
     assert_v0_2_resolution_queries(store, &entity, source.id).await?;
     assert_v0_3_discovery_queries(store, &collection, &entity).await?;
+    assert_v0_3_budget_queries(store, &collection).await?;
     assert_v0_2_failed_events(store).await?;
     assert_embedding_queries(store, document.id).await?;
 
@@ -2230,6 +2231,171 @@ async fn assert_v0_3_discovery_queries<S: RelationalStore>(
         return Err(StorageError::Unknown {
             backend: "conformance",
             message: "list_ai_runs 用不相干的 task_type 過濾卻回傳了這筆 run".into(),
+        });
+    }
+
+    Ok(())
+}
+
+/// V0.3 Phase 2：Discovery Budget（SPEC_V0.3 §10／§11）。
+///
+/// 最關鍵的一條是 #3——併發正確性：這是整個 Phase 2 存在的理由（防止
+/// runaway crawling／runaway AI cost），如果併發下會超額或漏算，這個機制
+/// 就完全沒有達到目的，而且不會報錯，只會在事後對帳時才發現。
+///
+/// 1. `put_collection_budget`／`get_collection_budget` 完整往返。
+/// 2. `get_daily_usage` 對「從沒用過的一天」回全零，不是 `NotFound`。
+/// 3. **併發消耗不超額也不漏算**：budget=5，8 個平行呼叫各消耗 1，
+///    必須剛好 5 個成功、3 個拒絕，且 `get_daily_usage` 讀回的值剛好是 5——
+///    多了代表超額放行，少了代表 lost update。
+/// 4. 拒絕時 `used_after` 回目前的既有用量（不是 0、不是被拒的那個值）。
+/// 5. `daily_request_budget` 與 `daily_ai_budget` 是獨立的兩個計數器，
+///    消耗其中一個不影響另一個。
+/// 6. 單次 `by` 就超過 `budget`（全新一天，目前用量是 0）必須直接拒絕——
+///    這是兩段式 SQL 要防的那個邊界情況（見派工說明的「關鍵設計」一節），
+///    不能因為是全新一天就無條件放行第一筆。
+async fn assert_v0_3_budget_queries<S: RelationalStore>(
+    store: &S,
+    collection: &Collection,
+) -> Result<(), StorageError> {
+    // --- CollectionBudget 往返 ---------------------------------------------
+    let budget_cfg = CollectionBudget {
+        collection_id: collection.id,
+        max_candidates_per_run: 200,
+        max_requests_per_run: 500,
+        max_ai_calls_per_run: 50,
+        max_depth: 3,
+        daily_request_budget: 5_000,
+        daily_ai_budget: 500,
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+    };
+    store.put_collection_budget(&budget_cfg).await?;
+    assert_eq_debug(
+        "collection_budget",
+        &budget_cfg,
+        &store
+            .get_collection_budget(collection.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 collection_budget 讀不到".into(),
+            })?,
+    );
+
+    // --- 從沒用過的一天回全零 -------------------------------------------------
+    let fresh_date = NaiveDate::from_ymd_opt(2020, 1, 1).expect("合法日期");
+    let never_used = store.get_daily_usage(collection.id, fresh_date).await?;
+    if never_used.requests_used != 0 || never_used.ai_calls_used != 0 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("從沒消耗過的一天 get_daily_usage 應該全零，實際 {never_used:?}"),
+        });
+    }
+
+    // --- 併發消耗：budget=5，8 個平行呼叫各消耗 1 ------------------------------
+    // `collection` 本身在 assert_relational_round_trip 裡每次呼叫都是新建的
+    // `Uuid::now_v7()`，所以 (collection_id, concurrency_date) 這個自然鍵
+    // 只要 collection_id 不同就不會跟其他測試撞到；這裡併發的日期是固定的
+    // 也安全（每個 run 都用自己的 collection id）。斷言邏輯才是重點。
+    let concurrency_date = NaiveDate::from_ymd_opt(2021, 1, 1).expect("合法日期");
+    let daily_budget = 5i64;
+    let (r0, r1, r2, r3, r4, r5, r6, r7) = tokio::join!(
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+        store.try_consume_daily_request_budget(collection.id, concurrency_date, 1, daily_budget),
+    );
+    let results = [r0, r1, r2, r3, r4, r5, r6, r7];
+    let mut allowed_count = 0usize;
+    let mut rejected_used_after: Option<i64> = None;
+    for result in results {
+        let consumption = result?;
+        if consumption.allowed {
+            allowed_count += 1;
+        } else {
+            rejected_used_after = Some(consumption.used_after);
+        }
+    }
+    if allowed_count != 5 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "budget=5，8 個平行呼叫各消耗 1，應該剛好 5 個成功，實際 {allowed_count} 個\
+                 ——代表 try_consume_daily_request_budget 的原子性有問題\
+                 （要嘛超額放行，要嘛少算，不管哪一種都是嚴重 bug）"
+            ),
+        });
+    }
+    // 拒絕時 used_after 必須是「已經用滿的 5」，不是別的值。
+    if rejected_used_after != Some(5) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "被拒絕的呼叫，used_after 應該回既有用量 5，實際 {rejected_used_after:?}"
+            ),
+        });
+    }
+    let usage_after = store
+        .get_daily_usage(collection.id, concurrency_date)
+        .await?;
+    if usage_after.requests_used != 5 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "併發消耗後 get_daily_usage 應回 5，實際 {}——最終用量與允許次數不一致",
+                usage_after.requests_used
+            ),
+        });
+    }
+
+    // --- daily_request_budget 與 daily_ai_budget 是獨立計數器 -------------------
+    let ai_date = NaiveDate::from_ymd_opt(2022, 6, 15).expect("合法日期");
+    let ai_result = store
+        .try_consume_daily_ai_budget(collection.id, ai_date, 3, 10)
+        .await?;
+    if !ai_result.allowed || ai_result.used_after != 3 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "try_consume_daily_ai_budget 第一次消耗應該成功且回 3，實際 {ai_result:?}"
+            ),
+        });
+    }
+    let ai_usage = store.get_daily_usage(collection.id, ai_date).await?;
+    if ai_usage.ai_calls_used != 3 || ai_usage.requests_used != 0 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "消耗 ai budget 不該影響 requests_used（應該是 0），實際 {ai_usage:?}"
+            ),
+        });
+    }
+
+    // --- 全新一天，單次 by 就超過 budget，必須直接拒絕（兩段式 SQL 要防的邊界）---
+    let overflow_date = NaiveDate::from_ymd_opt(2023, 3, 3).expect("合法日期");
+    let overflow_result = store
+        .try_consume_daily_request_budget(collection.id, overflow_date, 10, 5)
+        .await?;
+    if overflow_result.allowed {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "全新一天單次 by=10 > budget=5，理論上必須被拒絕，實際卻放行了\
+                       ——這正是兩段式 SQL 要防的邊界情況，代表退化回單一 ON CONFLICT \
+                       DO UPDATE 的漏洞"
+                .into(),
+        });
+    }
+    if overflow_result.used_after != 0 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "被拒絕且是全新一天，used_after 應該是 0，實際 {}",
+                overflow_result.used_after
+            ),
         });
     }
 

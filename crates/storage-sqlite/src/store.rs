@@ -2,11 +2,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use core_model::{
     AiRun, AiRunId, Candidate, CandidateEvidence, CandidateEvidenceId, CandidateId,
-    CandidateStatus, Collection, CollectionId, Connector, ConnectorId, Document, DocumentId,
-    DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
+    CandidateStatus, Collection, CollectionBudget, CollectionId, Connector, ConnectorId, Document,
+    DocumentId, DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
     EntityAlias, EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
     EntityIdentifierId, EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId,
     JobStatus, MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
@@ -15,6 +15,7 @@ use core_model::{
     ResolutionCandidateId, ResolutionStatus, Seed, SeedId, Source, SourceId,
 };
 use serde_json::Value;
+use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
@@ -22,8 +23,9 @@ use sqlx::sqlite::{
 use storage_core::codec::encode_enum;
 use storage_core::conformance::assert_sqlite_path_safe;
 use storage_core::{
-    CapabilityDescriptor, EmbeddedStore, HealthProvider, RelationalStore, SimhashCandidate,
-    StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
+    BudgetConsumption, CapabilityDescriptor, DailyUsage, EmbeddedStore, HealthProvider,
+    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
+    TransactionalStore,
 };
 use uuid::Uuid;
 
@@ -74,6 +76,13 @@ fn opt_json_text(value: &Option<Value>) -> Option<String> {
 
 fn uuid_text(id: Uuid) -> String {
     id.to_string()
+}
+
+/// `NaiveDate` → `YYYY-MM-DD`。`NaiveDate` 的 `Display` 本來就是這個格式，
+/// 這裡包一層是為了跟 `uuid_text`／`rfc3339` 統一風格，且方便之後要改格式
+/// 時只改一個地方。
+fn date_text(date: NaiveDate) -> String {
+    date.to_string()
 }
 
 fn opt_uuid_text(id: Option<Uuid>) -> Option<String> {
@@ -263,6 +272,67 @@ impl SqliteEmbeddedStore {
             .await
             .map_err(map_sqlx)?;
         Ok(())
+    }
+
+    async fn try_consume_daily_usage(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+        column: &str,
+    ) -> Result<BudgetConsumption, StorageError> {
+        sqlx::query(
+            "INSERT INTO discovery_daily_usage (collection_id, usage_date, requests_used, ai_calls_used) \
+             VALUES (?, ?, 0, 0) \
+             ON CONFLICT (collection_id, usage_date) DO NOTHING",
+        )
+        .bind(uuid_text(collection_id))
+        .bind(date_text(date))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+
+        // `column` 只會是兩個寫死的字面量，`AssertSqlSafe` 是 sqlx 0.9 對
+        // runtime 組 SQL 要求的顯式稽核閘——與 POSIX 版同理由，不是把使用者
+        // 輸入直接拼進去。
+        let update_sql = format!(
+            "UPDATE discovery_daily_usage \
+             SET {column} = {column} + ?3 \
+             WHERE collection_id = ?1 AND usage_date = ?2 AND {column} + ?3 <= ?4 \
+             RETURNING {column}"
+        );
+        let updated: Option<(i64,)> = sqlx::query_as(sqlx::AssertSqlSafe(update_sql))
+            .bind(uuid_text(collection_id))
+            .bind(date_text(date))
+            .bind(by)
+            .bind(budget)
+            .fetch_optional(self.conn().await?.as_mut())
+            .await
+            .map_err(map_sqlx)?;
+
+        match updated {
+            Some((used_after,)) => Ok(BudgetConsumption {
+                allowed: true,
+                used_after,
+            }),
+            None => {
+                let select_sql = format!(
+                    "SELECT {column} FROM discovery_daily_usage \
+                     WHERE collection_id = ? AND usage_date = ?"
+                );
+                let (used_after,): (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
+                    .bind(uuid_text(collection_id))
+                    .bind(date_text(date))
+                    .fetch_one(self.conn().await?.as_mut())
+                    .await
+                    .map_err(map_sqlx)?;
+                Ok(BudgetConsumption {
+                    allowed: false,
+                    used_after,
+                })
+            }
+        }
     }
 }
 
@@ -2634,5 +2704,99 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::ai_run).collect()
+    }
+
+    async fn put_collection_budget(&self, budget: &CollectionBudget) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO collection_budgets (
+                collection_id, max_candidates_per_run, max_requests_per_run,
+                max_ai_calls_per_run, max_depth, daily_request_budget, daily_ai_budget,
+                created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (collection_id) DO UPDATE SET
+                max_candidates_per_run = excluded.max_candidates_per_run,
+                max_requests_per_run = excluded.max_requests_per_run,
+                max_ai_calls_per_run = excluded.max_ai_calls_per_run,
+                max_depth = excluded.max_depth,
+                daily_request_budget = excluded.daily_request_budget,
+                daily_ai_budget = excluded.daily_ai_budget,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(uuid_text(budget.collection_id))
+        .bind(budget.max_candidates_per_run)
+        .bind(budget.max_requests_per_run)
+        .bind(budget.max_ai_calls_per_run)
+        .bind(budget.max_depth)
+        .bind(budget.daily_request_budget)
+        .bind(budget.daily_ai_budget)
+        .bind(rfc3339(budget.created_at))
+        .bind(rfc3339(budget.updated_at))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_collection_budget(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<CollectionBudget>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM collection_budgets WHERE collection_id = ?",
+            collection_id,
+            mapping::collection_budget,
+        )
+        .await
+    }
+
+    async fn try_consume_daily_request_budget(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+    ) -> Result<BudgetConsumption, StorageError> {
+        self.try_consume_daily_usage(collection_id, date, by, budget, "requests_used")
+            .await
+    }
+
+    async fn try_consume_daily_ai_budget(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+    ) -> Result<BudgetConsumption, StorageError> {
+        self.try_consume_daily_usage(collection_id, date, by, budget, "ai_calls_used")
+            .await
+    }
+
+    async fn get_daily_usage(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+    ) -> Result<DailyUsage, StorageError> {
+        let row = sqlx::query(
+            "SELECT requests_used, ai_calls_used FROM discovery_daily_usage \
+             WHERE collection_id = ? AND usage_date = ?",
+        )
+        .bind(uuid_text(collection_id))
+        .bind(date_text(date))
+        .fetch_optional(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(match row {
+            Some(row) => DailyUsage {
+                requests_used: row.try_get("requests_used").map_err(map_sqlx)?,
+                ai_calls_used: row.try_get("ai_calls_used").map_err(map_sqlx)?,
+            },
+            None => DailyUsage {
+                requests_used: 0,
+                ai_calls_used: 0,
+            },
+        })
     }
 }

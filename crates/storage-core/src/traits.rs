@@ -4,11 +4,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use core_model::{
     AiRun, AiRunId, Candidate, CandidateEvidence, CandidateEvidenceId, CandidateId,
-    CandidateStatus, Collection, CollectionId, Connector, ConnectorId, Document, DocumentId,
-    DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
+    CandidateStatus, Collection, CollectionBudget, CollectionId, Connector, ConnectorId, Document,
+    DocumentId, DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
     EntityAlias, EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
     EntityIdentifierId, EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId,
     JobStatus, MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
@@ -754,6 +754,75 @@ pub trait RelationalStore: HealthProvider {
         after: Option<AiRunId>,
         limit: u32,
     ) -> Result<Vec<AiRun>, StorageError>;
+
+    // =========================================================================
+    // ===== V0.3 Phase 2：Discovery Budget（SPEC_V0.3 §10／§11）=====
+    //
+    // Schema 在 migrations/*/0015_v0_3_budget.sql。`collection_budgets` 是
+    // 設定（1:1 對 collection，PK 就是 collection_id，不是可列表資源，
+    // 沒有 list 方法）；`discovery_daily_usage` 是計數器，只透過
+    // try_consume_* 原子操作寫入，沒有直接的 put——呼叫端不該自己決定
+    // 用量是多少，只能「嘗試消耗」。
+    // =========================================================================
+
+    /// 依主鍵（`collection_id`）upsert 一筆配額設定。
+    async fn put_collection_budget(&self, budget: &CollectionBudget) -> Result<(), StorageError>;
+    /// 沒有設定過的 collection 回 `None`——呼叫端用
+    /// [`core_model::CollectionBudget::conservative_default`] 退回，不是把
+    /// `None` 當成「無限制」。
+    async fn get_collection_budget(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<CollectionBudget>, StorageError>;
+
+    /// 原子性地嘗試消耗 `by` 筆這個 collection 在 `date` 這天的 request 配額：
+    /// 加上 `by` 之後仍 `<= budget` 才會真的累加，回傳允許/拒絕與累加後的值。
+    /// **這是唯一寫入 `discovery_daily_usage.requests_used` 的入口**——呼叫端
+    /// 不該自己讀出目前用量再自己加總後 `put`，那樣兩個並行呼叫會互相蓋掉
+    /// 對方的增量（lost update）。`budget` 由呼叫端傳入（通常是
+    /// `CollectionBudget::daily_request_budget`），這個方法本身不去查配額
+    /// 設定，讓呼叫端一次決定「用哪組配額判斷」。
+    async fn try_consume_daily_request_budget(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+    ) -> Result<BudgetConsumption, StorageError>;
+    /// 同 [`RelationalStore::try_consume_daily_request_budget`]，對象是
+    /// `ai_calls_used`。
+    async fn try_consume_daily_ai_budget(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+        by: i64,
+        budget: i64,
+    ) -> Result<BudgetConsumption, StorageError>;
+    /// 讀某天的用量（不消耗、不新增列）。沒有用過的一天回全零，不是
+    /// `NotFound`——「今天還沒用過」是正常狀態，不是錯誤。
+    async fn get_daily_usage(
+        &self,
+        collection_id: CollectionId,
+        date: NaiveDate,
+    ) -> Result<DailyUsage, StorageError>;
+}
+
+/// [`RelationalStore::try_consume_daily_request_budget`]／
+/// [`RelationalStore::try_consume_daily_ai_budget`] 的結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetConsumption {
+    /// `true`：這次消耗成功，`used_after` 已經包含這次的量。
+    /// `false`：加上這次的量會超過配額，沒有真的累加，`used_after` 是拒絕
+    /// 當下的既有用量（給呼叫端組訊息用，例如「今天已經用了 480/500」）。
+    pub allowed: bool,
+    pub used_after: i64,
+}
+
+/// [`RelationalStore::get_daily_usage`] 的結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DailyUsage {
+    pub requests_used: i64,
+    pub ai_calls_used: i64,
 }
 
 /// Dedup Stage 4 的候選列。

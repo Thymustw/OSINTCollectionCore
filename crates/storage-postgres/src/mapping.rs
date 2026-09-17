@@ -1,8 +1,8 @@
 use core_model::{
-    AiRun, Candidate, CandidateEvidence, Collection, Connector, Document, DuplicateGroup,
-    Embedding, Entity, EntityAlias, EntityExtraction, EntityIdentifier, Event, FailedEvent, Job,
-    MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence, Relationship,
-    RelationshipEvidence, RepointedReference, ResolutionCandidate, Seed, Source,
+    AiRun, Candidate, CandidateEvidence, Collection, CollectionBudget, Connector, Document,
+    DuplicateGroup, Embedding, Entity, EntityAlias, EntityExtraction, EntityIdentifier, Event,
+    FailedEvent, Job, MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence,
+    Relationship, RelationshipEvidence, RepointedReference, ResolutionCandidate, Seed, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -427,6 +427,20 @@ pub fn merge_history(row: &PgRow) -> Result<MergeHistory, StorageError> {
         merged_relationships: decode_merged_relationships(get(row, "merged_relationships")?)?,
         undone_at: get(row, "undone_at")?,
         auto_approval_audit: get(row, "auto_approval_audit")?,
+    })
+}
+
+pub fn collection_budget(row: &PgRow) -> Result<CollectionBudget, StorageError> {
+    Ok(CollectionBudget {
+        collection_id: get(row, "collection_id")?,
+        max_candidates_per_run: get(row, "max_candidates_per_run")?,
+        max_requests_per_run: get(row, "max_requests_per_run")?,
+        max_ai_calls_per_run: get(row, "max_ai_calls_per_run")?,
+        max_depth: get(row, "max_depth")?,
+        daily_request_budget: get(row, "daily_request_budget")?,
+        daily_ai_budget: get(row, "daily_ai_budget")?,
+        created_at: get(row, "created_at")?,
+        updated_at: get(row, "updated_at")?,
     })
 }
 
