@@ -113,3 +113,70 @@ pub enum EmbeddingTarget {
     EntityDescription,
     EventDescription,
 }
+
+// ===== V0.3 =====
+
+/// Seed 種類（SPEC_V0.3 §2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedType {
+    Keyword,
+    Topic,
+    Person,
+    Organization,
+    Account,
+    Channel,
+    Url,
+    Domain,
+    Ip,
+    Email,
+    Vulnerability,
+    Software,
+    Repository,
+    Hashtag,
+    Location,
+}
+
+/// Seed 的來源（SPEC_V0.3 §2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedOrigin {
+    Manual,
+    Connector,
+    Ai,
+    Graph,
+    Entity,
+    /// SPEC 原文是 "external import"（兩個字），`snake_case` 序列化成
+    /// `external_import`。
+    ExternalImport,
+    Discovery,
+}
+
+/// Candidate 種類（SPEC_V0.3 §6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateType {
+    Entity,
+    Relationship,
+    Account,
+    Channel,
+    Source,
+    Url,
+    Domain,
+    Repository,
+    Keyword,
+    Topic,
+    Seed,
+}
+
+/// Candidate 的審核狀態（SPEC_V0.3 §6）。跟 `ResolutionStatus` 同一種理由：
+/// `approved` 與 `auto_approved` 分開，才留得住「這筆有沒有人看過」的區別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateStatus {
+    Pending,
+    Approved,
+    AutoApproved,
+    Rejected,
+    Expired,
+}

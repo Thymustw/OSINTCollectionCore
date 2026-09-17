@@ -27,3 +27,10 @@ pub type ResolutionCandidateId = Uuid;
 pub type MergeHistoryId = Uuid;
 pub type FailedEventId = Uuid;
 pub type EmbeddingId = Uuid;
+
+// ===== V0.3（SPEC_V0.3 §2／§4／§6／§7）=====
+
+pub type SeedId = Uuid;
+pub type CandidateId = Uuid;
+pub type CandidateEvidenceId = Uuid;
+pub type AiRunId = Uuid;

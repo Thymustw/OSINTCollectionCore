@@ -3,6 +3,9 @@
 //! 欄位對齊 `docs/specs/SPEC_V0.1.md`。識別碼使用 UUID v7。
 //! 規格未列舉值的 status 維持 `String`，避免發明狀態機。
 
+pub mod ai_run;
+pub mod candidate;
+pub mod candidate_evidence;
 pub mod collection;
 pub mod connector;
 pub mod content;
@@ -24,9 +27,13 @@ pub mod provenance;
 pub mod raw_evidence;
 pub mod relationship;
 pub mod resolution;
+pub mod seed;
 pub mod source;
 pub mod url_norm;
 
+pub use ai_run::{AI_TASK_TYPES, AiRun};
+pub use candidate::{Candidate, DISCOVERY_METHODS};
+pub use candidate_evidence::CandidateEvidence;
 pub use collection::Collection;
 pub use connector::Connector;
 pub use content::{content_hash, normalize_content};
@@ -37,8 +44,8 @@ pub use entity::Entity;
 pub use entity_alias::EntityAlias;
 pub use entity_identifier::EntityIdentifier;
 pub use enums::{
-    DocumentType, EmbeddingTarget, EntityType, JobStatus, RelationshipType, ResolutionStatus,
-    SourceType,
+    CandidateStatus, CandidateType, DocumentType, EmbeddingTarget, EntityType, JobStatus,
+    RelationshipType, ResolutionStatus, SeedOrigin, SeedType, SourceType,
 };
 pub use event::Event;
 pub use extraction::EntityExtraction;
@@ -51,6 +58,7 @@ pub use provenance::Provenance;
 pub use raw_evidence::RawEvidence;
 pub use relationship::{Relationship, RelationshipEvidence};
 pub use resolution::{RESOLUTION_METHODS, ResolutionCandidate};
+pub use seed::Seed;
 pub use source::Source;
 
 #[cfg(test)]
@@ -485,6 +493,164 @@ mod tests {
         assert_eq!(sorted.len(), before, "RESOLUTION_METHODS 有重複名稱");
         // SPEC §6 要求「至少」這十種。少一個就代表清單被改壞了。
         assert_eq!(RESOLUTION_METHODS.len(), 10);
+    }
+
+    #[test]
+    fn v0_3_seed_round_trip() {
+        let seed = Seed {
+            id: id(),
+            collection_id: Some(id()),
+            seed_type: SeedType::Account,
+            value: "https://x.com/threatactor".into(),
+            entity_id: Some(id()),
+            priority: 10,
+            confidence: 0.9,
+            origin: SeedOrigin::Graph,
+            status: "pending".into(),
+            depth: 2,
+            created_at: ts(),
+        };
+        assert_eq!(round_trip(&seed), seed);
+        let v = serde_json::to_value(&seed).unwrap();
+        assert_eq!(v["seed_type"], "account");
+        assert_eq!(v["origin"], "graph");
+
+        // optional 欄位為 None：手動輸入、還沒分類、還沒解析成已知 Entity。
+        let standalone = Seed {
+            collection_id: None,
+            entity_id: None,
+            ..seed.clone()
+        };
+        let back = round_trip(&standalone);
+        assert_eq!(back, standalone);
+        let v = serde_json::to_value(&standalone).unwrap();
+        assert!(v["collection_id"].is_null());
+        assert!(v["entity_id"].is_null());
+    }
+
+    #[test]
+    fn v0_3_candidate_round_trip() {
+        let candidate = Candidate {
+            id: id(),
+            candidate_type: CandidateType::Account,
+            value: "@threatactor".into(),
+            normalized_value: "threatactor".into(),
+            collection_id: Some(id()),
+            discovered_by: "seed:01993c6a-7c3e-7a11-8000-7c3e7a110001".into(),
+            discovery_method: "account_expansion".into(),
+            confidence: 0.8,
+            score: 0.85,
+            status: CandidateStatus::Pending,
+            depth: 1,
+            created_at: ts(),
+            reviewed_at: None,
+        };
+        assert_eq!(round_trip(&candidate), candidate);
+        let v = serde_json::to_value(&candidate).unwrap();
+        assert_eq!(v["status"], "pending");
+
+        // optional 欄位為 None：不屬於任何 collection、還沒被審過。
+        let standalone = Candidate {
+            collection_id: None,
+            ..candidate.clone()
+        };
+        let back = round_trip(&standalone);
+        assert_eq!(back, standalone);
+        let v = serde_json::to_value(&standalone).unwrap();
+        assert!(v["collection_id"].is_null());
+        assert!(v["reviewed_at"].is_null());
+
+        // auto_approved 與 approved 分開是 schema 的一部分。
+        let approved = Candidate {
+            status: CandidateStatus::AutoApproved,
+            reviewed_at: Some(ts()),
+            ..candidate
+        };
+        assert_eq!(
+            serde_json::to_value(approved.status).unwrap(),
+            "auto_approved"
+        );
+    }
+
+    #[test]
+    fn v0_3_candidate_evidence_round_trip() {
+        // 四個參照欄位只填一個：raw_evidence_id。
+        let evidence = CandidateEvidence {
+            id: id(),
+            candidate_id: id(),
+            object_id: None,
+            entity_id: None,
+            relationship_id: None,
+            raw_evidence_id: Some(id()),
+            reason: "這個帳號在 raw evidence 的正文中被 Entity X 提到".into(),
+            weight: 1.0,
+            created_at: ts(),
+        };
+        assert_eq!(round_trip(&evidence), evidence);
+        let v = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(v["raw_evidence_id"], json!(evidence.raw_evidence_id));
+
+        // 同一筆證據同時指向一個 Document 與它抽出的一個 Entity。
+        let multi = CandidateEvidence {
+            object_id: Some(id()),
+            entity_id: Some(id()),
+            ..evidence.clone()
+        };
+        assert_eq!(round_trip(&multi), multi);
+
+        // 全部是 None 也必須能 round-trip（不硬性要求恰好一個有值）。
+        let none = CandidateEvidence {
+            object_id: None,
+            entity_id: None,
+            relationship_id: None,
+            raw_evidence_id: None,
+            ..evidence
+        };
+        assert_eq!(round_trip(&none), none);
+    }
+
+    #[test]
+    fn v0_3_ai_run_round_trip() {
+        let run = AiRun {
+            id: id(),
+            task_type: "entity_extraction".into(),
+            provider: "vllm".into(),
+            model: "Qwen3.8-27B".into(),
+            model_version: "UD-Q4_K_XL".into(),
+            prompt_version: "entity-extraction-v3".into(),
+            input_reference: json!({"text": "...", "context": {"seed_id": id()}}),
+            output: json!([{"type": "account", "name": "@threatactor"}]),
+            confidence: 0.6,
+            tokens: 1200,
+            estimated_cost: 0.0004,
+            duration_ms: 3500,
+            created_at: ts(),
+        };
+        assert_eq!(round_trip(&run), run);
+        let v = serde_json::to_value(&run).unwrap();
+        assert_eq!(v["task_type"], "entity_extraction");
+    }
+
+    #[test]
+    fn discovery_methods_are_unique_and_match_spec_count() {
+        let mut sorted = DISCOVERY_METHODS.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), before, "DISCOVERY_METHODS 有重複名稱");
+        // SPEC §8 列出這十一種。少一個就代表清單被改壞了。
+        assert_eq!(DISCOVERY_METHODS.len(), 11);
+    }
+
+    #[test]
+    fn ai_task_types_are_unique_and_match_spec_count() {
+        let mut sorted = AI_TASK_TYPES.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), before, "AI_TASK_TYPES 有重複名稱");
+        // SPEC §5 要求「至少」這八種。少一個就代表清單被改壞了。
+        assert_eq!(AI_TASK_TYPES.len(), 8);
     }
 
     #[test]
