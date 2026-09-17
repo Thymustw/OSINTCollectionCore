@@ -263,7 +263,7 @@ jobs:
       # 同一支工具就能出 CycloneDX，不必為此再引進第二個掃描器。
       #
       # 這個 job **不擋**任何東西：它只產生 artifact。真正的 gate 是 image-scan。
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: image-${{ matrix.service }}
           path: /tmp
@@ -301,7 +301,7 @@ jobs:
           - osint-stix-worker
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: image-${{ matrix.service }}
           path: /tmp
