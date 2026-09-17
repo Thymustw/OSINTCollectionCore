@@ -4,14 +4,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use core_model::{
-    Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-    DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity, EntityAlias,
-    EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
+    AiRun, AiRunId, Candidate, CandidateEvidence, CandidateEvidenceId, CandidateId,
+    CandidateStatus, Collection, CollectionId, Connector, ConnectorId, Document, DocumentId,
+    DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
+    EntityAlias, EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
     EntityIdentifierId, EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId,
     JobStatus, MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
     ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
     RelationshipEvidenceId, RelationshipId, RelationshipType, ResolutionCandidate,
-    ResolutionCandidateId, ResolutionStatus, Source, SourceId,
+    ResolutionCandidateId, ResolutionStatus, Seed, SeedId, Source, SourceId,
 };
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -2275,5 +2276,363 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::embedding).collect()
+    }
+
+    async fn put_seed(&self, seed: &Seed) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO seeds (
+                id, collection_id, seed_type, value, entity_id, priority, confidence,
+                origin, status, depth, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                collection_id = excluded.collection_id,
+                seed_type = excluded.seed_type,
+                value = excluded.value,
+                entity_id = excluded.entity_id,
+                priority = excluded.priority,
+                confidence = excluded.confidence,
+                origin = excluded.origin,
+                status = excluded.status,
+                depth = excluded.depth,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(uuid_text(seed.id))
+        .bind(opt_uuid_text(seed.collection_id))
+        .bind(encode_enum(&seed.seed_type)?)
+        .bind(&seed.value)
+        .bind(opt_uuid_text(seed.entity_id))
+        .bind(seed.priority)
+        .bind(seed.confidence)
+        .bind(encode_enum(&seed.origin)?)
+        .bind(&seed.status)
+        .bind(seed.depth)
+        .bind(rfc3339(seed.created_at))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_seed(&self, id: SeedId) -> Result<Option<Seed>, StorageError> {
+        self.fetch_optional_mapped("SELECT * FROM seeds WHERE id = ?", id, mapping::seed)
+            .await
+    }
+
+    async fn list_seeds(
+        &self,
+        status: Option<&str>,
+        after: Option<SeedId>,
+        limit: u32,
+    ) -> Result<Vec<Seed>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM seeds
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR status = ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(status)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::seed).collect()
+    }
+
+    async fn list_seeds_by_collection(
+        &self,
+        collection_id: CollectionId,
+        status: Option<&str>,
+        after: Option<SeedId>,
+        limit: u32,
+    ) -> Result<Vec<Seed>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM seeds
+            WHERE collection_id = ?1
+              AND (?2 IS NULL OR status = ?2)
+              AND (?3 IS NULL OR id < ?3)
+            ORDER BY id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(uuid_text(collection_id))
+        .bind(status)
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::seed).collect()
+    }
+
+    async fn update_seed_status(&self, id: SeedId, status: &str) -> Result<bool, StorageError> {
+        let result = sqlx::query("UPDATE seeds SET status = ?2 WHERE id = ?1")
+            .bind(uuid_text(id))
+            .bind(status)
+            .execute(self.conn().await?.as_mut())
+            .await
+            .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn put_candidate(&self, candidate: &Candidate) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO candidates (
+                id, candidate_type, value, normalized_value, collection_id, discovered_by,
+                discovery_method, confidence, score, status, depth, created_at, reviewed_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                candidate_type = excluded.candidate_type,
+                value = excluded.value,
+                normalized_value = excluded.normalized_value,
+                collection_id = excluded.collection_id,
+                discovered_by = excluded.discovered_by,
+                discovery_method = excluded.discovery_method,
+                confidence = excluded.confidence,
+                score = excluded.score,
+                status = excluded.status,
+                depth = excluded.depth,
+                created_at = excluded.created_at,
+                reviewed_at = excluded.reviewed_at
+            "#,
+        )
+        .bind(uuid_text(candidate.id))
+        .bind(encode_enum(&candidate.candidate_type)?)
+        .bind(&candidate.value)
+        .bind(&candidate.normalized_value)
+        .bind(opt_uuid_text(candidate.collection_id))
+        .bind(&candidate.discovered_by)
+        .bind(&candidate.discovery_method)
+        .bind(candidate.confidence)
+        .bind(candidate.score)
+        .bind(encode_enum(&candidate.status)?)
+        .bind(candidate.depth)
+        .bind(rfc3339(candidate.created_at))
+        .bind(opt_rfc3339(candidate.reviewed_at))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_candidate(&self, id: CandidateId) -> Result<Option<Candidate>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM candidates WHERE id = ?",
+            id,
+            mapping::candidate,
+        )
+        .await
+    }
+
+    async fn list_candidates(
+        &self,
+        status: Option<CandidateStatus>,
+        after: Option<CandidateId>,
+        limit: u32,
+    ) -> Result<Vec<Candidate>, StorageError> {
+        let status = status.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM candidates
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR status = ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(status)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::candidate).collect()
+    }
+
+    async fn list_candidates_by_collection(
+        &self,
+        collection_id: CollectionId,
+        status: Option<CandidateStatus>,
+        after: Option<CandidateId>,
+        limit: u32,
+    ) -> Result<Vec<Candidate>, StorageError> {
+        let status = status.as_ref().map(encode_enum).transpose()?;
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM candidates
+            WHERE collection_id = ?1
+              AND (?2 IS NULL OR status = ?2)
+              AND (?3 IS NULL OR id < ?3)
+            ORDER BY id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(uuid_text(collection_id))
+        .bind(status)
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::candidate).collect()
+    }
+
+    async fn update_candidate_status(
+        &self,
+        id: CandidateId,
+        status: CandidateStatus,
+        reviewed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError> {
+        let result =
+            sqlx::query("UPDATE candidates SET status = ?2, reviewed_at = ?3 WHERE id = ?1")
+                .bind(uuid_text(id))
+                .bind(encode_enum(&status)?)
+                .bind(rfc3339(reviewed_at))
+                .execute(self.conn().await?.as_mut())
+                .await
+                .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn put_candidate_evidence(
+        &self,
+        evidence: &CandidateEvidence,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO candidate_evidence (
+                id, candidate_id, object_id, entity_id, relationship_id, raw_evidence_id,
+                reason, weight, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                candidate_id = excluded.candidate_id,
+                object_id = excluded.object_id,
+                entity_id = excluded.entity_id,
+                relationship_id = excluded.relationship_id,
+                raw_evidence_id = excluded.raw_evidence_id,
+                reason = excluded.reason,
+                weight = excluded.weight,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(uuid_text(evidence.id))
+        .bind(uuid_text(evidence.candidate_id))
+        .bind(opt_uuid_text(evidence.object_id))
+        .bind(opt_uuid_text(evidence.entity_id))
+        .bind(opt_uuid_text(evidence.relationship_id))
+        .bind(opt_uuid_text(evidence.raw_evidence_id))
+        .bind(&evidence.reason)
+        .bind(evidence.weight)
+        .bind(rfc3339(evidence.created_at))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_candidate_evidence(
+        &self,
+        id: CandidateEvidenceId,
+    ) -> Result<Option<CandidateEvidence>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM candidate_evidence WHERE id = ?",
+            id,
+            mapping::candidate_evidence,
+        )
+        .await
+    }
+
+    async fn list_candidate_evidence_by_candidate(
+        &self,
+        candidate_id: CandidateId,
+        limit: u32,
+    ) -> Result<Vec<CandidateEvidence>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT * FROM candidate_evidence WHERE candidate_id = ? ORDER BY id DESC LIMIT ?",
+        )
+        .bind(uuid_text(candidate_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::candidate_evidence).collect()
+    }
+
+    async fn put_ai_run(&self, run: &AiRun) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO ai_runs (
+                id, task_type, provider, model, model_version, prompt_version,
+                input_reference, output, confidence, tokens, estimated_cost, duration_ms,
+                created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT (id) DO UPDATE SET
+                task_type = excluded.task_type,
+                provider = excluded.provider,
+                model = excluded.model,
+                model_version = excluded.model_version,
+                prompt_version = excluded.prompt_version,
+                input_reference = excluded.input_reference,
+                output = excluded.output,
+                confidence = excluded.confidence,
+                tokens = excluded.tokens,
+                estimated_cost = excluded.estimated_cost,
+                duration_ms = excluded.duration_ms,
+                created_at = excluded.created_at
+            "#,
+        )
+        .bind(uuid_text(run.id))
+        .bind(&run.task_type)
+        .bind(&run.provider)
+        .bind(&run.model)
+        .bind(&run.model_version)
+        .bind(&run.prompt_version)
+        .bind(json_text(&run.input_reference))
+        .bind(json_text(&run.output))
+        .bind(run.confidence)
+        .bind(run.tokens)
+        .bind(run.estimated_cost)
+        .bind(run.duration_ms)
+        .bind(rfc3339(run.created_at))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn get_ai_run(&self, id: AiRunId) -> Result<Option<AiRun>, StorageError> {
+        self.fetch_optional_mapped("SELECT * FROM ai_runs WHERE id = ?", id, mapping::ai_run)
+            .await
+    }
+
+    async fn list_ai_runs(
+        &self,
+        task_type: Option<&str>,
+        after: Option<AiRunId>,
+        limit: u32,
+    ) -> Result<Vec<AiRun>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM ai_runs
+            WHERE (?1 IS NULL OR id < ?1)
+              AND (?2 IS NULL OR task_type = ?2)
+            ORDER BY id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(task_type)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::ai_run).collect()
     }
 }

@@ -6,14 +6,15 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use core_model::{
-    Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-    DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity, EntityAlias,
-    EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
+    AiRun, AiRunId, Candidate, CandidateEvidence, CandidateEvidenceId, CandidateId,
+    CandidateStatus, Collection, CollectionId, Connector, ConnectorId, Document, DocumentId,
+    DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, Entity,
+    EntityAlias, EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
     EntityIdentifierId, EntityType, Event, EventId, FailedEvent, FailedEventId, Job, JobId,
     JobStatus, MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
     ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
     RelationshipEvidenceId, RelationshipId, RelationshipType, ResolutionCandidate,
-    ResolutionCandidateId, ResolutionStatus, Source, SourceId,
+    ResolutionCandidateId, ResolutionStatus, Seed, SeedId, Source, SourceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -655,6 +656,104 @@ pub trait RelationalStore: HealthProvider {
         target_type: EmbeddingTarget,
         limit: u32,
     ) -> Result<Vec<Embedding>, StorageError>;
+
+    // =========================================================================
+    // ===== V0.3 Phase 0：Discovery Foundation
+    // ===== （Seed／Candidate／CandidateEvidence／AiRun）=====
+    //
+    // Schema 在 `migrations/*/0014_v0_3_discovery.sql`。core_model 型別定義見
+    // `core-model/src/{seed,candidate,candidate_evidence,ai_run}.rs`。
+    //
+    // 沒有機械式套用 ResolutionCandidate 的五方法模板：CandidateEvidence 沒有
+    // status 欄位（不需要 update_status），也沒有跨 candidate 瀏覽的產品需求
+    // （只留 by_candidate 一種查法，仿 list_merge_history_by_entity：不接
+    // cursor，只夾 limit）。AiRun 是一次呼叫結束後寫一次的終態紀錄，SPEC §4
+    // 沒有狀態轉換也沒有可掛查詢的 FK（只留 put/get/list）。
+    // =========================================================================
+
+    /// 依主鍵 upsert 一筆 Seed（SPEC_V0.3 §2）。
+    async fn put_seed(&self, seed: &Seed) -> Result<(), StorageError>;
+    async fn get_seed(&self, id: SeedId) -> Result<Option<Seed>, StorageError>;
+    /// 依 `id` 遞減、cursor 分頁列出 Seed，可依 `status` 過濾（`None` = 不過濾）。
+    /// `status` 是自由字串（`Seed::status` 沒有封閉列舉），過濾**在 SQL 裡做**，
+    /// 理由同 [`RelationalStore::list_resolution_candidates`]。
+    async fn list_seeds(
+        &self,
+        status: Option<&str>,
+        after: Option<SeedId>,
+        limit: u32,
+    ) -> Result<Vec<Seed>, StorageError>;
+    /// 這個 Collection 底下的 Seed，可依 `status` 過濾，依 `id` 遞減、cursor 分頁。
+    async fn list_seeds_by_collection(
+        &self,
+        collection_id: CollectionId,
+        status: Option<&str>,
+        after: Option<SeedId>,
+        limit: u32,
+    ) -> Result<Vec<Seed>, StorageError>;
+    /// 更新一筆 Seed 的 `status`（自由字串）。回傳 `true` 代表真的改到一列，
+    /// `false` 代表 `id` 不存在——比照 [`RelationalStore::update_resolution_candidate_status`]
+    /// 的慣例。
+    async fn update_seed_status(&self, id: SeedId, status: &str) -> Result<bool, StorageError>;
+
+    /// 依主鍵 upsert 一筆 Candidate（SPEC_V0.3 §6）。
+    async fn put_candidate(&self, candidate: &Candidate) -> Result<(), StorageError>;
+    async fn get_candidate(&self, id: CandidateId) -> Result<Option<Candidate>, StorageError>;
+    /// 依 `id` 遞減、cursor 分頁列出 Candidate，可依 `status` 過濾。
+    async fn list_candidates(
+        &self,
+        status: Option<CandidateStatus>,
+        after: Option<CandidateId>,
+        limit: u32,
+    ) -> Result<Vec<Candidate>, StorageError>;
+    /// 這個 Collection 底下的 Candidate（`GET /collections/{id}/discovery`
+    /// 之後會用到），可依 `status` 過濾，依 `id` 遞減、cursor 分頁。
+    async fn list_candidates_by_collection(
+        &self,
+        collection_id: CollectionId,
+        status: Option<CandidateStatus>,
+        after: Option<CandidateId>,
+        limit: u32,
+    ) -> Result<Vec<Candidate>, StorageError>;
+    /// 更新一筆 Candidate 的審核狀態與 `reviewed_at`
+    /// （`POST /candidates/{id}/approve|reject` 之後會用到）。
+    async fn update_candidate_status(
+        &self,
+        id: CandidateId,
+        status: CandidateStatus,
+        reviewed_at: DateTime<Utc>,
+    ) -> Result<bool, StorageError>;
+
+    /// 依主鍵 upsert 一筆 Candidate Evidence（SPEC_V0.3 §7）。
+    async fn put_candidate_evidence(
+        &self,
+        evidence: &CandidateEvidence,
+    ) -> Result<(), StorageError>;
+    async fn get_candidate_evidence(
+        &self,
+        id: CandidateEvidenceId,
+    ) -> Result<Option<CandidateEvidence>, StorageError>;
+    /// 這個 Candidate 的全部證據，回答「Why was this discovered?」
+    /// （Acceptance C）。不接 cursor，依 `id` 遞減，`limit` 夾在 1..=100——
+    /// 仿 [`RelationalStore::list_merge_history_by_entity`]。
+    async fn list_candidate_evidence_by_candidate(
+        &self,
+        candidate_id: CandidateId,
+        limit: u32,
+    ) -> Result<Vec<CandidateEvidence>, StorageError>;
+
+    /// 依主鍵 upsert 一筆 AI Run（SPEC_V0.3 §4）。AI output 是 derived data
+    /// （CLAUDE.md §5）——這張表只記錄，不覆寫 source/raw。
+    async fn put_ai_run(&self, run: &AiRun) -> Result<(), StorageError>;
+    async fn get_ai_run(&self, id: AiRunId) -> Result<Option<AiRun>, StorageError>;
+    /// 依 `id` 遞減、cursor 分頁列出 AI Run，可依 `task_type` 過濾
+    /// （對到 `idx_ai_runs_task_type`）。
+    async fn list_ai_runs(
+        &self,
+        task_type: Option<&str>,
+        after: Option<AiRunId>,
+        limit: u32,
+    ) -> Result<Vec<AiRun>, StorageError>;
 }
 
 /// Dedup Stage 4 的候選列。

@@ -1,8 +1,8 @@
 use core_model::{
-    Collection, Connector, Document, DuplicateGroup, Embedding, Entity, EntityAlias,
-    EntityExtraction, EntityIdentifier, Event, FailedEvent, Job, MergeHistory, MergedRelationship,
-    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, RepointedReference,
-    ResolutionCandidate, Source,
+    AiRun, Candidate, CandidateEvidence, Collection, Connector, Document, DuplicateGroup,
+    Embedding, Entity, EntityAlias, EntityExtraction, EntityIdentifier, Event, FailedEvent, Job,
+    MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence, Relationship,
+    RelationshipEvidence, RepointedReference, ResolutionCandidate, Seed, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -346,6 +346,72 @@ pub fn resolution_candidate(row: &PgRow) -> Result<ResolutionCandidate, StorageE
         status: decode_enum(&get::<String>(row, "status")?, "status")?,
         created_at: get(row, "created_at")?,
         reviewed_at: get(row, "reviewed_at")?,
+    })
+}
+
+pub fn seed(row: &PgRow) -> Result<Seed, StorageError> {
+    Ok(Seed {
+        id: get(row, "id")?,
+        collection_id: get(row, "collection_id")?,
+        seed_type: decode_enum(&get::<String>(row, "seed_type")?, "seed_type")?,
+        value: get(row, "value")?,
+        entity_id: get(row, "entity_id")?,
+        priority: get(row, "priority")?,
+        confidence: get(row, "confidence")?,
+        origin: decode_enum(&get::<String>(row, "origin")?, "origin")?,
+        status: get(row, "status")?,
+        depth: get(row, "depth")?,
+        created_at: get(row, "created_at")?,
+    })
+}
+
+pub fn candidate(row: &PgRow) -> Result<Candidate, StorageError> {
+    Ok(Candidate {
+        id: get(row, "id")?,
+        candidate_type: decode_enum(&get::<String>(row, "candidate_type")?, "candidate_type")?,
+        value: get(row, "value")?,
+        normalized_value: get(row, "normalized_value")?,
+        collection_id: get(row, "collection_id")?,
+        discovered_by: get(row, "discovered_by")?,
+        discovery_method: get(row, "discovery_method")?,
+        confidence: get(row, "confidence")?,
+        score: get(row, "score")?,
+        status: decode_enum(&get::<String>(row, "status")?, "status")?,
+        depth: get(row, "depth")?,
+        created_at: get(row, "created_at")?,
+        reviewed_at: get(row, "reviewed_at")?,
+    })
+}
+
+pub fn candidate_evidence(row: &PgRow) -> Result<CandidateEvidence, StorageError> {
+    Ok(CandidateEvidence {
+        id: get(row, "id")?,
+        candidate_id: get(row, "candidate_id")?,
+        object_id: get(row, "object_id")?,
+        entity_id: get(row, "entity_id")?,
+        relationship_id: get(row, "relationship_id")?,
+        raw_evidence_id: get(row, "raw_evidence_id")?,
+        reason: get(row, "reason")?,
+        weight: get(row, "weight")?,
+        created_at: get(row, "created_at")?,
+    })
+}
+
+pub fn ai_run(row: &PgRow) -> Result<AiRun, StorageError> {
+    Ok(AiRun {
+        id: get(row, "id")?,
+        task_type: get(row, "task_type")?,
+        provider: get(row, "provider")?,
+        model: get(row, "model")?,
+        model_version: get(row, "model_version")?,
+        prompt_version: get(row, "prompt_version")?,
+        input_reference: get(row, "input_reference")?,
+        output: get(row, "output")?,
+        confidence: get(row, "confidence")?,
+        tokens: get(row, "tokens")?,
+        estimated_cost: get(row, "estimated_cost")?,
+        duration_ms: get(row, "duration_ms")?,
+        created_at: get(row, "created_at")?,
     })
 }
 

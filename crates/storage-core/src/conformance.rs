@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use core_model::{
-    AbsorberSnapshot, Collection, Connector, Document, DocumentType, DuplicateGroup, Embedding,
-    EmbeddingTarget, Entity, EntityAlias, EntityExtraction, EntityIdentifier, EntityType, Event,
-    FailedEvent, Job, JobStatus, MergeHistory, MergedRelationship, NetworkRule, Provenance,
-    RawEvidence, Relationship, RelationshipEvidence, RelationshipType, RepointedReference,
-    ResolutionCandidate, ResolutionStatus, Source, SourceType,
+    AbsorberSnapshot, AiRun, Candidate, CandidateEvidence, CandidateStatus, CandidateType,
+    Collection, Connector, Document, DocumentType, DuplicateGroup, Embedding, EmbeddingTarget,
+    Entity, EntityAlias, EntityExtraction, EntityIdentifier, EntityType, Event, FailedEvent, Job,
+    JobStatus, MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence,
+    Relationship, RelationshipEvidence, RelationshipType, RepointedReference, ResolutionCandidate,
+    ResolutionStatus, Seed, SeedOrigin, SeedType, Source, SourceType,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -632,6 +633,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
     assert_extraction_queries(store, &extraction).await?;
 
     assert_v0_2_resolution_queries(store, &entity, source.id).await?;
+    assert_v0_3_discovery_queries(store, &collection, &entity).await?;
     assert_v0_2_failed_events(store).await?;
     assert_embedding_queries(store, document.id).await?;
 
@@ -1921,6 +1923,316 @@ async fn assert_embedding_queries<S: RelationalStore>(
             message: "list_embeddings_by_target 不該把 DocumentBody 的列算進 DocumentTitle".into(),
         });
     }
+    Ok(())
+}
+
+/// V0.3 Phase 0：Discovery Foundation 的四張新表（seed／candidate／candidate_evidence／
+/// ai_run）。
+///
+/// 驗證的不是「每張表都能 put/get」這種至少在機器上能跑的冒煙測，而是逐條對齊
+/// SPEC_V0.3 的語意——Angular/Console 與 Discovery Engine 都靠這些方法回答產品問題，
+/// 少了哪一條都不會報錯，只會在整合時靜默得到空清單：
+///
+/// 1. `put_seed`／`get_seed` 把 `collection_id`／`entity_id` 都填 `Some` 完整往返——空 Option 的欄位最容易被 adapter 靜默丟掉，兩個都填才能抓到。
+/// 2. `list_seeds` 的 `status` 過濾在 SQL 端生效——取回一頁再在程式端 filter，「沒有 pending seed」與「最新一頁沒有 pending seed」會變成同一個答案。
+/// 3. `list_seeds_by_collection` 只回該 collection 的 seed——range 是 `GET /collections/{id}/discovery` 的邊界，越界資料等於洩漏。
+/// 4. `update_seed_status` 真的改到列、不存在的 id 回 `false`——回傳值驅動呼叫端「到底改到沒」的判斷。
+/// 5. `put_candidate`／`get_candidate` 往返。
+/// 6. `list_candidates` 的 `status` 過濾生效（同 #2，換成封閉列舉 `CandidateStatus`）。
+/// 7. `list_candidates_by_collection` 只回該 collection 的 candidate（同 #3）。
+/// 8. `update_candidate_status` 真的改到列且 `reviewed_at` 寫入、不存在的 id 回 `false`。
+/// 9. `put_candidate_evidence`／`get_candidate_evidence` 往返——`object_id` 填任意 `Uuid`（無 FK）、`entity_id` 填 `Some(entity.id)`、其餘參照留 `None`，證明 Option 欄位能空能填。
+/// 10. `list_candidate_evidence_by_candidate` 只回該 candidate 的證據、且**非空**——Acceptance C「能回答 Why was this discovered?」在這裡驗證資料真的讀得回來。
+/// 11. `put_ai_run`／`get_ai_run` 往返——`input_reference`／`output` 用非空 JSON，確保不是靜默存成 `{}`。
+/// 12. `list_ai_runs` 的 `task_type` 過濾生效（同 #2）。
+async fn assert_v0_3_discovery_queries<S: RelationalStore>(
+    store: &S,
+    collection: &Collection,
+    entity: &Entity,
+) -> Result<(), StorageError> {
+    let run = Uuid::now_v7();
+
+    // --- Seed ---------------------------------------------------------------
+    let seed = Seed {
+        id: Uuid::now_v7(),
+        collection_id: Some(collection.id),
+        seed_type: SeedType::Account,
+        value: format!("conformance-seed-{run}"),
+        entity_id: Some(entity.id),
+        priority: 5,
+        confidence: 0.9,
+        origin: SeedOrigin::Manual,
+        status: "pending".into(),
+        depth: 1,
+        created_at: fixture_ts(),
+    };
+    store.put_seed(&seed).await?;
+    assert_eq_debug(
+        "seed",
+        &seed,
+        &store
+            .get_seed(seed.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 seed 讀不到".into(),
+            })?,
+    );
+    // status 過濾必須在 SQL 端生效：pending 該看到、不相干的 status 不該看到。
+    let pending = store.list_seeds(Some("pending"), None, 100).await?;
+    if !pending.iter().any(|s| s.id == seed.id) {
+        return Err(StorageError::NotFound {
+            message: "list_seeds 用 status=pending 過濾不到剛寫入的 seed".into(),
+        });
+    }
+    let confirmed = store.list_seeds(Some("confirmed"), None, 100).await?;
+    if confirmed.iter().any(|s| s.id == seed.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_seeds 用不相干的 status 過濾卻回傳了這筆 seed".into(),
+        });
+    }
+    // 一筆屬於這個 collection、一筆 `collection_id: None`——by_collection 只該看到前者。
+    let orphan_seed = Seed {
+        id: Uuid::now_v7(),
+        collection_id: None,
+        seed_type: SeedType::Keyword,
+        value: format!("conformance-orphan-seed-{run}"),
+        entity_id: None,
+        priority: 1,
+        confidence: 0.5,
+        origin: SeedOrigin::Connector,
+        status: "pending".into(),
+        depth: 0,
+        created_at: fixture_ts(),
+    };
+    store.put_seed(&orphan_seed).await?;
+    let by_collection = store
+        .list_seeds_by_collection(collection.id, None, None, 100)
+        .await?;
+    if !by_collection.iter().any(|s| s.id == seed.id) {
+        return Err(StorageError::NotFound {
+            message: "list_seeds_by_collection 查不到屬於該 collection 的 seed".into(),
+        });
+    }
+    if by_collection.iter().any(|s| s.id == orphan_seed.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_seeds_by_collection 把 collection_id=None 的 seed 也算了進來".into(),
+        });
+    }
+    if !store.update_seed_status(seed.id, "confirmed").await? {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_seed_status 對剛寫入的 seed 回 false".into(),
+        });
+    }
+    let refreshed = store.get_seed(seed.id).await?.expect("seed");
+    if refreshed.status != "confirmed" {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "update_seed_status 之後 status 應為 confirmed，實際是 {}",
+                refreshed.status
+            ),
+        });
+    }
+    if store.update_seed_status(Uuid::now_v7(), "x").await? {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_seed_status 對不存在的 id 回 true".into(),
+        });
+    }
+
+    // --- Candidate ------------------------------------------------------------
+    let candidate = Candidate {
+        id: Uuid::now_v7(),
+        candidate_type: CandidateType::Account,
+        value: format!("conformance-candidate-{run}"),
+        normalized_value: format!("conformance-candidate-{run}"),
+        collection_id: Some(collection.id),
+        discovered_by: format!("seed:{}", seed.id),
+        discovery_method: "account_expansion".into(),
+        confidence: 0.85,
+        score: 0.9,
+        status: CandidateStatus::Pending,
+        depth: 1,
+        created_at: fixture_ts(),
+        reviewed_at: None,
+    };
+    store.put_candidate(&candidate).await?;
+    assert_eq_debug(
+        "candidate",
+        &candidate,
+        &store
+            .get_candidate(candidate.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 candidate 讀不到".into(),
+            })?,
+    );
+    let pending_candidates = store
+        .list_candidates(Some(CandidateStatus::Pending), None, 100)
+        .await?;
+    if !pending_candidates.iter().any(|c| c.id == candidate.id) {
+        return Err(StorageError::NotFound {
+            message: "list_candidates 過濾不到剛寫入的 pending candidate".into(),
+        });
+    }
+    let approved_candidates = store
+        .list_candidates(Some(CandidateStatus::Approved), None, 100)
+        .await?;
+    if approved_candidates.iter().any(|c| c.id == candidate.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_candidates 用不相干的 status 過濾卻回傳了這筆 candidate".into(),
+        });
+    }
+    let orphan_candidate = Candidate {
+        id: Uuid::now_v7(),
+        collection_id: None,
+        ..candidate.clone()
+    };
+    store.put_candidate(&orphan_candidate).await?;
+    let by_collection_candidates = store
+        .list_candidates_by_collection(collection.id, None, None, 100)
+        .await?;
+    if !by_collection_candidates
+        .iter()
+        .any(|c| c.id == candidate.id)
+    {
+        return Err(StorageError::NotFound {
+            message: "list_candidates_by_collection 查不到屬於該 collection 的 candidate".into(),
+        });
+    }
+    if by_collection_candidates
+        .iter()
+        .any(|c| c.id == orphan_candidate.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_candidates_by_collection 把 collection_id=None 的 candidate 算了進來"
+                .into(),
+        });
+    }
+    if !store
+        .update_candidate_status(candidate.id, CandidateStatus::Approved, fixture_ts())
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_candidate_status 對剛寫入的 candidate 回 false".into(),
+        });
+    }
+    let refreshed_candidate = store.get_candidate(candidate.id).await?.expect("candidate");
+    if refreshed_candidate.status != CandidateStatus::Approved
+        || refreshed_candidate.reviewed_at.is_none()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "update_candidate_status 之後 status 應為 approved 且 reviewed_at 有值，\
+                 實際 status={:?} reviewed_at={:?}",
+                refreshed_candidate.status, refreshed_candidate.reviewed_at
+            ),
+        });
+    }
+    if store
+        .update_candidate_status(Uuid::now_v7(), CandidateStatus::Rejected, fixture_ts())
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_candidate_status 對不存在的 id 回 true".into(),
+        });
+    }
+
+    // --- CandidateEvidence（先 put_candidate 成功後才能引用它的 id，順序錯會撞
+    // postgres 的外鍵；sqlite 不強制外鍵，但兩邊都照正確順序寫）------------------
+    let evidence = CandidateEvidence {
+        id: Uuid::now_v7(),
+        candidate_id: candidate.id,
+        object_id: Some(Uuid::now_v7()),
+        entity_id: Some(entity.id),
+        relationship_id: None,
+        raw_evidence_id: None,
+        reason: format!("discovered via seed {run}"),
+        weight: 0.8,
+        created_at: fixture_ts(),
+    };
+    store.put_candidate_evidence(&evidence).await?;
+    assert_eq_debug(
+        "candidate_evidence",
+        &evidence,
+        &store
+            .get_candidate_evidence(evidence.id)
+            .await?
+            .ok_or_else(|| StorageError::NotFound {
+                message: "剛寫入的 candidate_evidence 讀不到".into(),
+            })?,
+    );
+    let by_candidate = store
+        .list_candidate_evidence_by_candidate(candidate.id, 100)
+        .await?;
+    if by_candidate.is_empty() {
+        return Err(StorageError::NotFound {
+            message: "list_candidate_evidence_by_candidate 對剛寫入證據的 candidate 回空頁".into(),
+        });
+    }
+    if !by_candidate.iter().any(|e| e.id == evidence.id) {
+        return Err(StorageError::NotFound {
+            message: "list_candidate_evidence_by_candidate 查不到剛寫入的證據".into(),
+        });
+    }
+    if by_candidate.iter().any(|e| e.candidate_id != candidate.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_candidate_evidence_by_candidate 回了不屬於該 candidate 的證據".into(),
+        });
+    }
+
+    // --- AiRun ---------------------------------------------------------------
+    let input_reference = json!({ "seed_id": seed.id.to_string() });
+    let output = json!({ "candidate_id": candidate.id.to_string(), "score": 0.87 });
+    let ai_run = AiRun {
+        id: Uuid::now_v7(),
+        task_type: "candidate_scoring".into(),
+        provider: "llamacpp".into(),
+        model: "Qwen3.8-27B-UD-Q4_K_XL".into(),
+        model_version: "1".into(),
+        prompt_version: "v1".into(),
+        input_reference: input_reference.clone(),
+        output: output.clone(),
+        confidence: 0.7,
+        tokens: 120,
+        estimated_cost: 0.0012,
+        duration_ms: 850,
+        created_at: fixture_ts(),
+    };
+    store.put_ai_run(&ai_run).await?;
+    let got_run = store
+        .get_ai_run(ai_run.id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "剛寫入的 ai_run 讀不到".into(),
+        })?;
+    // 非空 JSON 才防得住 adapter 靜默把 value 存成 `{}` 後文字對不上。
+    assert_eq_debug("ai_run", &ai_run, &got_run);
+    let scoring_runs = store
+        .list_ai_runs(Some("candidate_scoring"), None, 100)
+        .await?;
+    if !scoring_runs.iter().any(|r| r.id == ai_run.id) {
+        return Err(StorageError::NotFound {
+            message: "list_ai_runs 用 task_type 過濾不到剛寫入的 run".into(),
+        });
+    }
+    let summary_runs = store.list_ai_runs(Some("summarization"), None, 100).await?;
+    if summary_runs.iter().any(|r| r.id == ai_run.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "list_ai_runs 用不相干的 task_type 過濾卻回傳了這筆 run".into(),
+        });
+    }
+
     Ok(())
 }
 

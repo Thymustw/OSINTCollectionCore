@@ -214,13 +214,15 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use core_model::{
-        Collection, CollectionId, Connector, ConnectorId, Document, DocumentId, DocumentType,
-        DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, EntityAlias, EntityAliasId,
-        EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier, EntityIdentifierId,
-        Event, EventId, FailedEvent, FailedEventId, Job, JobId, JobStatus, MergeHistory,
-        MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance, ProvenanceId,
-        RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence, RelationshipEvidenceId,
-        RelationshipId, RelationshipType, ResolutionCandidateId, Source, SourceId,
+        AiRun, AiRunId, Candidate, CandidateEvidence, CandidateEvidenceId, CandidateId,
+        CandidateStatus, Collection, CollectionId, Connector, ConnectorId, Document, DocumentId,
+        DocumentType, DuplicateGroup, DuplicateGroupId, Embedding, EmbeddingTarget, EntityAlias,
+        EntityAliasId, EntityExtraction, EntityExtractionId, EntityId, EntityIdentifier,
+        EntityIdentifierId, Event, EventId, FailedEvent, FailedEventId, Job, JobId, JobStatus,
+        MergeHistory, MergeHistoryId, NetworkRule, NetworkRuleId, ObjectId, Provenance,
+        ProvenanceId, RawEvidence, RawEvidenceId, Relationship, RelationshipEvidence,
+        RelationshipEvidenceId, RelationshipId, RelationshipType, ResolutionCandidateId, Seed,
+        SeedId, Source, SourceId,
     };
     use serde_json::json;
     use storage_core::health::{HealthProvider, StorageHealth};
@@ -833,6 +835,93 @@ mod tests {
             _: chrono::DateTime<Utc>,
         ) -> Result<bool, StorageError> {
             Self::unsupported("update_resolution_candidate_status")
+        }
+        async fn put_seed(&self, _: &Seed) -> Result<(), StorageError> {
+            Self::unsupported("put_seed")
+        }
+        async fn get_seed(&self, _: SeedId) -> Result<Option<Seed>, StorageError> {
+            Self::unsupported("get_seed")
+        }
+        async fn list_seeds(
+            &self,
+            _: Option<&str>,
+            _: Option<SeedId>,
+            _: u32,
+        ) -> Result<Vec<Seed>, StorageError> {
+            Self::unsupported("list_seeds")
+        }
+        async fn list_seeds_by_collection(
+            &self,
+            _: CollectionId,
+            _: Option<&str>,
+            _: Option<SeedId>,
+            _: u32,
+        ) -> Result<Vec<Seed>, StorageError> {
+            Self::unsupported("list_seeds_by_collection")
+        }
+        async fn update_seed_status(&self, _: SeedId, _: &str) -> Result<bool, StorageError> {
+            Self::unsupported("update_seed_status")
+        }
+        async fn put_candidate(&self, _: &Candidate) -> Result<(), StorageError> {
+            Self::unsupported("put_candidate")
+        }
+        async fn get_candidate(&self, _: CandidateId) -> Result<Option<Candidate>, StorageError> {
+            Self::unsupported("get_candidate")
+        }
+        async fn list_candidates(
+            &self,
+            _: Option<CandidateStatus>,
+            _: Option<CandidateId>,
+            _: u32,
+        ) -> Result<Vec<Candidate>, StorageError> {
+            Self::unsupported("list_candidates")
+        }
+        async fn list_candidates_by_collection(
+            &self,
+            _: CollectionId,
+            _: Option<CandidateStatus>,
+            _: Option<CandidateId>,
+            _: u32,
+        ) -> Result<Vec<Candidate>, StorageError> {
+            Self::unsupported("list_candidates_by_collection")
+        }
+        async fn update_candidate_status(
+            &self,
+            _: CandidateId,
+            _: CandidateStatus,
+            _: chrono::DateTime<Utc>,
+        ) -> Result<bool, StorageError> {
+            Self::unsupported("update_candidate_status")
+        }
+        async fn put_candidate_evidence(&self, _: &CandidateEvidence) -> Result<(), StorageError> {
+            Self::unsupported("put_candidate_evidence")
+        }
+        async fn get_candidate_evidence(
+            &self,
+            _: CandidateEvidenceId,
+        ) -> Result<Option<CandidateEvidence>, StorageError> {
+            Self::unsupported("get_candidate_evidence")
+        }
+        async fn list_candidate_evidence_by_candidate(
+            &self,
+            _: CandidateId,
+            _: u32,
+        ) -> Result<Vec<CandidateEvidence>, StorageError> {
+            Self::unsupported("list_candidate_evidence_by_candidate")
+        }
+        async fn put_ai_run(&self, _: &AiRun) -> Result<(), StorageError> {
+            Self::unsupported("put_ai_run")
+        }
+        async fn get_ai_run(&self, _: AiRunId) -> Result<Option<AiRun>, StorageError> {
+            Self::unsupported("get_ai_run")
+        }
+        async fn list_ai_runs(
+            &self,
+            _: Option<&str>,
+            _: Option<AiRunId>,
+            _: u32,
+        ) -> Result<Vec<AiRun>, StorageError> {
+            Self::unsupported("list_ai_runs")
         }
         async fn put_merge_history(&self, _: &MergeHistory) -> Result<(), StorageError> {
             Self::unsupported("put_merge_history")

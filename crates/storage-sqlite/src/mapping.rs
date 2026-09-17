@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 use core_model::{
-    Collection, Connector, Document, DuplicateGroup, Embedding, Entity, EntityAlias,
-    EntityExtraction, EntityIdentifier, Event, FailedEvent, Job, MergeHistory, MergedRelationship,
-    NetworkRule, Provenance, RawEvidence, Relationship, RelationshipEvidence, RepointedReference,
-    ResolutionCandidate, Source,
+    AiRun, Candidate, CandidateEvidence, Collection, Connector, Document, DuplicateGroup,
+    Embedding, Entity, EntityAlias, EntityExtraction, EntityIdentifier, Event, FailedEvent, Job,
+    MergeHistory, MergedRelationship, NetworkRule, Provenance, RawEvidence, Relationship,
+    RelationshipEvidence, RepointedReference, ResolutionCandidate, Seed, Source,
 };
 use serde_json::Value;
 use sqlx::Row;
@@ -413,6 +413,72 @@ pub fn resolution_candidate(row: &SqliteRow) -> Result<ResolutionCandidate, Stor
         status: decode_enum(&get_str(row, "status")?, "status")?,
         created_at: ts(row, "created_at")?,
         reviewed_at: opt_ts(row, "reviewed_at")?,
+    })
+}
+
+pub fn seed(row: &SqliteRow) -> Result<Seed, StorageError> {
+    Ok(Seed {
+        id: uuid_from(row, "id")?,
+        collection_id: opt_uuid(row, "collection_id")?,
+        seed_type: decode_enum(&get_str(row, "seed_type")?, "seed_type")?,
+        value: get_str(row, "value")?,
+        entity_id: opt_uuid(row, "entity_id")?,
+        priority: i32_from(row, "priority")?,
+        confidence: get_f64(row, "confidence")?,
+        origin: decode_enum(&get_str(row, "origin")?, "origin")?,
+        status: get_str(row, "status")?,
+        depth: i32_from(row, "depth")?,
+        created_at: ts(row, "created_at")?,
+    })
+}
+
+pub fn candidate(row: &SqliteRow) -> Result<Candidate, StorageError> {
+    Ok(Candidate {
+        id: uuid_from(row, "id")?,
+        candidate_type: decode_enum(&get_str(row, "candidate_type")?, "candidate_type")?,
+        value: get_str(row, "value")?,
+        normalized_value: get_str(row, "normalized_value")?,
+        collection_id: opt_uuid(row, "collection_id")?,
+        discovered_by: get_str(row, "discovered_by")?,
+        discovery_method: get_str(row, "discovery_method")?,
+        confidence: get_f64(row, "confidence")?,
+        score: get_f64(row, "score")?,
+        status: decode_enum(&get_str(row, "status")?, "status")?,
+        depth: i32_from(row, "depth")?,
+        created_at: ts(row, "created_at")?,
+        reviewed_at: opt_ts(row, "reviewed_at")?,
+    })
+}
+
+pub fn candidate_evidence(row: &SqliteRow) -> Result<CandidateEvidence, StorageError> {
+    Ok(CandidateEvidence {
+        id: uuid_from(row, "id")?,
+        candidate_id: uuid_from(row, "candidate_id")?,
+        object_id: opt_uuid(row, "object_id")?,
+        entity_id: opt_uuid(row, "entity_id")?,
+        relationship_id: opt_uuid(row, "relationship_id")?,
+        raw_evidence_id: opt_uuid(row, "raw_evidence_id")?,
+        reason: get_str(row, "reason")?,
+        weight: get_f64(row, "weight")?,
+        created_at: ts(row, "created_at")?,
+    })
+}
+
+pub fn ai_run(row: &SqliteRow) -> Result<AiRun, StorageError> {
+    Ok(AiRun {
+        id: uuid_from(row, "id")?,
+        task_type: get_str(row, "task_type")?,
+        provider: get_str(row, "provider")?,
+        model: get_str(row, "model")?,
+        model_version: get_str(row, "model_version")?,
+        prompt_version: get_str(row, "prompt_version")?,
+        input_reference: json(row, "input_reference")?,
+        output: json(row, "output")?,
+        confidence: get_f64(row, "confidence")?,
+        tokens: get_i64(row, "tokens")?,
+        estimated_cost: get_f64(row, "estimated_cost")?,
+        duration_ms: get_i64(row, "duration_ms")?,
+        created_at: ts(row, "created_at")?,
     })
 }
 
