@@ -1,7 +1,10 @@
 //! SPEC §20 topic 清單。另加 `job.dispatched` 給 Job 派工。
 //!
-//! V0.2 的九個 topic（`SPEC_V0.2.md` §20）也定義在這裡，與 V0.1 沒有任何名稱重疊。
-//! **這一批只有定義，沒有生產者也沒有消費者**——同 V0.1 的 `search.index.requested`。
+//! V0.2 的九個 topic（`SPEC_V0.2.md` §20）、V0.3 的十個 topic
+//! （`SPEC_V0.3.md` §18）也定義在這裡，與 V0.1 沒有任何名稱重疊。
+//! **這一批只有定義，沒有生產者也沒有消費者**——同 V0.1 的
+//! `search.index.requested`；V0.3 這十個要等 Phase 1（AI Gateway）與
+//! Phase 3（Discovery Engine）的 worker/handler 實際發布/訂閱才會有人用。
 
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +58,28 @@ pub enum EventTopic {
     EmbeddingCompleted,
     #[serde(rename = "timeline.updated")]
     TimelineUpdated,
+
+    // ===== V0.3（SPEC_V0.3 §18）=====
+    #[serde(rename = "seed.created")]
+    SeedCreated,
+    #[serde(rename = "seed.updated")]
+    SeedUpdated,
+    #[serde(rename = "discovery.requested")]
+    DiscoveryRequested,
+    #[serde(rename = "discovery.completed")]
+    DiscoveryCompleted,
+    #[serde(rename = "candidate.created")]
+    CandidateCreated,
+    #[serde(rename = "candidate.approved")]
+    CandidateApproved,
+    #[serde(rename = "candidate.rejected")]
+    CandidateRejected,
+    #[serde(rename = "ai.requested")]
+    AiRequested,
+    #[serde(rename = "ai.completed")]
+    AiCompleted,
+    #[serde(rename = "ai.failed")]
+    AiFailed,
 }
 
 impl EventTopic {
@@ -80,6 +105,16 @@ impl EventTopic {
             Self::EmbeddingRequested => "embedding.requested",
             Self::EmbeddingCompleted => "embedding.completed",
             Self::TimelineUpdated => "timeline.updated",
+            Self::SeedCreated => "seed.created",
+            Self::SeedUpdated => "seed.updated",
+            Self::DiscoveryRequested => "discovery.requested",
+            Self::DiscoveryCompleted => "discovery.completed",
+            Self::CandidateCreated => "candidate.created",
+            Self::CandidateApproved => "candidate.approved",
+            Self::CandidateRejected => "candidate.rejected",
+            Self::AiRequested => "ai.requested",
+            Self::AiCompleted => "ai.completed",
+            Self::AiFailed => "ai.failed",
         }
     }
 
@@ -87,7 +122,7 @@ impl EventTopic {
     ///
     /// 沒有這個清單，漏掉一個 topic 的 `as_str` 分支只會在執行期才發現，
     /// 而且是以「送到錯誤 topic」的形式發現——那時訊息已經在別的 partition 上了。
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 29] = [
         Self::RawCollected,
         Self::RawFailed,
         Self::ObjectNormalized,
@@ -107,6 +142,16 @@ impl EventTopic {
         Self::EmbeddingRequested,
         Self::EmbeddingCompleted,
         Self::TimelineUpdated,
+        Self::SeedCreated,
+        Self::SeedUpdated,
+        Self::DiscoveryRequested,
+        Self::DiscoveryCompleted,
+        Self::CandidateCreated,
+        Self::CandidateApproved,
+        Self::CandidateRejected,
+        Self::AiRequested,
+        Self::AiCompleted,
+        Self::AiFailed,
     ];
 }
 
@@ -156,6 +201,24 @@ mod tests {
             "embedding.completed"
         );
         assert_eq!(EventTopic::TimelineUpdated.as_str(), "timeline.updated");
+
+        // SPEC_V0.3 §18 的十個。
+        assert_eq!(EventTopic::SeedCreated.as_str(), "seed.created");
+        assert_eq!(EventTopic::SeedUpdated.as_str(), "seed.updated");
+        assert_eq!(
+            EventTopic::DiscoveryRequested.as_str(),
+            "discovery.requested"
+        );
+        assert_eq!(
+            EventTopic::DiscoveryCompleted.as_str(),
+            "discovery.completed"
+        );
+        assert_eq!(EventTopic::CandidateCreated.as_str(), "candidate.created");
+        assert_eq!(EventTopic::CandidateApproved.as_str(), "candidate.approved");
+        assert_eq!(EventTopic::CandidateRejected.as_str(), "candidate.rejected");
+        assert_eq!(EventTopic::AiRequested.as_str(), "ai.requested");
+        assert_eq!(EventTopic::AiCompleted.as_str(), "ai.completed");
+        assert_eq!(EventTopic::AiFailed.as_str(), "ai.failed");
     }
 
     /// `as_str()` 與 serde 的 `rename` 必須是同一個字串。
@@ -183,8 +246,8 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "EventTopic::ALL 有重複的 topic 名稱");
-        // V0.1 的 10 個 + V0.2 §20 的 9 個。新增 variant 時這個數字要一起改，
-        // 否則 ALL 漏掉的那個不會被上面兩個測試檢查到。
-        assert_eq!(total, 19);
+        // V0.1 的 10 個 + V0.2 §20 的 9 個 + V0.3 §18 的 10 個。新增 variant
+        // 時這個數字要一起改，否則 ALL 漏掉的那個不會被上面兩個測試檢查到。
+        assert_eq!(total, 29);
     }
 }

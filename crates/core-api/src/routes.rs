@@ -83,6 +83,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/graph/rebuild", post(resources::graph::rebuild))
         .route("/api/v1/export/stix", post(resources::stix::export_stix))
+        .route("/api/v1/seeds", post(resources::discovery::create_seed))
+        .route(
+            "/api/v1/candidates/{id}/approve",
+            post(resources::discovery::approve_candidate),
+        )
+        .route(
+            "/api/v1/candidates/{id}/reject",
+            post(resources::discovery::reject_candidate),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_mw::require_write,
@@ -142,6 +151,24 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/entities/{id}/timeline",
             get(resources::timeline::entity_timeline),
+        )
+        .route("/api/v1/seeds", get(resources::discovery::list_seeds))
+        .route(
+            "/api/v1/candidates",
+            get(resources::discovery::list_candidates),
+        )
+        .route(
+            "/api/v1/candidates/{id}",
+            get(resources::discovery::get_candidate),
+        )
+        .route(
+            "/api/v1/collections/{id}/discovery",
+            get(resources::discovery::collection_discovery),
+        )
+        .route("/api/v1/ai/runs", get(resources::discovery::list_ai_runs))
+        .route(
+            "/api/v1/ai/runs/{id}",
+            get(resources::discovery::get_ai_run),
         )
         .route(
             "/api/v1/relationships",
