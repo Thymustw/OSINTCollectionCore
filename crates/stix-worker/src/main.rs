@@ -127,6 +127,8 @@ async fn run() -> Result<(), String> {
         base_url: auto_section.llm.base_url.clone(),
         timeout: Duration::from_secs(auto_section.llm.timeout_secs),
         max_concurrent: auto_section.llm.max_concurrent,
+        max_retries: 0,
+        rate_limit_per_second: None,
     });
     let auto_config = AutoApprovalConfig {
         enabled: effectively_enabled,

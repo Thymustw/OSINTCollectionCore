@@ -14,10 +14,12 @@
 //! 多段 `content` 陣列或其他變體，會被當成 [`AiGatewayError::InvalidResponse`]。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tokio::sync::Mutex as AsyncMutex;
 
+use crate::redact::{redact_credentials, truncate};
 use crate::{
     AiGatewayError, ChatCompletionRequest, ChatCompletionResponse, ChatRole, LlmProvider,
     TokenUsage,
@@ -29,7 +31,7 @@ use crate::{
 /// `core-api` 組裝）把 `AutoApprovalLlmSection` 的欄位轉過來即可。
 ///
 /// `model`／`temperature`／`max_tokens` 走 [`ChatCompletionRequest`]，這裡只留
-/// client 連線與並發控制需要的欄位。
+/// client 連線、並發控制、重試、限流需要的欄位。
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleLlmProviderConfig {
     /// `false` 時不建 HTTP client，所有呼叫回 [`AiGatewayError::Unsupported`]。
@@ -42,6 +44,16 @@ pub struct OpenAiCompatibleLlmProviderConfig {
     /// 同時進行的 LLM 推論上限（`tokio::sync::Semaphore`）。
     /// `0` 會被當成 `1`，避免 semaphore 永遠發不出 permit。
     pub max_concurrent: usize,
+    /// 除了第一次嘗試外，[`AiGatewayError::Transient`] 最多重試幾次。
+    /// `0`＝不重試（V0.3 Phase 1 Step A 之前的既有行為）。
+    /// `Permanent`／`InvalidResponse`／`Unsupported` 一律不重試——重試對
+    /// 這三類錯誤沒有意義，白白多等一個逾時。
+    pub max_retries: usize,
+    /// 全域請求速率上限（次/秒），跟 `max_concurrent` 是兩個獨立機制：
+    /// `max_concurrent` 限制「同時有幾個請求在飛」，這個限制「多快能發出
+    /// 下一個請求」。`None` 代表不限制（只靠 `max_concurrent` 節流，
+    /// V0.3 Phase 1 Step A 之前的既有行為）。
+    pub rate_limit_per_second: Option<f64>,
 }
 
 /// OpenAI 相容 chat completion 的生產實作。
@@ -59,6 +71,38 @@ struct Inner {
     client: reqwest::Client,
     base_url: String,
     semaphore: Arc<tokio::sync::Semaphore>,
+    max_retries: usize,
+    rate_limiter: Option<RateLimiter>,
+}
+
+/// 簡單的固定間隔限流器：`next_allowed` 記錄下一個請求最早能出發的時間，
+/// 每次請求把它往後推一個 `interval`。跟 `tokio::sync::Semaphore` 不同——
+/// semaphore 限制「同時幾個」，這個限制「間隔多久一個」，兩者疊加使用。
+#[derive(Clone)]
+struct RateLimiter {
+    interval: Duration,
+    next_allowed: Arc<AsyncMutex<Instant>>,
+}
+
+impl RateLimiter {
+    fn new(per_second: f64) -> Self {
+        // per_second <= 0 視同極慢（每次間隔拉到最大合理值），不整個 panic
+        // 或除以零——設定打錯值時退化成「很慢」比「直接崩潰」對生產環境友善。
+        let per_second = if per_second > 0.0 { per_second } else { 0.001 };
+        Self {
+            interval: Duration::from_secs_f64(1.0 / per_second),
+            next_allowed: Arc::new(AsyncMutex::new(Instant::now())),
+        }
+    }
+
+    async fn wait_turn(&self) {
+        let mut next = self.next_allowed.lock().await;
+        let now = Instant::now();
+        if *next > now {
+            tokio::time::sleep(*next - now).await;
+        }
+        *next = next.max(now) + self.interval;
+    }
 }
 
 impl OpenAiCompatibleLlmProvider {
@@ -83,6 +127,8 @@ impl OpenAiCompatibleLlmProvider {
                 client,
                 base_url: config.base_url.clone(),
                 semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
+                max_retries: config.max_retries,
+                rate_limiter: config.rate_limit_per_second.map(RateLimiter::new),
             }),
         }
     }
@@ -97,7 +143,62 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
             return Err(AiGatewayError::Unsupported);
         };
 
-        let _permit = inner
+        tracing::debug!(
+            model = %request.model,
+            message_count = request.messages.len(),
+            "LLM 呼叫開始"
+        );
+
+        let mut attempt = 0usize;
+        loop {
+            match inner.send_once(request).await {
+                Ok(response) => {
+                    if attempt > 0 {
+                        tracing::info!(attempt, model = %request.model, "LLM 呼叫重試後成功");
+                    } else {
+                        tracing::debug!(
+                            model = %response.model,
+                            tokens = ?response.usage,
+                            "LLM 呼叫成功"
+                        );
+                    }
+                    return Ok(response);
+                }
+                Err(AiGatewayError::Transient { message }) if attempt < inner.max_retries => {
+                    let backoff = retry_backoff(attempt);
+                    tracing::warn!(
+                        attempt,
+                        max_retries = inner.max_retries,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %redact_credentials(&message),
+                        "LLM 暫時性錯誤，退避後重試"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+                Err(err) => {
+                    if attempt > 0 {
+                        tracing::error!(
+                            attempt,
+                            error = %err,
+                            "LLM 呼叫重試耗盡仍失敗"
+                        );
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+impl Inner {
+    /// 單次嘗試：取 semaphore permit、等限流輪到、發 HTTP 請求、解析回應。
+    /// 不含重試邏輯——重試迴圈在 [`LlmProvider::chat_completion`]。
+    async fn send_once(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, AiGatewayError> {
+        let _permit = self
             .semaphore
             .acquire()
             .await
@@ -105,7 +206,11 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
                 message: "LLM 並發限制 semaphore 已關閉（這不該發生；請重啟服務）".to_string(),
             })?;
 
-        let url = chat_completions_url(&inner.base_url);
+        if let Some(limiter) = &self.rate_limiter {
+            limiter.wait_turn().await;
+        }
+
+        let url = chat_completions_url(&self.base_url);
         let payload = json!({
             "model": request.model,
             "messages": request.messages.iter().map(|m| {
@@ -121,7 +226,7 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
             message: format!("序列化 LLM 請求失敗：{err}"),
         })?;
 
-        let response = inner
+        let response = self
             .client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -139,6 +244,13 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
 
         parse_chat_completion(&text, &request.model)
     }
+}
+
+/// 退避時間：100ms, 200ms, 400ms, ... 上限 5s。`attempt` 是第幾次重試
+/// （從 0 起算，即第一次重試用 100ms）。
+fn retry_backoff(attempt: usize) -> Duration {
+    let millis = 100u64.saturating_mul(1u64 << attempt.min(6));
+    Duration::from_millis(millis.min(5_000))
 }
 
 fn role_as_str(role: ChatRole) -> &'static str {
@@ -175,7 +287,7 @@ fn classify_reqwest(err: reqwest::Error) -> AiGatewayError {
 }
 
 fn classify_http(status: u16, body: &str) -> AiGatewayError {
-    let summary = truncate_str(&sanitize(body));
+    let summary = truncate(&redact_credentials(body), 500);
     match status {
         429 | 502 | 503 => AiGatewayError::Transient {
             message: format!(
@@ -204,7 +316,7 @@ fn parse_chat_completion(
         message: format!(
             "LLM 回應不是合法 JSON。請確認 auto_approval.llm.base_url 指向 OpenAI 相容的 /v1\
              （vLLM 或 llama.cpp server）。回應摘要：{}",
-            truncate_str(&sanitize(text))
+            truncate(&redact_credentials(text), 500)
         ),
     })?;
 
@@ -215,7 +327,7 @@ fn parse_chat_completion(
             message: format!(
                 "LLM 回應缺少 choices[0].message.content。請確認 endpoint 是 OpenAI Chat \
                  Completions 格式（字串 content，不是多段陣列）。回應摘要：{}",
-                truncate_str(&sanitize(text))
+                truncate(&redact_credentials(text), 500)
             ),
         })?;
 
@@ -239,25 +351,6 @@ fn parse_chat_completion(
         model,
         usage,
     })
-}
-
-/// 錯誤訊息不要原樣塞完整 body；這次沒有 API key，但仍避免把超長／敏感內容帶出去。
-fn sanitize(s: &str) -> String {
-    s.replace("Bearer ", "Bearer [已省略] ")
-}
-
-fn truncate_str(s: &str) -> String {
-    const LIMIT: usize = 500;
-    if s.len() <= LIMIT {
-        return s.to_string();
-    }
-    let end = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .take_while(|&i| i <= LIMIT)
-        .last()
-        .unwrap_or(0);
-    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]
@@ -300,6 +393,8 @@ mod tests {
             base_url,
             timeout,
             max_concurrent,
+            max_retries: 0,
+            rate_limit_per_second: None,
         }
     }
 
@@ -553,6 +648,8 @@ mod tests {
             base_url: format!("{}/v1", server.uri()),
             timeout: Duration::from_secs(5),
             max_concurrent: 2,
+            max_retries: 0,
+            rate_limit_per_second: None,
         });
         let err = provider
             .chat_completion(&sample_request())
@@ -629,6 +726,125 @@ mod tests {
         assert!(
             elapsed >= delay + Duration::from_millis(100),
             "semaphore 若沒卡住，三個請求會幾乎同時結束；elapsed {elapsed:?} 太短"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_one_transient_failure() {
+        let server = MockServer::start().await;
+        // 第一次回 503，第二次回成功——用 wiremock 的 up_to_n_times 各掛一個 Mock。
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(success_body(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 1);
+        config.max_retries = 2;
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let response = provider
+            .chat_completion(&sample_request())
+            .await
+            .expect("第一次 503、第二次成功，重試後應該成功");
+        assert_eq!(response.content, "same entity yes");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            received.len(),
+            2,
+            "應該發出兩次 HTTP 請求（第一次失敗+一次重試）"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_exhausts_and_returns_last_transient_error() {
+        let server = MockServer::start().await;
+        mount_json(&server, 503, r#"{"error":"unavailable"}"#).await;
+
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 1);
+        config.max_retries = 2;
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let err = provider
+            .chat_completion(&sample_request())
+            .await
+            .expect_err("一直 503，重試耗盡仍應失敗");
+        assert!(matches!(err, AiGatewayError::Transient { .. }));
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            received.len(),
+            3,
+            "max_retries=2 應該發出 3 次 HTTP 請求（1 次原始 + 2 次重試）"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_are_never_retried() {
+        let server = MockServer::start().await;
+        mount_json(&server, 401, r#"{"error":"unauthorized"}"#).await;
+
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 1);
+        config.max_retries = 3;
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let err = provider
+            .chat_completion(&sample_request())
+            .await
+            .expect_err("401 是 Permanent，不該重試");
+        assert!(matches!(err, AiGatewayError::Permanent { .. }));
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            received.len(),
+            1,
+            "Permanent 錯誤即使 max_retries=3 也只該發一次 HTTP 請求"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_spaces_out_sequential_requests() {
+        let server = MockServer::start().await;
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(StartRecorder {
+                starts: Arc::clone(&starts),
+                delay: Duration::from_millis(0),
+                body: success_body(),
+            })
+            .mount(&server)
+            .await;
+
+        // max_concurrent 給大值（不讓 semaphore 成為節流瓶頸），只測 rate_limit_per_second。
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 10);
+        config.rate_limit_per_second = Some(10.0); // 100ms 一個
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let req = sample_request();
+        for _ in 0..3 {
+            provider
+                .chat_completion(&req)
+                .await
+                .expect("rate limit 測試的請求應成功");
+        }
+
+        let observed = starts.lock().expect("start recorder mutex").clone();
+        assert_eq!(observed.len(), 3);
+        let first_to_third = observed[2].duration_since(observed[0]);
+        // 3 個請求、10 次/秒（間隔 100ms）→ 第三個至少比第一個晚 ~200ms。
+        assert!(
+            first_to_third >= Duration::from_millis(150),
+            "rate_limit_per_second=10 應該讓 3 個請求間隔開，實際 {first_to_third:?}"
         );
     }
 

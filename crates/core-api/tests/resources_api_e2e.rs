@@ -113,6 +113,8 @@ fn assemble_test_auto_approval(
             base_url: section.llm.base_url.clone(),
             timeout: std::time::Duration::from_secs(section.llm.timeout_secs),
             max_concurrent: section.llm.max_concurrent,
+            max_retries: 0,
+            rate_limit_per_second: None,
         },
     );
     core_api::AutoApprovalState {

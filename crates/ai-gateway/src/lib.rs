@@ -3,12 +3,23 @@
 //! **這不是 V0.3 完整的 AI Gateway**（多模型路由、prompt 管理、NER、enrichment）。
 //! 只提前借用其中最小的一塊：單一 OpenAI 相容 endpoint 的 chat completion。
 //! 見 ADR-012「借用 V0.3 AI Gateway 的範圍界線」。
+//!
+//! V0.3 Phase 1 Step A 補上 retry／rate limit／cost accounting／model
+//! registry／redaction／logging 六項 SPEC_V0.3 §3 要求的能力。prompt
+//! version／model version 是呼叫端（`resolver::auto_approval`）的概念，
+//! 留給 Phase 1 Step B。
 
+mod cost;
 mod mock;
 mod openai;
+mod redact;
+mod registry;
 
+pub use cost::Pricing;
 pub use mock::{MockLlmProvider, UnsupportedLlmProvider};
 pub use openai::{OpenAiCompatibleLlmProvider, OpenAiCompatibleLlmProviderConfig};
+pub use redact::{redact_credentials, truncate};
+pub use registry::ModelRegistry;
 
 /// LLM 生成式推論的統一介面。呼叫端用泛型 `<L: LlmProvider>`，不用 `dyn`
 /// （比照 `storage_core::EmbeddingProvider` 的用法）。
