@@ -623,6 +623,11 @@ pub struct AutoApprovalLlmSection {
     /// 模型名稱（對應 `docs/architecture/LOCAL_AI.md` 的 alias `qwen-primary`）。
     #[serde(default = "default_llm_model")]
     pub model: String,
+    /// 模型版本／revision（SPEC_V0.3 §4 `AiRun.model_version`）。目前沒有真的
+    /// 在跑的推論服務可以查版本，預設 `"unknown"` 誠實反映這件事——不要編一個
+    /// 假版本號。等真實 runtime（V0.3 Phase 5）接上才會有真實值可填。
+    #[serde(default = "default_llm_model_version")]
+    pub model_version: String,
     /// 單次推論逾時（秒）。
     #[serde(default = "default_llm_timeout_secs")]
     pub timeout_secs: u64,
@@ -664,6 +669,10 @@ fn default_llm_base_url() -> String {
 
 fn default_llm_model() -> String {
     "qwen-primary".to_string()
+}
+
+fn default_llm_model_version() -> String {
+    "unknown".to_string()
 }
 
 fn default_llm_timeout_secs() -> u64 {
@@ -708,6 +717,7 @@ impl Default for AutoApprovalLlmSection {
             enabled: false,
             base_url: default_llm_base_url(),
             model: default_llm_model(),
+            model_version: default_llm_model_version(),
             timeout_secs: default_llm_timeout_secs(),
             max_retries: 0,
             max_concurrent: default_llm_max_concurrent(),
@@ -901,6 +911,7 @@ mod tests {
             "http://ai-inference:8000/v1"
         );
         assert_eq!(cfg.auto_approval.llm.model, "qwen-primary");
+        assert_eq!(cfg.auto_approval.llm.model_version, "unknown");
         assert_eq!(cfg.auto_approval.llm.timeout_secs, 30);
         assert_eq!(cfg.auto_approval.llm.max_retries, 0);
         assert_eq!(cfg.auto_approval.llm.max_concurrent, 2);

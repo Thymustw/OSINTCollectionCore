@@ -213,6 +213,7 @@ survivor_strategy = "source"
 enabled = false
 base_url = "http://ai-inference:8000/v1"
 model = "qwen-primary"
+model_version = "unknown"
 timeout_secs = 30
 max_retries = 0
 max_concurrent = 2

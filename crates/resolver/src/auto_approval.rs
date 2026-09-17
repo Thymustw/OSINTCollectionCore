@@ -12,15 +12,19 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use ai_gateway::{AiGatewayError, ChatCompletionRequest, ChatMessage, ChatRole, LlmProvider};
+use ai_gateway::{
+    AiGatewayError, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ChatRole,
+    LlmProvider, Pricing, redact_credentials,
+};
 use chrono::Utc;
 use core_events::EventProducer;
-use core_model::{Entity, EntityId, MergeHistoryId, ResolutionCandidate, ResolutionStatus};
+use core_model::{AiRun, Entity, EntityId, MergeHistoryId, ResolutionCandidate, ResolutionStatus};
 use merge::MergeService;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use storage_core::TransactionalStore;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 /// `AutoApprovalEvaluator` 的門檻設定。呼叫端（Step 4 的 `core-api` 組裝）
 /// 從 `core_config::AutoApprovalSection` 轉過來。
@@ -37,6 +41,9 @@ pub struct AutoApprovalConfig {
     /// LLM prompt 用的模型名稱／temperature／max_tokens——這些不是連線參數
     /// （那些在 `OpenAiCompatibleLlmProviderConfig`），是每次請求要填的欄位。
     pub llm_model: String,
+    /// 寫進 `AiRun.model_version`。見 `AutoApprovalLlmSection::model_version`
+    /// 的 doc comment——目前沒有真的在跑的推論服務，預設 `"unknown"`。
+    pub llm_model_version: String,
     pub llm_temperature: f64,
     pub llm_max_tokens: u32,
 }
@@ -73,6 +80,19 @@ entities below refer to the same real-world entity. Reply with JSON only: \
 
 const DESCRIPTION_CHAR_LIMIT: usize = 500;
 const PROMPT_LIST_LIMIT: u32 = 10;
+
+/// `SYSTEM_PROMPT` 的版本號。**改動 `SYSTEM_PROMPT` 的文字內容時要一起把這個
+/// 值改掉**（例如 `"v2"`），`AiRun.prompt_version` 才能區分「這筆判斷用的是
+/// 哪一版 prompt」——否則歷史紀錄裡舊版判斷跟新版判斷的 prompt_version 會混在
+/// 一起看不出差異。
+const PROMPT_VERSION: &str = "v1";
+/// `core_model::AI_TASK_TYPES` 裡沒有專門的「entity resolution」task type，
+/// `classification`（二元判斷 same_entity 是/否）語意最接近，不自己發明
+/// 第九種——比照 `AI_TASK_TYPES` 檔頭「參考清單，不是白名單」的既有原則。
+const AI_TASK_TYPE: &str = "classification";
+/// 對應 `docs/architecture/LOCAL_AI.md` §15 的 `provider = local`——這裡呼叫的
+/// 是自架的 OpenAI 相容 endpoint，不是雲端供應商。
+const AI_PROVIDER: &str = "local";
 
 impl<S, L> AutoApprovalEvaluator<S, L>
 where
@@ -186,6 +206,7 @@ where
         // 8. 中間帶：llm_review_score <= score < auto_confirm_score，問 LLM。
         //    評估器一律嘗試呼叫，讓 provider 自己決定要不要真的打模型。
         let user_prompt = self.build_user_prompt(&survivor, &merged, best).await;
+        let redacted_user_prompt = redact_credentials(&user_prompt);
         let request = ChatCompletionRequest {
             model: self.config.llm_model.clone(),
             messages: vec![
@@ -203,15 +224,33 @@ where
         };
 
         let started = Instant::now();
-        match self.llm.chat_completion(&request).await {
+        let call_result = self.llm.chat_completion(&request).await;
+        let latency_ms = started.elapsed().as_millis() as i64;
+
+        // 9. 不管結果如何都留一筆 AiRun——這是這次改動要補的最大缺口：
+        //    之前只有「LLM 判 true 且 merge 成功」這條路徑會留下任何持久化
+        //    紀錄，其餘（判 false／解析失敗／呼叫失敗／未啟用）完全查不到
+        //    AI 到底看過什麼、判斷結果是什麼。寫入失敗只記 error，不影響
+        //    本次判斷（可觀測性本身的失敗不該擋住主流程，同 CLAUDE.md §5）。
+        self.persist_ai_run(
+            &request,
+            &call_result,
+            &redacted_user_prompt,
+            best,
+            latency_ms,
+        )
+        .await;
+
+        match call_result {
             Ok(response) => match parse_llm_verdict(&response.content) {
                 Some(true) => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
+                    let redacted_response = redact_credentials(&response.content);
                     let llm = json!({
-                        "model": request.model,
+                        "model": response.model,
                         "system_prompt_hash": sha256_hex(SYSTEM_PROMPT),
-                        "user_prompt": user_prompt,
-                        "raw_response": response.content,
+                        "prompt_version": PROMPT_VERSION,
+                        "user_prompt": redacted_user_prompt,
+                        "raw_response": redacted_response,
                         "parsed_same_entity": true,
                         "latency_ms": latency_ms,
                     });
@@ -237,7 +276,7 @@ where
                         %survivor_id,
                         %merged_id,
                         method = %best.method,
-                        raw_response = %response.content,
+                        raw_response = %redact_credentials(&response.content),
                         "LLM 回應無法解析 same_entity，維持 Pending"
                     );
                     AutoApprovalOutcome::Pending {
@@ -266,6 +305,32 @@ where
                     reason: format!("LLM 呼叫失敗：{err}"),
                 }
             }
+        }
+    }
+
+    /// 把這次 LLM 呼叫的完整脈絡寫成一筆 [`AiRun`]。見第 9 步的呼叫點註解。
+    async fn persist_ai_run(
+        &self,
+        request: &ChatCompletionRequest,
+        result: &Result<ChatCompletionResponse, AiGatewayError>,
+        redacted_user_prompt: &str,
+        best: &ResolutionCandidate,
+        latency_ms: i64,
+    ) {
+        let run = build_ai_run(
+            &self.config.llm_model_version,
+            request,
+            result,
+            redacted_user_prompt,
+            best,
+            latency_ms,
+        );
+        if let Err(err) = self.store.put_ai_run(&run).await {
+            error!(
+                error = %err,
+                ai_run_id = %run.id,
+                "寫入 AiRun 失敗（不影響本次自動核准判斷，只損失這筆可觀測性紀錄）"
+            );
         }
     }
 
@@ -546,6 +611,79 @@ fn sha256_hex(input: &str) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
 
+/// 組一筆 [`AiRun`]，涵蓋 LLM 呼叫的成功／失敗全部結果。純函式（不碰
+/// store），方便單元測試不需要真的接資料庫。
+fn build_ai_run(
+    model_version: &str,
+    request: &ChatCompletionRequest,
+    result: &Result<ChatCompletionResponse, AiGatewayError>,
+    redacted_user_prompt: &str,
+    best: &ResolutionCandidate,
+    latency_ms: i64,
+) -> AiRun {
+    let input_reference = json!({
+        "resolution_candidate_id": best.id,
+        "method": best.method,
+        "score": best.score,
+        "system_prompt_hash": sha256_hex(SYSTEM_PROMPT),
+        "prompt_version": PROMPT_VERSION,
+        "user_prompt": redacted_user_prompt,
+    });
+
+    let (model, output, confidence, tokens, estimated_cost) = match result {
+        Ok(response) => {
+            let redacted_response = redact_credentials(&response.content);
+            let parsed = parse_llm_verdict(&response.content);
+            let output = json!({
+                "raw_response": redacted_response,
+                "parsed_same_entity": parsed,
+            });
+            // 沒有真的「模型自報信心值」——SYSTEM_PROMPT 只問 same_entity
+            // 布林值。解析出乾淨的布林值代表拿到明確答案，用 1.0；解析失敗
+            // 代表完全沒有可用資訊，用 0.0。這是「有沒有拿到可用結果」的
+            // 代理值，不是模型算出來的機率。
+            let confidence = if parsed.is_some() { 1.0 } else { 0.0 };
+            let tokens = response
+                .usage
+                .map(|u| i64::from(u.prompt_tokens) + i64::from(u.completion_tokens))
+                .unwrap_or(0);
+            let estimated_cost = response
+                .usage
+                .map(|u| Pricing::free().estimate_cost(&u))
+                .unwrap_or(0.0);
+            (
+                response.model.clone(),
+                output,
+                confidence,
+                tokens,
+                estimated_cost,
+            )
+        }
+        Err(err) => {
+            let output = json!({
+                "error": redact_credentials(&err.to_string()),
+            });
+            (request.model.clone(), output, 0.0, 0, 0.0)
+        }
+    };
+
+    AiRun {
+        id: Uuid::now_v7(),
+        task_type: AI_TASK_TYPE.to_string(),
+        provider: AI_PROVIDER.to_string(),
+        model,
+        model_version: model_version.to_string(),
+        prompt_version: PROMPT_VERSION.to_string(),
+        input_reference,
+        output,
+        confidence,
+        tokens,
+        estimated_cost,
+        duration_ms: latency_ms,
+        created_at: Utc::now(),
+    }
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
@@ -639,6 +777,7 @@ mod tests {
             auto_confirm_score: 0.95,
             llm_review_score: 0.70,
             llm_model: "qwen-primary".into(),
+            llm_model_version: "test-fixture".into(),
             llm_temperature: 0.0,
             llm_max_tokens: 256,
         }
@@ -946,6 +1085,128 @@ mod tests {
         assert_eq!(llm.call_count(), 1);
         let still = h.store.get_entity(merged.id).await.unwrap().unwrap();
         assert!(still.merged_into.is_none());
+    }
+
+    #[tokio::test]
+    async fn ai_run_persisted_when_llm_confirms_same_entity() {
+        let h = open_harness().await;
+        let survivor = entity("eve-surv", EntityType::Person);
+        let merged = entity("eve-merged", EntityType::Person);
+        h.store.put_entity(&survivor).await.unwrap();
+        h.store.put_entity(&merged).await.unwrap();
+        let cand = candidate(survivor.id, merged.id, "semantic_similarity", 0.82);
+        h.store.put_resolution_candidate(&cand).await.unwrap();
+
+        let eval = evaluator(
+            h.store.clone(),
+            MockLlmProvider::always_same_entity(true),
+            enabled_config(),
+        );
+        let _ = eval
+            .evaluate_pair(survivor.id, merged.id, &[cand], "resolver")
+            .await;
+
+        let runs = h.store.list_ai_runs(None, None, 10).await.unwrap();
+        assert_eq!(runs.len(), 1, "本次 LLM 呼叫必須留一筆 AiRun");
+        let run = &runs[0];
+        assert_eq!(run.task_type, AI_TASK_TYPE);
+        assert_eq!(run.confidence, 1.0);
+        assert_eq!(run.prompt_version, PROMPT_VERSION);
+        assert_eq!(run.model_version, "test-fixture");
+        assert_eq!(run.output["parsed_same_entity"], true);
+    }
+
+    #[tokio::test]
+    async fn ai_run_persisted_when_llm_rejects_same_entity() {
+        let h = open_harness().await;
+        let survivor = entity("frank-surv", EntityType::Person);
+        let merged = entity("frank-merged", EntityType::Person);
+        h.store.put_entity(&survivor).await.unwrap();
+        h.store.put_entity(&merged).await.unwrap();
+        let cand = candidate(survivor.id, merged.id, "semantic_similarity", 0.80);
+        h.store.put_resolution_candidate(&cand).await.unwrap();
+
+        let eval = evaluator(
+            h.store.clone(),
+            MockLlmProvider::always_same_entity(false),
+            enabled_config(),
+        );
+        let _ = eval
+            .evaluate_pair(survivor.id, merged.id, &[cand], "resolver")
+            .await;
+
+        let runs = h.store.list_ai_runs(None, None, 10).await.unwrap();
+        assert_eq!(runs.len(), 1, "判 false 也必須留一筆 AiRun");
+        let run = &runs[0];
+        // 拿到明確的 false 判斷，仍然代表模型給了可用答案 → confidence 1.0。
+        assert_eq!(run.confidence, 1.0);
+        assert_eq!(run.output["parsed_same_entity"], false);
+    }
+
+    #[tokio::test]
+    async fn ai_run_persisted_when_llm_call_fails() {
+        let h = open_harness().await;
+        let survivor = entity("grace-surv", EntityType::Person);
+        let merged = entity("grace-merged", EntityType::Person);
+        h.store.put_entity(&survivor).await.unwrap();
+        h.store.put_entity(&merged).await.unwrap();
+        let cand = candidate(survivor.id, merged.id, "semantic_similarity", 0.80);
+        h.store.put_resolution_candidate(&cand).await.unwrap();
+
+        let eval = evaluator(
+            h.store.clone(),
+            MockLlmProvider::always_error(AiGatewayError::Transient {
+                message: "逾時".into(),
+            }),
+            enabled_config(),
+        );
+        let _ = eval
+            .evaluate_pair(survivor.id, merged.id, &[cand], "resolver")
+            .await;
+
+        let runs = h.store.list_ai_runs(None, None, 10).await.unwrap();
+        assert_eq!(runs.len(), 1, "呼叫失敗也必須留一筆 AiRun");
+        let run = &runs[0];
+        assert_eq!(run.confidence, 0.0);
+        assert_eq!(run.tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn ai_run_uses_redacted_user_prompt_when_provided() {
+        // `MockLlmProvider` 不能自訂回應 text（Step A 範圍，不動它），所以這裡
+        // 直接測 `build_ai_run` 自由函式：呼它時傳的 `redacted_user_prompt`
+        // 必須原樣進 `AiRun.input_reference.user_prompt`——這在驗證「呼叫端真的
+        // 有先呼叫 `redact_credentials` 才傳進來」這條契約的輸出端。
+        let request = ChatCompletionRequest {
+            model: "qwen-primary".into(),
+            messages: vec![],
+            temperature: 0.0,
+            max_tokens: 16,
+        };
+        let cand = candidate(Uuid::now_v7(), Uuid::now_v7(), "semantic_similarity", 0.80);
+        let run = build_ai_run(
+            "test-fixture",
+            &request,
+            &Ok(ChatCompletionResponse {
+                content: r#"{"same_entity": true, "reasoning": "ok"}"#.to_string(),
+                model: "qwen-primary".into(),
+                usage: None,
+            }),
+            "Bearer [已省略] xyz",
+            &cand,
+            12,
+        );
+        assert_eq!(
+            run.input_reference["user_prompt"].as_str().unwrap(),
+            "Bearer [已省略] xyz",
+        );
+        // 未遮罩的謊言版 `Bearer secret-token-value` 不應原樣存在。
+        assert!(
+            !run.input_reference["user_prompt"]
+                .as_str()
+                .unwrap()
+                .contains("secret-token-value")
+        );
     }
 
     #[tokio::test]

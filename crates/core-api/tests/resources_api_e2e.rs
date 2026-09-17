@@ -127,6 +127,7 @@ fn assemble_test_auto_approval(
                 auto_confirm_score: section.auto_confirm_score,
                 llm_review_score: section.llm_review_score,
                 llm_model: section.llm.model.clone(),
+                llm_model_version: section.llm.model_version.clone(),
                 llm_temperature: section.llm.temperature,
                 llm_max_tokens: section.llm.max_tokens,
             },

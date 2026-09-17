@@ -409,6 +409,7 @@ fn build_worker(stack: &Stack) -> TestWorker {
                 auto_confirm_score: 0.95,
                 llm_review_score: 0.70,
                 llm_model: "unused".into(),
+                llm_model_version: "unused".into(),
                 llm_temperature: 0.0,
                 llm_max_tokens: 16,
             },

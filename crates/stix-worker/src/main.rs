@@ -135,6 +135,7 @@ async fn run() -> Result<(), String> {
         auto_confirm_score: auto_section.auto_confirm_score,
         llm_review_score: auto_section.llm_review_score,
         llm_model: auto_section.llm.model.clone(),
+        llm_model_version: auto_section.llm.model_version.clone(),
         llm_temperature: auto_section.llm.temperature,
         llm_max_tokens: auto_section.llm.max_tokens,
     };
