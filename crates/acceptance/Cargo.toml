@@ -13,6 +13,7 @@ description = "跨服務驗收測試：SPEC §26 Acceptance F（crash 後重送�
 [dependencies]
 
 [dev-dependencies]
+ai-gateway = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
 collector = { path = "../collector" }
@@ -29,6 +30,7 @@ entity-worker = { path = "../entity-worker" }
 http-body-util = "0.1.3"
 indexer = { path = "../indexer" }
 normalizer = { path = "../normalizer" }
+resolver = { workspace = true }
 serde_json = { workspace = true }
 # 「claim 前 crash」情境要直接刪一列 provenance。那沒有（也不該有）
 # RelationalStore 方法——delete_provenance 會讓溯源鏈可被抹除。測試專用。
@@ -37,6 +39,8 @@ storage-core = { workspace = true }
 storage-opensearch = { path = "../storage-opensearch" }
 storage-postgres = { path = "../storage-postgres" }
 storage-s3 = { path = "../storage-s3" }
+stix-adapter = { workspace = true }
+stix-worker = { path = "../stix-worker" }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }

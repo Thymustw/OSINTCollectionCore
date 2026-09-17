@@ -156,6 +156,18 @@ async fn import_stix_inner(
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    // 存進物件儲存的必須是「STIX bundle 本身」，不是這支 handler 收到的整個
+    // 請求 envelope（`{"source_id":..,"bundle":{..}}`）。stix-worker 讀出這個
+    // blob 後直接 `serde_json::from_slice::<StixBundle>`，餵它整個 envelope
+    // 會在 `type` 欄位缺失時解析失敗——這裡曾經真的這樣寫過（`body.to_vec()`），
+    // 只是 Step 2／3 各自的測試都繞過真正的 HTTP 路徑（自己組 bundle 直接寫
+    // 物件儲存），從沒有測到「HTTP 匯入 → worker 消化」這條完整路徑，直到
+    // Acceptance G 用真正的 HTTP 全程跑一遍才抓到。
+    let bundle_bytes = serde_json::to_vec(&request.bundle).map_err(|err| {
+        tracing::error!(error = %err, "STIX bundle 重新序列化失敗（不該發生：body 已經是解析過的合法 JSON Value）");
+        ApiError::internal(format!("STIX bundle 序列化失敗：{err}"))
+    })?;
+
     let evidence = NewRawEvidence {
         source_id: source.id,
         connector_id: connector.id,
@@ -173,7 +185,7 @@ async fn import_stix_inner(
             "actor": principal.subject,
         }),
         collector_version: IMPORTER_VERSION.to_string(),
-        body: body.to_vec(),
+        body: bundle_bytes,
     };
 
     let stored = import.sink.persist(evidence).await.map_err(|err| {

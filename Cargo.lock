@@ -6,6 +6,7 @@ version = 4
 name = "acceptance"
 version = "0.1.0"
 dependencies = [
+ "ai-gateway",
  "axum",
  "chrono",
  "collector",
@@ -22,8 +23,11 @@ dependencies = [
  "http-body-util",
  "indexer",
  "normalizer",
+ "resolver",
  "serde_json",
  "sqlx",
+ "stix-adapter",
+ "stix-worker",
  "storage-core",
  "storage-opensearch",
  "storage-postgres",
