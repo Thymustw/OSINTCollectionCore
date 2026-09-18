@@ -12,6 +12,7 @@ name = "osint-discovery-worker"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { workspace = true }
 core-config = { workspace = true }
 core-events = { workspace = true }
 core-jobs = { workspace = true }
@@ -19,9 +20,13 @@ core-model = { workspace = true }
 core-observability = { workspace = true }
 serde_json = { workspace = true }
 storage-core = { workspace = true }
+storage-neo4j = { path = "../storage-neo4j" }
 storage-postgres = { path = "../storage-postgres" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 worker-skeleton = { path = "../worker-skeleton" }
+
+[dev-dependencies]
+storage-sqlite = { path = "../storage-sqlite" }

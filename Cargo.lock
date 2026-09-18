@@ -1328,6 +1328,7 @@ dependencies = [
 name = "discovery-worker"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "core-config",
  "core-events",
  "core-jobs",
@@ -1335,7 +1336,9 @@ dependencies = [
  "core-observability",
  "serde_json",
  "storage-core",
+ "storage-neo4j",
  "storage-postgres",
+ "storage-sqlite",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

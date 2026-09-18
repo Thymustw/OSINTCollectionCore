@@ -2,9 +2,11 @@
 //! method 執行邏輯留給 Step B。
 
 pub mod error;
+pub mod graph_expansion;
 mod health;
 
 pub use error::DiscoveryWorkerError;
+pub use graph_expansion::{DISCOVERY_METHOD_GRAPH_EXPANSION, run_graph_expansion};
 pub use health::serve as serve_health;
 
 /// `job.dispatched` 事件裡 `payload.job_type` 的值，`POST /discovery/run`

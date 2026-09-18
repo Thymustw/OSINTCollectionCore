@@ -12,8 +12,9 @@ use core_events::{EventConsumer, EventEnvelope, EventTopic};
 use core_jobs::JobService;
 use core_model::JobStatus;
 use core_observability::{MetricsRegistry, init_tracing};
-use discovery_worker::{JOB_TYPE_DISCOVERY_RUN, serve_health};
+use discovery_worker::{JOB_TYPE_DISCOVERY_RUN, run_graph_expansion, serve_health};
 use storage_core::conformance::load_workspace_dotenv;
+use storage_neo4j::Neo4jStore;
 use storage_postgres::PostgresCanonicalStore;
 use uuid::Uuid;
 
@@ -51,13 +52,15 @@ async fn run() -> Result<(), String> {
         .map_err(|err| err.to_string())?;
     store.migrate().await.map_err(|err| err.to_string())?;
 
+    let graph = connect_graph(&cfg).await?;
     let metrics = MetricsRegistry::new();
 
     let bind = cfg.discovery_worker.bind.clone();
     let health_metrics = metrics.clone();
     let health_store = store.clone();
+    let health_graph = graph.clone();
     tokio::spawn(async move {
-        if let Err(err) = serve_health(&bind, health_metrics, health_store).await {
+        if let Err(err) = serve_health(&bind, health_metrics, health_store, health_graph).await {
             tracing::error!(error = %err, "discovery-worker health 結束");
         }
     });
@@ -76,14 +79,35 @@ async fn run() -> Result<(), String> {
         "discovery-worker 開始消費 job.dispatched"
     );
 
-    consume_loop(&jobs, &consumer, &metrics).await;
+    consume_loop(&jobs, &store, &graph, &consumer, &metrics).await;
     Ok(())
+}
+
+/// 連 Neo4j。呼叫方式與 `crates/core-api/src/main.rs`／`crates/graph-worker/src/main.rs`
+/// 的 `connect_graph` 相同，但是**獨立的一份連線**——不要想辦法共用。
+async fn connect_graph(cfg: &AppConfig) -> Result<Neo4jStore, String> {
+    let password = cfg
+        .storage
+        .graph
+        .password_secret_ref
+        .resolve()
+        .map_err(|e| e.to_string())?;
+    Neo4jStore::connect(
+        &cfg.storage.graph.bolt_uri,
+        &cfg.storage.graph.username,
+        &password,
+        cfg.storage.graph.pool_max,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 消費迴圈。骨架階段只認得 `job_type=discovery_run`，一律轉 Failed；其他
 /// job_type（別的 worker 訂閱同一個 topic 各挑各的）安靜略過並 commit。
 async fn consume_loop(
     jobs: &JobService<PostgresCanonicalStore>,
+    store: &PostgresCanonicalStore,
+    graph: &Neo4jStore,
     consumer: &EventConsumer,
     metrics: &MetricsRegistry,
 ) {
@@ -96,7 +120,7 @@ async fn consume_loop(
             }
             result = consumer.next_envelope(IDLE_POLL) => match result {
                 Ok(envelope) => {
-                    handle_envelope(jobs, &envelope).await;
+                    handle_envelope(jobs, store, graph, &envelope).await;
                     processed += 1;
                     if processed % LAG_PROBE_EVERY == 0 {
                         update_queue_depth(consumer, metrics);
@@ -126,7 +150,12 @@ async fn consume_loop(
 /// 解不出來。唯一差異：`job_type != JOB_TYPE_DISCOVERY_RUN` 時這份文件要
 /// 我們「安靜略過」而不是以 `Ignored` outcome 記 debug——但兩者都是「不處理、
 /// 照樣 commit」，行為等價。
-async fn handle_envelope(jobs: &JobService<PostgresCanonicalStore>, envelope: &EventEnvelope) {
+async fn handle_envelope(
+    jobs: &JobService<PostgresCanonicalStore>,
+    store: &PostgresCanonicalStore,
+    graph: &Neo4jStore,
+    envelope: &EventEnvelope,
+) {
     let payload = &envelope.payload;
     let job_type = payload
         .get("job_type")
@@ -153,32 +182,51 @@ async fn handle_envelope(jobs: &JobService<PostgresCanonicalStore>, envelope: &E
         return;
     };
 
-    handle_discovery_run(jobs, job_id).await;
+    handle_discovery_run(jobs, store, graph, job_id).await;
 }
 
-/// Step A 骨架：`discovery_run` job 一律標記 Failed，訊息說明尚未實作。
-/// **不要偷懶回 `Completed`**——那會讓呼叫端以為 Discovery 真的跑過了。
-async fn handle_discovery_run(jobs: &JobService<PostgresCanonicalStore>, job_id: Uuid) {
-    // 先 Running 再 Failed：can_transition 不允許 Queued → Failed 一步到位
-    // （crates/core-jobs/src/transition.rs），必須先 Running。
+/// 執行一筆 `discovery_run` job：Running → 跑 [`run_graph_expansion`] →
+/// Completed（成功摘要）或 Failed（錯誤訊息）。
+async fn handle_discovery_run(
+    jobs: &JobService<PostgresCanonicalStore>,
+    store: &PostgresCanonicalStore,
+    graph: &Neo4jStore,
+    job_id: Uuid,
+) {
+    let job = match jobs.get(job_id).await {
+        Ok(job) => job,
+        Err(err) => {
+            tracing::error!(error = %err, %job_id, "discovery_run job 讀不到，無法執行");
+            return;
+        }
+    };
+
+    // 先 Running 再 Completed/Failed：can_transition 不允許 Queued → 其他終態
+    // 一步到位（crates/core-jobs/src/transition.rs）。
     if let Err(err) = jobs.transition(job_id, JobStatus::Running, None).await {
         tracing::error!(error = %err, %job_id, "啟動 discovery_run job 時標記 Running 失敗");
         return;
     }
-    if let Err(err) = jobs
-        .transition(
-            job_id,
-            JobStatus::Failed,
-            Some(
-                "discovery-worker Phase 3 Step A 骨架階段，Discovery method 執行邏輯尚未實作\
-                 （Step B 才會補上 Entity/Graph Expansion）。這不是真正的執行失敗，\
-                 是這個版本還沒做這件事"
-                    .into(),
-            ),
-        )
-        .await
-    {
-        tracing::error!(error = %err, %job_id, "標記 discovery_run job Failed 也失敗");
+
+    match run_graph_expansion(store, graph, job.parameters.as_ref()).await {
+        Ok(summary) => {
+            tracing::info!(%job_id, %summary, "discovery_run job 完成");
+            if let Err(err) = jobs
+                .transition(job_id, JobStatus::Completed, Some(summary))
+                .await
+            {
+                tracing::error!(error = %err, %job_id, "discovery_run job 標記 Completed 失敗");
+            }
+        }
+        Err(message) => {
+            tracing::warn!(%job_id, %message, "discovery_run job 執行失敗");
+            if let Err(err) = jobs
+                .transition(job_id, JobStatus::Failed, Some(message))
+                .await
+            {
+                tracing::error!(error = %err, %job_id, "標記 discovery_run job Failed 也失敗");
+            }
+        }
     }
 }
 
