@@ -81,7 +81,9 @@ pub const AUDIT_CONNECTOR_CREATE: &str = "connector.create";
 pub const AUDIT_CONNECTOR_UPDATE: &str = "connector.update";
 pub const AUDIT_COLLECTION_CREATE: &str = "collection.create";
 pub const AUDIT_OBJECT_CREATE: &str = "object.create";
-pub use discovery::{AUDIT_CANDIDATE_APPROVE, AUDIT_CANDIDATE_REJECT, AUDIT_SEED_CREATE};
+pub use discovery::{
+    AUDIT_CANDIDATE_APPROVE, AUDIT_CANDIDATE_REJECT, AUDIT_DISCOVERY_RUN, AUDIT_SEED_CREATE,
+};
 pub use graph::AUDIT_GRAPH_REBUILD;
 pub use merge::{
     AUDIT_ENTITY_MERGE, AUDIT_ENTITY_RESOLVE, AUDIT_ENTITY_RESOLVE_GRAPH_CONTEXT, AUDIT_MERGE_UNDO,

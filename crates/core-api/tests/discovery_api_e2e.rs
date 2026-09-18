@@ -16,6 +16,7 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use core_api::{AppState, AuthState, RateLimiter, ready_always, router};
 use core_config::ImportSection;
+use core_jobs::JobService;
 use core_model::{AiRun, Candidate, CandidateEvidence, CandidateStatus, CandidateType, Collection};
 use core_observability::MetricsRegistry;
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
@@ -70,7 +71,10 @@ fn build_api(stack: &Stack) -> TestApi {
         audit: Arc::new(audit.clone()),
         store: Some(Arc::new(stack.pg.clone())),
         objects: None,
-        jobs: None,
+        // JobService 用 `None` producer：`dispatch` 對沒有 producer 時只跳過
+        // `job.dispatched` 的 publish、照樣回 queued Job——Discovery Run 的
+        // e2e 只要驗「建立並派工 Job」這一段，不需要真的起 worker 或 broker。
+        jobs: Some(Arc::new(JobService::new(stack.pg.clone(), None))),
         merge: None,
         resolver: None,
         auto_approval: None,
@@ -525,6 +529,124 @@ async fn viewer_cannot_create_seed() {
         !entries
             .iter()
             .any(|e| e.action == core_api::AUDIT_SEED_CREATE),
+        "{entries:?}"
+    );
+}
+
+// ---------------------------------------------------------------- discovery run
+
+#[tokio::test]
+async fn run_discovery_creates_and_dispatches_job() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let body = json!({
+        "collection_id": Uuid::now_v7().to_string(),
+        "entity_id": Uuid::now_v7().to_string(),
+        "depth": 0,
+    });
+    let (status, resp) = send(
+        &api.app,
+        post_json("/api/v1/discovery/run", &api.operator, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    // 建立並派工 `discovery_run` Job，停在 queued（discovery-worker 沒起，
+    // 不會被消費成 running）。
+    assert_eq!(resp["type"], json!("discovery_run"), "{resp}");
+    assert_eq!(resp["status"], json!("queued"), "{resp}");
+    assert!(resp["id"].as_str().is_some(), "{resp}");
+    // 派工 parameters 記載來源與深度——discovery-worker 靠它開跑。
+    assert_eq!(
+        resp["parameters"]["collection_id"], body["collection_id"],
+        "{resp}"
+    );
+    assert_eq!(resp["parameters"]["entity_id"], body["entity_id"], "{resp}");
+    assert_eq!(resp["parameters"]["depth"], json!(0), "{resp}");
+}
+
+#[tokio::test]
+async fn run_discovery_writes_success_audit() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let body = json!({
+        "collection_id": Uuid::now_v7().to_string(),
+        "entity_id": Uuid::now_v7().to_string(),
+        "depth": 0,
+    });
+    let (status, resp) = send(
+        &api.app,
+        post_json("/api/v1/discovery/run", &api.operator, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    let entries = api.audit.entries();
+    let run = entries
+        .iter()
+        .find(|e| e.action == core_api::AUDIT_DISCOVERY_RUN)
+        .expect("discovery.run audit");
+    assert_eq!(run.outcome, "success");
+    assert_eq!(
+        run.resource_id.as_deref(),
+        Some(resp["id"].as_str().unwrap())
+    );
+}
+
+#[tokio::test]
+async fn discover_from_entity_creates_job_with_path_entity_id() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let entity_id = Uuid::now_v7();
+    // body 只帶 collection_id（entity_id 從路徑帶入，不該放進 body）。
+    let body = json!({
+        "collection_id": Uuid::now_v7().to_string(),
+        "depth": 0,
+    });
+    let (status, resp) = send(
+        &api.app,
+        post_json(
+            &format!("/api/v1/entities/{entity_id}/discover"),
+            &api.operator,
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{resp}");
+    assert_eq!(resp["type"], json!("discovery_run"), "{resp}");
+    assert_eq!(resp["status"], json!("queued"), "{resp}");
+    // entity_id 從路徑進 parameters。
+    assert_eq!(
+        resp["parameters"]["entity_id"],
+        json!(entity_id.to_string()),
+        "{resp}"
+    );
+    assert_eq!(
+        resp["parameters"]["collection_id"], body["collection_id"],
+        "{resp}"
+    );
+    assert_eq!(resp["parameters"]["depth"], json!(0), "{resp}");
+}
+
+#[tokio::test]
+async fn viewer_cannot_run_discovery() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let body = json!({
+        "collection_id": Uuid::now_v7().to_string(),
+        "entity_id": Uuid::now_v7().to_string(),
+        "depth": 0,
+    });
+    let (status, resp) = send(
+        &api.app,
+        post_json("/api/v1/discovery/run", &api.viewer, &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{resp}");
+    // 被擋的派工不該寫 success 稽核。
+    let entries = api.audit.entries();
+    assert!(
+        !entries
+            .iter()
+            .any(|e| e.action == core_api::AUDIT_DISCOVERY_RUN),
         "{entries:?}"
     );
 }

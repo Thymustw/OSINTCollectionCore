@@ -24,6 +24,7 @@ core-jobs = { workspace = true }
 core-model = { workspace = true }
 core-observability = { workspace = true }
 core-security = { workspace = true }
+discovery-worker = { path = "../discovery-worker" }
 dotenvy = { workspace = true }
 import-format = { workspace = true }
 # index mapping、欄位名常數與搜尋語法都在 indexer crate：core-api 與 osint-cli

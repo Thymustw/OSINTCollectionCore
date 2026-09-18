@@ -13,12 +13,13 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use chrono::Utc;
+use discovery_worker::JOB_TYPE_DISCOVERY_RUN;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use core_model::{
-    AiRun, Candidate, CandidateEvidence, CandidateStatus, Seed, SeedOrigin, SeedType,
+    AiRun, Candidate, CandidateEvidence, CandidateStatus, Job, Seed, SeedOrigin, SeedType,
 };
 use core_security::{Permission, Principal};
 
@@ -40,6 +41,11 @@ const MAX_SEED_VALUE: usize = 2_048;
 pub const AUDIT_SEED_CREATE: &str = "seed.create";
 pub const AUDIT_CANDIDATE_APPROVE: &str = "candidate.approve";
 pub const AUDIT_CANDIDATE_REJECT: &str = "candidate.reject";
+
+/// 稽核 action。字串會進 `audit_log.action`；Discovery 文件收尾時再寫進
+/// `docs/developer/security.md` 的動作清單。
+pub const AUDIT_DISCOVERY_RUN: &str = "discovery.run";
+const RESOURCE_DISCOVERY: &str = "discovery";
 
 // ============================================================================
 // Seed
@@ -460,4 +466,141 @@ pub async fn get_ai_run(
             ))
         })?;
     Ok(Json(run))
+}
+
+// ============================================================================
+// Discovery Run（SPEC_V0.3 §17）——派工给 discovery-worker（Phase 3 Step A/B）
+// ============================================================================
+
+/// `POST /api/v1/discovery/run` 的 body。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryRunBody {
+    pub collection_id: Uuid,
+    pub entity_id: Uuid,
+    /// Discovery 展開的起始深度。省略預設 `0`——一次全新觸發的 Discovery
+    /// 一般是從頭開始（Step B 的 `run_graph_expansion` 會把這個值當成
+    /// 「來源 Entity 目前的深度」，產出的 Candidate 深度是 `depth + 1`）。
+    #[serde(default)]
+    pub depth: i32,
+}
+
+/// `POST /api/v1/discovery/run`。operator 以上。建立並派工 `discovery_run`
+/// Job（202，狀態 `queued`）。真正執行的是 discovery-worker（Step B 的
+/// `run_graph_expansion`）。
+pub async fn run_discovery(
+    State(state): State<AppState>,
+    principal: Principal,
+    ip: ClientIp,
+    Json(body): Json<DiscoveryRunBody>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    principal.role.require(Permission::Write)?;
+    let metadata = json!({
+        "collection_id": body.collection_id,
+        "entity_id": body.entity_id,
+        "depth": body.depth,
+    });
+    let result =
+        dispatch_discovery_job(&state, body.collection_id, body.entity_id, body.depth).await;
+    audit_discovery_run(&state, &principal, &ip, &result, metadata).await;
+    result.map(|job| (StatusCode::ACCEPTED, Json(job)))
+}
+
+/// `POST /api/v1/entities/{id}/discover` 的 body。`entity_id` 從路徑帶入，
+/// 不重複放進 body。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntityDiscoverBody {
+    pub collection_id: Uuid,
+    #[serde(default)]
+    pub depth: i32,
+}
+
+/// `POST /api/v1/entities/{id}/discover`。operator 以上。跟
+/// `POST /discovery/run` 是同一個底層機制（同一種 `discovery_run` Job），
+/// 差別只是 `entity_id` 從路徑帶入。
+pub async fn discover_from_entity(
+    State(state): State<AppState>,
+    principal: Principal,
+    ip: ClientIp,
+    Path(entity_id): Path<Uuid>,
+    Json(body): Json<EntityDiscoverBody>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    principal.role.require(Permission::Write)?;
+    let metadata = json!({
+        "collection_id": body.collection_id,
+        "entity_id": entity_id,
+        "depth": body.depth,
+    });
+    let result = dispatch_discovery_job(&state, body.collection_id, entity_id, body.depth).await;
+    audit_discovery_run(&state, &principal, &ip, &result, metadata).await;
+    result.map(|job| (StatusCode::ACCEPTED, Json(job)))
+}
+
+/// 兩個 endpoint 共用：建立並派工 `discovery_run` Job。`parameters` 的欄位
+/// 名稱（`collection_id`／`entity_id`／`depth`）必須跟
+/// `discovery-worker::graph_expansion::run_graph_expansion` 解析 job
+/// parameters 的既有寫法完全一致——這個「契約」在 Step B 已經定案，這裡
+/// 不要改欄位名，也不要漏填任何一個必要欄位（`collection_id`／`entity_id`
+/// 對 discovery-worker 是必要參數，缺了 Job 到 discovery-worker 那端會
+/// 直接標記 Failed）。
+async fn dispatch_discovery_job(
+    state: &AppState,
+    collection_id: Uuid,
+    entity_id: Uuid,
+    depth: i32,
+) -> Result<Job, ApiError> {
+    let jobs = crate::jobs::jobs_or_unavailable(state)?;
+    jobs.create_and_dispatch(
+        JOB_TYPE_DISCOVERY_RUN,
+        None,
+        Some(json!({
+            "collection_id": collection_id.to_string(),
+            "entity_id": entity_id.to_string(),
+            "depth": depth,
+        })),
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
+async fn audit_discovery_run(
+    state: &AppState,
+    principal: &Principal,
+    ip: &ClientIp,
+    result: &Result<Job, ApiError>,
+    metadata: Value,
+) {
+    match result {
+        Ok(job) => {
+            audit(
+                state,
+                principal,
+                ip,
+                AuditEvent {
+                    action: AUDIT_DISCOVERY_RUN,
+                    resource_type: RESOURCE_DISCOVERY,
+                    resource_id: Some(job.id.to_string()),
+                    outcome: "success",
+                    metadata,
+                },
+            )
+            .await;
+        }
+        Err(err) => {
+            audit(
+                state,
+                principal,
+                ip,
+                AuditEvent {
+                    action: AUDIT_DISCOVERY_RUN,
+                    resource_type: RESOURCE_DISCOVERY,
+                    resource_id: None,
+                    outcome: "rejected",
+                    metadata: rejected_metadata(err, metadata),
+                },
+            )
+            .await;
+        }
+    }
 }

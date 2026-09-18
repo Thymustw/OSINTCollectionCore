@@ -752,6 +752,7 @@ dependencies = [
  "core-observability",
  "core-security",
  "deduplicator",
+ "discovery-worker",
  "dotenvy",
  "entity-worker",
  "hex",

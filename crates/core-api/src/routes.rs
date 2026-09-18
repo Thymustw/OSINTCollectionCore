@@ -85,6 +85,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/export/stix", post(resources::stix::export_stix))
         .route("/api/v1/seeds", post(resources::discovery::create_seed))
         .route(
+            "/api/v1/discovery/run",
+            post(resources::discovery::run_discovery),
+        )
+        .route(
+            "/api/v1/entities/{id}/discover",
+            post(resources::discovery::discover_from_entity),
+        )
+        .route(
             "/api/v1/candidates/{id}/approve",
             post(resources::discovery::approve_candidate),
         )
