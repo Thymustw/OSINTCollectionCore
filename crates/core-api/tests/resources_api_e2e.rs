@@ -204,6 +204,7 @@ fn build_api_with_backends(
             ..ImportSection::default()
         },
         stix_config: core_config::StixSection::default(),
+        auto_approval_max_concurrent: 2,
         object_bucket: stack.bucket.clone(),
         rate_limiter: RateLimiter::new(1_000),
     };

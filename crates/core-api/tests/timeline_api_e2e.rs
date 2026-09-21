@@ -84,6 +84,7 @@ fn build_api(stack: &Stack) -> TestApi {
             ..ImportSection::default()
         },
         stix_config: core_config::StixSection::default(),
+        auto_approval_max_concurrent: 2,
         object_bucket: "raw-evidence".into(),
         rate_limiter: RateLimiter::new(1_000),
     };

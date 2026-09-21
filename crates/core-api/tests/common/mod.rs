@@ -114,6 +114,7 @@ pub fn test_app_with_backends(
             max_bundle_bytes: 4_096,
             max_objects: 2,
         },
+        auto_approval_max_concurrent: 2,
         rate_limiter: RateLimiter::new(100),
     };
     (router(state), audit, tokens)

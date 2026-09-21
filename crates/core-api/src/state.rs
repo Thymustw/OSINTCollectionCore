@@ -209,6 +209,13 @@ pub struct AppState {
     pub import_config: ImportSection,
     /// STIX 匯入／匯出上限。永遠有值（`StixSection` 有 `Default`），不是 `Option`。
     pub stix_config: StixSection,
+    /// 目前唯一真的會呼叫 AI 的路徑（ADR-012 自動核准）允許的最大並發推論數。
+    /// 純設定值，永遠有值——跟 [`AppState::auto_approval`] 是否為 `None`
+    /// 無關（那個 `None` 代表沒接上 Postgres，這裡只是讀 config）。
+    /// `GET /ops/discovery` 用它回報「目前設定的並發上限」，**不是**即時
+    /// in-flight 請求數（那個目前沒有任何地方在計數，見 handler 的
+    /// doc comment）。
+    pub auto_approval_max_concurrent: usize,
     /// 物件儲存的 bucket 名稱。`GET /raw/{id}?body=true` 用它把
     /// `s3://{bucket}/{key}` 形式的 `storage_path` 還原成物件 key。
     /// 沒接物件儲存時是空字串（那時 `?body=true` 本來就會回 503）。

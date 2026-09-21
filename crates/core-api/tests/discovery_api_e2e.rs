@@ -96,6 +96,7 @@ fn build_api(stack: &Stack) -> TestApi {
             ..ImportSection::default()
         },
         stix_config: core_config::StixSection::default(),
+        auto_approval_max_concurrent: 2,
         object_bucket: "raw-evidence".into(),
         rate_limiter: RateLimiter::new(1_000),
     };
@@ -608,6 +609,73 @@ async fn list_and_get_ai_runs() {
     assert_eq!(get_status, StatusCode::OK, "{get_resp}");
     assert_eq!(get_resp["id"], json!(scoring.id.to_string()));
     assert_eq!(get_resp["task_type"], json!("candidate_scoring"));
+}
+
+// ---------------------------------------------------------------- ops discovery
+
+/// `GET /ops/discovery` 回設定值、backlog 近似計數、最近 AI Run。
+/// viewer 即可讀（Read 權限，不是 Write）。
+#[tokio::test]
+async fn ops_discovery_returns_backlog_and_recent_ai_runs() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let pending = put_candidate_fixture(&stack, None).await;
+    let (approve_status, _) = send(
+        &api.app,
+        post(
+            &format!("/api/v1/candidates/{}/approve", pending.id),
+            &api.operator,
+        ),
+    )
+    .await;
+    assert_eq!(approve_status, StatusCode::OK);
+    let still_pending = put_candidate_fixture(&stack, None).await;
+    let run = put_ai_run_fixture(&stack, "candidate_scoring").await;
+
+    let (status, resp) = send(&api.app, get("/api/v1/ops/discovery", &api.viewer)).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["ai_max_concurrent_requests"], json!(2), "{resp}");
+    assert!(
+        resp["candidate_backlog"]["pending"].as_u64().unwrap() >= 1,
+        "剛塞的 pending candidate {} 應被計入：{resp}",
+        still_pending.id
+    );
+    assert!(
+        resp["candidate_backlog"]["approved"].as_u64().unwrap() >= 1,
+        "剛核准的 candidate {} 應被計入：{resp}",
+        pending.id
+    );
+    assert_eq!(
+        resp["candidate_backlog"]["saturated"],
+        json!(false),
+        "{resp}"
+    );
+    let recent_ids: Vec<&str> = resp["ai_run_recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        recent_ids.iter().any(|id| *id == run.id.to_string()),
+        "剛寫入的 AI Run {} 應出現在最近歷史：{resp}",
+        run.id
+    );
+    let note = resp["note"].as_str().unwrap();
+    assert!(
+        note.contains("Phase 5"),
+        "note 要講清楚延後項目，避免呼叫端把缺欄位當成系統沒問題：{resp}"
+    );
+}
+
+/// viewer 讀 `/ops/discovery` 是 Read 權限，不是 403。
+#[tokio::test]
+async fn viewer_may_read_ops_discovery() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let (status, resp) = send(&api.app, get("/api/v1/ops/discovery", &api.viewer)).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert!(resp["candidate_backlog"].is_object(), "{resp}");
 }
 
 // ---------------------------------------------------------------- rbac

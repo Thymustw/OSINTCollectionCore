@@ -326,6 +326,7 @@ async fn run() -> Result<(), String> {
         request_body_limit_bytes: cfg.http.request_body_limit_bytes,
         import_config: cfg.import.clone(),
         stix_config: cfg.stix.clone(),
+        auto_approval_max_concurrent: cfg.auto_approval.llm.max_concurrent,
         object_bucket: cfg.storage.object.bucket.clone(),
         rate_limiter: core_api::RateLimiter::new(cfg.http.rate_limit_per_second),
     };
@@ -570,7 +571,7 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
             error: "not_found".into(),
             message: "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs、\
                  /api/v1/tokens（admin）、/api/v1/ops/health、/api/v1/ops/metrics、\
-                 /api/v1/ops/connectors、/api/v1/ops/queues、/api/v1/ops/dlq 與 /api/v1/ops/graph、\
+                 /api/v1/ops/connectors、/api/v1/ops/queues、/api/v1/ops/dlq、/api/v1/ops/graph 與 /api/v1/ops/discovery、\
                  sources／connectors／collections／objects／entities／relationships／events／raw、\
                  /api/v1/graph/*、POST /api/v1/import、POST /api/v1/search、POST /api/v1/search/semantic、\
                  POST /api/v1/search/hybrid 與 GET /api/v1/objects/{id}/similar"

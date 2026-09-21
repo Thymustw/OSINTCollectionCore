@@ -38,9 +38,9 @@ pub use import::{AUDIT_ACTION as IMPORT_AUDIT_ACTION, ImportRequest};
 pub use jobs::{AUDIT_JOB_CREATE, AUDIT_JOB_DISPATCH, AUDIT_JOB_RETRY, AUDIT_JOB_TRANSITION};
 pub use middleware::{AUDIT_AUTH_FAILED, AUDIT_AUTHZ_DENIED};
 pub use ops::{
-    BackendCheck, BrokerCheck, ConnectorHealth, ConnectorsView, DlqView, GraphCheck,
-    GraphProjectionView, OpsHealth, ProcessMetrics, QueueBinding, QueueEntry, QueueInspector,
-    QueueSummary,
+    BackendCheck, BrokerCheck, CandidateBacklogSummary, ConnectorHealth, ConnectorsView,
+    DiscoveryOpsView, DlqView, GraphCheck, GraphProjectionView, OpsHealth, ProcessMetrics,
+    QueueBinding, QueueEntry, QueueInspector, QueueSummary,
 };
 pub use pagination::{CursorPage, Pagination};
 pub use rate_limit::RateLimiter;

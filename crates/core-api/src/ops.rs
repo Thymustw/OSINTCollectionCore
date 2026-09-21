@@ -15,6 +15,8 @@
 //!   是否已重放過濾，cursor 分頁（SPEC §31）。
 //! * `POST /ops/failed-events/{id}/replay`：把一則失敗事件的原始 envelope 重發回它
 //!   原本的 topic 並標記為已重放（ADR-008 的手動復原路徑）。operator 以上。
+//! * `GET /ops/discovery`：SPEC_V0.3 §27 的讀側子集——AI 並發上限設定值、
+//!   Candidate backlog 近似計數、最近 AI Run 歷史。沒接 Postgres 回 503。
 //!
 //! # 為什麼與 `/ready`、`/metrics` 分開
 //!
@@ -901,6 +903,122 @@ pub async fn graph_projection(
         projection: gp.projection.clone(),
         lag,
         rebuild,
+    }))
+}
+
+// --------------------------------------------------------------- discovery ops
+
+/// `GET /ops/discovery` 一次最多數幾筆來近似 backlog 計數。
+///
+/// 這個數字對齊 storage adapter 的 `clamp_limit`（1..=100），不是任意挑的。
+/// 計畫草稿曾寫 1000，但 `list_candidates` 會把任何大於 100 的 limit 夾回 100，
+/// 用 1000 的話 `saturated` 永遠不會亮、計數卻會被低估——那是靜默失效。
+/// 沒有 COUNT 查詢可用，這是妥協——見 [`CandidateBacklogSummary`]。
+const BACKLOG_COUNT_LIMIT: u32 = 100;
+/// AI Run history 只回最近幾筆，這是總覽視圖不是完整清單
+/// （完整清單走既有的 `GET /ai/runs`，支援 cursor 分頁）。
+const RECENT_AI_RUN_LIMIT: u32 = 20;
+
+/// `GET /ops/discovery` 的回應。SPEC_V0.3 §27 AI/Discovery Operations
+/// 的讀側子集——只回現有資料能組出來的部分，見下方各欄位的排除說明。
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryOpsView {
+    /// 目前設定的 AI 呼叫並發上限（`auto_approval.llm.max_concurrent`）。
+    /// **這是靜態設定值，不是即時 in-flight 請求數**——目前系統裡沒有
+    /// 任何地方在計數「現在有幾個 AI 呼叫正在進行」，這個欄位只回答
+    /// 「設定成多少」，不回答「現在用了多少」。
+    pub ai_max_concurrent_requests: usize,
+    pub candidate_backlog: CandidateBacklogSummary,
+    /// 最近 N 筆 AI Run（依 id 遞減）。跟 `GET /ai/runs` 是同一份資料，
+    /// 這裡只是聚合進同一個 Ops 視圖方便一次看完。
+    pub ai_run_recent: Vec<core_model::AiRun>,
+    pub note: String,
+}
+
+/// 依 [`core_model::CandidateStatus`] 各分一組的近似計數。
+///
+/// **這是近似值，不是精確計數**——底層沒有 COUNT 查詢，是對每個 status
+/// 各撈一次（上限見 `BACKLOG_COUNT_LIMIT`）取 `.len()`。如果某個 status
+/// 底下的 Candidate 數量超過這個上限，回傳的數字會被低估；那種情況下
+/// `saturated: true` 會標記出來，代表「至少有這麼多」而不是「剛好這麼多」。
+#[derive(Debug, Clone, Serialize)]
+pub struct CandidateBacklogSummary {
+    pub pending: usize,
+    pub approved: usize,
+    pub auto_approved: usize,
+    pub rejected: usize,
+    pub expired: usize,
+    /// 任一個 status 的計數是否被 `BACKLOG_COUNT_LIMIT` 截斷。
+    pub saturated: bool,
+}
+
+async fn count_candidates_by_status(
+    store: &crate::state::SharedStore,
+    status: core_model::CandidateStatus,
+) -> Result<(usize, bool), ApiError> {
+    let items = store
+        .list_candidates(Some(status), None, BACKLOG_COUNT_LIMIT)
+        .await
+        .map_err(storage_error)?;
+    let count = items.len();
+    Ok((count, count as u32 >= BACKLOG_COUNT_LIMIT))
+}
+
+/// `GET /api/v1/ops/discovery`。viewer 以上。
+///
+/// SPEC_V0.3 §27 AI/Discovery Operations 的讀側子集。**明確排除**（延後到
+/// V0.3 Phase 5，屆時才有真實 AI runtime 可以驗證這些欄位有沒有意義）：
+/// P0-P4 佇列深度（程式碼裡不存在這個抽象）、即時 active
+/// requests/TPS/TTFT/P95（沒有真實推論流量可量測，也沒有任何地方在收集
+/// 這些指標）、Admission Controller state（不存在這個元件）、
+/// pause/resume P4／drain AI queue（沒有東西可以 pause/resume/drain）、
+/// OOM/retry/deferred counts（`max_retries` 目前只有 config 沒有累計
+/// metric）。這個端點回應裡的 `note` 欄位重述這件事，避免呼叫端誤以為
+/// 缺的欄位代表系統沒有問題。
+pub async fn discovery(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<Json<DiscoveryOpsView>, ApiError> {
+    principal.role.require(Permission::Read)?;
+    let store = store(&state)?;
+
+    let (pending, sat_pending) =
+        count_candidates_by_status(store, core_model::CandidateStatus::Pending).await?;
+    let (approved, sat_approved) =
+        count_candidates_by_status(store, core_model::CandidateStatus::Approved).await?;
+    let (auto_approved, sat_auto_approved) =
+        count_candidates_by_status(store, core_model::CandidateStatus::AutoApproved).await?;
+    let (rejected, sat_rejected) =
+        count_candidates_by_status(store, core_model::CandidateStatus::Rejected).await?;
+    let (expired, sat_expired) =
+        count_candidates_by_status(store, core_model::CandidateStatus::Expired).await?;
+
+    let ai_run_recent = store
+        .list_ai_runs(None, None, RECENT_AI_RUN_LIMIT)
+        .await
+        .map_err(storage_error)?;
+
+    Ok(Json(DiscoveryOpsView {
+        ai_max_concurrent_requests: state.auto_approval_max_concurrent,
+        candidate_backlog: CandidateBacklogSummary {
+            pending,
+            approved,
+            auto_approved,
+            rejected,
+            expired,
+            saturated: sat_pending
+                || sat_approved
+                || sat_auto_approved
+                || sat_rejected
+                || sat_expired,
+        },
+        ai_run_recent,
+        note: "P0-P4 佇列、即時 active requests/TPS/TTFT/P95、Admission \
+               Controller state、pause/resume/drain 操作延後到 V0.3 Phase 5\
+              （本地 AI Runtime 部署後才有真實資料可驗證這些欄位的設計）。\
+               本端點目前只回：AI 呼叫並發上限設定值、Candidate backlog \
+               各狀態近似計數、最近 AI Run 歷史。"
+            .into(),
     }))
 }
 

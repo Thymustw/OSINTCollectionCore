@@ -202,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ops/dlq", get(ops::dlq))
         .route("/api/v1/ops/failed-events", get(ops::list_failed_events))
         .route("/api/v1/ops/graph", get(ops::graph_projection))
+        .route("/api/v1/ops/discovery", get(ops::discovery))
         .route(
             "/api/v1/graph/entities/{id}/neighbors",
             get(resources::graph::neighbors),

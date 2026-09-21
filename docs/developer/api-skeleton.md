@@ -70,6 +70,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/ops/queues` | viewer | 200／503 | consumer group lag。沒接 Redpanda 回 503 |
 | GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`。沒接 Postgres 回 503 |
 | GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
+| GET | `/api/v1/ops/discovery` | viewer | 200／503 | AI/Discovery 讀側子集。沒接 Postgres 回 503 |
 | POST | `/api/v1/import` | operator | 201 | multipart |
 | POST | `/api/v1/import/stix` | operator | 202 | STIX 2.1 bundle 匯入，回 `stix_import` Job；不發 `raw.collected` |
 | POST | `/api/v1/export/stix` | operator | 202 | 回 `stix_export` Job；`filter` 可省略 |
@@ -554,6 +555,7 @@ curl -s "http://127.0.0.1:18080/api/v1/entities/$ENTITY_ID/timeline?limit=20" \
 | `/api/v1/ops/queues` | viewer+ | 哪個 consumer group 落後 |
 | `/api/v1/ops/dlq` | viewer+ | 有哪些失敗的 Job（V0.1 沒有 DLQ topic） |
 | `/api/v1/ops/graph` | viewer+ | 圖投影 lag 與 rebuild 狀態 |
+| `/api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog 近似計數、最近 AI Run |
 
 Redis／Redpanda 刻意**不放進 `/ready`**：API 自己不需要它們，
 把它們塞進 `/ready` 會讓「Redis 掛了」變成「API 不接受流量」，
@@ -734,6 +736,32 @@ SPEC §31 的 "basic DLQ view"。viewer 以上。沒接 Postgres 回 503。
 失敗的 Job 可以用 `POST /api/v1/jobs/{id}/retry`（operator 以上）重試；
 會轉成 `retrying` 而不是 `queued`（見上方 Jobs 一節），且成功與被拒都會寫稽核。
 
+## `GET /ops/discovery`（AI / Discovery 讀側子集）
+
+SPEC_V0.3 §27 的讀側子集。viewer 以上。沒接 Postgres 回 503。
+唯讀、不寫稽核——跟 `/ops/queues`／`/ops/dlq` 同一級。
+
+```json
+{
+  "ai_max_concurrent_requests": 2,
+  "candidate_backlog": {
+    "pending": 3,
+    "approved": 1,
+    "auto_approved": 0,
+    "rejected": 0,
+    "expired": 0,
+    "saturated": false
+  },
+  "ai_run_recent": [{"id": "0199...", "task_type": "candidate_scoring", "…": "…"}],
+  "note": "P0-P4 佇列、即時 active requests/TPS/TTFT/P95、Admission Controller state…"
+}
+```
+
+- `ai_max_concurrent_requests` 是 `auto_approval.llm.max_concurrent` 的**靜態設定值**，不是即時 in-flight 請求數。系統目前沒有任何地方在計數「現在有幾個 AI 呼叫正在進行」。
+- `candidate_backlog` 是近似值：對每個 `CandidateStatus` 各撈一次（上限 100，對齊 storage 的 `clamp_limit`）取 `.len()`。某個 status 超過上限時 `saturated: true`，代表「至少有這麼多」而不是「剛好這麼多」。沒有 COUNT 查詢可用。
+- `ai_run_recent` 與 `GET /ai/runs` 是同一份資料，這裡只回最近 20 筆；完整清單請走那個 endpoint。
+- `note` 重述延後項目：P0–P4 佇列、即時 TPS/TTFT/P95、Admission Controller、pause/resume/drain 延後到 V0.3 Phase 5。缺的欄位不代表系統沒有問題。
+
 ## API token 管理（`/api/v1/tokens`，admin-only）
 
 V0.1 第一組真正需要 admin 角色的路由。
@@ -783,6 +811,7 @@ Phase 6b 另外加了三個欄位：
 | `backends_missing` | `Vec<&'static str>` | **沒接上**（因此不在 `backends` 裡）的後端名稱 |
 | `object_bucket` | `String` | `GET /raw/{id}?body=true` 用來把 `s3://{bucket}/{key}` 形式的 `storage_path` 還原成物件 key；沒接物件儲存時是空字串 |
 | `graph_projection` | `Option<SharedGraphProjection>`（`GraphProjectionState`：`ProjectionStore` + 投影名稱） | `GET /api/v1/ops/graph` 的 lag／rebuild。`None` 回 503。回應型別是 `GraphProjectionView` |
+| `auto_approval_max_concurrent` | `usize` | `GET /ops/discovery` 回報的 AI 並發上限**設定值**。永遠有值，跟 `auto_approval` 是否為 `None` 無關 |
 
 `backends` 與 `ready` **刻意分開**：`/ready` 只檢查 API 自己非有不可的依賴
 （給 orchestrator 決定要不要送流量），`backends` 是整套 pipeline 的後端

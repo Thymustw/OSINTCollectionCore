@@ -51,6 +51,7 @@ fn read_paths() -> Vec<String> {
         "/api/v1/ops/health".into(),
         "/api/v1/ops/metrics".into(),
         "/api/v1/ops/graph".into(),
+        "/api/v1/ops/discovery".into(),
         format!("/api/v1/graph/entities/{id}/neighbors"),
         format!("/api/v1/graph/entities/{id}/relationships"),
         format!("/api/v1/graph/path?from={id}&to={id}&max_hops=2"),
@@ -486,6 +487,7 @@ async fn ops_endpoints_are_not_public() {
         "/api/v1/ops/health",
         "/api/v1/ops/metrics",
         "/api/v1/ops/graph",
+        "/api/v1/ops/discovery",
     ] {
         let (status, _) = send(&app, get(path, None)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 不該公開");

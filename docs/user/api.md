@@ -356,6 +356,9 @@ curl -s $API/ops/health -H "Authorization: Bearer $TOKEN"
 # 圖投影 lag／rebuild（沒接 Neo4j 回 503）
 curl -s $API/ops/graph -H "Authorization: Bearer $TOKEN"
 
+# AI / Discovery 讀側（沒接 Postgres 回 503）。這是設定值與近似 backlog，不是即時 GPU 負載
+curl -s $API/ops/discovery -H "Authorization: Bearer $TOKEN"
+
 # 這個 API 行程用了多少記憶體與 CPU
 curl -s $API/ops/metrics -H "Authorization: Bearer $TOKEN"
 

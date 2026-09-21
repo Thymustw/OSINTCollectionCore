@@ -333,6 +333,7 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>) -> TestApi {
         request_body_limit_bytes: 1_048_576,
         import_config: core_config::ImportSection::default(),
         stix_config: core_config::StixSection::default(),
+        auto_approval_max_concurrent: 2,
         object_bucket: String::new(),
         rate_limiter: RateLimiter::new(1_000),
     };
