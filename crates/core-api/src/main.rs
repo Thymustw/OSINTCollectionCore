@@ -434,6 +434,7 @@ fn assemble_auto_approval(
         llm_model_version: section.llm.model_version.clone(),
         llm_temperature: section.llm.temperature,
         llm_max_tokens: section.llm.max_tokens,
+        enable_reasoning: section.llm.enable_reasoning,
     };
     AutoApprovalState {
         evaluator: Arc::new(resolver::AutoApprovalEvaluator::new(

@@ -224,3 +224,5 @@ max_retries = 0
 max_concurrent = 2
 max_tokens = 512
 temperature = 0.0
+# entity resolution 是結構化輸入上的二元判斷，預設關閉推理以省 token。
+enable_reasoning = false

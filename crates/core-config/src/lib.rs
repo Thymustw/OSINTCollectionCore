@@ -669,6 +669,13 @@ pub struct AutoApprovalLlmSection {
     /// 0.0 = 確定性輸出，適合判斷任務而非生成任務。
     #[serde(default)]
     pub temperature: f64,
+    /// 是否允許模型在中間帶判斷時展開推理過程（部分本地模型走
+    /// chain-of-thought，回應會多一個 `reasoning` 欄位）。預設 `false`：
+    /// entity resolution 是二元判斷、輸入已經結構化，不需要推理過程，
+    /// 關閉可以更快、更省 token。設 `true` 可以讓模型展開推理，代價是
+    /// 較慢較貴，但對輸入複雜、需要模型先拆解問題的情境可能更準確。
+    #[serde(default = "default_llm_enable_reasoning")]
+    pub enable_reasoning: bool,
 }
 
 fn default_auto_confirm_score() -> f64 {
@@ -711,6 +718,10 @@ fn default_llm_max_tokens() -> u32 {
     512
 }
 
+fn default_llm_enable_reasoning() -> bool {
+    false
+}
+
 impl AutoApprovalSection {
     /// 門檻設定是否自洽（`auto_confirm_score >= llm_review_score`）。
     /// 不自洽時呼叫端應該視為設定錯誤、記警告並停用自動核准——但記警告
@@ -747,6 +758,7 @@ impl Default for AutoApprovalLlmSection {
             max_concurrent: default_llm_max_concurrent(),
             max_tokens: default_llm_max_tokens(),
             temperature: 0.0,
+            enable_reasoning: default_llm_enable_reasoning(),
         }
     }
 }
@@ -941,6 +953,7 @@ mod tests {
         assert_eq!(cfg.auto_approval.llm.max_concurrent, 2);
         assert_eq!(cfg.auto_approval.llm.max_tokens, 512);
         assert_eq!(cfg.auto_approval.llm.temperature, 0.0);
+        assert!(!cfg.auto_approval.llm.enable_reasoning);
         assert!(cfg.auto_approval.thresholds_are_sane());
         assert_eq!(cfg.stix.max_bundle_bytes, 50 * 1024 * 1024);
         assert_eq!(cfg.stix.max_objects, 10_000);
@@ -1129,6 +1142,7 @@ mod tests {
         assert_eq!(section.survivor_strategy, "source");
         assert_eq!(section.llm, AutoApprovalLlmSection::default());
         assert!(!section.llm.enabled);
+        assert!(!section.llm.enable_reasoning);
     }
 
     #[test]

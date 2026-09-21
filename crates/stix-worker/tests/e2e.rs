@@ -63,6 +63,7 @@ fn disabled_auto() -> AutoApprovalConfig {
         llm_model_version: "unused".into(),
         llm_temperature: 0.0,
         llm_max_tokens: 16,
+        enable_reasoning: false,
     }
 }
 
@@ -76,6 +77,7 @@ fn alias_auto() -> AutoApprovalConfig {
         llm_model_version: "unused".into(),
         llm_temperature: 0.0,
         llm_max_tokens: 16,
+        enable_reasoning: false,
     }
 }
 

@@ -211,7 +211,7 @@ impl Inner {
         }
 
         let url = chat_completions_url(&self.base_url);
-        let payload = json!({
+        let mut payload = json!({
             "model": request.model,
             "messages": request.messages.iter().map(|m| {
                 json!({
@@ -222,6 +222,11 @@ impl Inner {
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
         });
+        // `false` 才顯式關閉 thinking；`true` 不加這個欄位，維持跟舊版
+        // 完全相同的 payload 形狀（多數 endpoint 預設就是開 thinking）。
+        if !request.enable_reasoning {
+            payload["chat_template_kwargs"] = json!({"enable_thinking": false});
+        }
         let body = serde_json::to_vec(&payload).map_err(|err| AiGatewayError::Permanent {
             message: format!("序列化 LLM 請求失敗：{err}"),
         })?;
@@ -380,6 +385,7 @@ mod tests {
             ],
             temperature: 0.0,
             max_tokens: 128,
+            enable_reasoning: false,
         }
     }
 
@@ -845,6 +851,65 @@ mod tests {
         assert!(
             first_to_third >= Duration::from_millis(150),
             "rate_limit_per_second=10 應該讓 3 個請求間隔開，實際 {first_to_third:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_reasoning_false_sends_chat_template_kwargs() {
+        let server = MockServer::start().await;
+        mount_json(&server, 200, &success_body()).await;
+        let provider = OpenAiCompatibleLlmProvider::new(&enabled_config(
+            format!("{}/v1", server.uri()),
+            Duration::from_secs(5),
+            1,
+        ));
+
+        let mut request = sample_request();
+        request.enable_reasoning = false;
+        provider
+            .chat_completion(&request)
+            .await
+            .expect("200 + 合法 OpenAI JSON 必須成功");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1, "應該只發出一次 HTTP 請求");
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("送出的 body 必須是合法 JSON");
+        assert_eq!(
+            body.get("chat_template_kwargs"),
+            Some(&json!({"enable_thinking": false})),
+            "enable_reasoning=false 必須送 chat_template_kwargs.enable_thinking=false，實際 {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_reasoning_true_omits_chat_template_kwargs() {
+        let server = MockServer::start().await;
+        mount_json(&server, 200, &success_body()).await;
+        let provider = OpenAiCompatibleLlmProvider::new(&enabled_config(
+            format!("{}/v1", server.uri()),
+            Duration::from_secs(5),
+            1,
+        ));
+
+        let mut request = sample_request();
+        request.enable_reasoning = true;
+        provider
+            .chat_completion(&request)
+            .await
+            .expect("200 + 合法 OpenAI JSON 必須成功");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1, "應該只發出一次 HTTP 請求");
+        let body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("送出的 body 必須是合法 JSON");
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "enable_reasoning=true 不該送 chat_template_kwargs，實際 {body}"
+        );
+        assert!(
+            body.get("enable_thinking").is_none(),
+            "enable_thinking 不該出現在 payload 頂層，實際 {body}"
         );
     }
 

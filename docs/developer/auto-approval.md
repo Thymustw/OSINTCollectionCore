@@ -110,6 +110,7 @@ LLM 預期回傳以下格式的 JSON：
 | `max_concurrent` | `2` | 同時進行的 LLM 推論上限（bounded Semaphore，CLAUDE.md §6） |
 | `max_tokens` | `512` | LLM 回應的 token 上限 |
 | `temperature` | `0.0` | 0.0 = 確定性輸出，適合判斷任務 |
+| `enable_reasoning` | `false` | 是否允許模型展開推理過程。`false` 時 `ai-gateway` 會在請求加 `chat_template_kwargs.enable_thinking=false`，關閉 chain-of-thought（更快、省 token）。`true` 時不加這個欄位，沿用 endpoint 預設。這是呼叫端明確宣告，不是依 `task_type` 自動推導——entity resolution 的二元判斷輸入已結構化，預設關閉 |
 
 ### 門檻自洽檢查
 
@@ -166,6 +167,7 @@ max_retries = 0
 max_concurrent = 2
 max_tokens = 512
 temperature = 0.0
+enable_reasoning = false
 ```
 
 完全關閉（恢復 ADR-012 之前行為）：

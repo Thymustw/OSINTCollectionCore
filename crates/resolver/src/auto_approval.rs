@@ -46,6 +46,9 @@ pub struct AutoApprovalConfig {
     pub llm_model_version: String,
     pub llm_temperature: f64,
     pub llm_max_tokens: u32,
+    /// 是否允許模型展開推理過程。見 `ChatCompletionRequest::enable_reasoning`。
+    /// 由 `AutoApprovalLlmSection::enable_reasoning` 轉過來，預設 `false`。
+    pub enable_reasoning: bool,
 }
 
 /// 單一一對 Entity 的自動核准評估結果。**沒有 `Result` 包裝**——
@@ -221,6 +224,7 @@ where
             ],
             temperature: self.config.llm_temperature,
             max_tokens: self.config.llm_max_tokens,
+            enable_reasoning: self.config.enable_reasoning,
         };
 
         let started = Instant::now();
@@ -788,6 +792,7 @@ mod tests {
             llm_model_version: "test-fixture".into(),
             llm_temperature: 0.0,
             llm_max_tokens: 256,
+            enable_reasoning: false,
         }
     }
 
@@ -1217,6 +1222,7 @@ mod tests {
             messages: vec![],
             temperature: 0.0,
             max_tokens: 16,
+            enable_reasoning: false,
         };
         let cand = candidate(Uuid::now_v7(), Uuid::now_v7(), "semantic_similarity", 0.80);
         let run = build_ai_run(

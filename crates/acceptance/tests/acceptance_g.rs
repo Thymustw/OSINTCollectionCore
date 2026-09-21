@@ -413,6 +413,7 @@ fn build_worker(stack: &Stack) -> TestWorker {
                 llm_model_version: "unused".into(),
                 llm_temperature: 0.0,
                 llm_max_tokens: 16,
+                enable_reasoning: false,
             },
         },
     )

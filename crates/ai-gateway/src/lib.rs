@@ -46,6 +46,20 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
     pub temperature: f64,
     pub max_tokens: u32,
+    /// 是否允許模型展開推理過程（部分本地模型走 chain-of-thought，
+    /// 回應會多一個 `reasoning` 欄位，`false` 時關閉這個行為）。
+    ///
+    /// 呼叫端**明確宣告**，不是由 task_type 自動推導——輸入已經結構化、
+    /// 模型只需要做直接判斷的呼叫（例如 entity resolution 的二元
+    /// same_entity 判斷）應該傳 `false`：更快、更省 token，且不需要
+    /// 推理過程。輸入是未經抽取的自由文字、需要模型先拆解問題才能回答
+    /// 的呼叫（例如從一段文章抽取實體/關係/事件）應該傳 `true`。
+    ///
+    /// 對不支援這個概念的 endpoint（不走 reasoning 的一般模型）沒有影響
+    /// ——`OpenAiCompatibleLlmProvider` 只在 `false` 時額外送一個
+    /// `chat_template_kwargs` 欄位，多數 OpenAI 相容 server 會忽略不認識
+    /// 的欄位；`true` 時不送這個欄位，使用 endpoint 的預設行為。
+    pub enable_reasoning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -138,6 +138,7 @@ async fn run() -> Result<(), String> {
         llm_model_version: auto_section.llm.model_version.clone(),
         llm_temperature: auto_section.llm.temperature,
         llm_max_tokens: auto_section.llm.max_tokens,
+        enable_reasoning: auto_section.llm.enable_reasoning,
     };
 
     let service = StixWorker::new(

@@ -4,25 +4,24 @@ Authoritative specification:
 
 `../architecture/LOCAL_AI.md`
 
-Current baseline:
+Deployment shape:
 
 ```text
 Windows + WSL2
-Qwen3.8-27B
-UD-Q4_K_XL
-GGUF
+Local generative model (family/quantization/format: deployment-specific)
 Alias: qwen-primary
 ```
 
-Preferred benchmark target:
+The exact model artifact, quantization, and runtime are deployment
+configuration, not part of this guide — see `../architecture/LOCAL_AI.md`
+§0/§1/§2 for why, and consult your deployment's own operations record for
+what is actually running.
+
+Runtime candidates:
 
 ```text
-vLLM + vllm-gguf-plugin
-```
-
-Fallback/reference:
-
-```text
+vLLM (native, or with a format-specific plugin depending on the deployed
+artifact)
 llama.cpp
 ```
 

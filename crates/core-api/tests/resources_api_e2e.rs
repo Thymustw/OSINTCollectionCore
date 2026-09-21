@@ -130,6 +130,7 @@ fn assemble_test_auto_approval(
                 llm_model_version: section.llm.model_version.clone(),
                 llm_temperature: section.llm.temperature,
                 llm_max_tokens: section.llm.max_tokens,
+                enable_reasoning: section.llm.enable_reasoning,
             },
         )),
         max_auto_merges_per_resolve: section.max_auto_merges_per_resolve,
