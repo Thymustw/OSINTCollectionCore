@@ -104,7 +104,7 @@ LLM 預期回傳以下格式的 JSON：
 |---|---|---|
 | `enabled` | `false` | LLM 中間帶審查開關。即使 `auto_approval.enabled = true`，也必須此處為 `true` 才打 LLM |
 | `base_url` | `"http://ai-inference:8000/v1"` | OpenAI 相容 endpoint base URL（實際打 `{base_url}/chat/completions`，會去掉尾端 `/`） |
-| `model` | `"qwen-primary"` | 對應 `docs/architecture/LOCAL_AI.md` 的 alias `qwen-primary`（Qwen3.8-27B UD-Q4_K_XL） |
+| `model` | `"qwen-primary"` | 對應 `docs/architecture/LOCAL_AI.md` 的 alias `qwen-primary`——這個 alias 是穩定契約，它實際指向哪個模型是部署配置，不寫死在這裡 |
 | `timeout_secs` | `30` | 單次 HTTP 請求逾時（含連線 + 讀 body） |
 | `max_retries` | `0` | 逾時後重試次數。預設 0：LLM 失敗直接退回 Pending，不重試（降級路徑本來就安全） |
 | `max_concurrent` | `2` | 同時進行的 LLM 推論上限（bounded Semaphore，CLAUDE.md §6） |
@@ -321,4 +321,4 @@ curl -s -X POST http://127.0.0.1:18080/api/v1/merge-history/<id>/undo \
 - `docs/developer/resolver.md`（五個掃描方法、`exact_identifier` 衝突 helper）
 - `docs/developer/schema-v0.2.md`（migration 0012、`auto_approval_audit` 欄位）
 - `docs/developer/storage-adapters.md`（`update_resolution_candidate_status`）
-- `docs/architecture/LOCAL_AI.md`（Qwen3.8-27B UD-Q4_K_XL 執行環境）
+- `docs/architecture/LOCAL_AI.md`（本地 AI runtime 契約，不綁定特定模型/量化/runtime）
