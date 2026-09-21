@@ -233,7 +233,7 @@ jobs:
           outputs: type=docker,dest=/tmp/${{ matrix.service }}.tar
           cache-from: type=gha,scope=osint-core-builder
           cache-to: type=gha,mode=max,scope=osint-core-builder
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: image-${{ matrix.service }}
           path: /tmp/${{ matrix.service }}.tar
@@ -276,7 +276,7 @@ jobs:
           format: cyclonedx
           output: sbom-${{ matrix.service }}.cdx.json
           exit-code: "0"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom-${{ matrix.service }}
           path: sbom-${{ matrix.service }}.cdx.json
@@ -300,7 +300,7 @@ jobs:
           format: cyclonedx
           output: sbom-neo4j.cdx.json
           exit-code: "0"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom-neo4j
           path: sbom-neo4j.cdx.json
