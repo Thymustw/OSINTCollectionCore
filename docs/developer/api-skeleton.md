@@ -70,6 +70,8 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/ops/queues` | viewer | 200／503 | consumer group lag。沒接 Redpanda 回 503 |
 | GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`。沒接 Postgres 回 503 |
 | GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
+| GET | `/api/v1/ops/failed-events` | viewer | 200／503 | 永久失敗事件清單（ADR-008）。`?topic=`、`?unreplayed_only=`、`?cursor=`、`?limit=`。沒接 Postgres 回 503 |
+| POST | `/api/v1/ops/failed-events/{id}/replay` | operator | 200／404／500／503 | 把失敗事件的原始 envelope 重發回原 topic 並標記已重放。envelope 壞掉回 500，broker 不可用回 503 |
 | GET | `/api/v1/ops/discovery` | viewer | 200／503 | AI/Discovery 讀側子集。沒接 Postgres 回 503 |
 | POST | `/api/v1/import` | operator | 201 | multipart |
 | POST | `/api/v1/import/stix` | operator | 202 | STIX 2.1 bundle 匯入，回 `stix_import` Job；不發 `raw.collected` |
@@ -554,6 +556,7 @@ curl -s "http://127.0.0.1:18080/api/v1/entities/$ENTITY_ID/timeline?limit=20" \
 | `/api/v1/ops/connectors` | viewer+ | 哪個 connector 沒在採集，以及為什麼 |
 | `/api/v1/ops/queues` | viewer+ | 哪個 consumer group 落後 |
 | `/api/v1/ops/dlq` | viewer+ | 有哪些失敗的 Job（V0.1 沒有 DLQ topic） |
+| `/api/v1/ops/failed-events` | viewer+ | 有哪些**事件**永久失敗（ADR-008，跟上面的 Job 層級是兩回事） |
 | `/api/v1/ops/graph` | viewer+ | 圖投影 lag 與 rebuild 狀態 |
 | `/api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog 近似計數、最近 AI Run |
 
@@ -735,6 +738,53 @@ SPEC §31 的 "basic DLQ view"。viewer 以上。沒接 Postgres 回 503。
 
 失敗的 Job 可以用 `POST /api/v1/jobs/{id}/retry`（operator 以上）重試；
 會轉成 `retrying` 而不是 `queued`（見上方 Jobs 一節），且成功與被拒都會寫稽核。
+
+## `GET /ops/failed-events` / `POST /ops/failed-events/{id}/replay`（ADR-008）
+
+V0.3 Phase 4 補上的**事件**層級失敗紀錄，跟上面 `/ops/dlq` 的**Job**層級是
+兩個獨立的視圖——一個是「一批處理事件失敗了」，一個是「一則排程工作失敗
+了」，語意不同，資料來源也不同（`failed_events` 表 vs `jobs` 表）。
+
+`GET /ops/failed-events`：viewer 以上。沒接 Postgres 回 503。
+`?topic=`、`?unreplayed_only=`（預設 `false`，只給 `true` 才過濾掉已重放
+的列）、`?cursor=`、`?limit=`。
+
+```json
+{
+  "items": [
+    {
+      "id": "0199...",
+      "topic": "raw.collected",
+      "partition": 0,
+      "offset": 1234,
+      "consumer_group": "normalizer",
+      "failure_reason": "...",
+      "attempt_count": 1,
+      "envelope": {"...": "..."},
+      "first_seen": "2026-09-21T...",
+      "last_seen": "2026-09-21T...",
+      "replayed_at": null
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`POST /api/v1/ops/failed-events/{id}/replay`：operator 以上。把
+`envelope` 欄位存的原始事件重發回它原本的 `topic`，成功後標記
+`replayed_at`。找不到 id 回 404；`envelope` 反序列化失敗（資料本身壞了）
+回 500；broker 不可用（沒接上 Redpanda producer）回 503。成功與失敗都
+寫稽核（`failed_event.replay`）。
+
+目前只有三個 consumer（normalizer／deduplicator／entity-worker）的
+單則事件失敗分支會寫入 `failed_events`；indexer 的批次 flush 失敗語意
+不同（整批不進 index、不提交 offset），刻意不接這個機制。
+
+> ⚠️ **重放靠 `envelope` 欄位，不是回頭去 broker 撈**——撈不撈得到取決於
+> retention，而 retention 正是這個機制要避開的坑。重放沒有保留原
+> partition（`partition_key` 傳 `None`），ADR-008 沒有要求要保留。
+> **重放是否冪等是呼叫端的責任**：重複呼叫同一個 id 的 replay 會重複
+> 發布，重放路徑本身不做去重。
 
 ## `GET /ops/discovery`（AI / Discovery 讀側子集）
 
