@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use core_config::AppConfig;
 use core_events::{EventConsumer, EventProducer, EventTopic};
+use core_model::FailedEvent;
 use core_observability::{MetricsRegistry, init_tracing};
 use entity_worker::{EntityWorker, ExtractionBounds, serve_health};
+use storage_core::RelationalStore;
 use storage_core::conformance::load_workspace_dotenv;
 use storage_postgres::PostgresCanonicalStore;
 
@@ -115,12 +117,38 @@ async fn run() -> Result<(), String> {
                                 event_id = %envelope.id,
                                 "entity 抽取處理完畢"
                             ),
-                            Err(err) => tracing::error!(
-                                error = %err,
-                                event_id = %envelope.id,
-                                "entity 抽取失敗，仍提交 offset 以免卡住 partition。\
-                                 該 Document 的 claim 沒有寫入，重送事件時會再試一次"
-                            ),
+                            Err(err) => {
+                                // 這則事件本身處理失敗，不是消費失敗：記錄成
+                                // failed_event（ADR-008）。寫入失敗只 warn，不影響
+                                // 後續的 commit_last——一則毒訊息照舊不卡 partition。
+                                tracing::error!(
+                                    error = %err,
+                                    event_id = %envelope.id,
+                                    "entity 抽取失敗，仍提交 offset 以免卡住 partition。\
+                                     該 Document 的 claim 沒有寫入，重送事件時會再試一次"
+                                );
+                                if let Some((topic, partition, offset)) =
+                                    consumer.last_coordinates()
+                                {
+                                    let failed = FailedEvent {
+                                        id: uuid::Uuid::now_v7(),
+                                        topic,
+                                        partition,
+                                        offset,
+                                        consumer_group: cfg.entity_worker.consumer_group.clone(),
+                                        failure_reason: err.to_string(),
+                                        attempt_count: 1,
+                                        envelope: serde_json::to_value(&envelope)
+                                            .unwrap_or(serde_json::json!({})),
+                                        first_seen: chrono::Utc::now(),
+                                        last_seen: chrono::Utc::now(),
+                                        replayed_at: None,
+                                    };
+                                    if let Err(store_err) = store.put_failed_event(&failed).await {
+                                        tracing::warn!(error = %store_err, "寫入 failed_events 失敗，事件仍會照常提交 offset");
+                                    }
+                                }
+                            }
                         }
                         if let Err(err) = consumer.commit_last() {
                             tracing::warn!(error = %err, "commit offset 失敗");

@@ -11,6 +11,10 @@
 //! * `GET /ops/dlq`：失敗的 Job 清單（SPEC §31「basic DLQ view」）。
 //!   **V0.1 沒有 DLQ topic**，回應裡的 `dlq_topic: null` 就是這件事的宣告。
 //! * `GET /ops/graph`：圖投影 lag 與 rebuild 狀態。沒接 Neo4j 回 503。
+//! * `GET /ops/failed-events`：永久失敗的事件清單（ADR-008）。支援依 topic、
+//!   是否已重放過濾，cursor 分頁（SPEC §31）。
+//! * `POST /ops/failed-events/{id}/replay`：把一則失敗事件的原始 envelope 重發回它
+//!   原本的 topic 並標記為已重放（ADR-008 的手動復原路徑）。operator 以上。
 //!
 //! # 為什麼與 `/ready`、`/metrics` 分開
 //!
@@ -39,14 +43,21 @@ use axum::http::StatusCode;
 use chrono::Utc;
 use core_observability::{CheckResult, ReadyStatus};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use storage_core::HealthProvider;
+use uuid::Uuid;
 
 use core_security::{Permission, Principal};
 
 use crate::error::ApiError;
+use crate::extractors::ClientIp;
+use crate::pagination::{CursorPage, Pagination};
 use crate::ready::ReadyCheck;
-use crate::resources::storage_error;
+use crate::resources::{AuditEvent, audit, rejected_metadata, storage_error, store};
 use crate::state::AppState;
+
+/// 稽核 action。字串會進稽核表，改動等於改稽核查詢條件（比照 `jobs.rs` 的常數）。
+pub const AUDIT_FAILED_EVENT_REPLAY: &str = "failed_event.replay";
 
 /// 把任何 `HealthProvider`（storage adapter）包成一個具名的 ops 檢查。
 ///
@@ -665,6 +676,189 @@ pub async fn dlq(
         failed_jobs,
         truncated,
     }))
+}
+
+// --------------------------------------------------------------- failed events
+
+/// `GET /ops/failed-events` 的 query。過濾條件進 SQL（跟 `/ops/dlq` 的 Job 視圖
+/// 是兩個獨立的東西——一個是失敗 Job，一個是失敗事件，語意不同）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FailedEventsQuery {
+    /// 不限 topic 時省略或空白。
+    pub topic: Option<String>,
+    /// `true` 只回還沒被重放過的（`replayed_at IS NULL`）。預設 `false`。
+    pub unreplayed_only: Option<bool>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// `GET /api/v1/ops/failed-events`。viewer 以上。
+///
+/// 列出永久失敗的事件（ADR-008）。含已重放的列——「上次那批到底補回去了沒」
+/// 只能靠它回答（同 trait 的註解）。
+pub async fn list_failed_events(
+    State(state): State<AppState>,
+    principal: Principal,
+    axum::extract::Query(query): axum::extract::Query<FailedEventsQuery>,
+) -> Result<Json<CursorPage<core_model::FailedEvent>>, ApiError> {
+    principal.role.require(Permission::Read)?;
+    let store = store(&state)?;
+    let (after, limit) = Pagination {
+        cursor: query.cursor.clone(),
+        limit: query.limit,
+    }
+    .decode()?;
+    let unreplayed_only = query.unreplayed_only.unwrap_or(false);
+    let items = store
+        .list_failed_events_filtered(query.topic.as_deref(), unreplayed_only, after, limit)
+        .await
+        .map_err(storage_error)?;
+    Ok(Json(CursorPage::from_items(items, limit, |e| e.id)))
+}
+
+/// `EventError` → `ApiError`。
+///
+/// 重放是對外部 broker 的呼叫：失敗多半是暫時性（broker 掛、位址設定錯），
+/// 統一回 503 給可以重試的語意，但保留「這是 broker 相關問題」的訊息，
+/// 不要讓呼叫端誤以為 failed event 本身壞了（那由 envelope 反序列化回 500 負責）。
+fn event_error(err: core_events::EventError) -> ApiError {
+    tracing::error!(error = %err, "重放事件到 broker 失敗");
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "Redpanda 暫時無法接受事件。請確認 broker 在跑、[broker].brokers 設定正確，稍後重試",
+    )
+}
+
+/// Redpanda producer handle。沒接上（`AppState.import` 為 `None` 或沒有 producer）
+/// 回 503。`failed_events` 重放需要發得出事件才有意義。
+fn producer_or_unavailable(state: &AppState) -> Result<&Arc<core_events::EventProducer>, ApiError> {
+    let Some(import) = &state.import else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "未接上 Redpanda producer，無法重放事件。請設定 [broker].brokers 並重啟 osint-api",
+        ));
+    };
+    let Some(producer) = import.producer.as_ref() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "未接上 Redpanda producer，無法重放事件。請設定 [broker].brokers 並重啟 osint-api",
+        ));
+    };
+    Ok(producer)
+}
+
+/// `POST /api/v1/ops/failed-events/{id}/replay`。operator 以上。
+///
+/// 把 failed event 存的原始 envelope 重新發回它原本的 topic（ADR-008 的手動
+/// 復原路徑），成功後標記 `replayed_at`。資料壞掉（envelope 解不回來）回 500，
+/// 因為那是資料本身的問題，跟呼叫端無關。成功與失敗都寫稽核（比照
+/// `jobs.rs::retry_job`）。
+pub async fn replay_failed_event(
+    State(state): State<AppState>,
+    principal: Principal,
+    ip: ClientIp,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<core_model::FailedEvent>, ApiError> {
+    principal.role.require(Permission::Write)?;
+    let result = async {
+        let store = store(&state)?;
+        let event = store
+            .get_failed_event(id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    format!(
+                        "failed event {id} 不存在。請先查 GET /api/v1/ops/failed-events \
+                         拿一個有效的 id"
+                    ),
+                )
+            })?;
+        let envelope: core_events::EventEnvelope = serde_json::from_value(event.envelope.clone())
+            .map_err(|err| {
+            ApiError::internal(format!(
+                "這筆 failed event 的 envelope 無法還原成事件：{err}。\
+                     資料本身壞了，無法重放；若持續發生請檢查寫入時用的序列化邏輯"
+            ))
+        })?;
+        let producer = producer_or_unavailable(&state)?;
+        producer
+            .publish_to_topic(&event.topic, None, &envelope)
+            .await
+            .map_err(event_error)?;
+        // 重放成功才標記；publish 失敗就不標記，讓它躺著可以再重試。
+        let replayed_at = Utc::now();
+        if !store
+            .mark_replayed(id, replayed_at)
+            .await
+            .map_err(storage_error)?
+        {
+            tracing::warn!(
+                failed_event_id = %id,
+                "重放成功但 mark_replayed 回 false（列已消失？）"
+            );
+        }
+        // 重讀一次回更新後的列（比照 discovery.rs::set_candidate_status）。
+        // `mark_replayed` 剛回 true，理論上一定讀得到；讀不到是有人從外部刪了列。
+        match store.get_failed_event(id).await.map_err(storage_error)? {
+            Some(event) => Ok(event),
+            None => Err(ApiError::internal(format!(
+                "重放成功、mark_replayed 也回 true，但重讀 {id} 讀不到列。\
+                 請確認 failed_events 表沒有被外部刪除"
+            ))),
+        }
+    }
+    .await;
+    audit_failed_event_replay(&state, &principal, &ip, id, &result).await;
+    result.map(Json)
+}
+
+/// 重放動作的稽核。成功與失敗都寫（比照 `jobs.rs::audit_outcome` 的立意：
+/// 只記成功的話，「一直嘗試重放同一筆不存在的 id」這種訊號完全看不到）。
+async fn audit_failed_event_replay(
+    state: &AppState,
+    principal: &Principal,
+    ip: &ClientIp,
+    id: Uuid,
+    result: &Result<core_model::FailedEvent, ApiError>,
+) {
+    match result {
+        Ok(_) => {
+            audit(
+                state,
+                principal,
+                ip,
+                AuditEvent {
+                    action: AUDIT_FAILED_EVENT_REPLAY,
+                    resource_type: "failed_event",
+                    resource_id: Some(id.to_string()),
+                    outcome: "success",
+                    metadata: json!({}),
+                },
+            )
+            .await;
+        }
+        Err(err) => {
+            audit(
+                state,
+                principal,
+                ip,
+                AuditEvent {
+                    action: AUDIT_FAILED_EVENT_REPLAY,
+                    resource_type: "failed_event",
+                    resource_id: Some(id.to_string()),
+                    outcome: "rejected",
+                    metadata: rejected_metadata(err, json!({})),
+                },
+            )
+            .await;
+        }
+    }
 }
 
 // --------------------------------------------------------------- graph projection

@@ -292,6 +292,25 @@ impl EventConsumer {
                 message: err.to_string(),
             })
     }
+
+    /// 上一則成功解析的 envelope 的座標 `(topic, partition, offset)`。
+    ///
+    /// `next_envelope` 呼叫成功後才會有值；[`Self::commit_last`] 用的是同一份
+    /// `last` 資料，這裡只是把它變成可讀，給失敗分支組 `FailedEvent` 用
+    /// （ADR-008：錯誤分支要記錄是哪一則事件處理失敗）。
+    ///
+    /// `remember_offset` 存的是「下一筆要讀」的 offset（Kafka 慣例，offset+1），
+    /// 這裡要還原成「剛剛處理的那一則」的真實 offset，所以要減 1。
+    ///
+    /// 沒有上一則（尚未成功讀到任何 envelope）或 lock 被毒化時回 `None`。
+    pub fn last_coordinates(&self) -> Option<(String, i32, i64)> {
+        // `remember_offset` 每次寫入的都是「只有一筆」的 list，所以空 list 等於
+        // 「沒有上一則」。lock 被毒化也回 None，不要把失敗當成 panic。
+        match self.last.lock() {
+            Ok(guard) => first_coordinates(&guard.clone().unwrap_or(TopicPartitionList::new())),
+            Err(_) => None,
+        }
+    }
 }
 
 fn remember_offset(
@@ -311,6 +330,30 @@ fn remember_offset(
     }
 }
 
+/// 從 `TopicPartitionList` 取出第一筆的 `(topic, partition, offset)`。
+///
+/// `remember_offset` 每次都建一份全新、只有一筆的 list，所以取 elements 第一筆。
+/// `offset` 減 1：`remember_offset` 存的是「下一筆要讀」的 offset（Kafka 慣例），
+/// 這裡要還原成「剛剛處理的那一則」的真實 offset。
+///
+/// `Offset` 除了 `Offset::Offset(_)` 之外都是「沒有數值的記號」；理論上不會出現
+/// （`remember_offset` 自己寫入的一定是 `Offset::Offset`），但不要 `unwrap`，
+/// 用 match 對其他分支回 `None`。
+fn first_coordinates(list: &TopicPartitionList) -> Option<(String, i32, i64)> {
+    if let Some(element) = list.elements().into_iter().next() {
+        let topic = element.topic();
+        let partition = element.partition();
+        match element.offset() {
+            Offset::Offset(value) => {
+                return Some((topic.to_string(), partition, value.saturating_sub(1)));
+            }
+            // Invalid／Beginning／End／Stored／OffsetTail 沒有數值，回 None。
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn is_temporary_consume_error(text: &str) -> bool {
     text.contains("UnknownTopicOrPartition")
         || text.contains("unknown topic")
@@ -328,5 +371,33 @@ mod tests {
             Ok(_) => panic!("空 broker 不該連成功"),
             Err(err) => panic!("預期 Configuration，得到 {err}"),
         }
+    }
+
+    #[test]
+    fn remember_offset_stores_next_and_first_coordinates_restores_real_offset() {
+        // 不連 broker：直接測 `remember_offset` 寫入 + `first_coordinates` 還原
+        // 這段座標邏輯本身。`remember_offset` 存「下一筆要讀」的 offset（41 + 1），
+        // `first_coordinates` 要還原成「剛剛處理的那一則」的真實 offset（41）。
+        let last = Mutex::new(None);
+        remember_offset(&last, "raw.collected", 3, 41);
+        let Ok(guard) = last.lock() else {
+            panic!("offset lock 不該被毒化")
+        };
+        let Some(list) = guard.clone() else {
+            panic!("remember_offset 應該寫入座標")
+        };
+        let Some((topic, partition, offset)) = first_coordinates(&list) else {
+            panic!("Offset::Offset 應該有數值")
+        };
+        assert_eq!(topic, "raw.collected");
+        assert_eq!(partition, 3);
+        assert_eq!(offset, 41);
+    }
+
+    #[test]
+    fn empty_list_has_no_coordinates() {
+        // 尚未成功讀到任何 envelope 時，記憶體裡沒有座標，回 None 而不是 panic。
+        let list = TopicPartitionList::new();
+        assert_eq!(first_coordinates(&list), None);
     }
 }

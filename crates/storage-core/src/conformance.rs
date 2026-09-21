@@ -636,6 +636,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
     assert_v0_3_discovery_queries(store, &collection, &entity).await?;
     assert_v0_3_budget_queries(store, &collection).await?;
     assert_v0_2_failed_events(store).await?;
+    assert_v0_2_failed_events_filtered(store).await?;
     assert_embedding_queries(store, document.id).await?;
 
     let missing = Uuid::now_v7();
@@ -2529,6 +2530,98 @@ async fn assert_v0_2_failed_events<S: RelationalStore>(store: &S) -> Result<(), 
         return Err(StorageError::Unknown {
             backend: "conformance",
             message: "mark_replayed 對不存在的 id 應回 false".into(),
+        });
+    }
+    Ok(())
+}
+
+/// ADR-008 的 `failed_events` 過濾查詢：依 topic、是否未重放、以及兩者合併。
+///
+/// 單獨列出與重放標記已經由上面 `assert_v0_2_failed_events` 覆蓋，這裡只驗證
+/// 新增的 `list_failed_events_filtered` 三種組合沒有把過濾條件放錯欄位。
+/// 同一個 topic 放兩筆：一筆未重放、一筆已重放。
+async fn assert_v0_2_failed_events_filtered<S: RelationalStore>(
+    store: &S,
+) -> Result<(), StorageError> {
+    let run = Uuid::now_v7();
+    // topic 帶 run id：共用的 Postgres 上有其他測試的殘留列，避免撞到。
+    let topic = format!("conformance.failed.filtered.{run}");
+    let unreplayed = FailedEvent {
+        id: Uuid::now_v7(),
+        topic: topic.clone(),
+        partition: 1,
+        offset: 100,
+        consumer_group: "conformance-group".into(),
+        failure_reason: "未重放的那筆".into(),
+        attempt_count: 1,
+        envelope: json!({}),
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        replayed_at: None,
+    };
+    store.put_failed_event(&unreplayed).await?;
+    let replayed = FailedEvent {
+        id: Uuid::now_v7(),
+        topic: topic.clone(),
+        partition: 1,
+        offset: 101,
+        consumer_group: "conformance-group".into(),
+        failure_reason: "已重放的那筆".into(),
+        attempt_count: 1,
+        envelope: json!({}),
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        replayed_at: Some(fixture_ts() + chrono::Duration::seconds(60)),
+    };
+    store.put_failed_event(&replayed).await?;
+
+    // (a) 依 topic 過濾（unreplayed_only=false）：該 topic 的兩筆都要回。
+    let by_topic = store
+        .list_failed_events_filtered(Some(&topic), false, None, 10)
+        .await?;
+    if by_topic.len() != 2
+        || !by_topic.iter().any(|e| e.id == unreplayed.id)
+        || !by_topic.iter().any(|e| e.id == replayed.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "依 topic 過濾應回該 topic 的兩筆（{0}、{1}），實際 {by_topic:?}",
+                unreplayed.id, replayed.id,
+            ),
+        });
+    }
+
+    // (b) unreplayed_only=true 不限 topic：只回未重放的列。共用表上有其他測試的
+    // 資料，所以在這裡用 `e.topic == topic` 收窄到本測試建立的那一欄。
+    let only_unreplayed: Vec<Uuid> = store
+        .list_failed_events_filtered(None, true, None, 10)
+        .await?
+        .iter()
+        .filter(|e| e.topic == topic)
+        .map(|e| e.id)
+        .collect();
+    if only_unreplayed != [unreplayed.id] {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "unreplayed_only=true 應只回未重放的那筆（{0}），實際 {only_unreplayed:?}",
+                unreplayed.id,
+            ),
+        });
+    }
+
+    // (c) 兩個條件同時給：只回該 topic、未重放的那筆。
+    let both = store
+        .list_failed_events_filtered(Some(&topic), true, None, 10)
+        .await?;
+    if both.len() != 1 || both[0].id != unreplayed.id {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "topic + unreplayed_only 合併過濾應只回 {0}，實際 {both:?}",
+                unreplayed.id,
+            ),
         });
     }
     Ok(())

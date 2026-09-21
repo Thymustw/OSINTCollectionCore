@@ -282,6 +282,52 @@ jobs:
           path: sbom-${{ matrix.service }}.cdx.json
           retention-days: 30
 
+  # ADR-010 の SBOM 缺口：Neo4j 是外部 registry image（不是本 repo build 出來
+  # 的），所以不能跟其他九個服務共用 image-build → download-artifact 那條路
+  # （那套是為了掃描本 repo 自建 image 的 tar 產物）。直接 pull 官方 image
+  # 後用同一套 trivy 流程掃，理由與範圍見
+  # docs/adr/ADR-010-neo4j-community-edition.md Consequences 段落。
+  sbom-neo4j:
+    name: SBOM + scan (neo4j)
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker pull neo4j:5.26.30-community
+      - name: Generate CycloneDX SBOM
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: neo4j:5.26.30-community
+          format: cyclonedx
+          output: sbom-neo4j.cdx.json
+          exit-code: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-neo4j
+          path: sbom-neo4j.cdx.json
+          retention-days: 30
+      # 兩段式，跟下面 image-scan 的 osint-core/* 服務同一套規矩
+      # （HIGH 列出來分流、CRITICAL 擋）。
+      - name: HIGH findings (triage list, non-blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: neo4j:5.26.30-community
+          scanners: vuln
+          severity: HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "0"
+      - name: CRITICAL gate (blocking)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: neo4j:5.26.30-community
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
   image-scan:
     name: Image scan (${{ matrix.service }})
     runs-on: ubuntu-latest

@@ -1132,6 +1132,15 @@ mod tests {
         ) -> Result<Vec<FailedEvent>, StorageError> {
             Self::unsupported("list_failed_events")
         }
+        async fn list_failed_events_filtered(
+            &self,
+            _: Option<&str>,
+            _: bool,
+            _: Option<FailedEventId>,
+            _: u32,
+        ) -> Result<Vec<FailedEvent>, StorageError> {
+            Self::unsupported("list_failed_events_filtered")
+        }
         async fn mark_replayed(
             &self,
             _: FailedEventId,

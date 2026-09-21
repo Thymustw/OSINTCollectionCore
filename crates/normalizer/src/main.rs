@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use core_config::AppConfig;
 use core_events::{EventConsumer, EventProducer, EventTopic};
+use core_model::FailedEvent;
 use core_observability::{MetricsRegistry, init_tracing};
 use normalizer::{Normalizer, serve_health};
+use storage_core::RelationalStore;
 use storage_core::conformance::{load_workspace_dotenv, verify_not_opencti_s3};
 use storage_postgres::PostgresCanonicalStore;
 use storage_s3::S3ObjectStore;
@@ -126,7 +128,33 @@ async fn run() -> Result<(), String> {
                     Ok(envelope) => {
                         match service.handle_payload(&envelope.payload).await {
                             Ok(outcome) => tracing::info!(?outcome, event_id = %envelope.id, "正規化完成"),
-                            Err(err) => tracing::error!(error = %err, event_id = %envelope.id, "正規化失敗，仍提交 offset 以免卡住 partition"),
+                            Err(err) => {
+                                tracing::error!(error = %err, event_id = %envelope.id, "正規化失敗，仍提交 offset 以免卡住 partition");
+                                // ADR-008：把這則失敗的事件落地成可查詢的紀錄。
+                                // 寫入失敗只 warn，**不影響後續流程**——`commit_last`
+                                // 照樣要執行，否則一則毒訊息會卡死整個 partition。
+                                if let Some((topic, partition, offset)) =
+                                    consumer.last_coordinates()
+                                {
+                                    let failed = FailedEvent {
+                                        id: uuid::Uuid::now_v7(),
+                                        topic,
+                                        partition,
+                                        offset,
+                                        consumer_group: cfg.normalizer.consumer_group.clone(),
+                                        failure_reason: err.to_string(),
+                                        attempt_count: 1,
+                                        envelope: serde_json::to_value(&envelope)
+                                            .unwrap_or(serde_json::json!({})),
+                                        first_seen: chrono::Utc::now(),
+                                        last_seen: chrono::Utc::now(),
+                                        replayed_at: None,
+                                    };
+                                    if let Err(store_err) = store.put_failed_event(&failed).await {
+                                        tracing::warn!(error = %store_err, "寫入 failed_events 失敗，事件仍會照常提交 offset");
+                                    }
+                                }
+                            }
                         }
                         if let Err(err) = consumer.commit_last() {
                             tracing::warn!(error = %err, "commit offset 失敗");

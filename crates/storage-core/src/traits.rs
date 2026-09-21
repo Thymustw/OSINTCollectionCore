@@ -613,6 +613,17 @@ pub trait RelationalStore: HealthProvider {
         after: Option<FailedEventId>,
         limit: u32,
     ) -> Result<Vec<FailedEvent>, StorageError>;
+    /// 依 topic 與是否已重放過濾的 failed_events 查詢。`topic: None` 代表不限
+    /// topic；`unreplayed_only: true` 只回 `replayed_at IS NULL` 的列（走既有
+    /// migration 建好的 partial index `idx_failed_events_unreplayed`）。
+    /// cursor/limit 語意同 [`RelationalStore::list_failed_events`]（UUID v7 由新到舊）。
+    async fn list_failed_events_filtered(
+        &self,
+        topic: Option<&str>,
+        unreplayed_only: bool,
+        after: Option<FailedEventId>,
+        limit: u32,
+    ) -> Result<Vec<FailedEvent>, StorageError>;
     /// 標記一則 failed event 已重放成功。回傳是否真的更新到列。
     ///
     /// `replayed_at` 由呼叫端傳入而不是 adapter 自己取 `Utc::now()`：

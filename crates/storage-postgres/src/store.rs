@@ -2232,6 +2232,33 @@ impl RelationalStore for PostgresCanonicalStore {
         rows.iter().map(mapping::failed_event).collect()
     }
 
+    async fn list_failed_events_filtered(
+        &self,
+        topic: Option<&str>,
+        unreplayed_only: bool,
+        after: Option<FailedEventId>,
+        limit: u32,
+    ) -> Result<Vec<FailedEvent>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM failed_events
+            WHERE ($1::uuid IS NULL OR id < $1)
+              AND ($2::text IS NULL OR topic = $2)
+              AND ($3::bool = FALSE OR replayed_at IS NULL)
+            ORDER BY id DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(after)
+        .bind(topic)
+        .bind(unreplayed_only)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::failed_event).collect()
+    }
+
     async fn mark_replayed(
         &self,
         id: FailedEventId,

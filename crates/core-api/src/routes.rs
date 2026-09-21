@@ -44,6 +44,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs/{id}/transition", post(jobs::transition_job))
         .route("/api/v1/jobs/{id}/dispatch", post(jobs::dispatch_job))
         .route("/api/v1/jobs/{id}/retry", post(jobs::retry_job))
+        .route(
+            "/api/v1/ops/failed-events/{id}/replay",
+            post(ops::replay_failed_event),
+        )
         .route("/api/v1/sources", post(resources::sources::create_source))
         .route(
             "/api/v1/sources/{id}",
@@ -196,6 +200,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/ops/connectors", get(ops::connectors))
         .route("/api/v1/ops/queues", get(ops::queues))
         .route("/api/v1/ops/dlq", get(ops::dlq))
+        .route("/api/v1/ops/failed-events", get(ops::list_failed_events))
         .route("/api/v1/ops/graph", get(ops::graph_projection))
         .route(
             "/api/v1/graph/entities/{id}/neighbors",
