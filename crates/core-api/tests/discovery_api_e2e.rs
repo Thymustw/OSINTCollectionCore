@@ -164,6 +164,33 @@ async fn put_candidate_fixture(stack: &Stack, collection_id: Option<Uuid>) -> Ca
     candidate
 }
 
+/// 讀 `candidate_type: Url` 的 fixture，`value` 由呼叫端指定（approve 前
+/// 的 URL 格式驗證只在這種 candidate 上觸發）。
+async fn put_url_candidate_fixture(stack: &Stack, value: String) -> Candidate {
+    let now = Utc::now();
+    let candidate = Candidate {
+        id: Uuid::now_v7(),
+        candidate_type: CandidateType::Url,
+        value: value.clone(),
+        normalized_value: value,
+        collection_id: None,
+        discovered_by: "ds-e2e-seed".into(),
+        discovery_method: "link_expansion".into(),
+        confidence: 0.85,
+        score: 0.9,
+        status: CandidateStatus::Pending,
+        depth: 1,
+        created_at: now,
+        reviewed_at: None,
+    };
+    stack
+        .pg
+        .put_candidate(&candidate)
+        .await
+        .expect("seed url candidate");
+    candidate
+}
+
 async fn put_evidence_fixture(stack: &Stack, candidate_id: Uuid) -> CandidateEvidence {
     let evidence = CandidateEvidence {
         id: Uuid::now_v7(),
@@ -391,6 +418,79 @@ async fn reject_candidate_audits_reject_action() {
         .find(|e| e.action == core_api::AUDIT_CANDIDATE_REJECT)
         .expect("candidate.reject audit");
     assert_eq!(reject.outcome, "success");
+}
+
+// §26「unsafe model-generated URL/action」：approve 一筆 Url candidate 之前，
+// value 必須能被 `url_norm::canonicalize` 正規化成絕對 URL，否則 400 拒絕。
+// reject 不受這道驗證影響——拒絕一個格式不合格的 candidate 永遠放行。
+#[tokio::test]
+async fn approve_url_candidate_with_non_absolute_value_is_400() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    // 沒有 scheme、無法解析成絕對 URL——`canonicalize` 回 `None` → 400。
+    // （刻意不用 `javascript:...`：`url` crate 把這類有 scheme 的 opaque URL
+    // 視為 can-be-a-base，canonicalize 會接受；那不是這道關卡的攔截對象。）
+    let candidate = put_url_candidate_fixture(&stack, "path-without-scheme".into()).await;
+
+    let (status, resp) = send(
+        &api.app,
+        post(
+            &format!("/api/v1/candidates/{}/approve", candidate.id),
+            &api.operator,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+    assert!(
+        resp["message"].as_str().unwrap().contains("不是合法 URL"),
+        "{resp}"
+    );
+
+    // 被拒後狀態不該被改動，仍是 pending。
+    let (get_status, get_resp) = send(
+        &api.app,
+        get(&format!("/api/v1/candidates/{}", candidate.id), &api.viewer),
+    )
+    .await;
+    assert_eq!(get_status, StatusCode::OK);
+    assert_eq!(get_resp["status"], json!("pending"), "{get_resp}");
+}
+
+#[tokio::test]
+async fn approve_url_candidate_with_valid_absolute_url_succeeds() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let candidate = put_url_candidate_fixture(&stack, "https://example.com/path".into()).await;
+
+    let (status, resp) = send(
+        &api.app,
+        post(
+            &format!("/api/v1/candidates/{}/approve", candidate.id),
+            &api.operator,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["status"], json!("approved"), "{resp}");
+}
+
+#[tokio::test]
+async fn reject_url_candidate_ignores_url_validation() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    // 跟前一筆 approve 測試相同的不合法 URL：reject 必須照樣成功，不被擋住。
+    let candidate = put_url_candidate_fixture(&stack, "path-without-scheme".into()).await;
+
+    let (status, resp) = send(
+        &api.app,
+        post(
+            &format!("/api/v1/candidates/{}/reject", candidate.id),
+            &api.operator,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["status"], json!("rejected"), "{resp}");
 }
 
 #[tokio::test]

@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use core_model::{
-    AiRun, Candidate, CandidateEvidence, CandidateStatus, Job, Seed, SeedOrigin, SeedType,
+    AiRun, Candidate, CandidateEvidence, CandidateStatus, CandidateType, Job, Seed, SeedOrigin,
+    SeedType, url_norm,
 };
 use core_security::{Permission, Principal};
 
@@ -307,12 +308,45 @@ pub async fn get_candidate(
 /// `update_candidate_status` 回 `false` 代表 `id` 不存在，轉成 404。
 /// 更新成功後緊接著的 `get_candidate` 理論上不可能讀不到（沒有刪除 API）；
 /// 讀不到代表出現了沒設計到的併發狀況，用 500 讓它明確可見，不要吞掉。
+///
+/// `validate_url` 只在 approve 路徑開 `true`：核准一筆 `candidate_type == Url`
+/// 的 candidate 之前，先確認它的 `value` 能被 `url_norm::canonicalize` 正規化
+/// 成有明確身分的絕對 URL（§26「unsafe model-generated URL/action」的其中一道
+/// 關卡）。reject 永遠放行——拒絕一個格式不合格的 candidate 不該被這道檢查擋住
+/// （見下面的 `reject_candidate`）。
+///
+/// **已知界線**：`canonicalize` 只擋「無法解析成絕對 URL」的字串——`javascript:`／
+/// `data:` 這類有 scheme 的 opaque URL（cannot-be-a-base）會被 `url` crate 接受、
+/// canonicalize 會回 `Some`。所以這道關卡**不攔**這類危險 scheme，只驗格式、不驗
+/// scheme 安全。若要連它們一起擋，需要在這裡外加 http/https scheme 白名單
+/// （目前刻意不做，維持本關卡的最小範圍）。
 async fn set_candidate_status(
     state: &AppState,
     id: Uuid,
     status: CandidateStatus,
+    validate_url: bool,
 ) -> Result<Candidate, ApiError> {
     let store = store(state)?;
+    if validate_url {
+        let candidate = store
+            .get_candidate(id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "找不到 Candidate `{id}`。請用 GET /api/v1/candidates 確認 id"
+                ))
+            })?;
+        if candidate.candidate_type == CandidateType::Url
+            && url_norm::canonicalize(&candidate.value).is_none()
+        {
+            return Err(ApiError::bad_request(format!(
+                "Candidate `{id}`（candidate_type=Url）的 value `{}` 不是合法 URL，\
+拒絕核准。請提供能被正規化成有 host 的絕對 URL（例如 https://example.com/path）",
+                url_norm::short(&candidate.value),
+            )));
+        }
+    }
     let updated = store
         .update_candidate_status(id, status, Utc::now())
         .await
@@ -337,7 +371,7 @@ pub async fn approve_candidate(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Candidate>, ApiError> {
     principal.role.require(Permission::Write)?;
-    match set_candidate_status(&state, id, CandidateStatus::Approved).await {
+    match set_candidate_status(&state, id, CandidateStatus::Approved, true).await {
         Ok(candidate) => {
             audit(
                 &state,
@@ -381,7 +415,7 @@ pub async fn reject_candidate(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Candidate>, ApiError> {
     principal.role.require(Permission::Write)?;
-    match set_candidate_status(&state, id, CandidateStatus::Rejected).await {
+    match set_candidate_status(&state, id, CandidateStatus::Rejected, false).await {
         Ok(candidate) => {
             audit(
                 &state,
