@@ -950,7 +950,7 @@ mod tests {
         assert_eq!(cfg.auto_approval.llm.model_version, "unknown");
         assert_eq!(cfg.auto_approval.llm.timeout_secs, 30);
         assert_eq!(cfg.auto_approval.llm.max_retries, 0);
-        assert_eq!(cfg.auto_approval.llm.max_concurrent, 2);
+        assert_eq!(cfg.auto_approval.llm.max_concurrent, 24);
         assert_eq!(cfg.auto_approval.llm.max_tokens, 512);
         assert_eq!(cfg.auto_approval.llm.temperature, 0.0);
         assert!(!cfg.auto_approval.llm.enable_reasoning);

@@ -220,8 +220,14 @@ base_url = "http://ai-inference:8000/v1"
 model = "qwen-primary"
 model_version = "unknown"
 timeout_secs = 30
+# 24：2026-09-22 對實際部署的 benchmark matrix 實測結果（1-32 並發，
+# 詳見部署現況記錄）——aggregate throughput 在 24 並發時達到甜蜜點
+# （187.22 TPS，全部成功），32 並發時吞吐量反而下降且延遲大幅跳升。
+# 這是在特定模型/服務端/prompt 下測出來的值，換一個部署環境（不同
+# GPU、不同模型、獨占 vs 共用）合理的上限可能不同，重新部署時應該
+# 重跑一次 benchmark matrix 校準這個值，不要直接沿用。
 max_retries = 0
-max_concurrent = 2
+max_concurrent = 24
 max_tokens = 512
 temperature = 0.0
 # entity resolution 是結構化輸入上的二元判斷，預設關閉推理以省 token。
