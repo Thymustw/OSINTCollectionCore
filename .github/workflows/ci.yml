@@ -222,7 +222,7 @@ jobs:
       # 產出存成 tar 給 sbom / image-scan job 用。分成不同 job 是為了讓
       # DEVSECOPS §12 的 gate 在 CI 上各自可見（哪一關擋下來一目了然），
       # 不是為了讓它們各自重編一次。
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
