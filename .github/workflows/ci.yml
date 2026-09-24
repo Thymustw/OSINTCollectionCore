@@ -215,7 +215,7 @@ jobs:
           - osint-stix-worker
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       # 九個 target 共用同一個 builder stage。GHA cache 讓第二個之後的
       # service 直接命中，不會把同一份 workspace 編八次。
       #
