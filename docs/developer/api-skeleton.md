@@ -810,7 +810,7 @@ SPEC_V0.3 §27 的讀側子集。viewer 以上。沒接 Postgres 回 503。
 - `ai_max_concurrent_requests` 是 `auto_approval.llm.max_concurrent` 的**靜態設定值**，不是即時 in-flight 請求數。系統目前沒有任何地方在計數「現在有幾個 AI 呼叫正在進行」。
 - `candidate_backlog` 是近似值：對每個 `CandidateStatus` 各撈一次（上限 100，對齊 storage 的 `clamp_limit`）取 `.len()`。某個 status 超過上限時 `saturated: true`，代表「至少有這麼多」而不是「剛好這麼多」。沒有 COUNT 查詢可用。
 - `ai_run_recent` 與 `GET /ai/runs` 是同一份資料，這裡只回最近 20 筆；完整清單請走那個 endpoint。
-- `note` 重述延後項目：P0–P4 佇列、即時 TPS/TTFT/P95、Admission Controller、pause/resume/drain 延後到 V0.3 Phase 5。缺的欄位不代表系統沒有問題。
+- `note` 重述尚未掛上這個 endpoint 的項目：P0–P4 佇列深度、即時 TPS/TTFT/P95、Admission Controller state、pause/resume/drain。Admission Controller **本體**已在 `ai-gateway`（V0.3 Phase 5）落地，但這個讀側 endpoint 還沒把它曝露出來。缺的欄位不代表系統沒有問題。
 
 ## API token 管理（`/api/v1/tokens`，admin-only）
 

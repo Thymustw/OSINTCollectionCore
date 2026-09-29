@@ -24,6 +24,7 @@ struct Inner {
     search_latency_ms_sum: AtomicU64,
     search_latency_count: AtomicU64,
     extra: Mutex<BTreeMap<String, u64>>,
+    extra_gauges: Mutex<BTreeMap<String, u64>>,
 }
 
 impl MetricsRegistry {
@@ -97,6 +98,19 @@ impl MetricsRegistry {
         *extra.entry(name.to_string()).or_insert(0) += n;
     }
 
+    /// 任意 gauge（可上可下的即時值，不同於 [`Self::inc`] 的只能遞增）。
+    /// 名稱驗證規則同 [`Self::inc`]：只接受 `[a-z0-9_]`。
+    pub fn set_gauge(&self, name: &str, value: u64) {
+        if !is_metric_name(name) {
+            tracing::warn!(name, "忽略不合法的 metric 名稱");
+            return;
+        }
+        let Ok(mut gauges) = self.inner.extra_gauges.lock() else {
+            return;
+        };
+        gauges.insert(name.to_string(), value);
+    }
+
     /// Prometheus text exposition（非正式 parser，給 `/metrics` 用）。
     #[must_use]
     pub fn render_prometheus(&self) -> String {
@@ -150,6 +164,11 @@ impl MetricsRegistry {
         if let Ok(extra) = self.inner.extra.lock() {
             for (name, value) in extra.iter() {
                 push_counter(&mut out, name, *value);
+            }
+        }
+        if let Ok(gauges) = self.inner.extra_gauges.lock() {
+            for (name, value) in gauges.iter() {
+                push_gauge(&mut out, name, *value);
             }
         }
         out
@@ -248,6 +267,49 @@ mod tests {
     fn rejects_bad_extra_name() {
         let m = MetricsRegistry::new();
         m.inc("Not Valid", 1);
+        assert!(!m.render_prometheus().contains("Not Valid"));
+    }
+
+    #[test]
+    fn set_gauge_renders_as_gauge_and_does_not_affect_counters() {
+        let m = MetricsRegistry::new();
+        m.inc_collected(10);
+        m.inc("osint_ai_admission_rejected_total", 3);
+        m.set_gauge("osint_ai_admission_p0_available", 2);
+        m.set_gauge("osint_ai_admission_p0_available", 1);
+
+        let text = m.render_prometheus();
+        assert!(
+            text.contains("# TYPE osint_ai_admission_p0_available gauge"),
+            "set_gauge 必須渲染成 gauge，實際 {text}"
+        );
+        assert!(
+            text.contains("osint_ai_admission_p0_available 1"),
+            "set_gauge 應覆寫成最新值，實際 {text}"
+        );
+        assert!(
+            !text.contains("# TYPE osint_ai_admission_p0_available counter"),
+            "gauge 不該被宣告成 counter，實際 {text}"
+        );
+        assert!(
+            text.contains("# TYPE osint_ai_admission_rejected_total counter"),
+            "既有 extra counter 必須維持 counter，實際 {text}"
+        );
+        assert!(
+            text.contains("osint_ai_admission_rejected_total 3"),
+            "inc() 累加不得被 set_gauge 影響，實際 {text}"
+        );
+        assert!(
+            text.contains("# TYPE osint_collected_total counter"),
+            "內建 counter 不得被 set_gauge 影響，實際 {text}"
+        );
+        assert!(text.contains("osint_collected_total 10"), "{text}");
+    }
+
+    #[test]
+    fn set_gauge_rejects_bad_name() {
+        let m = MetricsRegistry::new();
+        m.set_gauge("Not Valid", 1);
         assert!(!m.render_prometheus().contains("Not Valid"));
     }
 }

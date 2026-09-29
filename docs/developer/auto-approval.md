@@ -112,6 +112,29 @@ LLM 預期回傳以下格式的 JSON：
 | `temperature` | `0.0` | 0.0 = 確定性輸出，適合判斷任務 |
 | `enable_reasoning` | `false` | 是否允許模型展開推理過程。`false` 時 `ai-gateway` 會在請求加 `chat_template_kwargs.enable_thinking=false`，關閉 chain-of-thought（更快、省 token）。`true` 時不加這個欄位，沿用 endpoint 預設。這是呼叫端明確宣告，不是依 `task_type` 自動推導——entity resolution 的二元判斷輸入已結構化，預設關閉 |
 
+### Admission 優先權（不走 config）
+
+`priority` **不是** `[auto_approval]` 的設定欄位。它代表這個呼叫端在架構
+裡的角色，硬編在組裝點。實作在 `crates/ai-gateway/src/admission.rs` 的
+`AdmissionController`：P0 走 `try_admit_p0`（立刻成功或立刻失敗），P1–P4
+走 `admit`（通過壓力判斷後才等 shared semaphore）。
+
+| 組裝點 | 值 | 理由 |
+|---|---|---|
+| `core-api::assemble_auto_approval` | `Priority::P0` | `POST /entities/{id}/resolve` 是使用者在等的同步 HTTP；P0 走獨立保留名額，拿不到立刻失敗、不排隊 |
+| `stix-worker::main` | `Priority::P3` | 背景 enrichment，走 P1–P4 共用佇列，可被資源壓力擋下 |
+
+`OpenAiCompatibleLlmProviderConfig` 的容量欄位也不走 `[auto_approval]` TOML：
+
+| 欄位 | 這輪的值 | 意義 |
+|---|---|---|
+| `p0_reserved_capacity` | 硬編 `2` | P0 同時進行上限。沒有壓測數據，2 是保守起點 |
+| `shared_capacity` | `auto_approval.llm.max_concurrent` | P1–P4 共用名額，沿用既有並發上限以免縮水 |
+
+資源壓力訊號這輪只有 `StaticPressure`（永遠 `Normal`），沒有真實 GPU 監控。
+被拒時 LLM 呼叫回 `AiGatewayError::Transient`，評估器收斂成 `Pending`，
+不會擋住 ingestion。
+
 ### 門檻自洽檢查
 
 啟動時 `core-api` 呼叫 `AutoApprovalSection::thresholds_are_sane()`
@@ -257,7 +280,18 @@ ORDER BY created_at DESC;
 
 ### Metrics
 
-ADR-012 記錄的 metric 名稱（目前為規格，實作在後續版本補上）：
+Admission Controller 已寫入 `MetricsRegistry`（`/metrics` Prometheus text）：
+
+- `osint_ai_admission_p0_available`（gauge）——P0 剩餘保留名額
+- `osint_ai_admission_shared_available`（gauge）——P1–P4 共用佇列剩餘名額
+- `osint_ai_admission_rejected_total`（counter）——admission 被拒次數
+
+這些值在每次 `chat_completion` 通過（或拒絕）admission 時更新（gauge 走
+`MetricsRegistry::set_gauge`，跟 `inc()` 的 counter 分開存放，Prometheus
+輸出是 `# TYPE … gauge`）。`metrics: None` 時不記錄（測試 fixture 與未接
+registry 的組裝點）。
+
+ADR-012 記錄、尚未實作的 metric：
 
 - `auto_approval_merges_total{source, decision_path, method}`
 - `auto_approval_llm_calls_total{outcome}`

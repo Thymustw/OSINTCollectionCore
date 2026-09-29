@@ -64,6 +64,7 @@ fn disabled_auto() -> AutoApprovalConfig {
         llm_temperature: 0.0,
         llm_max_tokens: 16,
         enable_reasoning: false,
+        priority: ai_gateway::Priority::P3,
     }
 }
 
@@ -78,6 +79,7 @@ fn alias_auto() -> AutoApprovalConfig {
         llm_temperature: 0.0,
         llm_max_tokens: 16,
         enable_reasoning: false,
+        priority: ai_gateway::Priority::P3,
     }
 }
 

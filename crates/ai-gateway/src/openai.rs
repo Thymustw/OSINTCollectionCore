@@ -21,8 +21,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::redact::{redact_credentials, truncate};
 use crate::{
-    AiGatewayError, ChatCompletionRequest, ChatCompletionResponse, ChatRole, LlmProvider,
-    TokenUsage,
+    AdmissionController, AiGatewayError, ChatCompletionRequest, ChatCompletionResponse, ChatRole,
+    LlmProvider, Priority, StaticPressure, TokenUsage,
 };
 
 /// 組裝 [`OpenAiCompatibleLlmProvider`] 用的建構參數。
@@ -54,6 +54,13 @@ pub struct OpenAiCompatibleLlmProviderConfig {
     /// 下一個請求」。`None` 代表不限制（只靠 `max_concurrent` 節流，
     /// V0.3 Phase 1 Step A 之前的既有行為）。
     pub rate_limit_per_second: Option<f64>,
+    /// P0 保留名額容量。互動請求走這條，拿不到立刻失敗、不排隊。
+    pub p0_reserved_capacity: usize,
+    /// P1-P4 共用名額容量。
+    pub shared_capacity: usize,
+    /// metrics registry，用來曝露 admission 狀態。`None` 時不記錄
+    /// metrics（比照「這個能力沒接上」的既有慣例，不 panic、不用假的 registry）。
+    pub metrics: Option<core_observability::MetricsRegistry>,
 }
 
 /// OpenAI 相容 chat completion 的生產實作。
@@ -73,6 +80,8 @@ struct Inner {
     semaphore: Arc<tokio::sync::Semaphore>,
     max_retries: usize,
     rate_limiter: Option<RateLimiter>,
+    admission: AdmissionController<StaticPressure>,
+    metrics: Option<core_observability::MetricsRegistry>,
 }
 
 /// 簡單的固定間隔限流器：`next_allowed` 記錄下一個請求最早能出發的時間，
@@ -129,6 +138,12 @@ impl OpenAiCompatibleLlmProvider {
                 semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
                 max_retries: config.max_retries,
                 rate_limiter: config.rate_limit_per_second.map(RateLimiter::new),
+                admission: AdmissionController::new(
+                    config.p0_reserved_capacity,
+                    config.shared_capacity,
+                    StaticPressure,
+                ),
+                metrics: config.metrics.clone(),
             }),
         }
     }
@@ -143,9 +158,42 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
             return Err(AiGatewayError::Unsupported);
         };
 
+        let _admit_guard = match request.priority {
+            Priority::P0 => inner.admission.try_admit_p0().map_err(|err| {
+                tracing::warn!(error = %err, "P0 admission 被拒");
+                if let Some(metrics) = &inner.metrics {
+                    metrics.inc("osint_ai_admission_rejected_total", 1);
+                }
+                AiGatewayError::Transient {
+                    message: format!("AI admission 被拒：{err}"),
+                }
+            })?,
+            p => inner.admission.admit(p).await.map_err(|err| {
+                tracing::warn!(error = %err, priority = ?p, "AI admission 被拒");
+                if let Some(metrics) = &inner.metrics {
+                    metrics.inc("osint_ai_admission_rejected_total", 1);
+                }
+                AiGatewayError::Transient {
+                    message: format!("AI admission 被拒：{err}"),
+                }
+            })?,
+        };
+
+        if let Some(metrics) = &inner.metrics {
+            metrics.set_gauge(
+                "osint_ai_admission_p0_available",
+                inner.admission.p0_available() as u64,
+            );
+            metrics.set_gauge(
+                "osint_ai_admission_shared_available",
+                inner.admission.shared_available() as u64,
+            );
+        }
+
         tracing::debug!(
             model = %request.model,
             message_count = request.messages.len(),
+            priority = ?request.priority,
             "LLM 呼叫開始"
         );
 
@@ -386,6 +434,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 128,
             enable_reasoning: false,
+            priority: crate::Priority::P0,
         }
     }
 
@@ -401,6 +450,9 @@ mod tests {
             max_concurrent,
             max_retries: 0,
             rate_limit_per_second: None,
+            p0_reserved_capacity: 2,
+            shared_capacity: max_concurrent.max(1),
+            metrics: None,
         }
     }
 
@@ -656,6 +708,9 @@ mod tests {
             max_concurrent: 2,
             max_retries: 0,
             rate_limit_per_second: None,
+            p0_reserved_capacity: 2,
+            shared_capacity: 2,
+            metrics: None,
         });
         let err = provider
             .chat_completion(&sample_request())
@@ -702,11 +757,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatibleLlmProvider::new(&enabled_config(
+        // 這個測試要驗的是 Inner 的 HTTP semaphore，不是 P0 admission。
+        // sample_request 是 P0，預設保留名額 2 會讓第三個請求立刻被拒、
+        // 根本打不到 mock——把 P0 名額放開，讓瓶頸回到 max_concurrent。
+        let mut config = enabled_config(
             format!("{}/v1", server.uri()),
             Duration::from_secs(5),
             max_concurrent,
-        ));
+        );
+        config.p0_reserved_capacity = 8;
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
         let req = sample_request();
         let started = Instant::now();
         let (a, b, c) = tokio::join!(

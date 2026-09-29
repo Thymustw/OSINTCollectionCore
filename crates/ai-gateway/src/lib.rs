@@ -9,12 +9,16 @@
 //! version／model version 是呼叫端（`resolver::auto_approval`）的概念，
 //! 留給 Phase 1 Step B。
 
+mod admission;
 mod cost;
 mod mock;
 mod openai;
 mod redact;
 mod registry;
 
+pub use admission::{
+    AdmissionController, AdmissionError, PressureSource, Priority, ResourcePressure, StaticPressure,
+};
 pub use cost::Pricing;
 pub use mock::{MockLlmProvider, UnsupportedLlmProvider};
 pub use openai::{OpenAiCompatibleLlmProvider, OpenAiCompatibleLlmProviderConfig};
@@ -60,6 +64,12 @@ pub struct ChatCompletionRequest {
     /// `chat_template_kwargs` 欄位，多數 OpenAI 相容 server 會忽略不認識
     /// 的欄位；`true` 時不送這個欄位，使用 endpoint 的預設行為。
     pub enable_reasoning: bool,
+    /// 這次呼叫的優先權（SPEC_V0.3 §23/§24 Admission Controller）。
+    /// 呼叫端明確宣告——P0 是「使用者在等的互動請求」，走獨立保留名額
+    /// 不排隊；P1-P4 是背景工作，共用一個佇列。這是架構角色宣告，
+    /// 不是運維可調參數，不走 config（詳見 `crates/resolver/src/
+    /// auto_approval.rs` 裡 `AutoApprovalConfig.priority` 的說明）。
+    pub priority: crate::admission::Priority,
 }
 
 #[derive(Debug, Clone, PartialEq)]

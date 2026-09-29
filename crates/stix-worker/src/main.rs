@@ -129,6 +129,12 @@ async fn run() -> Result<(), String> {
         max_concurrent: auto_section.llm.max_concurrent,
         max_retries: 0,
         rate_limit_per_second: None,
+        p0_reserved_capacity: 2,
+        shared_capacity: auto_section.llm.max_concurrent,
+        // stix-worker 有自己的 MetricsRegistry，但那份是給 worker 內部
+        // job 計數用；admission gauge 這輪先接上同一份，避免再建一份
+        // 沒人 scrape 的 registry。
+        metrics: Some(metrics.clone()),
     });
     let auto_config = AutoApprovalConfig {
         enabled: effectively_enabled,
@@ -139,6 +145,8 @@ async fn run() -> Result<(), String> {
         llm_temperature: auto_section.llm.temperature,
         llm_max_tokens: auto_section.llm.max_tokens,
         enable_reasoning: auto_section.llm.enable_reasoning,
+        // 背景 enrichment：P3，走 shared 佇列，可被資源壓力擋下。
+        priority: ai_gateway::Priority::P3,
     };
 
     let service = StixWorker::new(

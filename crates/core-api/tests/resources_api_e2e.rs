@@ -115,6 +115,9 @@ fn assemble_test_auto_approval(
             max_concurrent: section.llm.max_concurrent,
             max_retries: 0,
             rate_limit_per_second: None,
+            p0_reserved_capacity: 2,
+            shared_capacity: section.llm.max_concurrent,
+            metrics: None,
         },
     );
     core_api::AutoApprovalState {
@@ -131,6 +134,7 @@ fn assemble_test_auto_approval(
                 llm_temperature: section.llm.temperature,
                 llm_max_tokens: section.llm.max_tokens,
                 enable_reasoning: section.llm.enable_reasoning,
+                priority: ai_gateway::Priority::P0,
             },
         )),
         max_auto_merges_per_resolve: section.max_auto_merges_per_resolve,

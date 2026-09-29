@@ -414,6 +414,7 @@ fn build_worker(stack: &Stack) -> TestWorker {
                 llm_temperature: 0.0,
                 llm_max_tokens: 16,
                 enable_reasoning: false,
+                priority: ai_gateway::Priority::P3,
             },
         },
     )

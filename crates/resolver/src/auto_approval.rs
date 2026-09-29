@@ -49,6 +49,11 @@ pub struct AutoApprovalConfig {
     /// 是否允許模型展開推理過程。見 `ChatCompletionRequest::enable_reasoning`。
     /// 由 `AutoApprovalLlmSection::enable_reasoning` 轉過來，預設 `false`。
     pub enable_reasoning: bool,
+    /// 這個 evaluator 實例在架構裡的角色。**架構事實，不是運維參數**——
+    /// 硬編在組裝點（`core-api::assemble_auto_approval` 傳 P0，
+    /// `stix-worker::main.rs` 傳 P3），不走 config：P0 代表「使用者在等的
+    /// 互動請求，不該排隊」，這個保證不該被使用者在設定檔裡意外改掉。
+    pub priority: ai_gateway::Priority,
 }
 
 /// 單一一對 Entity 的自動核准評估結果。**沒有 `Result` 包裝**——
@@ -225,6 +230,7 @@ where
             temperature: self.config.llm_temperature,
             max_tokens: self.config.llm_max_tokens,
             enable_reasoning: self.config.enable_reasoning,
+            priority: self.config.priority,
         };
 
         let started = Instant::now();
@@ -793,6 +799,7 @@ mod tests {
             llm_temperature: 0.0,
             llm_max_tokens: 256,
             enable_reasoning: false,
+            priority: ai_gateway::Priority::P0,
         }
     }
 
@@ -1223,6 +1230,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 16,
             enable_reasoning: false,
+            priority: ai_gateway::Priority::P0,
         };
         let cand = candidate(Uuid::now_v7(), Uuid::now_v7(), "semantic_similarity", 0.80);
         let run = build_ai_run(

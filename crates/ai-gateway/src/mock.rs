@@ -106,6 +106,7 @@ mod tests {
             temperature: 0.0,
             max_tokens: 128,
             enable_reasoning: false,
+            priority: crate::Priority::P0,
         }
     }
 

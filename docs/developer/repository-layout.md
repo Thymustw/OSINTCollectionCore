@@ -35,7 +35,7 @@ crates/
   entity-worker/         抽取服務（osint-entity-worker）：dedup.completed → Entity/Relationship/Evidence（SPEC §17／§11／§12）
   resolver/              Entity resolution（SPEC_V0.2 §5／§6）：resolve_entity 聚合 normalized_name／alias／domain／semantic_similarity／account_handle；graph_context 走獨立 GraphContextResolver；auto_approval.rs 為 ADR-012 自動核准評估器；無獨立 binary
   merge/                 Entity merge／undo（SPEC_V0.2 §7）：execute_merge／execute_merge_with_audit（ADR-012）／undo_merge；無獨立 binary
-  ai-gateway/            LLM 生成式推論抽象層（ADR-012 AI 輔助自動核准）：LlmProvider trait、OpenAiCompatibleLlmProvider、MockLlmProvider、UnsupportedLlmProvider；非 V0.3 完整 AI Gateway，僅借用最小的 OpenAI 相容 chat completion 能力
+  ai-gateway/            LLM 生成式推論抽象層（ADR-012）：LlmProvider trait、OpenAiCompatibleLlmProvider、MockLlmProvider、UnsupportedLlmProvider；V0.3 Phase 5 補上 Admission Controller（P0 保留名額不排隊、P1-P4 共用佇列、PressureSource 目前只有永遠回 Normal 的 StaticPressure）
   stix-adapter/          STIX 2.1 型別、bundle 驗證、雙向映射（SPEC_V0.2 §18-19）：手刻型別不依賴外部 crate；無獨立 binary
   stix-worker/           STIX 匯入／匯出服務（osint-stix-worker）：job.dispatched → stix_import／stix_export；不可重建（沒有 --rebuild）
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析

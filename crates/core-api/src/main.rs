@@ -68,6 +68,10 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    // 提前建，讓 assemble_auto_approval 能把同一份 registry 灌進 LLM
+    // admission metrics；後面 AppState 也用這一份，不要 new 第二次。
+    let metrics = MetricsRegistry::new();
+
     let mut shared_store: Option<SharedStore> = None;
     let mut shared_objects: Option<SharedObjects> = None;
     // 具體型別的 Postgres store，給 GraphContextResolver 用。
@@ -141,6 +145,7 @@ async fn run() -> Result<(), String> {
                 store.clone(),
                 producer.clone(),
                 &cfg.auto_approval,
+                metrics.clone(),
             )));
             pg_store = Some(store);
             (jobs, merge, resolver, auto_approval, import, ready)
@@ -297,7 +302,7 @@ async fn run() -> Result<(), String> {
     warn_unimplemented_hybrid_weights(&cfg.search_hybrid);
 
     let state = AppState {
-        metrics: MetricsRegistry::new(),
+        metrics: metrics.clone(),
         auth: AuthState {
             jwt: Arc::new(jwt),
             tokens,
@@ -396,6 +401,7 @@ fn assemble_auto_approval(
     store: PostgresCanonicalStore,
     producer: Option<Arc<EventProducer>>,
     section: &core_config::AutoApprovalSection,
+    metrics: MetricsRegistry,
 ) -> AutoApprovalState {
     let effectively_enabled = section.enabled && section.thresholds_are_sane();
     if section.enabled && !section.thresholds_are_sane() {
@@ -424,6 +430,12 @@ fn assemble_auto_approval(
             max_concurrent: section.llm.max_concurrent,
             max_retries: 0,
             rate_limit_per_second: None,
+            // P0 是互動請求，不該完全沒有名額，但也不該獨佔太多。這輪沒有
+            // 真實壓測數據，2 是保守起點。
+            p0_reserved_capacity: 2,
+            // 沿用既有 max_concurrent，避免既有配置的並發效果縮水。
+            shared_capacity: section.llm.max_concurrent,
+            metrics: Some(metrics),
         },
     );
     let evaluator_config = resolver::AutoApprovalConfig {
@@ -435,6 +447,8 @@ fn assemble_auto_approval(
         llm_temperature: section.llm.temperature,
         llm_max_tokens: section.llm.max_tokens,
         enable_reasoning: section.llm.enable_reasoning,
+        // HTTP resolve 路徑：使用者在等，走獨立保留名額、不排隊。
+        priority: ai_gateway::Priority::P0,
     };
     AutoApprovalState {
         evaluator: Arc::new(resolver::AutoApprovalEvaluator::new(
