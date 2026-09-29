@@ -89,7 +89,7 @@ pub type SharedGraphProjection = Arc<GraphProjectionState>;
 pub type SharedStore = Arc<dyn RelationalStore + Send + Sync>;
 
 /// 物件儲存（Raw Evidence blob）handle。理由同 [`SharedStore`]：
-/// handler 只需要 `ObjectStore` 的四個方法，不需要知道後面是 MinIO 還是別的 S3。
+/// handler 只需要 `ObjectStore` 的四個方法，不需要知道後面是哪一套 S3 相容後端。
 pub type SharedObjects = Arc<dyn ObjectStore + Send + Sync>;
 
 /// `POST /api/v1/search` 要用到的下游。沒接上時只有這條路由回 503。
@@ -152,7 +152,7 @@ pub struct AppState {
     pub audit: SharedAudit,
     /// canonical store。`None` 代表沒接上 Postgres，資源類 handler 應回 503。
     pub store: Option<SharedStore>,
-    /// 物件儲存。`None` 代表沒接上 MinIO。
+    /// 物件儲存。`None` 代表沒接上 S3 相容後端。
     pub objects: Option<SharedObjects>,
     pub jobs: Option<SharedJobService>,
     /// Entity merge。`None` 代表沒接上 Postgres，對應 handler 回 503。

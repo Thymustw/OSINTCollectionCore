@@ -2,7 +2,7 @@
 //! `POST /objects` 的 501、`/api/v1/ops/*`。
 //!
 //! 需要真實資料的行為（200 的回應形狀、404、If-Match、409／422、raw body）
-//! 在 `tests/resources_api_e2e.rs`，那支連本機 Postgres／MinIO。
+//! 在 `tests/resources_api_e2e.rs`，那支連本機 Postgres／SeaweedFS。
 //!
 //! 這支刻意**不接任何 store**：middleware 在 handler 之前就跑完，
 //! 所以 401／403 的行為與接了資料庫時完全一樣。

@@ -248,9 +248,9 @@ mod tests {
 
     #[test]
     fn serde_round_trip() {
-        let original = SecretRef::parse("env:MINIO_ROOT_PASSWORD").unwrap();
+        let original = SecretRef::parse("env:S3_SECRET_KEY").unwrap();
         let json = serde_json::to_string(&original).unwrap();
-        assert_eq!(json, "\"env:MINIO_ROOT_PASSWORD\"");
+        assert_eq!(json, "\"env:S3_SECRET_KEY\"");
         let back: SecretRef = serde_json::from_str(&json).unwrap();
         assert_eq!(original, back);
     }

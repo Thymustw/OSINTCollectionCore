@@ -2,7 +2,7 @@
 //! PATCH 的 If-Match（412／428）、POST 的 409／422／400、`GET /raw/{id}?body=true`、
 //! `POST /jobs/{id}/retry`、`/api/v1/ops/health` 對真實後端。
 //!
-//! 只連本機 Docker 服務（Postgres／MinIO／Redpanda），不打外部網路；
+//! 只連本機 Docker 服務（Postgres／SeaweedFS／Redpanda），不打外部網路；
 //! 埠隔離沿用 storage-core conformance（本機 8080／9000 可能是別的系統）。
 //!
 //! 認證／RBAC／501 那一半在 `tests/resources_api.rs`，那支不需要資料庫。
@@ -59,8 +59,8 @@ async fn connect_stack() -> Stack {
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
-    let access = required_env("MINIO_ROOT_USER").expect("MINIO_ROOT_USER");
-    let secret = required_env("MINIO_ROOT_PASSWORD").expect("MINIO_ROOT_PASSWORD");
+    let access = required_env("S3_ACCESS_KEY").expect("S3_ACCESS_KEY");
+    let secret = required_env("S3_SECRET_KEY").expect("S3_SECRET_KEY");
     let brokers = required_env("REDPANDA_BROKERS")
         .or_else(|_| required_env("OSINT__BROKER__BROKERS"))
         .unwrap_or_else(|_| "127.0.0.1:9092".into());

@@ -14,40 +14,40 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up 
 | opensearch | opensearchproject/opensearch:2.19.6 | 9200 | 19200 |
 | redpanda | redpandadata/redpanda:v26.2.2 | 9092, 8081, 8082, 9644 | 同左 |
 | redis | redis:7.4-bookworm | 6379 | 6379 |
-| minio | quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z | 9000, 9001 | 19000, 19001 |
+| seaweedfs | chrislusf/seaweedfs:4.48 | 8333 | 8333（不 remap） |
 | neo4j | neo4j:5.26.30-community | 7474, 7687 | 同左 |
 
 `docker-compose.dev.yml` 的記憶體上限：postgres 1GB、**opensearch 2GB（heap 1g）**、
-redpanda 512MB、redis 256MB、minio 512MB、**neo4j 1GB（heap 512m + pagecache 256m）**，
+redpanda 512MB、redis 256MB、seaweedfs 512MB（延用自 MinIO，未重新量測）、**neo4j 1GB（heap 512m + pagecache 256m）**，
 合計 5.25GB / 4.5 CPU。明細見內部架構文件 RESOURCE_BUDGET.md §5.1（未隨原始碼公開）。
 
 ⚠️ OpenSearch 在 V0.2 Phase 0a 從 1GB／heap 512m 升到 2GB／heap 1g。
 **這不是預留餘裕**：低於這個值 embedding 模型一定 deploy 不起來，
 而且容器不會掛、healthcheck 全綠（`docs/developer/embedding.md` §4）。
 
-OpenSearch / MinIO 改掛 19200 / 19000 是因為本機 9200、9000 已被其他堆疊佔用。canonical 埠仍寫在 `docker-compose.yml` 與 `config/default.toml`。
+OpenSearch 改掛 19200 是因為本機 9200 已被其他堆疊佔用。SeaweedFS 用 8333，本機無人佔用，不 remap。canonical 埠寫在 `docker-compose.yml` 與 `config/default.toml`。
 
-## 本機 9200 / 9000 可能被其他服務佔用
+## 本機 9200 可能被其他服務佔用
 
-本機常見情境：9200/9000 被另一套本機服務（例如安全/情資平台）佔用。本機開發改用偏移埠 19200/19000 以避免衝突：
+本機常見情境：9200 被另一套本機服務（例如安全/情資平台的 Elasticsearch）佔用。本機開發把 OpenSearch 改掛 19200 以避免衝突。SeaweedFS 的 8333 沒有這個問題（以前 MinIO 的 9000 有，已隨 ADR-015 換埠而消失）：
 
 | 主機埠 | 本專案角色 |
 |---|---|
 | 9200 | **本機 dev 不用**（可能被其他本機服務佔用） |
-| 9000 | **本機 dev 不用**（可能被其他本機服務佔用） |
+| 9000 | **本專案不用**（宿主上可能是其他堆疊的 MinIO；本專案改用 8333） |
 | **19200** | osint-core OpenSearch（`osint-core-opensearch-1`） |
-| **19000** | osint-core MinIO（`osint-core-minio-1`） |
+| **8333** | osint-core SeaweedFS S3（`osint-core-seaweedfs-1`） |
 
-用 `config/default.toml` 的 9200 / 9000 去連，可能會誤寫進宿主上的其他服務。
+用 `config/default.toml` 的 9200 去連 OpenSearch，可能會誤寫進宿主上的其他服務。物件儲存的 canonical 埠已是 8333，本機與容器內外同一個數字。
 
 實務：
 
 1. 從 `.env.example` 複製出 **真實** `.env`（已 gitignore）。
-2. 設 `OPENSEARCH_URL=http://127.0.0.1:19200`、`S3_ENDPOINT=http://127.0.0.1:19000`。
+2. 設 `OPENSEARCH_URL=http://127.0.0.1:19200`、`S3_ENDPOINT=http://127.0.0.1:8333`。
 3. 建議同時設 `OSINT__STORAGE__SEARCH__URL` 與 `OSINT__STORAGE__OBJECT__ENDPOINT`，覆蓋 default.toml。
 4. 寫入前可用 `docker ps` 確認容器名。OpenSearch GET `/` 應出現 `version.distribution=opensearch`，**不可**出現 Elasticsearch tagline `You Know, for Search`。
 
-storage conformance 對非 19200 / 19000 的 URL **硬失敗**。
+storage conformance 在本機開了 `OSINT_STRICT_PORT_ISOLATION=1` 時會拒絕 OpenSearch 連到 9200。SeaweedFS 8333 目前無已知衝突，不擋任何 S3 埠。
 
 ## 全容器化：`make compose-up-full`
 
@@ -86,7 +86,7 @@ make compose-down-full    # 停掉
 |---|---|---|
 | PostgreSQL | `127.0.0.1:5432` | `postgres:5432` |
 | OpenSearch | `127.0.0.1:**19200**` | `opensearch:**9200**` |
-| MinIO | `127.0.0.1:**19000**` | `minio:**9000**` |
+| SeaweedFS | `127.0.0.1:**8333**` | `seaweedfs:**8333**` |
 | Redis | `127.0.0.1:6379` | `redis:6379` |
 | Redpanda | `127.0.0.1:**9092**` | `redpanda:**29092**` |
 | Neo4j | `127.0.0.1:7474`／`7687` | `neo4j:7474`／`7687` |
@@ -95,7 +95,7 @@ make compose-down-full    # 停掉
 
 三個一定要理解的原因：
 
-1. **19200/19000 是宿主端的規避手段**。本機常見情境是 9200/9000 被其他本機服務占用（例如另一套安全/情資平台），所以本機開發改用 19200/19000。compose network 內沒有這個衝突，`opensearch:9200` 就是本專案自己的服務。
+1. **19200 是宿主端的規避手段**。本機常見情境是 9200 被其他本機服務占用（例如另一套安全/情資平台的 Elasticsearch），所以本機開發把 OpenSearch 改用 19200。SeaweedFS 8333 宿主與容器同一個埠，不用雙軌。compose network 內沒有 OpenSearch 的衝突，`opensearch:9200` 就是本專案自己的服務。
 2. **`OSINT_STRICT_PORT_ISOLATION` 在容器裡絕對不能設**。它會讓 `verify_not_opencti_search`（函式名稱裡的 `opencti` 反映了原始撰寫時的本機衝突對象，函式名稱本身沒有改）擋下任何指向 9200 的 URL，而且錯誤訊息會叫你「改成 http://127.0.0.1:19200」——那在容器內是完全錯誤的建議。同理，**不要對應用服務用 `env_file: ../.env`**。
 3. **Redpanda 在容器內是 29092，不是 9092**。見下一節。
 
@@ -465,7 +465,7 @@ curl -s http://127.0.0.1:18088/health
 
 ```bash
 cargo test -p stix-adapter
-cargo test -p stix-worker --all-targets   # 含 tests/e2e.rs，需要本機 Postgres/MinIO
+cargo test -p stix-worker --all-targets   # 含 tests/e2e.rs，需要本機 Postgres/SeaweedFS
 cargo test -p acceptance --test acceptance_g   # HTTP 匯入→Core→匯出 全程驗收
 ```
 
@@ -481,7 +481,7 @@ cargo test -p acceptance --test failure_recovery -- --ignored --test-threads=1
 ```
 
 ⚠️ **跑的當下不要同時跑其他測試。** 這四個測試會 `docker compose stop`
-postgres／opensearch／minio，跑 workspace 測試的話會被連帶弄壞，
+postgres／opensearch／seaweedfs，跑 workspace 測試的話會被連帶弄壞，
 而失敗訊息完全指不到真正的原因。
 
 * 全部標 `#[ignore]`，所以 `cargo test --workspace` **不會**跑到它們，要加 `--ignored`。
@@ -497,5 +497,5 @@ postgres／opensearch／minio，跑 workspace 測試的話會被連帶弄壞，
 
 ```bash
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml \
-  start postgres opensearch minio
+  start postgres opensearch seaweedfs
 ```

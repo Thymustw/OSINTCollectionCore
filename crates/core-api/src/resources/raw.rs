@@ -109,14 +109,14 @@ async fn fetch_body(state: &AppState, evidence: &RawEvidence) -> Result<RawBody,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "storage_unavailable",
                 "物件儲存讀取失敗。metadata 仍可取得（去掉 ?body=true），\
-                 請確認 MinIO 在跑後重試",
+                 請確認物件儲存在跑後重試",
             )
         })?
         .ok_or_else(|| {
             ApiError::not_found(format!(
                 "RawEvidence `{}` 的 metadata 存在，但物件儲存裡找不到 key `{key}`。\
                  這代表資料庫與物件儲存不一致（bucket 被清過，或寫入時只成功了一半），\
-                 請檢查 MinIO bucket 內容",
+                 請檢查物件儲存 bucket 內容",
                 evidence.id
             ))
         })?;

@@ -56,17 +56,18 @@ pub fn find_workspace_root() -> Option<PathBuf> {
 pub fn required_env(name: &str) -> Result<String, StorageError> {
     env::var(name).map_err(|_| StorageError::Configuration {
         message: format!(
-            "環境變數 `{name}` 未設定。請在 repo 根目錄放 `.env`（可從 `.env.example` 複製），並確認 OpenSearch 用 19200、MinIO 用 19000，不要連到主機 9200/9000 的其他堆疊"
+            "環境變數 `{name}` 未設定。請在 repo 根目錄放 `.env`（可從 `.env.example` 複製），並確認 OpenSearch 用 19200、SeaweedFS 用 8333，不要連到主機 9200 的其他堆疊"
         ),
     })
 }
 
-/// 只有本機開發機（同時跑 OpenCTI，9200/9000 canonical 埠被占走）才需要開嚴格埠號檢查。
-/// 設 `OSINT_STRICT_PORT_ISOLATION=1`（已寫在本機 `.env`，不進版本庫）才會擋 9200/9000；
-/// CI 或其他沒有這個埠衝突的機器不要設這個變數，9200/9000 在那裡通常就是我們自己的服務。
+/// 只有本機開發機（同時跑 OpenCTI，9200 canonical 埠被占走）才需要開嚴格埠號檢查。
+/// 設 `OSINT_STRICT_PORT_ISOLATION=1`（已寫在本機 `.env`，不進版本庫）才會擋 OpenSearch
+/// 的 9200；S3／SeaweedFS 目前不擋任何埠（8333 無已知衝突）。
+/// CI 或其他沒有這個埠衝突的機器不要設這個變數，9200 在那裡通常就是我們自己的 OpenSearch。
 ///
 /// 這條規則原本寫死「9200/9000 一律拒絕」，在 GitHub Actions 的第一次 CI run 上就直接把
-/// 我們自己乾淨的 OpenSearch/MinIO（canonical 埠,沒有 OpenCTI 衝突）誤判成 OpenCTI 擋下來——
+/// 我們自己乾淨的 OpenSearch/物件儲存（canonical 埠,沒有 OpenCTI 衝突）誤判成 OpenCTI 擋下來——
 /// 埠號在不同環境代表不同東西,不能寫死。真正該信任的是連線後的身分驗證
 /// （見 [`assert_opensearch_identity`]),埠號檢查只在已知有衝突的這台機器上當額外防線。
 fn strict_port_isolation_enabled() -> bool {
@@ -91,20 +92,25 @@ pub fn verify_not_opencti_search(url: &str) -> Result<Url, StorageError> {
     Ok(parsed)
 }
 
-/// 驗證 URL 格式正確；只有在本機開了 `OSINT_STRICT_PORT_ISOLATION` 時才額外擋 9000
-/// （本機的 OpenCTI MinIO）。MinIO 目前沒有等同 [`assert_opensearch_identity`] 的身分驗證，
-/// 所以這台已知衝突的機器上，埠號檢查仍是唯一防線，其餘環境不受影響。
+/// 驗證 S3 endpoint URL 格式正確。
+///
+/// 歷史：這個函式原本在 `OSINT_STRICT_PORT_ISOLATION=1` 時擋埠 9000
+/// （本機的 OpenCTI MinIO）。2026-09 物件儲存從 MinIO 換成 SeaweedFS 後，
+/// S3 埠改為 8333——目前沒有已知的 8333 衝突可擋，所以嚴格模式下也不拒絕
+/// 任何 S3 埠。函式骨架保留，之後若真的出現 8333 衝突，在這裡加判斷。
+///
+/// 「MinIO 沒有等同 [`assert_opensearch_identity`] 的身分驗證 API」這句話
+/// 對 SeaweedFS 依然成立：S3 gateway 的 `GET /status` 同樣不驗證身分、
+/// 固定回 200，不能拿來當「連到的是不是我們自己的 SeaweedFS」的證明。
 pub fn verify_not_opencti_s3(endpoint: &str) -> Result<Url, StorageError> {
     let parsed = Url::parse(endpoint).map_err(|err| StorageError::Configuration {
         message: format!("S3_ENDPOINT `{endpoint}` 不是合法 URL：{err}"),
     })?;
-    if strict_port_isolation_enabled() && parsed.port_or_known_default() == Some(9000) {
-        return Err(StorageError::Configuration {
-            message: format!(
-                "S3_ENDPOINT `{endpoint}` 指向埠 9000。本機 9000 是 OpenCTI MinIO，不是 osint-core-minio-1。請改成 http://127.0.0.1:19000"
-            ),
-        });
-    }
+    // 目前無對象可擋。SeaweedFS 用 8333，本機沒有已知衝突
+    // （OpenCTI MinIO 仍佔 9000，但本專案已不再使用該埠）。
+    // 舊的「嚴格模式擋 9000」已拿掉——擋了也不保護任何東西，反而會讓
+    // 誤設 S3_ENDPOINT=http://127.0.0.1:9000 的人看到過期的「請改成 19000」建議。
+    // 若未來 8333 也被佔用，在 `strict_port_isolation_enabled()` 為 true 時於這裡加入判斷。
     Ok(parsed)
 }
 
@@ -3873,17 +3879,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_minio_canonical_port_when_strict() {
+    fn does_not_block_s3_ports_even_when_strict() {
+        // SeaweedFS 8333 目前無衝突可擋；9000 也不再擋（我們已不使用該埠）。
         with_strict_isolation(|| {
-            let err = verify_not_opencti_s3("http://127.0.0.1:9000").unwrap_err();
-            assert!(format!("{err}").contains("19000"));
+            verify_not_opencti_s3("http://127.0.0.1:8333").unwrap();
+            verify_not_opencti_s3("http://127.0.0.1:9000").unwrap();
         });
     }
 
     #[test]
-    fn accepts_minio_canonical_port_by_default() {
+    fn accepts_s3_canonical_port_by_default() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe { env::remove_var("OSINT_STRICT_PORT_ISOLATION") };
+        verify_not_opencti_s3("http://127.0.0.1:8333").unwrap();
         verify_not_opencti_s3("http://127.0.0.1:9000").unwrap();
     }
 

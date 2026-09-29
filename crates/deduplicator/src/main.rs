@@ -67,7 +67,7 @@ async fn run() -> Result<(), String> {
     store.migrate().await.map_err(|err| err.to_string())?;
 
     // deduplicator 不讀 RawEvidence 的 blob（只讀 metadata 取 platform），
-    // 所以不需要 MinIO。少一個相依就少一個啟動失敗點。
+    // 所以不需要物件儲存。少一個相依就少一個啟動失敗點。
     let producer = EventProducer::connect(&cfg.broker.brokers, "deduplicator")
         .map_err(|err| err.to_string())?;
     let metrics = MetricsRegistry::new();

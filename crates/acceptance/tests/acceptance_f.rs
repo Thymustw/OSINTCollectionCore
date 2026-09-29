@@ -19,7 +19,7 @@
 //!
 //! 兩者都重送**真正發出去的那一則事件 payload**，不是自己組一個形狀相近的 JSON。
 //!
-//! 需要本機 Docker：Postgres／MinIO／Redpanda。不打外網。
+//! 需要本機 Docker：Postgres／SeaweedFS／Redpanda。不打外網。
 
 mod common;
 

@@ -17,7 +17,7 @@ pub enum NormalizerError {
     #[error("找不到 RawEvidence `{id}`。請確認 collector 已寫入 Postgres，或這則事件已過期")]
     EvidenceMissing { id: String },
     #[error(
-        "MinIO 讀不到 `{path}`。請確認 collector 有把 body 寫進物件儲存，且 bucket 是 raw-evidence"
+        "物件儲存讀不到 `{path}`。請確認 collector 有把 body 寫進物件儲存，且 bucket 是 raw-evidence"
     )]
     BodyMissing { path: String },
     #[error("{message}")]

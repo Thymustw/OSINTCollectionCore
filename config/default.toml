@@ -21,10 +21,10 @@ url = "http://127.0.0.1:9200"
 
 [storage.object]
 adapter = "s3"
-endpoint = "http://127.0.0.1:9000"
+endpoint = "http://127.0.0.1:8333"
 bucket = "raw-evidence"
-access_key_ref = "env:MINIO_ROOT_USER"
-secret_key_ref = "env:MINIO_ROOT_PASSWORD"
+access_key_ref = "env:S3_ACCESS_KEY"
+secret_key_ref = "env:S3_SECRET_KEY"
 
 [storage.cache]
 adapter = "redis"

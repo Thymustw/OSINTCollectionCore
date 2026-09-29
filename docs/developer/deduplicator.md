@@ -378,7 +378,7 @@ migrations/sqlite/0004_dedup_stage_columns.sql
 
 ## 本機啟動
 
-需要 compose（Postgres、MinIO 19000、Redpanda 9092）與正確 `.env`。不要連 8080／9200／9000。
+需要 compose（Postgres、SeaweedFS 8333、Redpanda 9092）與正確 `.env`。不要連 8080／9200。
 
 ```bash
 make run-collector

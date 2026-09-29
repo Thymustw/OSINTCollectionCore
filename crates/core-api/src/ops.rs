@@ -63,7 +63,7 @@ pub const AUDIT_FAILED_EVENT_REPLAY: &str = "failed_event.replay";
 
 /// 把任何 `HealthProvider`（storage adapter）包成一個具名的 ops 檢查。
 ///
-/// 這樣 `/ops/health` 不需要知道後面是 Postgres、MinIO 還是 Redis——
+/// 這樣 `/ops/health` 不需要知道後面是 Postgres、物件儲存還是 Redis——
 /// 加一個新後端只要在 `main.rs` 多包一個，不必改這個檔（CLAUDE.md §13）。
 pub struct BackendCheck {
     name: &'static str,

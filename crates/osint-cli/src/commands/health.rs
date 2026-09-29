@@ -126,7 +126,7 @@ async fn check_postgres(ctx: &Context) -> ServiceHealth {
 
 async fn check_object(ctx: &Context) -> ServiceHealth {
     let endpoint = ctx.cfg.storage.object.endpoint.clone();
-    with_timeout("MinIO/S3", endpoint, async {
+    with_timeout("SeaweedFS/S3", endpoint, async {
         let objects = ctx.objects().map_err(|err| err.to_string())?;
         objects.health().await.map_err(|err| err.to_string())
     })

@@ -18,7 +18,7 @@ pub const PAGE_SIZE: u32 = 100;
     long_about = "OSINT Intelligence Core 本機唯讀查詢工具。
 
 這是「本機管理工具」，不是給遠端使用者的介面：
-  * 它直接連 Core 的 PostgreSQL／MinIO，不經過 core-api。
+  * 它直接連 Core 的 PostgreSQL／SeaweedFS，不經過 core-api。
   * 因此它不受 API 的 RBAC 與 AuditLog 保護——只在你自己能存取資料庫的機器上用。
   * 它只做查詢。任何寫入／刪除都要走 POST/PATCH/DELETE /api/v1/...，
     那條路徑才有授權與稽核紀錄。
@@ -72,7 +72,7 @@ pub enum Command {
     /// 直接查 OpenSearch，不經 core-api——與其他子命令一致。
     /// 查詢語法（片語、AND/OR/NOT、括號）見 `docs/user/search.md`。
     Search(SearchArgs),
-    /// 對 PostgreSQL／MinIO／Redis／OpenSearch／Redpanda 各做一次 health check
+    /// 對 PostgreSQL／SeaweedFS／Redis／OpenSearch／Redpanda 各做一次 health check
     Health,
 }
 
@@ -122,7 +122,7 @@ pub enum RawAction {
         #[arg(long, value_name = "SOURCE_ID")]
         source: Option<Uuid>,
     },
-    /// 顯示單一 RawEvidence 的 metadata，可選擇一併印出 MinIO 內容
+    /// 顯示單一 RawEvidence 的 metadata，可選擇一併印出物件儲存內容
     Show {
         /// RawEvidence 的 UUID
         id: Uuid,

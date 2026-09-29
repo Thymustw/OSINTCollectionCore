@@ -60,7 +60,7 @@ async fn run() -> Result<(), String> {
     store.migrate().await.map_err(|err| err.to_string())?;
 
     // entity-worker 只讀 Document 的文字欄位（normalizer 已經把正文寫進 documents.body），
-    // 不讀 RawEvidence 的 blob，所以不需要 MinIO。少一個相依就少一個啟動失敗點。
+    // 不讀 RawEvidence 的 blob，所以不需要物件儲存。少一個相依就少一個啟動失敗點。
     let producer = EventProducer::connect(&cfg.broker.brokers, "entity-worker")
         .map_err(|err| err.to_string())?;
     let metrics = MetricsRegistry::new();

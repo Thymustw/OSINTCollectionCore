@@ -101,7 +101,7 @@ pub(crate) fn store(state: &AppState) -> Result<&SharedStore, ApiError> {
     })
 }
 
-/// 物件儲存 handle。沒接上 MinIO 時回 503。
+/// 物件儲存 handle。沒接上 S3 相容後端時回 503。
 pub(crate) fn objects(state: &AppState) -> Result<&SharedObjects, ApiError> {
     state.objects.as_ref().ok_or_else(|| {
         ApiError::new(

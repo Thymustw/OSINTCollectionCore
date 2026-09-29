@@ -12,7 +12,7 @@
 //! `attributes.raw_evidence_id` 這種問題就驗不出來，而那正好會讓 Acceptance E
 //! 在第一步就斷掉。
 //!
-//! 只連本機 Docker（Postgres／MinIO／Redpanda／OpenSearch 19200），不打外部網路。
+//! 只連本機 Docker（Postgres／SeaweedFS／Redpanda／OpenSearch 19200），不打外部網路。
 
 use std::sync::Arc;
 
@@ -63,8 +63,8 @@ async fn connect_stack() -> Stack {
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
-    let access = required_env("MINIO_ROOT_USER").expect("MINIO_ROOT_USER");
-    let secret = required_env("MINIO_ROOT_PASSWORD").expect("MINIO_ROOT_PASSWORD");
+    let access = required_env("S3_ACCESS_KEY").expect("S3_ACCESS_KEY");
+    let secret = required_env("S3_SECRET_KEY").expect("S3_SECRET_KEY");
     let search_url = required_env("OPENSEARCH_URL").expect("OPENSEARCH_URL");
     verify_not_opencti_search(&search_url).expect("OpenSearch 埠隔離");
     let brokers = required_env("REDPANDA_BROKERS")

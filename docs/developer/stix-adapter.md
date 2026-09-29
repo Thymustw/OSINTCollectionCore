@@ -165,7 +165,7 @@ max_objects_per_tx = 10000    # 單次 import 交易最多寫入幾個去重後�
 ```bash
 make run-stix-worker      # 訂閱 job.dispatched，執行 stix_import／stix_export
 cargo test -p stix-adapter
-cargo test -p stix-worker --all-targets   # 含 tests/e2e.rs，需要本機 Postgres/MinIO
+cargo test -p stix-worker --all-targets   # 含 tests/e2e.rs，需要本機 Postgres/SeaweedFS
 cargo test -p acceptance --test acceptance_g   # Import→Core→Export 全程 HTTP 驗收
 ```
 

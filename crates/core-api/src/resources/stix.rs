@@ -302,7 +302,7 @@ fn import_or_unavailable(state: &AppState) -> Result<&ImportState, ApiError> {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "unavailable",
-            "STIX 匯入未接上 Postgres／MinIO。請設定 DATABASE_URL 與 S3_ENDPOINT 後重啟 osint-api",
+            "STIX 匯入未接上 Postgres／物件儲存。請設定 DATABASE_URL 與 S3_ENDPOINT 後重啟 osint-api",
         )
     })
 }

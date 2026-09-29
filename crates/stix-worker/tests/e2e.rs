@@ -1,10 +1,10 @@
-//! stix-worker e2e：對本機 Docker（Postgres／MinIO）真跑，**不接 Kafka**。
+//! stix-worker e2e：對本機 Docker（Postgres／SeaweedFS）真跑，**不接 Kafka**。
 //!
 //! 直接呼叫 [`stix_worker::StixWorker::process_dispatched_job`]。少一個
 //! 非確定性來源（消費者何時收到）就少一類 flaky。
 //!
 //! 每個測試的 Entity 名稱含 run-specific UUID，避免與前幾次跑的資料共用列。
-//! 測完刪掉這次寫進 MinIO 的 key。
+//! 測完刪掉這次寫進物件儲存的 key。
 
 use chrono::{TimeZone, Utc};
 use core_jobs::JobService;
@@ -42,8 +42,8 @@ async fn connect_stack() -> Stack {
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
-    let access = required_env("MINIO_ROOT_USER").expect("MINIO_ROOT_USER");
-    let secret = required_env("MINIO_ROOT_PASSWORD").expect("MINIO_ROOT_PASSWORD");
+    let access = required_env("S3_ACCESS_KEY").expect("S3_ACCESS_KEY");
+    let secret = required_env("S3_SECRET_KEY").expect("S3_SECRET_KEY");
 
     let pg = PostgresCanonicalStore::connect(&dsn, 5)
         .await

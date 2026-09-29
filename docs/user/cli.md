@@ -12,7 +12,7 @@
 
 | | |
 |---|---|
-| **是** | 本機管理工具。直接連 Core 的 PostgreSQL 與 MinIO。 |
+| **是** | 本機管理工具。直接連 Core 的 PostgreSQL 與 SeaweedFS。 |
 | **不是** | 給遠端使用者的介面。它**不經過 core-api**，因此**沒有 RBAC、沒有 AuditLog**。 |
 | **能做** | 查詢。列出、顯示單筆、看 provenance、health check。 |
 | **不能做** | 任何寫入或刪除。刻意沒有實作。 |
@@ -28,7 +28,7 @@
 ## 準備
 
 ```bash
-make compose-up          # 啟動 PostgreSQL / MinIO / Redis / OpenSearch / Redpanda
+make compose-up          # 啟動 PostgreSQL / SeaweedFS / Redis / OpenSearch / Redpanda
 make migrate-postgres    # 第一次執行，或 schema 有更新時
 cp .env.example .env     # 已經有 .env 就跳過
 ```
@@ -39,7 +39,7 @@ cp .env.example .env     # 已經有 .env 就跳過
 config/default.toml → OSINT_CONFIG_FILE 指的檔案 → OSINT__* 環境變數
 ```
 
-密鑰走 SecretRef（`DATABASE_URL`、`MINIO_ROOT_USER` 等寫在 `.env`）。
+密鑰走 SecretRef（`DATABASE_URL`、`S3_ACCESS_KEY` 等寫在 `.env`）。
 CLI 不會自己另外讀環境變數，所以它看到的設定跟服務看到的一致。
 
 執行：
@@ -158,7 +158,7 @@ osint-cli raw list --source 01a091e3-b8d5-708a-90c5-7ad3a83b274b
 osint-cli raw show 01a091e3-bf1a-7594-91d9-a92d941ea661
 ```
 
-加 `--body` 會從 MinIO 取回實際內容：
+加 `--body` 會從物件儲存取回實際內容：
 
 ```bash
 osint-cli raw show <id> --body --max-body-bytes 300
@@ -420,7 +420,7 @@ osint-cli health
 │ 服務       ┆ 狀態 ┆ 位址                   ┆ 訊息                     │
 ╞════════════╪══════╪════════════════════════╪══════════════════════════╡
 │ PostgreSQL ┆ OK   ┆ env:DATABASE_URL       ┆ SELECT 1 成功            │
-│ MinIO/S3   ┆ OK   ┆ http://127.0.0.1:19000 ┆ bucket 存在              │
+│ SeaweedFS/S3 ┆ OK   ┆ http://127.0.0.1:8333 ┆ bucket 存在              │
 │ Redis      ┆ OK   ┆ env:REDIS_URL          ┆ PING PONG                │
 │ OpenSearch ┆ OK   ┆ http://127.0.0.1:19200 ┆ cluster status=green     │
 │ Redpanda   ┆ OK   ┆ 127.0.0.1:9092         ┆ metadata OK，1 個 broker │
@@ -431,7 +431,7 @@ osint-cli health
 | 服務 | 實際做的事 |
 |---|---|
 | PostgreSQL | `SELECT 1` |
-| MinIO/S3 | 檢查 bucket 存在（不會建立 bucket） |
+| SeaweedFS/S3 | 檢查 bucket 存在（不會建立 bucket） |
 | Redis | `PING` |
 | OpenSearch | `_cluster/health`（green/yellow 算健康） |
 | Redpanda | 抓 cluster metadata，回報 broker 數 |
@@ -468,7 +468,7 @@ until osint-cli health --json | jq -e 'all(.healthy)' >/dev/null; do sleep 2; do
 | `relation "documents" does not exist` | migration 沒跑。CLI 會在錯誤訊息後面附上 `make migrate-postgres` 的提示。**CLI 刻意不自己跑 migration**——唯讀工具不該偷改 schema。 |
 | `讀取設定失敗` | 不在 repo 根目錄執行（它會往上找 `config/default.toml`），或 `OSINT_CONFIG_FILE` 指到不存在的檔。 |
 | `找不到 Document ...` | id 打錯或被截斷。訊息會告訴你用哪個 list 子命令查。 |
-| `health` 顯示 OpenSearch/MinIO 連到奇怪的東西 | 本機若同時跑 OpenCTI，9200/9000 是它的。`.env` 要用 19200/19000，並設 `OSINT_STRICT_PORT_ISOLATION=1`。 |
+| `health` 顯示 OpenSearch 連到奇怪的東西 | 本機若同時跑 OpenCTI，9200 是它的 Elasticsearch。`.env` 的 `OPENSEARCH_URL` 要用 19200，並設 `OSINT_STRICT_PORT_ISOLATION=1`。物件儲存改用 SeaweedFS 8333，不再跟 OpenCTI MinIO 的 9000 衝突。 |
 | `search` 查不到東西，但 `documents list` 有資料 | 搜尋查的是 OpenSearch 投影。跑 `make rebuild-index` 從 PostgreSQL 補齊，或 `make run-indexer` 常駐索引。 |
 | `連不上搜尋投影（OpenSearch）` | `.env` 的 `OPENSEARCH_URL` 要是 19200（9200 是 OpenCTI 的 Elasticsearch）。CLI 會做叢集身分驗證，連錯會直接拒絕而不是查到錯的資料。 |
 

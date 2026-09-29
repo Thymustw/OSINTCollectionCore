@@ -136,7 +136,7 @@ POST `/api/v1/import`（Manual／JSON／CSV 上傳）是 `multipart/form-data`�
 | 422 | 引用的資源不存在（connector 的 `source_id`、collection 的 `source_ids`） | 先建立那個資源 |
 | 428 | PATCH 沒帶 `If-Match` | 先 GET 拿 `ETag` |
 | 501 | `POST /objects`（ADR-006）；`/ops/metrics` 在非 Linux | 改用 `POST /import` |
-| 503 | 後端沒接上（Postgres／MinIO／OpenSearch／Redpanda／Neo4j）；`/ops/health` 有任一後端 down | 看訊息裡指的環境變數 |
+| 503 | 後端沒接上（Postgres／SeaweedFS／OpenSearch／Redpanda／Neo4j）；`/ops/health` 有任一後端 down | 看訊息裡指的環境變數 |
 
 錯誤 body 一律是 `{"error": "...", "message": "…下一步建議…"}`。
 
@@ -851,7 +851,7 @@ curl -s -X DELETE http://127.0.0.1:18080/api/v1/tokens/$ID -H "Authorization: Be
 | 欄位 | 型別 | `None` 代表 |
 |---|---|---|
 | `store` | `SharedStore` = `Arc<dyn RelationalStore + Send + Sync>` | 沒接上 Postgres，資源類 handler 回 503 |
-| `objects` | `SharedObjects` = `Arc<dyn ObjectStore + Send + Sync>` | 沒接上 MinIO |
+| `objects` | `SharedObjects` = `Arc<dyn ObjectStore + Send + Sync>` | 沒接上物件儲存 |
 
 Phase 6b 另外加了三個欄位：
 

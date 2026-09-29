@@ -1,4 +1,4 @@
-//! 端到端：`POST /api/v1/import` → RawEvidence（Postgres + MinIO）→ Redpanda
+//! 端到端：`POST /api/v1/import` → RawEvidence（Postgres + 物件儲存）→ Redpanda
 //! `raw.collected` → normalizer → Document。
 //!
 //! 只連本機 Docker 服務，不打外部網路；埠隔離沿用 storage-core conformance
@@ -46,8 +46,8 @@ async fn connect_stack() -> Stack {
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
-    let access = required_env("MINIO_ROOT_USER").expect("MINIO_ROOT_USER");
-    let secret = required_env("MINIO_ROOT_PASSWORD").expect("MINIO_ROOT_PASSWORD");
+    let access = required_env("S3_ACCESS_KEY").expect("S3_ACCESS_KEY");
+    let secret = required_env("S3_SECRET_KEY").expect("S3_SECRET_KEY");
     let brokers = required_env("REDPANDA_BROKERS")
         .or_else(|_| required_env("OSINT__BROKER__BROKERS"))
         .unwrap_or_else(|_| "127.0.0.1:9092".into());
@@ -271,13 +271,13 @@ async fn json_import_round_trip_produces_documents() {
     assert_eq!(meta.metadata["upload"]["actor"], "e2e-operator");
     assert_eq!(meta.source_url, "import://json/payload.json");
 
-    // 2. body 在 MinIO，且與上傳位元組完全一致。
+    // 2. body 在物件儲存，且與上傳位元組完全一致。
     let blob = stack
         .s3
         .get(&meta.storage_path)
         .await
         .expect("get blob")
-        .expect("MinIO 應有 body");
+        .expect("物件儲存應有 body");
     assert_eq!(blob, JSON_PAYLOAD.as_bytes());
 
     // 3. 自動配置的 connector 不會被 collector 撿去跑。
@@ -422,7 +422,7 @@ async fn manual_upload_is_stored_but_not_normalized() {
         .get(&meta.storage_path)
         .await
         .expect("get blob")
-        .expect("MinIO 應有 body");
+        .expect("物件儲存應有 body");
     assert_eq!(blob, pdf);
 
     let outcome = normalizer(&stack)

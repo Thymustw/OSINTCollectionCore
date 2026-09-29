@@ -1,7 +1,7 @@
 //! `osint-cli`：本機唯讀查詢工具。
 //!
 //! 定位：在 console（Phase 6）出現之前，讓人能從終端機看到「系統裡到底有什麼資料」。
-//! 它直接連 Core 的 PostgreSQL／MinIO，**不經過 core-api**，因此也不受 API 的
+//! 它直接連 Core 的 PostgreSQL／SeaweedFS，**不經過 core-api**，因此也不受 API 的
 //! RBAC 與 AuditLog 保護——只在自己已經能存取資料庫的機器上使用。
 //!
 //! 唯讀是刻意的：任何寫入都必須走 core-api，那條路徑才留得下稽核紀錄。

@@ -56,7 +56,7 @@ SHA256 用 `sha2` 0.10。同一 `id` 再寫仍是 `StorageError::Conflict`。物
 
 - 單元：IP 分類、規則驗證、rate limit、retry、feed-rs parse
 - `connector-sdk/tests/ssrf_http.rs`：本機 axum 假 server（ephemeral 埠），涵蓋 default deny、白名單、過期規則、IMDS、redirect、DNS pin、oversized、304、timeout
-- `connector-rss/tests/e2e.rs`：假 RSS → MinIO + Postgres 讀回核對。需要本機 compose 與 `.env`
+- `connector-rss/tests/e2e.rs`：假 RSS → 物件儲存 + Postgres 讀回核對。需要本機 compose 與 `.env`
 - `connector-static-web/tests/e2e.rs`：假 HTML → RawEvidence；ETag 304 不寫新證據
 - `connector-rest-api/tests/e2e.rs`：假 JSON API + SecretRef bearer → RawEvidence；configuration 含 Authorization 會被拒
 - `normalizer/tests/e2e.rs`：假 RSS／HTML／JSON → collector → Document 或 `SkippedUnsupported`。見 `docs/developer/collector-normalizer.md`

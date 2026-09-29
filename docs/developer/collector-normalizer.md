@@ -24,7 +24,7 @@ crates/normalizer     bin: osint-normalizer
 | cron | `croner` 4.0.0（`default-features=false` + `chrono`）。從未跑過（`last_run` 空）視為到期。空／壞 schedule 在 tick 裡當 `NotDue`，手動 `run_connector` 仍可跑 |
 | 併發 | 全域 semaphore + per-domain inflight。`tick` 用 `JoinSet`，spawn 數夾在 `global_inflight`，不可依外部輸入無界 `tokio::spawn` |
 | 速率 | SDK `DomainRateLimiter` 另外管 RPS；這層只管「同時幾個在跑」 |
-| 成功 | SDK sink 寫 RawEvidence（Postgres metadata + MinIO body），更新 checkpoint／`last_run`／`last_success`，publish `raw.collected`（partition key = `source_id`） |
+| 成功 | SDK sink 寫 RawEvidence（Postgres metadata + 物件儲存 body），更新 checkpoint／`last_run`／`last_success`，publish `raw.collected`（partition key = `source_id`） |
 | 失敗 | `error_count` +1、publish `raw.failed`、單一 connector 失敗不中斷迴圈 |
 | Job | 每次收集建 `job_type=collect`、`correlation_id=connector.id`。Job 轉態失敗只 warn，不中止收集 |
 
@@ -41,7 +41,7 @@ per_domain_inflight = 1
 
 ## Normalizer
 
-Redpanda consumer 訂閱 `raw.collected`（`enable.auto.commit=false`，處理完 `commit_last`）。載入 RawEvidence metadata（Postgres）+ body（MinIO）。RSS／Atom 走 `connector-rss::parse_feed`（`object_type=Article`）；Static Web 走 `connector-static-web::parse_html`（`object_type=WebPage`）。publish `object.normalized` 只在有寫 Document 時。
+Redpanda consumer 訂閱 `raw.collected`（`enable.auto.commit=false`，處理完 `commit_last`）。載入 RawEvidence metadata（Postgres）+ body（物件儲存）。RSS／Atom 走 `connector-rss::parse_feed`（`object_type=Article`）；Static Web 走 `connector-static-web::parse_html`（`object_type=WebPage`）。publish `object.normalized` 只在有寫 Document 時。
 
 **匯入（push）路徑**：`metadata["import"]` 帶有 `ImportSpec`（由 `POST /api/v1/import` 寫入）時，改走 `import-format` 解析，每筆紀錄一份 Document（`object_type` 由上傳者指定，預設 `report`）。`kind=manual` 一律 `SkippedUnsupported`。
 
@@ -130,7 +130,7 @@ Postgres 與 SQLite adapter 都有實作；conformance 會斷言。
 
 ## 本機啟動
 
-需要 compose（Postgres、MinIO 19000、Redpanda 9092）與正確 `.env`。不要連 8080／9200／9000。
+需要 compose（Postgres、SeaweedFS 8333、Redpanda 9092）與正確 `.env`。不要連 8080／9200。
 
 ```bash
 make run-collector
@@ -149,7 +149,7 @@ cargo test -p normalizer --test e2e -- --nocapture --test-threads=1
 
 e2e（對本機 Docker，不連外網）：
 
-1. 假 RSS → `run_connector` → RawEvidence（Postgres+MinIO）→ 真的 `raw.collected` → `handle_payload` → Document 讀回
+1. 假 RSS → `run_connector` → RawEvidence（Postgres+物件儲存）→ 真的 `raw.collected` → `handle_payload` → Document 讀回
 2. 同一 `raw_evidence_id` 連續正規化兩次 → 第二次 `AlreadyDone`，`normalized`／`derived_from` 各一列
 3. 並發兩次 → 一次 `Created`、一次 `AlreadyDone`，Document 仍只有一組
 4. 未知 `connector_type`（例如 `manual_upload`）→ `SkippedUnknownType`

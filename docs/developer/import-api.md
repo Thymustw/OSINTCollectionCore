@@ -16,7 +16,7 @@ SPEC §19 列了 `POST /objects`，但那是另一件事：
 | | `POST /objects`（尚未實作） | `POST /api/v1/import` |
 |---|---|---|
 | 收什麼 | 已經整理好的 canonical Document | 原始位元組（檔案） |
-| 產生什麼 | Document | RawEvidence（immutable，body 在 MinIO） |
+| 產生什麼 | Document | RawEvidence（immutable，body 在物件儲存） |
 | 之後 | 直接進 canonical store | 發 `raw.collected` → normalizer 拆 Document |
 | provenance | 呼叫者即作者，無 RawEvidence 可回溯 | 有 RawEvidence，可回到原始檔案 |
 

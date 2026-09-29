@@ -41,7 +41,7 @@ crates/
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   graph-worker/          圖投影（osint-graph-worker）：relationship.changed → Neo4j（SPEC_V0.2 §8）；常駐模式也消費 job.dispatched 執行 graph_rebuild；只有 Entity→Entity 的邊才進圖
   embedding-worker/      向量投影（osint-embedding-worker）：entity.extracted → osint-documents overlay + osint-entities（SPEC_V0.2 §11–§14）；不訂 embedding.requested
-  osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/MinIO，不經 core-api
+  osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/物件儲存，不經 core-api
   acceptance/            跨服務驗收測試（SPEC §26 Acceptance F、failure/recovery）。無生產程式碼
 docker/
   docker-compose.yml
@@ -51,7 +51,7 @@ migrations/
   sqlite/
 ```
 
-`osint-cli` 是**唯讀**的：它直接連 Core 的 PostgreSQL／MinIO，因此不受 API 的 RBAC 與 AuditLog
+`osint-cli` 是**唯讀**的：它直接連 Core 的 PostgreSQL／SeaweedFS，因此不受 API 的 RBAC 與 AuditLog
 保護，所以刻意不提供任何寫入子命令——寫入一律走 `core-api`。用法見 `docs/user/cli.md`。
 
 `indexer` 同時放**索引**與**查詢語法**，這是刻意的：index mapping（欄位型別、analyzer、

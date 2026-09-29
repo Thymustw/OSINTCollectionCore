@@ -40,7 +40,7 @@ pub enum CollectOutcome {
     NotDue,
 }
 
-/// 生產用 runner：Postgres + MinIO + Redpanda。
+/// 生產用 runner：Postgres + 物件儲存 + Redpanda。
 #[derive(Clone)]
 pub struct CollectorRunner {
     store: PostgresCanonicalStore,

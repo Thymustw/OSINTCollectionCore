@@ -126,7 +126,7 @@ jobs:
     # `ubuntu-latest` on PUBLIC repositories is 4 vCPU / 16 GB RAM / 14 GB SSD
     # — not the 7 GB an earlier note assumed. Configured ceilings here:
     #   postgres shared_buffers 256M, opensearch heap 512M,
-    #   redpanda 256M, redis 192M, minio small, neo4j heap 512M + pagecache 256M
+    #   redpanda 256M, redis 192M, seaweedfs small, neo4j heap 512M + pagecache 256M
     # ≈ 2 GB of declared limits, leaving ample headroom for the cargo build.
     # NOTE: docker-compose.yml carries no `mem_limit` (those live in the dev
     # override), so these are per-process heap settings, not cgroup caps.
@@ -141,10 +141,10 @@ jobs:
       DATABASE_URL: postgres://osint:osint_dev@localhost:5432/osint_core
       SQLITE_URL: "sqlite:./var/osint-local.sqlite?mode=rwc"
       OPENSEARCH_URL: http://localhost:9200
-      S3_ENDPOINT: http://localhost:9000
+      S3_ENDPOINT: http://localhost:8333
       S3_BUCKET: raw-evidence
-      MINIO_ROOT_USER: osint
-      MINIO_ROOT_PASSWORD: osint_dev_minio
+      S3_ACCESS_KEY: osint
+      S3_SECRET_KEY: osint_dev_minio
       REDIS_URL: redis://localhost:6379/0
       REDPANDA_BROKERS: localhost:9092
       # Neo4j (V0.2 phase 0b). Canonical ports; the local-dev override does not

@@ -79,7 +79,7 @@ pub fn test_app_with_backends(
             tokens: tokens.clone(),
         },
         audit: Arc::new(audit.clone()),
-        // 不接 Postgres／MinIO：資源類 handler 回 503，
+        // 不接 Postgres／SeaweedFS：資源類 handler 回 503，
         // 但認證／RBAC／稽核的測試仍然有效——middleware 在 handler 之前就跑完了。
         store: None,
         objects: None,

@@ -15,7 +15,7 @@
 //!    物件（不是只斷言「存在一條 attributed-to 關係」）——這才是
 //!    「不遺失主要 semantic relationship」的實質意義。
 //!
-//! 需要本機 Docker：Postgres／MinIO。不打外網。
+//! 需要本機 Docker：Postgres／SeaweedFS。不打外網。
 //!
 //! # 為什麼命名分段跨越整個 HTTP 邊界
 //!

@@ -53,7 +53,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `GraphStore` | `storage-neo4j`；mock：`storage_core::mock::MockGraphStore` | 圖寫入／遍歷（V0.2 Phase 0g／Phase 2）。見下方「`GraphStore`」與「`storage-neo4j`」 |
 | `EmbeddingProvider` | `storage-opensearch`（`MlCommonsEmbeddingProvider`）；mock：`storage_core::mock::MockEmbeddingProvider` | 文字→向量（V0.2 Phase 3）。見下方「`EmbeddingProvider`」 |
 | `KeyValueStore` | `storage-redis`；mock：`storage_core::mock::MockKeyValueStore` | get/set/set_ex/del/expire。**第一個應用資料用途**是 Stage 5／embedding-worker 共用的向量暫存（`embedding-cache:v1:{content_hash}`，見下方） |
-| `ObjectStore` | `storage-s3` | MinIO put/get/delete/exists |
+| `ObjectStore` | `storage-s3` | SeaweedFS/S3 put/get/delete/exists |
 | `HealthProvider` | 全部 | `health()` |
 | `StorageAdapter` | 全部 | `CapabilityDescriptor` |
 
@@ -246,7 +246,11 @@ DLQ 重放仍沒有生產呼叫端。graph-worker（`osint-graph-worker`）是 `
   `osint-projection-state`——這一支會 `reset_projection`，跑在正式那個上等於把真的
   indexer 進度清掉），測完整個刪除。
 - OpenSearch：index 名 `osint-core-conformance-<uuid>`；`assert_opensearch_identity`（拒絕 Elasticsearch tagline `You Know, for Search`）是唯一的環境無關身分驗證。`verify_not_opencti_search`（函式名稱裡的 `opencti` 反映了原始撰寫時的本機衝突對象，函式名稱本身沒有改）只在本機 `.env` 設了 `OSINT_STRICT_PORT_ISOLATION=1` 時才額外擋埠 9200——這是本機專屬防線，不是通則，CI 等其他環境不會擋。ADR-005 的決策：該 port-isolation guard 原本被寫死為無條件規則，結果第一次 CI run 就失敗（CI 沒有那個本機衝突，`docker/docker-compose.yml` 正確地把 OpenSearch 綁在 9200，卻被 hard-coded 規則拒絕）；決策是把 hard rejection 改成由 `OSINT_STRICT_PORT_ISOLATION=1` opt-in，並改以 `assert_opensearch_identity` 驗實際遠端身分（環境無關），而非用 port 號推斷。
-- S3：key prefix `conformance/<uuid>`；`verify_not_opencti_s3`（函式名稱同上，反映本機原始衝突對象）同樣只在本機開 `OSINT_STRICT_PORT_ISOLATION=1` 時才擋埠 9000。MinIO 沒有等同 OpenSearch 的身分驗證 API，所以這是目前唯一防線，僅在已知衝突的機器生效。可 `ensure_bucket`（`object_store` 本身沒有 CreateBucket，adapter 用同一套 rustls HTTP client 簽 SigV4 打 `PUT /{bucket}`），不清空既有物件。測試另外用 `delete_empty_bucket`（同樣是 SigV4 `DELETE /{bucket}`）清掉為驗證新建而建的空 bucket。
+- S3：key prefix `conformance/<uuid>`；`verify_not_opencti_s3`（函式名稱同上，反映本機原始衝突對象）目前只驗 URL 格式。SeaweedFS 改用 8333 後沒有已知埠衝突可擋，舊的「嚴格模式擋 9000」已拿掉（見 ADR-015）。SeaweedFS 的 `GET /status` 同樣不驗證身分——「沒有等同 OpenSearch 的身分驗證 API」這句話延續成立。可 `ensure_bucket`（`object_store` 本身沒有 CreateBucket，adapter 用同一套 rustls HTTP client 簽 SigV4 打標準 S3 `PUT /{bucket}`），不清空既有物件。測試另外用 `delete_empty_bucket`（同樣是 SigV4 `DELETE /{bucket}`）清掉為驗證新建而建的空 bucket。**SeaweedFS 4.48 錯誤字串已對著真實容器驗證（2026-09-29）**：`cargo test -p storage-s3` 兩條 conformance 都過（含 `ensure_bucket` 對缺失 bucket 的路徑，以及 round-trip 的缺失 object）。另外用 SigV4 打同一組端點，回應原文是：
+  - 缺失 bucket `GET /{bucket}` → HTTP 404，`<Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message>`
+  - 缺失 object `GET /{bucket}/{key}` → HTTP 404，`<Code>NoSuchKey</Code><Message>The specified key does not exist.</Message>`
+  - 未簽名請求 → HTTP 403 `<Code>AccessDenied</Code>`（沒有 anonymous identity）
+  `object_store` 0.14.1 會把 HTTP 404 映成 `ObjectStoreError::NotFound`，`is_missing_bucket` / `is_missing_object` 的第一臂就會命中；字串比對（`NoSuchBucket` / `The specified bucket does not exist` / `NoSuchKey`）與 SeaweedFS 原文也一致。matcher **沒有改**。
 - Redis：key prefix `osint-core-conformance:`；TTL 用毫秒（PSETEX / PEXPIRE）。
 - Neo4j GraphStore：`assert_graph_store_contract`，節點／邊用 per-run UUID，測完
   `delete_node`（`DETACH DELETE`）清掉。**不 DROP constraint**。
@@ -268,21 +272,21 @@ DLQ 重放仍沒有生產呼叫端。graph-worker（`osint-graph-worker`）是 `
 
 ```bash
 cp .env.example .env   # 若還沒有
-# 本機常見情境：9200/9000 可能被其他本機服務占用。必須改成偏移埠：
+# 本機常見情境：9200 可能被其他本機服務占用。OpenSearch 必須改成偏移埠：
 # OPENSEARCH_URL=http://127.0.0.1:19200
-# S3_ENDPOINT=http://127.0.0.1:19000
+# S3_ENDPOINT=http://127.0.0.1:8333
 make compose-up
 make migrate-postgres
 cargo test --workspace --all-targets -- --nocapture
 ```
 
-`config/default.toml` 仍寫 canonical 9200 / 9000。conformance 讀 `.env`；埠號閘門只在本機開了 `OSINT_STRICT_PORT_ISOLATION=1` 時才會拒絕連到 canonical 埠上的其他服務，其他環境（CI 等）不受影響。
+`config/default.toml` 的 OpenSearch canonical 埠仍是 9200、物件儲存已是 8333。conformance 讀 `.env`；OpenSearch 的埠號閘門只在本機開了 `OSINT_STRICT_PORT_ISOLATION=1` 時才會拒絕連到 9200 上的其他服務，其他環境（CI 等）不受影響。SeaweedFS 目前不擋任何埠。
 
 ## TLS / 依賴約束
 
 - sqlx：`runtime-tokio` + `tls-rustls-ring`，不開 native-tls。
 - OpenSearch client：`rustls-tls`。
-- object_store：`default-features = false` + `aws`。`aws` 會開 `reqwest/rustls` 與 `aws-lc-rs`，不開 native-tls。crate 預設的 `fs` feature 關掉，因為我們只接 MinIO。
+- object_store：`default-features = false` + `aws`。`aws` 會開 `reqwest/rustls` 與 `aws-lc-rs`，不開 native-tls。crate 預設的 `fs` feature 關掉，因為我們只接 S3 相容後端。
 - redis：精確 `=1.2.2`。`1.3+` 的 rust-version 是 1.88，超過 workspace `1.85.0`。
 - rdkafka：`cmake-build` + `libz`，不開 `ssl-vendored`（見 `docs/developer/events.md`）。
 

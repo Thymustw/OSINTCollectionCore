@@ -7,7 +7,7 @@
 //! | [`broker_redelivery_is_idempotent`] | 不停服務（consumer 不 commit 就 drop） | 同 group 的下一個 consumer 會拿到同一則，重新處理不會多出 Document |
 //! | [`db_temporary_failure_degrades_then_recovers`] | `postgres` | 讀取路由回 503 且不會 hang；PG 回來之後自己恢復 |
 //! | [`search_unavailable_does_not_block_ingestion`] | `opensearch` | 匯入照常 201，只有搜尋回 503；索引重建後搜得到 |
-//! | [`object_storage_unavailable_leaves_no_half_written_evidence`] | `minio` | 匯入回 503，而且**沒有留下沒有 body 的 metadata** |
+//! | [`object_storage_unavailable_leaves_no_half_written_evidence`] | `seaweedfs` | 匯入回 503，而且**沒有留下沒有 body 的 metadata** |
 //!
 //! # 這些測試會停掉真的 Docker 服務
 //!
@@ -88,8 +88,8 @@ fn workspace_root() -> std::path::PathBuf {
 
 /// 跑一次 `docker compose -f docker-compose.yml -f docker-compose.dev.yml <args>`。
 ///
-/// 兩個 `-f` 都要帶：dev override 決定了 OpenSearch／MinIO 掛在 19200／19000，
-/// 只帶第一個檔會操作到另一組埠設定的服務定義。
+/// 兩個 `-f` 都要帶：dev override 決定了 OpenSearch 掛在 19200（SeaweedFS
+/// 8333 不 remap），只帶第一個檔會操作到另一組埠設定的服務定義。
 fn compose(args: &[&str]) -> std::process::Output {
     let root = workspace_root();
     let mut command = Command::new("docker");
@@ -218,7 +218,7 @@ struct TestApi {
     token: String,
 }
 
-/// 組一個接上 Postgres／MinIO（以及可選的 OpenSearch）的 API。
+/// 組一個接上 Postgres／物件儲存（以及可選的 OpenSearch）的 API。
 ///
 /// 這裡刻意用**與 `main.rs` 相同的 handle 來源**（同一個 pool、同一個 S3 client）：
 /// 失效測試要驗的是「連線建立好之後後端才掛掉」這個真實情境，
@@ -772,19 +772,19 @@ async fn search_unavailable_does_not_block_ingestion() {
 // 4. object storage unavailable
 // ---------------------------------------------------------------------------
 
-/// `stop minio` → 匯入回 503，而且 **`raw_evidence` 一列都不會留**
-/// → `start minio` → 再匯入 → 201。
+/// `stop seaweedfs` → 匯入回 503，而且 **`raw_evidence` 一列都不會留**
+/// → `start seaweedfs` → 再匯入 → 201。
 ///
 /// # 這裡真正要防的東西
 ///
 /// 不是「回了錯誤碼」，而是**沒有 body 的 metadata**。RawEvidence 的 metadata 在
-/// Postgres、body 在 MinIO；如果先寫 metadata 再寫 body，MinIO 掛掉就會留下一列
+/// Postgres、body 在物件儲存；如果先寫 metadata 再寫 body，物件儲存掛掉就會留下一列
 /// 指向不存在物件的證據——之後 normalizer 讀不到內容，而 DB 看起來一切正常。
 /// `StoreEvidenceSink::persist` 的順序（先 `objects.put` 再
 /// `insert_raw_evidence`，insert 失敗才回頭刪物件）就是為了這件事，
 /// 這個測試是它唯一的執行期證明。
 #[tokio::test]
-#[ignore = "會 stop/start minio 容器；請用 --ignored --test-threads=1 單獨跑"]
+#[ignore = "會 stop/start seaweedfs 容器；請用 --ignored --test-threads=1 單獨跑"]
 async fn object_storage_unavailable_leaves_no_half_written_evidence() {
     let stack = connect_stack().await;
     let run = Uuid::now_v7();
@@ -796,14 +796,14 @@ async fn object_storage_unavailable_leaves_no_half_written_evidence() {
 
     let payload = json!([{
         "title": format!("failrecminio{} advisory", run.simple()),
-        "description": "MinIO 掛掉時不可以留下半套證據",
+        "description": "物件儲存掛掉時不可以留下半套證據",
         "id": format!("failrecminio{}-1", run.simple()),
     }])
     .to_string();
 
-    let mut guard = ServiceGuard::stop("minio");
+    let mut guard = ServiceGuard::stop("seaweedfs");
 
-    // ---- MinIO 掛掉：503 ----
+    // ---- 物件儲存掛掉：503 ----
     let (status, body, elapsed) = import_json(&api, source.id, &payload).await;
     assert_eq!(
         status,
@@ -829,13 +829,13 @@ async fn object_storage_unavailable_leaves_no_half_written_evidence() {
          DB 上會有一筆指向不存在物件的證據，而且不會有任何錯誤訊息"
     );
 
-    // ---- MinIO 回來：同一個 API 行程直接恢復 ----
+    // ---- 物件儲存回來：同一個 API 行程直接恢復 ----
     guard.restore();
     let (status, body, _) = import_json(&api, source.id, &payload).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
-        "MinIO 恢復之後匯入要能成功（不需要重啟 osint-api）：{body}"
+        "物件儲存恢復之後匯入要能成功（不需要重啟 osint-api）：{body}"
     );
     assert_eq!(
         count_raw_evidence(&stack.pg, source.id).await,
@@ -843,7 +843,7 @@ async fn object_storage_unavailable_leaves_no_half_written_evidence() {
         "恢復之後應該只有這一次成功匯入留下的證據"
     );
 
-    // body 真的在 MinIO，而且與上傳的位元組一致。
+    // body 真的在物件儲存，而且與上傳的位元組一致。
     let raw_evidence_id: Uuid = body["raw_evidence_id"]
         .as_str()
         .and_then(|s| s.parse().ok())
@@ -857,6 +857,6 @@ async fn object_storage_unavailable_leaves_no_half_written_evidence() {
     let blob = storage_core::ObjectStore::get(&stack.s3, &meta.storage_path)
         .await
         .expect("讀物件")
-        .expect("MinIO 應有 body");
+        .expect("物件儲存應有 body");
     assert_eq!(blob, payload.as_bytes(), "存下來的內容必須與上傳的一致");
 }

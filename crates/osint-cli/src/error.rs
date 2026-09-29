@@ -16,7 +16,7 @@ pub enum CliError {
     PostgresUnavailable { message: String },
 
     #[error(
-        "連不上物件儲存（MinIO/S3）：{message}\n下一步：確認 `.env` 的 S3_ENDPOINT／MINIO_ROOT_USER／MINIO_ROOT_PASSWORD，\n並用 `make compose-ps` 確認 osint-core-minio-1 是 healthy。"
+        "連不上物件儲存（SeaweedFS/S3）：{message}\n下一步：確認 `.env` 的 S3_ENDPOINT／S3_ACCESS_KEY／S3_SECRET_KEY，\n並用 `make compose-ps` 確認 osint-core-seaweedfs-1 是 healthy。"
     )]
     ObjectStoreUnavailable { message: String },
 

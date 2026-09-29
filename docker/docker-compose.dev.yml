@@ -1,13 +1,14 @@
 # 開發覆寫：對齊本機約 31GB RAM / 8 核心，並避開已被其他堆疊佔用的主機埠。
 #
-# 實測（2026-09-10）：主機 9200 已被 OpenCTI Elasticsearch 佔用、
-# 9000 已被 OpenCTI MinIO 佔用。canonical 埠仍寫在 docker-compose.yml；
-# 這個 override 把 OpenSearch / MinIO 改掛 19200 / 19000 / 19001。
+# 實測（2026-09-10）：主機 9200 已被 OpenCTI Elasticsearch 佔用。
+# canonical 埠仍寫在 docker-compose.yml；這個 override 把 OpenSearch 改掛 19200。
+# SeaweedFS 改用 8333 後不需要埠 remap（8333 無人佔用，2026-09-29 `ss -ltn` 實測）；
+# 以前 MinIO 佔 9000、dev overlay 掛 19000/19001 的理由已不適用。
 # Postgres 5432、Redis 6379、Redpanda 9092/8081/8082/9644 主機端目前空閒，維持原埠。
 # Neo4j 7474/7687 同樣空閒（2026-09-12 實測），維持原埠。
 #
 # 基礎建設的記憶體合計（V0.2 Phase 0a-2 後）：
-#   postgres 1g + opensearch 3g + redpanda 512m + redis 256m + minio 512m + neo4j 1g
+#   postgres 1g + opensearch 3g + redpanda 512m + redis 256m + seaweedfs 512m + neo4j 1g
 #   = 6.25 GB / 4.5 CPU
 # opensearch 從 1g 升到 2g 再升到 3g 的理由見下方該服務的註解
 #（0a：單一 embedding 模型；0a-2：中英雙模型並存）。
@@ -69,17 +70,16 @@ services:
     mem_limit: 256m
     cpus: "0.50"
 
-  minio:
+  # SeaweedFS 8333 在這台機器上沒有衝突，不 remap 埠。
+  # 512MB/0.5CPU 延用自 MinIO，未針對 SeaweedFS 重新量測。
+  seaweedfs:
     mem_limit: 512m
     cpus: "0.50"
-    ports: !override
-      - "19000:9000"
-      - "19001:9001"
 
   # 1 GB 給 512m heap + 256m pagecache，剩下約 256 MB 留給 JVM 的 metaspace、
   # 執行緒堆疊與網路緩衝。V0.2 的圖投影規模（幾十萬節點級）用不到更多。
   # 埠**不覆寫**：7474/7687 在這台機器上是空的（2026-09-12 `ss -ltn` 實測），
-  # 沒有像 9200/9000 那樣的 OpenCTI 衝突要規避。
+  # 沒有像 OpenSearch 9200 那樣的 OpenCTI 衝突要規避。
   #
   # 值與 base compose 相同是刻意重複：base 那份是給 CI 的保險
   # （Neo4j 沒設定會依可見 RAM 自動推算 heap），這份是本機的天花板。
@@ -110,7 +110,7 @@ services:
   # RESOURCE_BUDGET.md 的 OSINT_RAM_SOFT_LIMIT_GB / OSINT_CPU_SOFT_PERCENT 重算。
   #
   # 宿主埠**不覆寫**：18080–18088 在這台機器上是空的（`ss -ltn` 實測），
-  # 沒有像 9200/9000 那樣的 OpenCTI 衝突要規避。
+  # 沒有像 OpenSearch 9200 那樣的 OpenCTI 衝突要規避。
 
   osint-api:
     mem_limit: 512m

@@ -107,7 +107,7 @@ async fn run() -> Result<(), String> {
                 Arc::new(store.clone()),
             )));
 
-            // 匯入另外需要物件儲存。MinIO 沒接上時只有 /api/v1/import 回 503，
+            // 匯入另外需要物件儲存。物件儲存沒接上時只有 /api/v1/import 回 503，
             // 其他路由照常——沒有理由讓查詢功能陪著一起掛掉。
             let import = match connect_objects(&cfg).await {
                 Ok(objects) => {
@@ -127,7 +127,7 @@ async fn run() -> Result<(), String> {
                     }))
                 }
                 Err(err) => {
-                    tracing::warn!(error = %err, "MinIO 未連上；POST /api/v1/import 會回 503");
+                    tracing::warn!(error = %err, "物件儲存未連上；POST /api/v1/import 會回 503");
                     missing.push("object_store");
                     None
                 }

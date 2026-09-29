@@ -1,6 +1,6 @@
 //! `POST /api/v1/import` 的 HTTP 層行為：認證、RBAC、大小上限、稽核、輸入驗證。
 //!
-//! 這支不接 Postgres／MinIO（`test_app` 的 import state 是 None），所以只驗到
+//! 這支不接 Postgres／SeaweedFS（`test_app` 的 import state 是 None），所以只驗到
 //! 「請求有沒有被正確擋下／收下」。真正落地與正規化在 `import_e2e.rs`。
 
 use axum::body::Body;
