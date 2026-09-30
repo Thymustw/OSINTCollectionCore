@@ -213,10 +213,11 @@ jobs:
           - osint-graph-worker
           - osint-embedding-worker
           - osint-stix-worker
+          - osint-discovery-worker
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
-      # 九個 target 共用同一個 builder stage。GHA cache 讓第二個之後的
+      # 十個 target 共用同一個 builder stage。GHA cache 讓第二個之後的
       # service 直接命中，不會把同一份 workspace 編八次。
       #
       # 產出存成 tar 給 sbom / image-scan job 用。分成不同 job 是為了讓
@@ -256,6 +257,7 @@ jobs:
           - osint-graph-worker
           - osint-embedding-worker
           - osint-stix-worker
+          - osint-discovery-worker
     steps:
       # V0.1 只要求「有產生路徑」（DEVSECOPS.md §25：正式 SBOM 是 V1.0 的
       # release gate）。這裡用 trivy 而不是 syft，理由是 SECURITY_CI.md 的
@@ -283,7 +285,7 @@ jobs:
           retention-days: 30
 
   # ADR-010 の SBOM 缺口：Neo4j 是外部 registry image（不是本 repo build 出來
-  # 的），所以不能跟其他九個服務共用 image-build → download-artifact 那條路
+  # 的），所以不能跟其他十個服務共用 image-build → download-artifact 那條路
   # （那套是為了掃描本 repo 自建 image 的 tar 產物）。直接 pull 官方 image
   # 後用同一套 trivy 流程掃，理由與範圍見
   # docs/adr/ADR-010-neo4j-community-edition.md Consequences 段落。
@@ -345,6 +347,7 @@ jobs:
           - osint-graph-worker
           - osint-embedding-worker
           - osint-stix-worker
+          - osint-discovery-worker
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4

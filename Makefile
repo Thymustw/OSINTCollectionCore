@@ -8,7 +8,7 @@
 	run-indexer rebuild-index rebuild-index-drop run-cli \
 	run-graph-worker rebuild-graph rebuild-graph-drop \
 	run-embedding-worker rebuild-embeddings rebuild-embeddings-drop \
-	run-stix-worker \
+	run-stix-worker run-discovery-worker \
 	image-build image-scan image-prune image-ls \
 	compose-up-full compose-down-full compose-ps-full \
 	disk clean
@@ -51,12 +51,13 @@ help:
 	@echo "  make rebuild-embeddings 從 PostgreSQL 補齊 Document／Entity 向量後結束"
 	@echo "  make rebuild-embeddings-drop 先刪 osint-entities 再從零重建（永不刪 osint-documents）"
 	@echo "  make run-stix-worker   啟動 osint-stix-worker（需 compose 與 .env；沒有 --rebuild）"
+	@echo "  make run-discovery-worker 啟動 osint-discovery-worker（需 compose 與 .env）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
-	@echo "  make image-build       建九個服務的容器 image（不 push）"
-	@echo "  make image-scan        trivy image 掃九個 image（需已安裝 trivy）"
+	@echo "  make image-build       建十個服務的容器 image（不 push）"
+	@echo "  make image-scan        trivy image 掃十個 image（需已安裝 trivy）"
 	@echo "  make image-ls          列出本專案的 image 與大小"
 	@echo "  make image-prune       清掉 dangling layer 與 builder 快取"
-	@echo "  make compose-up-full   基礎建設 + 九個應用服務（會先 build）"
+	@echo "  make compose-up-full   基礎建設 + 十個應用服務（會先 build）"
 	@echo "  make compose-down-full 停掉含應用服務的整套"
 	@echo "  make compose-ps-full   含應用服務的狀態"
 	@echo "  make disk              顯示 target/、.git、docker volume 的磁碟用量"
@@ -116,14 +117,15 @@ compose-ps:
 	$(COMPOSE) $(COMPOSE_FILES) ps
 
 # --- 容器化（Phase 7a）--------------------------------------------------
-# 九個應用服務在 compose 的 `app` profile 底下，預設不啟動。
+# 十個應用服務在 compose 的 `app` profile 底下，預設不啟動。
 # 沒有 --profile app 的目標（compose-up / compose-down / compose-ps）行為不變。
 
 IMAGE_TAG ?= 0.1.0
 IMAGE_PREFIX ?= osint-core
 SERVICES := osint-api osint-collector osint-normalizer \
 	osint-deduplicator osint-entity-worker osint-indexer \
-	osint-graph-worker osint-embedding-worker
+	osint-graph-worker osint-embedding-worker osint-stix-worker \
+	osint-discovery-worker
 
 # 只 build，不啟動。image 名稱固定成 $(IMAGE_PREFIX)/<服務>:$(IMAGE_TAG)，
 # 所以重 build 會覆蓋同一個 tag（舊的變成 dangling，用 image-prune 清）。
@@ -262,6 +264,12 @@ rebuild-embeddings-drop:
 # 細節見 docs/developer/stix-adapter.md。
 run-stix-worker:
 	$(CARGO) run -p stix-worker --bin osint-stix-worker
+
+# V0.3 Discovery Engine。訂閱 job.dispatched，只執行 job_type=discovery_run
+# （Graph Expansion + Source Expansion），其餘一律忽略並 commit。
+# 沒有 --rebuild：Candidate 不是可重建的投影。細節見 docs/developer/discovery-worker.md。
+run-discovery-worker:
+	$(CARGO) run -p discovery-worker --bin osint-discovery-worker
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。

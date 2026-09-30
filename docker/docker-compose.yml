@@ -374,7 +374,7 @@ services:
   # 每個服務都必須把 bind 覆寫成 0.0.0.0：config/default.toml 的預設
   # 127.0.0.1 在容器內等於「只有容器自己連得到」，宿主與其他容器都打不到。
   #
-  # 宿主埠沿用本機開發同一組 18080–18085，方便在容器版與 `cargo run` 版之間
+  # 宿主埠沿用本機開發同一組 18080–18089，方便在容器版與 `cargo run` 版之間
   # 直接切換（兩者不能同時跑，會搶埠）。
 
   osint-api:
@@ -525,6 +525,26 @@ services:
       OSINT__STIX_WORKER__BIND: 0.0.0.0:18088
     ports:
       - "18088:18088"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+
+  # V0.3 Discovery Engine（Graph Expansion + Source Expansion）。訂閱
+  # job.dispatched，只執行 job_type=discovery_run。2026-09-30 補上容器化，
+  # 之前只能 `cargo run -p discovery-worker`。
+  osint-discovery-worker:
+    build:
+      <<: *osint-build
+      target: osint-discovery-worker
+    image: osint-core/osint-discovery-worker:0.1.0
+    hostname: osint-discovery-worker
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__DISCOVERY_WORKER__BIND: 0.0.0.0:18089
+    ports:
+      - "18089:18089"
     networks:
       - osint-core
     depends_on: *osint-depends
