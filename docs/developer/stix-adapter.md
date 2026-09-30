@@ -42,7 +42,7 @@ core-api                HTTP 入口：POST /api/v1/import/stix、POST /api/v1/ex
 
 10 種 EntityType 有原生對應（Person/Organization → Identity；ThreatActor/Malware/Vulnerability/Indicator/Domain/Ip/Url/Email → 對應 SDO/SCO）。
 
-6 種沒有原生 STIX 對應的（Account／Hostname／Repository／Hash／Software／Location）產出 `CustomObject`（`type=x-osint-core-entity`），把 Core 型別與 id 塞進 `extra`（`x_osint_core_type`／`x_osint_core_id`），不丟 provenance。
+7 種沒有原生 STIX 對應的（Account／Hostname／Repository／Hash／Software／Product／Location）產出 `CustomObject`（`type=x-osint-core-entity`），把 Core 型別與 id 塞進 `extra`（`x_osint_core_type`／`x_osint_core_id`），不丟 provenance。
 
 **這是單向的**：Custom 的 STIX → Core 反向映射刻意不做（見測試 `unknown_and_relationship_and_custom_return_none`），避免只做一半。
 
@@ -52,7 +52,7 @@ core-api                HTTP 入口：POST /api/v1/import/stix、POST /api/v1/ex
 
 | EntityType | 正規化規則 |
 |---|---|
-| Person／Organization／ThreatActor／Malware／Indicator／Account／Hostname／Software／Repository／Location | `entity-worker::normalize_person_or_org`（空白壓成單一半形空格＋`to_lowercase`） |
+| Person／Organization／ThreatActor／Malware／Indicator／Account／Hostname／Software／Product／Repository／Location | `entity-worker::normalize_person_or_org`（空白壓成單一半形空格＋`to_lowercase`） |
 | Domain／Email | `to_ascii_lowercase` ＋ 去尾端 `.` |
 | Ip | `IpAddr` parse 後 `Display`；解析失敗保留原文 |
 | Url | `core_model::url_norm::canonicalize` |
@@ -75,7 +75,7 @@ core-api                HTTP 入口：POST /api/v1/import/stix、POST /api/v1/ex
 
 ## `core_model::enums` 擴充
 
-`EntityType` 新增 `ThreatActor`／`Malware`／`Indicator`（都納入 `ALL_ENTITY_TYPES`）；`RelationshipType` 新增 `Indicates`／`AttributedTo`／`Targets`／`Mitigates`；`SourceType` 新增 `StixImport`。三者欄位是 TEXT NOT NULL 無 CHECK constraint，加新 variant 不需要 migration。
+`EntityType` 新增 `ThreatActor`／`Malware`／`Indicator`（都納入 `ALL_ENTITY_TYPES`），V0.3 Acceptance A 再補 `Product`（走 Custom，無原生 STIX 對應；`ALL_ENTITY_TYPES` 現為 17 個變體）；`RelationshipType` 新增 `Indicates`／`AttributedTo`／`Targets`／`Mitigates`；`SourceType` 新增 `StixImport`。欄位是 TEXT NOT NULL 無 CHECK constraint，加新 variant 不需要 migration。
 
 ## 決定性 id：與既有資料自然收斂
 

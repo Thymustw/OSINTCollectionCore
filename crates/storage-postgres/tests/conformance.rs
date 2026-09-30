@@ -1,6 +1,6 @@
 use storage_core::conformance::{
-    assert_canonical_health, assert_relational_round_trip, assert_transactional_contract,
-    load_workspace_dotenv, required_env,
+    assert_canonical_health, assert_list_sources_by_entity, assert_relational_round_trip,
+    assert_transactional_contract, load_workspace_dotenv, required_env,
 };
 use storage_postgres::PostgresCanonicalStore;
 
@@ -26,4 +26,17 @@ async fn postgres_canonical_conformance() {
     assert_transactional_contract(&store, "postgres")
         .await
         .expect("transactional contract");
+}
+
+#[tokio::test]
+async fn postgres_list_sources_by_entity_dedup_and_empty() {
+    load_workspace_dotenv();
+    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
+    let store = PostgresCanonicalStore::connect(&dsn, 5)
+        .await
+        .expect("連 Postgres");
+    store.migrate().await.expect("migrate");
+    assert_list_sources_by_entity(&store)
+        .await
+        .expect("list_sources_by_entity：多 source 去重 + 無關聯回空");
 }

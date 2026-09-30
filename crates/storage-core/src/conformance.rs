@@ -637,6 +637,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             .expect("extraction"),
     );
     assert_extraction_queries(store, &extraction).await?;
+    assert_list_sources_by_entity(store).await?;
 
     assert_v0_2_resolution_queries(store, &entity, source.id).await?;
     assert_v0_3_discovery_queries(store, &collection, &entity).await?;
@@ -879,6 +880,216 @@ async fn assert_extraction_queries<S: RelationalStore>(
         return Err(StorageError::Unknown {
             backend: "conformance",
             message: "list_entity_extractions_by_object 對不存在的 object_id 回了資料".into(),
+        });
+    }
+    Ok(())
+}
+
+/// 這個 Entity 出現在哪些 Source：entity_extractions → provenance
+/// （action=`derived_from`）→ raw_evidence.source_id。SQL 層 DISTINCT。
+pub async fn assert_list_sources_by_entity<S: RelationalStore>(
+    store: &S,
+) -> Result<(), StorageError> {
+    async fn put_chain<S: RelationalStore>(
+        store: &S,
+        entity_id: Uuid,
+        source: &Source,
+        suffix: &str,
+    ) -> Result<(), StorageError> {
+        store.put_source(source).await?;
+        let connector = Connector {
+            id: Uuid::now_v7(),
+            source_id: source.id,
+            name: format!("src-by-entity-{suffix}"),
+            connector_type: "rss".into(),
+            version: "0.1.0".into(),
+            enabled: true,
+            configuration: json!({}),
+            credential_reference: None,
+            schedule: None,
+            rate_limit: json!({}),
+            timeout: json!({}),
+            proxy_reference: None,
+            checkpoint: json!({}),
+            last_run: None,
+            last_success: None,
+            status: "idle".into(),
+            error_count: 0,
+        };
+        store.put_connector(&connector).await?;
+        let evidence = RawEvidence {
+            id: Uuid::now_v7(),
+            source_id: source.id,
+            connector_id: connector.id,
+            collection_id: None,
+            external_id: Some(suffix.into()),
+            source_url: format!("https://example.invalid/{suffix}"),
+            retrieved_at: fixture_ts(),
+            content_type: Some("text/plain".into()),
+            mime_type: Some("text/plain".into()),
+            content_length: Some(16),
+            sha256: format!("{:0<64}", Uuid::now_v7().simple()),
+            storage_path: format!("s3://raw-evidence/{suffix}"),
+            http_status: Some(200),
+            http_headers: json!({}),
+            metadata: json!({}),
+            collector_version: "0.1.0".into(),
+        };
+        store.insert_raw_evidence(&evidence).await?;
+        let document = Document {
+            id: Uuid::now_v7(),
+            object_type: DocumentType::Advisory,
+            schema_version: "1.0".into(),
+            title: Some(suffix.into()),
+            body: Some("body".into()),
+            summary: None,
+            language: Some("en".into()),
+            author: None,
+            published_at: None,
+            modified_at: None,
+            observed_at: fixture_ts(),
+            collected_at: fixture_ts(),
+            source_url: None,
+            canonical_url: None,
+            normalized_content_hash: None,
+            confidence: 0.9,
+            labels: vec![],
+            attributes: json!({}),
+            external_key: None,
+            simhash: None,
+            duplicate_of: None,
+        };
+        store.put_document(&document).await?;
+        store
+            .put_provenance(&Provenance {
+                id: Uuid::now_v7(),
+                subject_id: document.id,
+                action: "derived_from".into(),
+                parent_id: Some(evidence.id),
+                raw_evidence_id: Some(evidence.id),
+                processor: "normalizer".into(),
+                processor_version: "0.1.0".into(),
+                timestamp: fixture_ts(),
+                metadata: json!({}),
+            })
+            .await?;
+        store
+            .put_entity_extraction(&EntityExtraction {
+                id: Uuid::now_v7(),
+                object_id: document.id,
+                entity_id,
+                extractor: "regex-cve".into(),
+                extractor_version: "0.1.0".into(),
+                confidence: 0.99,
+                text_offset: Some(0),
+                excerpt: Some(suffix.into()),
+            })
+            .await?;
+        Ok(())
+    }
+
+    fn sample_source(name: &str) -> Source {
+        Source {
+            id: Uuid::now_v7(),
+            name: name.into(),
+            source_type: SourceType::Rss,
+            platform: Some("nvd".into()),
+            base_url: Some("https://example.invalid/rss".into()),
+            description: None,
+            language: Some("en".into()),
+            country: None,
+            enabled: true,
+            collection_policy: json!({}),
+            created_at: fixture_ts(),
+            updated_at: fixture_ts(),
+            last_seen: None,
+        }
+    }
+
+    // ---- 案例 1：同一 entity 關聯兩個 source，其中一個 source 出現兩次必須去重
+    let linked_name = format!("src-entity-{}", Uuid::now_v7().simple());
+    let linked = Entity {
+        id: Uuid::now_v7(),
+        entity_type: EntityType::Organization,
+        name: linked_name.clone(),
+        normalized_name: linked_name.to_ascii_lowercase(),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        merged_into: None,
+        attributes: json!({}),
+    };
+    store.put_entity(&linked).await?;
+
+    let source_a = sample_source("source-a");
+    let source_b = sample_source("source-b");
+    // source_a 寫兩次（兩篇 document、兩筆 extraction），SQL DISTINCT 後只算一次。
+    put_chain(
+        store,
+        linked.id,
+        &source_a,
+        &format!("{}-a1", linked.id.simple()),
+    )
+    .await?;
+    put_chain(
+        store,
+        linked.id,
+        &source_a,
+        &format!("{}-a2", linked.id.simple()),
+    )
+    .await?;
+    put_chain(
+        store,
+        linked.id,
+        &source_b,
+        &format!("{}-b1", linked.id.simple()),
+    )
+    .await?;
+
+    let found = store.list_sources_by_entity(linked.id, 100).await?;
+    if found.len() != 2 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_sources_by_entity 應對兩個 source 去重後回 2 筆，實際 {} 筆：{found:?}",
+                found.len()
+            ),
+        });
+    }
+    if !found.contains(&source_a.id) || !found.contains(&source_b.id) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_sources_by_entity 應含 {} 與 {}，實際 {found:?}",
+                source_a.id, source_b.id
+            ),
+        });
+    }
+
+    // ---- 案例 2：沒有任何關聯的 entity 回空陣列
+    let lonely_name = format!("src-lonely-{}", Uuid::now_v7().simple());
+    let lonely = Entity {
+        id: Uuid::now_v7(),
+        entity_type: EntityType::Organization,
+        name: lonely_name.clone(),
+        normalized_name: lonely_name.to_ascii_lowercase(),
+        description: None,
+        confidence: 1.0,
+        first_seen: fixture_ts(),
+        last_seen: fixture_ts(),
+        merged_into: None,
+        attributes: json!({}),
+    };
+    store.put_entity(&lonely).await?;
+    let empty = store.list_sources_by_entity(lonely.id, 100).await?;
+    if !empty.is_empty() {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "沒有 extraction 的 entity 應回空陣列，實際 {} 筆：{empty:?}",
+                empty.len()
+            ),
         });
     }
     Ok(())

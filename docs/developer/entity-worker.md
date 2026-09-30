@@ -371,7 +371,7 @@ Account 的 namespace 從 `attributes.platform` 決定，不是從 `entity_type`
 
 - **Hash**：T10，見上一節。
 - **Person／Organization**：`name` 是人看的名字，不是命名空間內的唯一鍵。這次也不寫 `entity_aliases`。
-- **Software／Repository／Location／Hostname**：沒有清楚的 namespace 語意。
+- **Software／Product／Repository／Location／Hostname**：沒有清楚的 namespace 語意。Product 在還沒有 CPE／PURL 這類識別碼系統之前先當顯示名稱型別，不寫 identifier。
 
 `source_id` 從 Document 的 RawEvidence 反查；查不到就留 `None`，不編造。
 

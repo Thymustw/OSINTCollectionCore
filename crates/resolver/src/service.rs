@@ -13,10 +13,11 @@ use crate::identifier_methods::{check_account_handle, check_alias, check_domain}
 use crate::persist::persist_candidate;
 use crate::semantic::check_semantic_similarity;
 
-/// SPEC §10 的既有型別加上 STIX 對應的 ThreatActor／Malware／Indicator。
+/// SPEC §10 的既有型別加上 STIX 對應的 ThreatActor／Malware／Indicator，
+/// 以及 V0.3 Acceptance A 補上的 Product。
 /// 新增變體時下面的 match 會編譯失敗，強迫 resolver 決定要不要把新型別
 /// 納入 `normalized_name` 掃描。
-pub const ALL_ENTITY_TYPES: [EntityType; 16] = [
+pub const ALL_ENTITY_TYPES: [EntityType; 17] = [
     EntityType::Person,
     EntityType::Organization,
     EntityType::Account,
@@ -27,6 +28,7 @@ pub const ALL_ENTITY_TYPES: [EntityType; 16] = [
     EntityType::Email,
     EntityType::Vulnerability,
     EntityType::Software,
+    EntityType::Product,
     EntityType::Repository,
     EntityType::Hash,
     EntityType::Location,
@@ -48,6 +50,7 @@ const fn assert_entity_type_known(t: EntityType) {
         | EntityType::Email
         | EntityType::Vulnerability
         | EntityType::Software
+        | EntityType::Product
         | EntityType::Repository
         | EntityType::Hash
         | EntityType::Location
@@ -820,6 +823,13 @@ mod tests {
             _: u32,
         ) -> Result<Vec<EntityExtraction>, StorageError> {
             Self::unsupported("list_entity_extractions_by_entity")
+        }
+        async fn list_sources_by_entity(
+            &self,
+            _: EntityId,
+            _: u32,
+        ) -> Result<Vec<SourceId>, StorageError> {
+            Self::unsupported("list_sources_by_entity")
         }
         async fn put_entity_alias(&self, _: &EntityAlias) -> Result<(), StorageError> {
             Self::unsupported("put_entity_alias")

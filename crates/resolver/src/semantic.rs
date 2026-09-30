@@ -151,6 +151,9 @@ fn is_identity_type(entity_type: EntityType) -> bool {
         | EntityType::Account
         | EntityType::Vulnerability
         | EntityType::Software
+        // Product 在還沒有更嚴謹的識別碼系統（例如 CPE／PURL）之前，
+        // 先當顯示名稱型別處理，不是唯一識別碼型別。
+        | EntityType::Product
         | EntityType::Repository
         | EntityType::Location
         // STIX 對應的三種：名字是顯示名稱，不是識別碼本身，語意相近仍有意義。
@@ -745,6 +748,13 @@ mod tests {
             _: u32,
         ) -> Result<Vec<EntityExtraction>, StorageError> {
             Self::unsupported("list_entity_extractions_by_entity")
+        }
+        async fn list_sources_by_entity(
+            &self,
+            _: EntityId,
+            _: u32,
+        ) -> Result<Vec<SourceId>, StorageError> {
+            Self::unsupported("list_sources_by_entity")
         }
         async fn put_entity_alias(&self, _: &EntityAlias) -> Result<(), StorageError> {
             Self::unsupported("put_entity_alias")

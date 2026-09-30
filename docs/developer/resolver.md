@@ -85,7 +85,7 @@ ResolverService<S: RelationalStore, E: EmbeddingProvider>
 
 ### `normalized_name` 規則
 
-對 `ALL_ENTITY_TYPES`（SPEC §10 的 13 個變體）逐一
+對 `ALL_ENTITY_TYPES`（目前 17 個變體：SPEC §10 原有型別＋STIX 對應的 ThreatActor／Malware／Indicator＋V0.3 的 Product）逐一
 `find_entity_by_normalized_name(type, entity.normalized_name)`。
 
 - **跳過 entity 自己的 `entity_type`**。同 type 同名在 UUID v5 自然鍵下去重後

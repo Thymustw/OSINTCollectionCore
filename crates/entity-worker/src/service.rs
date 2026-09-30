@@ -952,8 +952,9 @@ pub fn extraction_id(
 /// * **Account**：同一個 `EntityType` 底下不同平台要寫進不同 namespace
 ///   （`github_handle`／`twitter_handle`／`telegram_handle`），不能用
 ///   一對一對照。寫入端走 [`account_identifier_fields`]，不走這條。
-/// * **Software／Repository／Location／Hostname**：這次沒有清楚的
-///   namespace 語意，不寫。
+/// * **Software／Product／Repository／Location／Hostname**：這次沒有清楚的
+///   namespace 語意，不寫。Product 在還沒有 CPE／PURL 這類識別碼系統之前
+///   先當顯示名稱型別，跟 `is_identity_type: false` 一致。
 #[must_use]
 pub fn identifier_namespace_for(entity_type: EntityType) -> Option<&'static str> {
     match entity_type {
@@ -962,10 +963,10 @@ pub fn identifier_namespace_for(entity_type: EntityType) -> Option<&'static str>
         EntityType::Url => Some("url"),
         EntityType::Email => Some("email"),
         EntityType::Vulnerability => Some("cve"),
-        // Person／Organization／Account／Hash／Hostname／Software／Repository／
-        // Location，以及 STIX 對應的 ThreatActor／Malware／Indicator：name
-        // 是顯示名稱，不是命名空間內唯一鍵。這一步沒有 STIX 匯入寫入者，
-        // 不發明 identifier namespace。
+        // Person／Organization／Account／Hash／Hostname／Software／Product／
+        // Repository／Location，以及 STIX 對應的 ThreatActor／Malware／
+        // Indicator：name 是顯示名稱，不是命名空間內唯一鍵。這一步沒有
+        // STIX 匯入寫入者，不發明 identifier namespace。
         _ => None,
     }
 }
@@ -1214,6 +1215,7 @@ mod tests {
         assert_eq!(identifier_namespace_for(EntityType::Account), None);
         assert_eq!(identifier_namespace_for(EntityType::Hostname), None);
         assert_eq!(identifier_namespace_for(EntityType::Software), None);
+        assert_eq!(identifier_namespace_for(EntityType::Product), None);
         assert_eq!(identifier_namespace_for(EntityType::Repository), None);
         assert_eq!(identifier_namespace_for(EntityType::Location), None);
         assert_eq!(identifier_namespace_for(EntityType::ThreatActor), None);

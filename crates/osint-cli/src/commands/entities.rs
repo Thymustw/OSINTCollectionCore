@@ -36,7 +36,7 @@ async fn list(ctx: &Context, args: ListArgs, entity_type: Option<String>) -> Res
                 CliError::InvalidArgument {
                     message: format!(
                         "`{raw}` 不是有效的 entity type。可用值：person, organization, account, \
-                     domain, hostname, ip, url, email, vulnerability, software, repository, \
+                     domain, hostname, ip, url, email, vulnerability, software, product, repository, \
                      hash, location, threat_actor, malware, indicator"
                     ),
                 }

@@ -1786,6 +1786,34 @@ impl RelationalStore for PostgresCanonicalStore {
         .await
     }
 
+    async fn list_sources_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<SourceId>, StorageError> {
+        // provenance.action = 'derived_from' 對齊 normalizer::ACTION_DERIVED。
+        // JOIN 欄位：p.subject_id = ee.object_id（Document id）、
+        // re.id = p.raw_evidence_id。DISTINCT 在 SQL 層做，避免 limit
+        // 截在去重之前。
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT re.source_id
+            FROM entity_extractions ee
+            JOIN provenance p ON p.subject_id = ee.object_id AND p.action = 'derived_from'
+            JOIN raw_evidence re ON re.id = p.raw_evidence_id
+            WHERE ee.entity_id = $1
+            ORDER BY re.source_id
+            LIMIT $2
+            "#,
+        )
+        .bind(entity_id)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     // ===== V0.2 =====
 
     async fn put_entity_alias(&self, alias: &EntityAlias) -> Result<(), StorageError> {

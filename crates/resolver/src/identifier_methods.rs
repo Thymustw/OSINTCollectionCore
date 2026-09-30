@@ -848,6 +848,13 @@ mod tests {
         ) -> Result<Vec<EntityExtraction>, StorageError> {
             Self::unsupported("list_entity_extractions_by_entity")
         }
+        async fn list_sources_by_entity(
+            &self,
+            _: EntityId,
+            _: u32,
+        ) -> Result<Vec<SourceId>, StorageError> {
+            Self::unsupported("list_sources_by_entity")
+        }
         async fn put_entity_alias(&self, _: &EntityAlias) -> Result<(), StorageError> {
             Self::unsupported("put_entity_alias")
         }

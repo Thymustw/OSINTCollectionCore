@@ -115,7 +115,8 @@ osint-cli search --entity 203.0.113.5          # 不確定型別就只給名稱
 * **大小寫不敏感**：`cve-2026-0001` 與 `CVE-2026-0001` 結果相同。
 * 型別可省略。給了型別就必須是同一個實體同時符合型別與名稱。
 * 型別名稱：`vulnerability`／`ip`／`domain`／`hostname`／`url`／`email`／`hash`／
-  `person`／`organization`／`account`／`file`／`malware`／`campaign`／`location`／`event`。
+  `person`／`organization`／`account`／`file`／`malware`／`campaign`／`location`／`event`／
+  `product`。
 * 名稱本身含冒號（IPv6、網址）不用跳脫——只有已知型別開頭才會被當成型別前綴：
   `--entity 2001:db8::1` 會整串當作名稱。
 

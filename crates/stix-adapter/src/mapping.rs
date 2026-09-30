@@ -146,7 +146,7 @@ pub fn stix_relationship_to_core(rel: &StixRelationship) -> MappedRelationship {
 /// Core Entity → STIX 物件。
 ///
 /// 對映不到已知 SDO／SCO 的 `EntityType`（Account／Hostname／Repository／
-/// Hash／Software／Location）回 [`StixObject::Custom`]（`type` =
+/// Hash／Software／Product／Location）回 [`StixObject::Custom`]（`type` =
 /// `x-osint-core-entity`），把 Core 型別與 id 塞進 `extra`，不丟資訊。
 #[must_use]
 pub fn entity_to_stix_object(entity: &Entity) -> StixObject {
@@ -202,6 +202,7 @@ pub fn entity_to_stix_object(entity: &Entity) -> StixObject {
         | EntityType::Repository
         | EntityType::Hash
         | EntityType::Software
+        | EntityType::Product
         | EntityType::Location => StixObject::Custom(custom_from_entity(entity)),
     }
 }
@@ -361,7 +362,7 @@ fn mapped(
 
 /// 正規化規則照抄 `entity-worker`／`core-model` 既有慣例，不發明新規則：
 ///
-/// * Person／Organization（以及同為顯示名稱的 ThreatActor／Malware／Indicator）：
+/// * Person／Organization（以及同為顯示名稱的 ThreatActor／Malware／Indicator／Product）：
 ///   `entity-worker::extract::normalize_person_or_org`——空白壓成單一半形空格再
 ///   `to_lowercase`。
 /// * Domain：`to_ascii_lowercase` + 去掉尾端 `.`（`extract.rs` `domain_item`）。
@@ -381,6 +382,7 @@ fn normalize_name(entity_type: EntityType, name: &str) -> String {
         | EntityType::Account
         | EntityType::Hostname
         | EntityType::Software
+        | EntityType::Product
         | EntityType::Repository
         | EntityType::Location => normalize_person_or_org(name),
         EntityType::Domain => name.to_ascii_lowercase().trim_end_matches('.').to_string(),
@@ -498,6 +500,7 @@ fn entity_type_wire(entity_type: EntityType) -> &'static str {
         EntityType::Email => "email",
         EntityType::Vulnerability => "vulnerability",
         EntityType::Software => "software",
+        EntityType::Product => "product",
         EntityType::Repository => "repository",
         EntityType::Hash => "hash",
         EntityType::Location => "location",

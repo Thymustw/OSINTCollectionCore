@@ -171,5 +171,5 @@ curl -s http://127.0.0.1:18080/api/v1/jobs/$JOB_ID/result \
 
 ## 已知限制
 
-1. **`x-osint-core-entity` 無法反向匯入**：本系統匯出 Account、Hostname、Repository、Hash、Software、Location 這六種型別時，會用自訂的 `x-osint-core-entity` STIX 物件格式，但其他工具通常不認識這個型別。這是單向的：匯出可以，但把含 `x-osint-core-entity` 的 bundle 再匯回本系統，這些物件會被略過。
+1. **`x-osint-core-entity` 無法反向匯入**：本系統匯出 Account、Hostname、Repository、Hash、Software、Product、Location 這七種型別時，會用自訂的 `x-osint-core-entity` STIX 物件格式，但其他工具通常不認識這個型別。這是單向的：匯出可以，但把含 `x-osint-core-entity` 的 bundle 再匯回本系統，這些物件會被略過。
 2. **大量關係的實體可能有遺漏**：單一實體若參與超過 100 條關係，匯出時可能只包含其中一部分。這是查詢效能的設計限制。如果你的資料集有這樣的情況，建議分批匯出或聯絡系統管理員。

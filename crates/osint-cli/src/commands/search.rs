@@ -173,6 +173,7 @@ const ENTITY_TYPES: &[&str] = &[
     "file",
     "hash",
     "vulnerability",
+    "product",
     "malware",
     "campaign",
     "location",

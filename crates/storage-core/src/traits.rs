@@ -421,6 +421,23 @@ pub trait RelationalStore: HealthProvider {
         limit: u32,
     ) -> Result<Vec<EntityExtraction>, StorageError>;
 
+    /// 這個 Entity 出現在哪些 Source 裡（透過 entity_extractions → provenance
+    /// → raw_evidence.source_id 三跳關聯式查詢。Source 不在 Neo4j 圖投影裡，
+    /// 這條路徑是唯一能回答「這個 entity 關聯哪些情報來源」的方法）。
+    ///
+    /// 依 `source_id` 去重（SQL `DISTINCT`，不在 Rust 層去重——一個
+    /// organization 可能出現在幾百篇文章裡，去重要在 SQL 層做才不會被
+    /// `limit` 不可預期地截斷）。`limit` 夾在 1..=100（比照
+    /// [`RelationalStore::list_entity_extractions_by_entity`]）。
+    ///
+    /// 回傳 `Vec<SourceId>`，不是 `Vec<Source>`——呼叫端要看 Source 詳情
+    /// 自己再呼叫既有的 [`RelationalStore::get_source`]。
+    async fn list_sources_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<SourceId>, StorageError>;
+
     // =========================================================================
     // ===== V0.2 =====
     //

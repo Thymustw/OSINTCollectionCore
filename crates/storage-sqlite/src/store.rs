@@ -1819,6 +1819,35 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
     }
 
+    async fn list_sources_by_entity(
+        &self,
+        entity_id: EntityId,
+        limit: u32,
+    ) -> Result<Vec<SourceId>, StorageError> {
+        // 語意與 PostgreSQL 實作相同；SQLite UUID 以 TEXT 存，JOIN／DISTINCT
+        // 走字串相等。欄位名對齊 schema：provenance.subject_id／action／
+        // raw_evidence_id，action 值是 normalizer 寫入的 'derived_from'。
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT re.source_id
+            FROM entity_extractions ee
+            JOIN provenance p ON p.subject_id = ee.object_id AND p.action = 'derived_from'
+            JOIN raw_evidence re ON re.id = p.raw_evidence_id
+            WHERE ee.entity_id = ?1
+            ORDER BY re.source_id
+            LIMIT ?2
+            "#,
+        )
+        .bind(uuid_text(entity_id))
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| mapping::uuid_column(row, "source_id"))
+            .collect()
+    }
+
     // ===== V0.2 =====
 
     async fn put_entity_alias(&self, alias: &EntityAlias) -> Result<(), StorageError> {

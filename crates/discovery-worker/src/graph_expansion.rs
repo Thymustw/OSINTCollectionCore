@@ -22,12 +22,36 @@ use uuid::Uuid;
 
 pub const DISCOVERY_METHOD_GRAPH_EXPANSION: &str = "graph_expansion";
 
+/// SPEC_V0.3 §8 已列的參考名稱；這次補上真正的實作（關聯式 Source 查詢路徑）。
+pub const DISCOVERY_METHOD_SOURCE_EXPANSION: &str = "source_expansion";
+
 /// Graph Expansion 產出的 candidate score／confidence 固定值——弱訊號：
 /// 「這個既有 Entity 跟來源 Entity 有圖上的直接連結」不代表跟這次調查
 /// 相關，純粹是「值得人工看一眼」的訊號。比 resolver 的
 /// `GRAPH_CONTEXT_SCORE_WEIGHT`（0.7，衡量兩者是否同一實體）更弱——
 /// 這裡衡量的是完全不同的東西（相關性，不是同一性），不能援用那個數字。
 pub const GRAPH_EXPANSION_SCORE: f64 = 0.4;
+
+/// Source Expansion 的 score／confidence。數值跟 [`GRAPH_EXPANSION_SCORE`]
+/// 同量級，但**必須獨立宣告**：這是關聯式查詢（entity_extractions →
+/// provenance → raw_evidence）的訊號，不是圖遍歷，之後兩邊可能各自調整。
+pub const SOURCE_EXPANSION_SCORE: f64 = 0.4;
+
+/// Graph Expansion 只產出這四類鄰居（Acceptance A：product／vulnerability／
+/// repo／source 裡，前三類走圖；`source` 走關聯式路徑，見
+/// [`DISCOVERY_METHOD_SOURCE_EXPANSION`]）。`software` 與 `product` 都保留，
+/// 因為目前無法斷定使用者輸入的是哪種語意。
+///
+/// **字串必須是 serde snake_case**（例如 `"vulnerability"` 不是
+/// `"Vulnerability"`）。Neo4j 端是 `IN $entityTypes` 精確字串比對，傳錯
+/// 格式會靜默回空結果，不會報錯。
+const GRAPH_EXPANSION_ENTITY_TYPES: &[&str] =
+    &["vulnerability", "repository", "software", "product"];
+
+/// `list_sources_by_entity` 的查詢上限。比照
+/// `list_entity_extractions_by_entity` 的 1..=100 慣例；真正寫入還要再被
+/// `max_candidates_per_run` 截斷。
+const SOURCE_EXPANSION_QUERY_LIMIT: u32 = 100;
 
 /// 對 `source` 做一次 1-hop Graph Expansion，回傳**尚未寫入 store** 的
 /// `(Candidate, CandidateEvidence)` 配對。
@@ -36,21 +60,31 @@ pub const GRAPH_EXPANSION_SCORE: f64 = 0.4;
 /// `max_depth` 檢查在這裡做（Acceptance D）：`depth + 1 > max_depth` 直接
 /// 回空 Vec，**不呼叫 `GraphStore`**——超過限制不得擴張，也不消耗任何
 /// 請求配額。
+///
+/// `entity_types` 交給 [`GraphTraversalOptions`]，過濾在 storage 層做完。
+/// `None` = 不過濾（測試迴歸用）；生產路徑傳
+/// [`GRAPH_EXPANSION_ENTITY_TYPES`] 的 snake_case 字串。
 pub async fn graph_expansion<G: GraphStore>(
     graph: &G,
     source: &Entity,
     collection_id: Option<CollectionId>,
     depth: i32,
     max_depth: i32,
+    entity_types: Option<Vec<String>>,
 ) -> Result<Vec<(Candidate, CandidateEvidence)>, storage_core::StorageError> {
     let next_depth = depth + 1;
     if next_depth > max_depth {
         return Ok(Vec::new());
     }
 
-    let neighbors = graph
-        .neighbors(&source.id, &GraphTraversalOptions::one_hop())
-        .await?;
+    let options = GraphTraversalOptions {
+        max_hops: 1,
+        relationship_types: None,
+        entity_types,
+        min_confidence: None,
+        time_range: None,
+    };
+    let neighbors = graph.neighbors(&source.id, &options).await?;
 
     let now = Utc::now();
     let mut out = Vec::with_capacity(neighbors.len());
@@ -161,13 +195,26 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
         ));
     }
 
-    let pairs = graph_expansion(graph, &entity, Some(collection_id), depth, budget.max_depth)
-        .await
-        .map_err(|e| e.to_string())?;
+    let pairs = graph_expansion(
+        graph,
+        &entity,
+        Some(collection_id),
+        depth,
+        budget.max_depth,
+        Some(
+            GRAPH_EXPANSION_ENTITY_TYPES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        ),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
+    let cap = budget.max_candidates_per_run as usize;
     let mut written = 0usize;
     for (candidate, evidence) in &pairs {
-        if written >= budget.max_candidates_per_run as usize {
+        if written >= cap {
             tracing::warn!(
                 %entity_id,
                 cap = budget.max_candidates_per_run,
@@ -186,8 +233,84 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
         written += 1;
     }
 
+    // Source 不在 Neo4j 圖投影裡。這段關聯式路徑
+    // （entity_extractions → provenance → raw_evidence.source_id）
+    // 是唯一能回答「這個 entity 關聯哪些情報來源」的方法。
+    // 與 Graph Expansion 共用 `written` 計數器，不額外消耗 daily_request_budget。
+    let mut source_found = 0usize;
+    if written < cap {
+        let source_ids = store
+            .list_sources_by_entity(entity_id, SOURCE_EXPANSION_QUERY_LIMIT)
+            .await
+            .map_err(|e| e.to_string())?;
+        source_found = source_ids.len();
+        let now = Utc::now();
+        let next_depth = depth + 1;
+        for source_id in source_ids {
+            if written >= cap {
+                tracing::warn!(
+                    %entity_id,
+                    cap = budget.max_candidates_per_run,
+                    "graph_expansion 候選數超過 max_candidates_per_run，source_expansion 已截斷"
+                );
+                break;
+            }
+            let Some(source) = store
+                .get_source(source_id)
+                .await
+                .map_err(|e| e.to_string())?
+            else {
+                tracing::warn!(
+                    %entity_id,
+                    %source_id,
+                    "list_sources_by_entity 回了 source_id 但 get_source 讀不到，略過"
+                );
+                continue;
+            };
+            let candidate_id: CandidateId = Uuid::now_v7();
+            let candidate = Candidate {
+                id: candidate_id,
+                candidate_type: CandidateType::Source,
+                value: source.name.clone(),
+                normalized_value: source.name.trim().to_lowercase(),
+                collection_id: Some(collection_id),
+                discovered_by: format!("entity:{}", entity.id),
+                discovery_method: DISCOVERY_METHOD_SOURCE_EXPANSION.to_string(),
+                confidence: SOURCE_EXPANSION_SCORE,
+                score: SOURCE_EXPANSION_SCORE,
+                status: CandidateStatus::Pending,
+                depth: next_depth,
+                created_at: now,
+                reviewed_at: None,
+            };
+            let evidence = CandidateEvidence {
+                id: Uuid::now_v7(),
+                candidate_id,
+                object_id: None,
+                entity_id: Some(entity.id),
+                relationship_id: None,
+                raw_evidence_id: None,
+                reason: format!(
+                    "Entity `{}` 透過 raw evidence 關聯到 Source `{}`，經 entity_extractions → provenance → raw_evidence 三跳查詢發現",
+                    entity.name, source.name
+                ),
+                weight: SOURCE_EXPANSION_SCORE,
+                created_at: now,
+            };
+            store
+                .put_candidate(&candidate)
+                .await
+                .map_err(|e| e.to_string())?;
+            store
+                .put_candidate_evidence(&evidence)
+                .await
+                .map_err(|e| e.to_string())?;
+            written += 1;
+        }
+    }
+
     Ok(format!(
-        "graph_expansion 完成：Entity `{entity_id}` 找到 {} 個鄰居，寫入 {written} 筆 Candidate",
+        "graph_expansion 完成：Entity `{entity_id}` 找到 {} 個鄰居、{source_found} 個關聯 Source，寫入 {written} 筆 Candidate",
         pairs.len()
     ))
 }
@@ -198,7 +321,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use chrono::{TimeZone, Utc};
-    use core_model::{Collection, EntityType};
+    use core_model::{
+        Collection, Connector, Document, DocumentType, EntityExtraction, EntityType, Provenance,
+        RawEvidence, Source, SourceType,
+    };
     use serde_json::json;
     use storage_core::conformance::find_workspace_root;
     use storage_core::mock::MockGraphStore;
@@ -214,9 +340,13 @@ mod tests {
     }
 
     fn node(id: u128, name: &str) -> GraphNode {
+        node_typed(id, name, "vulnerability")
+    }
+
+    fn node_typed(id: u128, name: &str, entity_type: &str) -> GraphNode {
         GraphNode {
             entity_id: nid(id),
-            entity_type: "person".into(),
+            entity_type: entity_type.into(),
             display_name: name.into(),
             attributes: json!({}),
         }
@@ -260,7 +390,7 @@ mod tests {
 
         let source = entity(1, "A");
         let collection_id = Some(Uuid::now_v7());
-        let pairs = graph_expansion(&graph, &source, collection_id, 0, 3)
+        let pairs = graph_expansion(&graph, &source, collection_id, 0, 3, None)
             .await
             .expect("graph_expansion 應該成功");
 
@@ -284,7 +414,7 @@ mod tests {
         let graph = MockGraphStore::new();
         graph.upsert_node(&node(1, "A")).await.unwrap();
         let source = entity(1, "A");
-        let pairs = graph_expansion(&graph, &source, None, 0, 3)
+        let pairs = graph_expansion(&graph, &source, None, 0, 3, None)
             .await
             .expect("graph_expansion 應該成功");
         assert!(pairs.is_empty(), "{pairs:?}");
@@ -299,10 +429,58 @@ mod tests {
         graph.upsert_edge(&edge(1, 1, 2)).await.unwrap();
         let source = entity(1, "A");
         // depth=2, max_depth=2 → next_depth=3 > 2，必須拒絕擴張。
-        let pairs = graph_expansion(&graph, &source, None, 2, 2)
+        let pairs = graph_expansion(&graph, &source, None, 2, 2, None)
             .await
             .expect("即使拒絕擴張，函式本身不該回錯誤");
         assert!(pairs.is_empty(), "超過 max_depth 不該有任何候選，{pairs:?}");
+    }
+
+    #[test]
+    fn graph_expansion_entity_type_filter_is_serde_snake_case() {
+        // 過濾值必須是 serde snake_case。Neo4j `IN $entityTypes` 精確比對，
+        // 傳 Debug 格式（"Vulnerability"）會靜默回空。
+        for &wire in GRAPH_EXPANSION_ENTITY_TYPES {
+            let parsed: EntityType = serde_json::from_value(json!(wire))
+                .unwrap_or_else(|err| panic!("`{wire}` 不是合法的 EntityType snake_case：{err}"));
+            let roundtrip = serde_json::to_value(parsed).expect("EntityType 可序列化");
+            assert_eq!(roundtrip, json!(wire), "{wire}");
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_expansion_filters_neighbors_by_entity_type() {
+        let graph = MockGraphStore::new();
+        graph
+            .upsert_node(&node_typed(1, "Org", "organization"))
+            .await
+            .unwrap();
+        graph
+            .upsert_node(&node_typed(2, "PersonNeighbor", "person"))
+            .await
+            .unwrap();
+        graph
+            .upsert_node(&node_typed(3, "CVE-1", "vulnerability"))
+            .await
+            .unwrap();
+        graph.upsert_edge(&edge(1, 1, 2)).await.unwrap();
+        graph.upsert_edge(&edge(2, 1, 3)).await.unwrap();
+
+        let source = entity(1, "Org");
+        let types: Vec<String> = GRAPH_EXPANSION_ENTITY_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let pairs = graph_expansion(&graph, &source, None, 0, 3, Some(types))
+            .await
+            .expect("graph_expansion 應該成功");
+
+        assert_eq!(
+            pairs.len(),
+            1,
+            "person 鄰居應被過濾，只留 vulnerability：{pairs:?}"
+        );
+        assert_eq!(pairs[0].0.value, "CVE-1");
+        assert_eq!(pairs[0].1.entity_id, Some(nid(3)));
     }
 
     // ------------------------------------------------------- run_graph_expansion（整合）
@@ -356,9 +534,18 @@ mod tests {
     }
 
     fn budget(id: Uuid, daily_request_budget: i64, max_depth: i32) -> CollectionBudget {
+        budget_with_cap(id, daily_request_budget, max_depth, 10)
+    }
+
+    fn budget_with_cap(
+        id: Uuid,
+        daily_request_budget: i64,
+        max_depth: i32,
+        max_candidates_per_run: i32,
+    ) -> CollectionBudget {
         CollectionBudget {
             collection_id: id,
-            max_candidates_per_run: 10,
+            max_candidates_per_run,
             max_requests_per_run: 10,
             max_ai_calls_per_run: 10,
             max_depth,
@@ -502,5 +689,215 @@ mod tests {
         .await
         .expect("沒有明確設定 budget 時應退回保守預設並成功");
         assert!(summary.contains("寫入 1 筆"), "summary：{summary}");
+    }
+
+    /// 建一條 entity_extractions → provenance(derived_from) → raw_evidence
+    /// → source 的關聯式路徑。Entity／Collection 必須已經存在。
+    async fn seed_source_path(
+        store: &SqliteEmbeddedStore,
+        entity_id: Uuid,
+        source_name: &str,
+    ) -> Uuid {
+        let source_id = Uuid::now_v7();
+        store
+            .put_source(&Source {
+                id: source_id,
+                name: source_name.into(),
+                source_type: SourceType::Rss,
+                platform: Some("nvd".into()),
+                base_url: Some("https://example.invalid/rss".into()),
+                description: None,
+                language: Some("en".into()),
+                country: None,
+                enabled: true,
+                collection_policy: json!({}),
+                created_at: ts(),
+                updated_at: ts(),
+                last_seen: None,
+            })
+            .await
+            .unwrap();
+        let connector_id = Uuid::now_v7();
+        store
+            .put_connector(&Connector {
+                id: connector_id,
+                source_id,
+                name: format!("connector-{source_name}"),
+                connector_type: "rss".into(),
+                version: "0.1.0".into(),
+                enabled: true,
+                configuration: json!({}),
+                credential_reference: None,
+                schedule: None,
+                rate_limit: json!({}),
+                timeout: json!({}),
+                proxy_reference: None,
+                checkpoint: json!({}),
+                last_run: None,
+                last_success: None,
+                status: "idle".into(),
+                error_count: 0,
+            })
+            .await
+            .unwrap();
+        let evidence_id = Uuid::now_v7();
+        store
+            .insert_raw_evidence(&RawEvidence {
+                id: evidence_id,
+                source_id,
+                connector_id,
+                collection_id: None,
+                external_id: Some(source_name.into()),
+                source_url: format!("https://example.invalid/{source_name}"),
+                retrieved_at: ts(),
+                content_type: Some("text/plain".into()),
+                mime_type: Some("text/plain".into()),
+                content_length: Some(32),
+                sha256: format!("{:0<64}", evidence_id.simple()),
+                storage_path: format!("s3://raw-evidence/{evidence_id}"),
+                http_status: Some(200),
+                http_headers: json!({}),
+                metadata: json!({}),
+                collector_version: "0.1.0".into(),
+            })
+            .await
+            .unwrap();
+        let document_id = Uuid::now_v7();
+        store
+            .put_document(&Document {
+                id: document_id,
+                object_type: DocumentType::Advisory,
+                schema_version: "1.0".into(),
+                title: Some(source_name.into()),
+                body: Some("body".into()),
+                summary: None,
+                language: Some("en".into()),
+                author: None,
+                published_at: None,
+                modified_at: None,
+                observed_at: ts(),
+                collected_at: ts(),
+                source_url: None,
+                canonical_url: None,
+                normalized_content_hash: None,
+                confidence: 0.9,
+                labels: vec![],
+                attributes: json!({}),
+                external_key: None,
+                simhash: None,
+                duplicate_of: None,
+            })
+            .await
+            .unwrap();
+        store
+            .put_provenance(&Provenance {
+                id: Uuid::now_v7(),
+                subject_id: document_id,
+                action: "derived_from".into(),
+                parent_id: Some(evidence_id),
+                raw_evidence_id: Some(evidence_id),
+                processor: "normalizer".into(),
+                processor_version: "0.1.0".into(),
+                timestamp: ts(),
+                metadata: json!({}),
+            })
+            .await
+            .unwrap();
+        store
+            .put_entity_extraction(&EntityExtraction {
+                id: Uuid::now_v7(),
+                object_id: document_id,
+                entity_id,
+                extractor: "regex-cve".into(),
+                extractor_version: "0.1.0".into(),
+                confidence: 0.99,
+                text_offset: Some(0),
+                excerpt: Some(source_name.into()),
+            })
+            .await
+            .unwrap();
+        source_id
+    }
+
+    #[tokio::test]
+    async fn run_graph_expansion_writes_source_candidate_from_raw_evidence_path() {
+        let h = open_harness().await;
+        let collection_id = Uuid::now_v7();
+        h.store
+            .put_collection(&collection(collection_id))
+            .await
+            .unwrap();
+        let org = entity(1, "Acme");
+        h.store.put_entity(&org).await.unwrap();
+        seed_source_path(&h.store, org.id, "NVD Feed").await;
+        h.store
+            .put_collection_budget(&budget(collection_id, 10, 3))
+            .await
+            .unwrap();
+
+        // 圖上沒有鄰居，產出必須完全來自 source_expansion。
+        let graph = MockGraphStore::new();
+        graph
+            .upsert_node(&node_typed(1, "Acme", "organization"))
+            .await
+            .unwrap();
+
+        let summary = run_graph_expansion(
+            &h.store,
+            &graph,
+            Some(&parameters(org.id, collection_id, 0)),
+        )
+        .await
+        .expect("run_graph_expansion 應該成功");
+        assert!(summary.contains("寫入 1 筆"), "summary：{summary}");
+        assert!(summary.contains("1 個關聯 Source"), "summary：{summary}");
+
+        let candidates = h
+            .store
+            .list_candidates_by_collection(collection_id, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].candidate_type, CandidateType::Source);
+        assert_eq!(
+            candidates[0].discovery_method,
+            DISCOVERY_METHOD_SOURCE_EXPANSION
+        );
+        assert_eq!(candidates[0].value, "NVD Feed");
+        assert_eq!(candidates[0].status, CandidateStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn run_graph_expansion_shares_candidate_cap_with_source_expansion() {
+        let h = open_harness().await;
+        let (entity_id, collection_id, graph) = seed_single_neighbor(&h.store).await;
+        seed_source_path(&h.store, entity_id, "NVD Feed").await;
+        // cap=1：圖鄰居先寫，source 類 Candidate 必須被同一個 written 計數器截斷。
+        // 若 source 有獨立配額，這裡會寫出 2 筆。
+        h.store
+            .put_collection_budget(&budget_with_cap(collection_id, 10, 3, 1))
+            .await
+            .unwrap();
+
+        let summary = run_graph_expansion(
+            &h.store,
+            &graph,
+            Some(&parameters(entity_id, collection_id, 0)),
+        )
+        .await
+        .expect("run_graph_expansion 應該成功");
+        assert!(summary.contains("寫入 1 筆"), "summary：{summary}");
+
+        let candidates = h
+            .store
+            .list_candidates_by_collection(collection_id, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1, "共用計數器應截成 1 筆：{candidates:?}");
+        assert_eq!(
+            candidates[0].candidate_type,
+            CandidateType::Entity,
+            "圖鄰居先寫，source 應被截斷"
+        );
     }
 }
