@@ -38,6 +38,10 @@ credentials.json
 *.log
 logs/
 
+# Docs site (MkDocs build output from `make docs-build` / `make docs-serve`).
+# The docs-site/.venv it creates is already covered by `.venv/` above.
+/docs-site/site/
+
 # OS / editor
 .DS_Store
 Thumbs.db

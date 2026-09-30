@@ -11,6 +11,7 @@
 	run-stix-worker run-discovery-worker \
 	image-build image-scan image-prune image-ls \
 	compose-up-full compose-down-full compose-ps-full \
+	docs-serve docs-build \
 	disk clean
 
 export PATH := $(HOME)/.cargo/bin:$(PATH)
@@ -60,6 +61,8 @@ help:
 	@echo "  make compose-up-full   基礎建設 + 十個應用服務（會先 build）"
 	@echo "  make compose-down-full 停掉含應用服務的整套"
 	@echo "  make compose-ps-full   含應用服務的狀態"
+	@echo "  make docs-serve        在 http://127.0.0.1:8000 開文件網站（改檔即時更新）"
+	@echo "  make docs-build        產生靜態文件網站到 docs-site/site/"
 	@echo "  make disk              顯示 target/、.git、docker volume 的磁碟用量"
 	@echo "  make clean             cargo clean（target/ 會長到數十 GB，定期清）"
 
@@ -75,6 +78,26 @@ disk:
 
 clean:
 	$(CARGO) clean
+
+# --- 文件網站（MkDocs Material）---------------------------------------
+# 用獨立 venv，不污染系統 Python。版本鎖在 docs-site/requirements.txt：
+# mkdocs-material 9.7.x 宣告 mkdocs<2——MkDocs 2.0（目前只有 pre-release）
+# 移除了外掛系統，與 Material 不相容，不要升級到 2.x。
+# NO_MKDOCS_2_WARNING 只是關掉 Material 對 MkDocs 2.0 的提醒橫幅。
+DOCS_VENV := docs-site/.venv
+DOCS_ENV := NO_MKDOCS_2_WARNING=1
+
+$(DOCS_VENV)/bin/mkdocs: docs-site/requirements.txt
+	python3 -m venv $(DOCS_VENV)
+	$(DOCS_VENV)/bin/pip install -q -r docs-site/requirements.txt
+	touch $@
+
+docs-serve: $(DOCS_VENV)/bin/mkdocs
+	cd docs-site && $(DOCS_ENV) .venv/bin/mkdocs serve -a 127.0.0.1:8000
+
+# --strict：壞掉的頁內連結、找不到的頁面一律當錯誤，不讓它靜默上線。
+docs-build: $(DOCS_VENV)/bin/mkdocs
+	cd docs-site && $(DOCS_ENV) .venv/bin/mkdocs build --strict
 
 check:
 	$(CARGO) check --workspace --all-targets

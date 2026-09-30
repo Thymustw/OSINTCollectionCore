@@ -1,0 +1,18 @@
+[
+  {
+    "title": "Acme Router 韌體多個遠端程式碼執行漏洞",
+    "publisher": "Acme Security Response",
+    "author": "Acme PSIRT",
+    "published_at": "2026-09-28",
+    "url": "https://advisories.example.com/acme-2026-0928",
+    "body": "Acme 公司發布安全公告，修補 Acme Router 韌體中的 CVE-2026-31337 與 CVE-2026-31338。攻擊者可從 203.0.113.45 對管理介面發動攻擊，惡意程式回連至 c2.malicious-example.net。建議立即更新韌體，詳情參見 https://advisories.example.com/acme-2026-0928 。聯絡窗口 psirt@acme-example.com。"
+  },
+  {
+    "title": "威脅情報：針對 Acme Router 的攻擊活動持續擴大",
+    "publisher": "Example Threat Intel",
+    "author": "Example Research Team",
+    "published_at": "2026-09-29",
+    "url": "https://intel.example.org/acme-campaign",
+    "body": "研究團隊觀察到攻擊者持續利用 CVE-2026-31337，攻擊來源除了 203.0.113.45 之外，新增 198.51.100.77。惡意程式同樣回連 c2.malicious-example.net。"
+  }
+]

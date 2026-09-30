@@ -47,6 +47,12 @@ Phase 6a 起 `AuditLog` 落地到 Postgres 的 `audit_log` 表。哪些動作會
 | `GET /api/v1/ops/graph` | viewer+ | 圖投影 lag／rebuild | 運維的人 |
 | `GET /api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog、最近 AI Run | 運維的人 |
 
+`/api/v1/ops/*` 另有五條（與上表不是「健康／指標」的分工關係，所以不列在表內）：
+`GET /ops/connectors`（連接器狀態）、`GET /ops/queues`（佇列／consumer lag）、
+`GET /ops/dlq`（dead letter）、`GET /ops/failed-events`（失敗事件列表）、
+`POST /ops/failed-events/{id}/replay`（重送，operator 以上）。完整清單以
+`crates/core-api/src/routes.rs` 為準。
+
 ### 為什麼 Redis／Redpanda 不放進 `/ready`
 
 `/ready` 決定的是「要不要把流量送進來」。API 自己不需要 Redis 與 Redpanda

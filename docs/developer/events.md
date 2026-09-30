@@ -109,12 +109,12 @@ graph-worker 寫入不存在的邊。發送失敗**不讓** `execute_merge`／`u
 沒有乾淨的自動重試路徑；漏發靠 graph rebuild 補齊。entity-worker 則用 `?`
 往上拋，因為 offset 還沒 commit、失敗了下次會重跑。
 
-`EventTopic::ALL` 列出全部 19 個 variant，供兩個測試使用：
+`EventTopic::ALL` 列出全部 29 個 variant（V0.3 起；V0.2 時是 19 個），供兩個測試使用：
 `as_str()` 必須與 serde 的 `rename` 是同一個字串（兩邊各寫一次名字，
 **寫錯一邊不會編譯失敗**——produce 用 `as_str()` 決定 topic、envelope 的
 `event_type` 走 serde，結果是 consumer 訂到一個空 topic 而且看起來只是
 「目前沒有事件」），以及 topic 名稱不可重複。新增 variant 時
-`ALL` 的長度常數與那個 `assert_eq!(total, 19)` 要一起改。
+`ALL` 的長度常數與那個 `assert_eq!(total, 29)` 要一起改。
 
 Partition key：job 派工使用 `job_id`（TECH_STACK 預設表沒有 job；這是實作補充）。收集事件 `raw.collected`／`raw.failed` 使用 `source_id`（TECH_STACK 預設）。
 

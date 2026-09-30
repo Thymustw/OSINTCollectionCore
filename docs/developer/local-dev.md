@@ -17,11 +17,12 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up 
 | seaweedfs | chrislusf/seaweedfs:4.48 | 8333 | 8333（不 remap） |
 | neo4j | neo4j:5.26.30-community | 7474, 7687 | 同左 |
 
-`docker-compose.dev.yml` 的記憶體上限：postgres 1GB、**opensearch 2GB（heap 1g）**、
+`docker-compose.dev.yml` 的記憶體上限：postgres 1GB、**opensearch 3GB（heap 1536m）**、
 redpanda 512MB、redis 256MB、seaweedfs 512MB（延用自 MinIO，未重新量測）、**neo4j 1GB（heap 512m + pagecache 256m）**，
-合計 5.25GB / 4.5 CPU。明細見內部架構文件 RESOURCE_BUDGET.md §5.1（未隨原始碼公開）。
+合計 6.25GB / 4.5 CPU。明細見內部架構文件 RESOURCE_BUDGET.md §5.1（未隨原始碼公開）。
 
-⚠️ OpenSearch 在 V0.2 Phase 0a 從 1GB／heap 512m 升到 2GB／heap 1g。
+⚠️ OpenSearch 在 V0.2 Phase 0a 從 1GB／heap 512m 升到 2GB／heap 1g，
+Phase 0a-2 再升到 3GB／heap 1536m（中英雙 embedding 模型並存）。
 **這不是預留餘裕**：低於這個值 embedding 模型一定 deploy 不起來，
 而且容器不會掛、healthcheck 全綠（`docs/developer/embedding.md` §4）。
 
@@ -214,7 +215,9 @@ bash scripts/opensearch-ml-setup.sh     # 冪等；已部署時 0.2 秒結束
 DJL 的 PyTorch native libs 507 MB），OpenSearch volume 會從 2 MB 長到約 730 MB。
 這是常駐的，不是磁碟洩漏。
 
-⚠️ 需要 OpenSearch 容器 2 GB / heap 1 GB（dev override 已設）。
+⚠️ 只跑這一個英文模型時，OpenSearch 容器最少要 2 GB / heap 1 GB。
+dev override 實際設的是 **3 GB / heap 1536m**，因為還要與多語 e5 模型並存
+（理由見 `docker/docker-compose.dev.yml` 的 opensearch 註解）。
 不足時 deploy 失敗在「Memory Circuit Breaker is open」，
 **容器不會掛、healthcheck 全綠**，只有模型永遠起不來。
 
@@ -244,7 +247,7 @@ curl -s -X POST localhost:18080/api/v1/search -H "Authorization: Bearer $JWT" \
 ```
 
 ⚠️ `POST /api/v1/search` 的欄位是 **`query`**，不是 `q`。給 `q` 會拿到
-400「unknown field」。用 `{"total": 0}` 當成功判準時要先確認 HTTP 狀態碼，
+422「unknown field」（2026-09-30 實測；舊版文件寫 400 是錯的）。用 `{"total": 0}` 當成功判準時要先確認 HTTP 狀態碼，
 否則會把一個打錯的欄位名誤判成「管線沒有把文件送進 index」。
 
 ## Migration

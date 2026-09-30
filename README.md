@@ -7,6 +7,22 @@ searching open-source intelligence data.
 > Internal design specs, architecture rationale, and governance/security
 > policy documents are maintained privately.
 
+## Documentation / 文件
+
+The product documentation site lives in [`docs-site/`](docs-site/) (written in
+Traditional Chinese). Build and open it locally:
+
+產品文件網站在 [`docs-site/`](docs-site/)（繁體中文）。在本機開啟：
+
+```bash
+make docs-serve    # → http://127.0.0.1:8000
+```
+
+**New here? Start with the quickstart / 第一次來？從快速上手開始：**
+[`docs-site/docs/getting-started/quickstart.md`](docs-site/docs/getting-started/quickstart.md)
+— start the whole system, import sample data, search it, and see it on the graph in
+about 20 minutes. / 大約 20 分鐘，從啟動系統到匯入資料、搜尋、在關聯圖上看到結果。
+
 ## Architecture (overview)
 
 ```text

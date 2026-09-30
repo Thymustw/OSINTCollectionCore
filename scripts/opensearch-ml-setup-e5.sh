@@ -18,7 +18,9 @@
 #   OPENSEARCH_URL   預設 http://127.0.0.1:19200
 #   E5_CACHE_DIR     ONNX／tokenizer／zip 的暫存位置，預設 /tmp/osint-e5-model
 #   E5_SERVE_ADDR    臨時 HTTP 服務要綁的位址，預設自動偵測 compose network gateway
-#   E5_SERVE_PORT    預設 18080
+#   E5_SERVE_PORT    預設 18099（不可用 18080–18089：那是十個服務的埠。
+#                    2026-09-30 實測：原預設 18080 在 `make compose-up-full`
+#                    之後必定撞上 osint-api，腳本失敗在「臨時 HTTP 服務起不來」）
 #   ML_TIMEOUT_SECS  非同步工作輪詢上限，預設 900
 #
 # ---------------------------------------------------------------------------
@@ -38,7 +40,7 @@ set -euo pipefail
 
 OPENSEARCH_URL="${OPENSEARCH_URL:-http://127.0.0.1:19200}"
 E5_CACHE_DIR="${E5_CACHE_DIR:-/tmp/osint-e5-model}"
-E5_SERVE_PORT="${E5_SERVE_PORT:-18080}"
+E5_SERVE_PORT="${E5_SERVE_PORT:-18099}"
 ML_TIMEOUT_SECS="${ML_TIMEOUT_SECS:-900}"
 
 ML_MODEL_NAME="intfloat/multilingual-e5-small-int8"
@@ -365,7 +367,11 @@ fi  # 冪等短路結束
 # 絕對數值，只斷言「同主題 > 不相關」以及維度正確。真正的品質證據是
 # docs/developer/embedding.md 的小型檢索測試（中文 top-1 5/5）。
 log "冒煙測試推論（中文）"
-api POST "/_plugins/_ml/_predict/text_embedding/${MODEL_ID}" '{
+# 剛部署完第二個模型時，JVM heap 會短暫衝高，第一次推論可能被斷路器擋成 429。
+# 2026-09-30 在全新環境實測：部署完立刻推論得到 429，但當下 heap 只有 12–13 %，
+# 過幾秒重跑同一支腳本就通過——是暫態尖峰，不是 heap 設錯。
+# 所以遇到 429 先等待重試；重試用完仍是 429，才是真的設定問題（交給下面的判斷報錯）。
+SMOKE_BODY='{
   "text_docs": [
     "query: Microsoft 是一家科技公司",
     "query: 微軟是軟體大廠",
@@ -373,12 +379,23 @@ api POST "/_plugins/_ml/_predict/text_embedding/${MODEL_ID}" '{
   ],
   "return_number": true,
   "target_response": ["sentence_embedding"]
-}' | EXPECTED_DIM="$EXPECTED_DIM" jq_py "
+}'
+SMOKE_RESP=""
+for attempt in 1 2 3 4 5 6; do
+  SMOKE_RESP="$(api POST "/_plugins/_ml/_predict/text_embedding/${MODEL_ID}" "$SMOKE_BODY")"
+  if printf '%s' "$SMOKE_RESP" | grep -q 'circuit_breaking_exception\|"status":429'; then
+    printf '   推論暫時被斷路器擋下（第 %d 次），10 秒後重試…\n' "$attempt"
+    sleep 10
+    continue
+  fi
+  break
+done
+printf '%s' "$SMOKE_RESP" | EXPECTED_DIM="$EXPECTED_DIM" jq_py "
 import json, math, os, sys
 expected = int(os.environ['EXPECTED_DIM'])
 d = json.load(sys.stdin)
 if d.get('status') == 429 or 'circuit_breaking_exception' in json.dumps(d):
-    sys.exit('推論被斷路器擋下（HTTP 429）。這通常**不是**容器記憶體不足，'
+    sys.exit('推論被斷路器擋下（HTTP 429），重試 6 次（約 1 分鐘）仍然如此。這通常**不是**容器記憶體不足，'
              '而是 JVM heap 超過 jvm_heap_memory_threshold(85)。'
              '請確認 OPENSEARCH_JAVA_OPTS 是 -Xmx1536m 而不是 -Xmx1g。'
              '詳見 docs/developer/embedding.md。')

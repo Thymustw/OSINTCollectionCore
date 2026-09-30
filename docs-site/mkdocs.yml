@@ -1,0 +1,105 @@
+site_name: OSINT Intelligence Core 文件
+site_description: 高併發、Rust 為核心的開源情報（OSINT）平台基礎
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  language: zh-TW
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: 切換為深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: 切換為淺色模式
+
+plugins:
+  - search:
+      lang:
+        - en
+        - zh
+      # 中文沒有空白分詞，預設 tokenizer 只切空白與標點，中文整句會變成一個詞、
+      # 搜不到句子中間的字。最後兩段用 lookbehind／lookahead 在每個中文字
+      # 「前後」切開，讓每個字各自成為一個詞。
+      # ⚠️ 不能寫成 `|[一-鿿]`——那會把中文字本身當成分隔符號吃掉，
+      #    中文整段消失、完全搜不到（2026-09-30 用 re.split 模擬實測過）。
+      separator: '[\s​\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])|(?<=[一-鿿])|(?=[一-鿿])'
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      # 預設 slug 會丟掉所有非 ASCII 字元，中文標題的錨點變成 _1、_2，
+      # 頁內連結 #遇到問題 會失效、分享出去的網址也看不出是哪一節。
+      # 改用保留 Unicode 的 slug。
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+
+nav:
+  - 首頁: index.md
+  - 開始使用:
+      - getting-started/index.md
+      - 這是什麼: getting-started/overview.md
+      - 快速上手: getting-started/quickstart.md
+      - 核心概念: getting-started/concepts.md
+  - 使用指南:
+      - usage/index.md
+      - 取得 API 憑證: usage/authentication.md
+      - 匯入資料: usage/import.md
+      - 搜尋: usage/search.md
+      - 在圖上看關聯: usage/graph.md
+      - 發現新關聯（Discovery）: usage/discovery.md
+      - STIX 匯入匯出: usage/stix.md
+      - 命令列工具: usage/cli.md
+  - 部署與維運:
+      - operations/index.md
+      - 系統需求: operations/requirements.md
+      - 服務與埠號: operations/services.md
+      - 健康檢查與監控: operations/health.md
+      - 疑難排解: operations/troubleshooting.md
+  - 參考:
+      - reference/index.md
+      - API 端點總覽: reference/api.md
+      - 實體類型: reference/entity-types.md
+      - 設定檔: reference/configuration.md
+  - 架構:
+      - architecture/index.md
+      - 系統架構: architecture/overview.md
+      - 資料流: architecture/data-flow.md
+      - 設計原則: architecture/principles.md
+      - 目前的限制: architecture/limitations.md

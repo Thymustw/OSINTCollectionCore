@@ -259,7 +259,11 @@ fi
 # 區隔度只有 0.047（英文是 0.79），拿中文當 CI 斷言會是脆弱的測試。
 # 中文能力的實測數字與後果見 docs/developer/embedding.md。
 log "冒煙測試推論"
-api POST "/_plugins/_ml/_predict/text_embedding/${MODEL_ID}" '{
+# 剛部署完時 JVM heap 會短暫衝高，第一次推論可能被斷路器擋成 429
+# （回應裡 durability 是 TRANSIENT）。2026-09-30 實測：OpenSearch 重啟後
+# 在已有大量索引的環境跑這支腳本，模型狀態是 DEPLOYED，冒煙測試卻回 429、
+# 腳本 exit 1——是假陰性。所以遇到 429 先等待重試；重試用完仍是 429 才報錯。
+SMOKE_BODY='{
   "text_docs": [
     "Microsoft is a technology company",
     "Microsoft is a major software vendor",
@@ -267,10 +271,25 @@ api POST "/_plugins/_ml/_predict/text_embedding/${MODEL_ID}" '{
   ],
   "return_number": true,
   "target_response": ["sentence_embedding"]
-}' | EXPECTED_DIM="$EXPECTED_DIM" jq_py "
+}'
+SMOKE_RESP=""
+for attempt in 1 2 3 4 5 6; do
+  SMOKE_RESP="$(api POST "/_plugins/_ml/_predict/text_embedding/${MODEL_ID}" "$SMOKE_BODY")"
+  if printf '%s' "$SMOKE_RESP" | grep -q 'circuit_breaking_exception\|"status":429'; then
+    printf '   推論暫時被斷路器擋下（第 %d 次），10 秒後重試…\n' "$attempt"
+    sleep 10
+    continue
+  fi
+  break
+done
+printf '%s' "$SMOKE_RESP" | EXPECTED_DIM="$EXPECTED_DIM" jq_py "
 import json, math, os, sys
 expected = int(os.environ['EXPECTED_DIM'])
 d = json.load(sys.stdin)
+if d.get('status') == 429 or 'circuit_breaking_exception' in json.dumps(d):
+    sys.exit('推論被斷路器擋下（HTTP 429），重試 6 次（約 1 分鐘）仍然如此。'
+             '模型可能已部署，但 JVM heap 持續超過門檻。請確認 OpenSearch 的記憶體設定，'
+             '詳見 docs/developer/embedding.md。')
 results = d.get('inference_results')
 if not results:
     sys.exit('推論沒有回傳 inference_results：%s' % json.dumps(d, ensure_ascii=False)[:500])
