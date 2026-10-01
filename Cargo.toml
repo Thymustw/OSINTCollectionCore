@@ -73,7 +73,7 @@ core-observability = { path = "crates/core-observability" }
 core-security = { path = "crates/core-security" }
 croner = { version = "4.0.0", default-features = false, features = ["chrono"] }
 csv = "1.4.0"
-feed-rs = "2.4.0"
+feed-rs = "3.0.0"
 hex = "0.4.3"
 import-format = { path = "crates/import-format" }
 ipnet = "2.12.2"
