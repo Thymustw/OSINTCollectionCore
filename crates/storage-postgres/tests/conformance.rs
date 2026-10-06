@@ -1,6 +1,7 @@
 use storage_core::conformance::{
-    assert_canonical_health, assert_list_sources_by_entity, assert_relational_round_trip,
-    assert_transactional_contract, load_workspace_dotenv, required_env,
+    assert_canonical_health, assert_evidence_collections, assert_list_sources_by_entity,
+    assert_relational_round_trip, assert_transactional_contract, load_workspace_dotenv,
+    required_env,
 };
 use storage_postgres::PostgresCanonicalStore;
 
@@ -39,4 +40,17 @@ async fn postgres_list_sources_by_entity_dedup_and_empty() {
     assert_list_sources_by_entity(&store)
         .await
         .expect("list_sources_by_entity：多 source 去重 + 無關聯回空");
+}
+
+#[tokio::test]
+async fn postgres_evidence_collections_many_to_many() {
+    load_workspace_dotenv();
+    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
+    let store = PostgresCanonicalStore::connect(&dsn, 5)
+        .await
+        .expect("連 Postgres");
+    store.migrate().await.expect("migrate");
+    assert_evidence_collections(&store)
+        .await
+        .expect("evidence ↔ collections 多對多寫入／反查／unlink／刪文件清關聯");
 }

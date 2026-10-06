@@ -136,6 +136,13 @@ Phase 6b（`GET /api/v1/*` 的過濾參數）新增的四個，語意與上表�
 > `POST /api/v1/import` 建立的 connector 用 **UUID v5**（由 source + format 推導以保持冪等），
 > 沒有時間戳。只有 source／raw evidence／document／job 的 id 是 UUID v7。
 
+V0.3 migration `0016_v0_3_evidence_collections.sql` 把 `raw_evidence.collection_id`
+單欄改成 `raw_evidence_collections` 多對多；`insert_raw_evidence` 現在同時收
+`collection_ids`，在同一個交易裡寫證據與關聯。`collection_objects.object_id`
+也補上對 `documents(id)` 的 `ON DELETE CASCADE`。`0017_v0_3_collection_objects_object_idx.sql`
+再補 `collection_objects_object_id_idx`（`collection_objects (object_id)`）：
+PK 前綴是 `collection_id`，刪文件時用 `object_id` 找關聯列走不到 PK。
+
 Collection 的三個關聯反查（`GET /api/v1/collections/{id}` 用，只夾 `limit`、不帶 cursor）：
 
 | 方法 | 排序 | 來源表 |
@@ -143,6 +150,17 @@ Collection 的三個關聯反查（`GET /api/v1/collections/{id}` 用，只夾 `
 | `list_collection_sources(collection_id, limit)` | `source_id ASC` | `collection_sources` |
 | `list_collection_connectors(collection_id, limit)` | `connector_id ASC` | `collection_connectors` |
 | `list_collection_objects(collection_id, limit)` | `object_id ASC` | `collection_objects` |
+| `list_collections_by_source(source_id, limit)` | `collection_id ASC` | `collection_sources` 反查 |
+| `list_collections_by_connector(connector_id, limit)` | `collection_id ASC` | `collection_connectors` 反查 |
+| `list_collections_by_raw_evidence(raw_evidence_id, limit)` | `collection_id ASC` | `raw_evidence_collections` |
+| `unlink_collection_source` / `unlink_collection_connector` | — | 回 `bool`：有刪到列為 true |
+
+`GET /api/v1/raw/{id}` 把 `list_collections_by_raw_evidence(..., LINK_PAGE)` 的結果掛上
+`collection_ids`；滿 100 筆時 `collection_ids_truncated` 為 true。寫入端
+`POST /collections` 的 `source_ids`／`connector_ids` 一次最多 100 筆
+（`MAX_LINKS_PER_REQUEST`）；每個來源／連接器最多屬於 50 個集合
+（`MAX_COLLECTIONS_PER_SOURCE`／`MAX_COLLECTIONS_PER_CONNECTOR`），超過 422。
+這樣 collector／匯入／normalizer 用 `limit=100` 讀得到完整清單。
 
 SPEC §7 的 Relations 在 Phase 6b 之前只寫得進去、讀不出來（只有 `link_*` 沒有
 `list_*`），`GET /collections/{id}` 會永遠回空清單而且不會有任何錯誤。

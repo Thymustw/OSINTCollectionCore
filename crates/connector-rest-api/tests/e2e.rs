@@ -191,7 +191,7 @@ async fn rest_api_to_raw_evidence_round_trip() {
     let ctx = CollectContext {
         source: source.clone(),
         connector: connector.clone(),
-        collection_id: Some(collection.id),
+        collection_ids: vec![collection.id],
         checkpoint: ConnectorCheckpoint::default(),
         now,
     };
@@ -281,7 +281,7 @@ async fn rest_api_rejects_inline_authorization_header() {
     let ctx = CollectContext {
         source,
         connector,
-        collection_id: None,
+        collection_ids: vec![],
         checkpoint: ConnectorCheckpoint::default(),
         now,
     };

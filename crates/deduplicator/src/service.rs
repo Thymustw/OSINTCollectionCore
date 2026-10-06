@@ -531,15 +531,32 @@ impl Deduplicator {
 
         match self.semantic.detect(document).await? {
             SemanticOutcome::Hit {
-                canonical_object_id,
+                canonical_object_id: hit_id,
                 similarity,
                 model,
-            } => Ok(Some(DuplicateHit {
-                canonical_object_id,
-                stage: DedupStage::Semantic,
-                similarity,
-                model: Some(model),
-            })),
+            } => {
+                // Stage 5 的命中來自 OpenSearch 向量索引——那是**可重建的投影，不是真相**
+                // （CLAUDE.md §5）。投影可能殘留 PostgreSQL 已刪除的 Document，
+                // 直接拿它當 canonical 會讓 `duplicate_of` 指向不存在的列，寫入撞上
+                // documents_duplicate_of_fkey，這份 Document 卡住、後面的實體抽取都不會跑。
+                // 2026-10-06 實測發生過：e2e 清掉的文件仍在 osint-documents 索引裡。
+                // Stage 1～4 都經過 resolve_canonical 回 PostgreSQL 確認，Stage 5 原本漏了。
+                let Some(canonical_object_id) = self.resolve_canonical(hit_id).await? else {
+                    tracing::warn!(
+                        document_id = %document.id,
+                        stale_hit = %hit_id,
+                        "Stage 5 最近鄰在 PostgreSQL 已不存在（搜尋索引殘留），不當作重複；\
+                         需要時跑 make rebuild-index 清掉殘留"
+                    );
+                    return Ok(None);
+                };
+                Ok(Some(DuplicateHit {
+                    canonical_object_id,
+                    stage: DedupStage::Semantic,
+                    similarity,
+                    model: Some(model),
+                }))
+            }
             // Unsupported 與 NoMatch 對流程的效果相同，
             // 差別只在寫進 provenance 的 `semantic_detector` 字串——
             // 那是「這份資料是在有沒有 Stage 5 的年代處理的」唯一的判斷依據。

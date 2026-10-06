@@ -277,6 +277,31 @@ cargo test --workspace --all-targets -- --nocapture
 
 Postgres 測試會插入 UUID v7 列，不會 TRUNCATE。OpenSearch 用一次性 index 名；S3 用 `conformance/<uuid>/` prefix。
 
+### ⚠️ 跑測試前先停掉應用服務容器
+
+`make compose-up-full` 起來的 10 個應用服務（`--profile app`）跟 e2e 測試**訂閱同一批 Kafka topic、
+用同一個 consumer group**。容器開著時，容器會搶先消費測試發出的事件並處理掉，測試自己
+再處理時拿到 `AlreadyDone`，斷言「預期 Created」失敗。
+
+2026-10-06 實測：容器開著跑 `cargo test --workspace` 有 **12 個失敗**（acceptance_f、
+import_e2e、search_api_e2e、deduplicator／entity-worker／normalizer 的 e2e），症狀幾乎都是
+「預期 Created，得到 AlreadyDone」。**只停掉 10 個應用容器、基礎設施保留**後重跑同一批，
+**50 passed / 0 failed**。這不是程式壞了，是測試環境被佔用。
+
+```bash
+# 只停應用服務，基礎設施（postgres、opensearch…）照常
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --profile app stop \
+  osint-api osint-collector osint-normalizer osint-deduplicator osint-entity-worker \
+  osint-indexer osint-graph-worker osint-embedding-worker osint-stix-worker osint-discovery-worker
+
+cargo test --workspace
+
+make compose-up-full   # 測完再起回來
+```
+
+`core-events::redpanda_roundtrip` 在本機會因 `MessageTimedOut` 失敗，與容器開關無關，是既有的
+環境問題（見 `docs/KNOWN_GAPS.md` §14）。
+
 Adapter 細節見 `docs/developer/storage-adapters.md`。Connector SDK／RSS 見 `docs/developer/connector-sdk.md`。`source_network_rules` 在 `migrations/*/0002_source_network_rules.sql`。
 
 ## API skeleton

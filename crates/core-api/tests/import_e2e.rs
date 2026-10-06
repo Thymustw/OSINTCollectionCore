@@ -15,9 +15,10 @@ use connector_sdk::StoreEvidenceSink;
 use core_api::{AppState, AuthState, ImportState, RateLimiter, ready_always, router};
 use core_config::ImportSection;
 use core_events::{EventConsumer, EventProducer, EventTopic};
-use core_model::{Source, SourceType};
+use core_model::{Collection, EntityType, RelationshipType, Source, SourceType};
 use core_observability::MetricsRegistry;
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
+use entity_worker::{EntityWorker, ExtractOutcome, ExtractionBounds};
 use http_body_util::BodyExt;
 use normalizer::{NormalizeOutcome, Normalizer};
 use serde_json::{Value, json};
@@ -85,6 +86,31 @@ async fn seed_source(pg: &PostgresCanonicalStore, source_type: SourceType) -> So
     };
     pg.put_source(&source).await.expect("source");
     source
+}
+
+async fn seed_collection(pg: &PostgresCanonicalStore, name: &str) -> Collection {
+    let now = Utc::now();
+    let collection = Collection {
+        id: Uuid::now_v7(),
+        workspace_id: None,
+        name: name.into(),
+        description: None,
+        status: "active".into(),
+        priority: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    pg.put_collection(&collection).await.expect("collection");
+    collection
+}
+
+fn entity_worker(stack: &Stack) -> EntityWorker {
+    EntityWorker::new(
+        stack.pg.clone(),
+        None,
+        MetricsRegistry::new(),
+        ExtractionBounds::default(),
+    )
 }
 
 struct TestApi {
@@ -544,5 +570,166 @@ async fn repeated_uploads_reuse_the_same_import_connector() {
     assert_ne!(
         first["raw_evidence_id"], second["raw_evidence_id"],
         "每次上傳都是獨立的 RawEvidence（immutable）"
+    );
+}
+
+/// 兩個集合共用一個來源 → 匯入一筆（不顯式給 collection_ids）→
+/// 原始證據與文件同時屬於兩個集合；`publisher` 寫進 attributes 並抽出 Organization。
+#[tokio::test]
+async fn two_collections_and_publisher_flow_through_import() {
+    let stack = connect_stack().await;
+    let source = seed_source(&stack.pg, SourceType::JsonImport).await;
+    let collection_a = seed_collection(&stack.pg, "import-e2e-a").await;
+    let collection_b = seed_collection(&stack.pg, "import-e2e-b").await;
+    stack
+        .pg
+        .link_collection_source(collection_a.id, source.id)
+        .await
+        .expect("link a");
+    stack
+        .pg
+        .link_collection_source(collection_b.id, source.id)
+        .await
+        .expect("link b");
+
+    let run = Uuid::now_v7();
+    let publisher = format!("Import Publisher {run}");
+    let title = format!("Import CVE {run}");
+    let payload = format!(
+        r#"[{{"title":"{title}","description":"兩集合共用來源","publisher":"{publisher}","author":"Import Author {run}"}}]"#
+    );
+
+    let producer = Arc::new(
+        EventProducer::connect(&stack.brokers, "core-api-import-e2e-collections")
+            .expect("producer"),
+    );
+    let api = build_api(&stack, producer, ImportSection::default());
+    // 不傳 collection_ids：應走來源反查，掛上兩個集合。
+    let request = format!(r#"{{"source_id":"{}","kind":"json"}}"#, source.id);
+    let (status, body) = upload(&api, &request, "payload.json", payload.as_bytes()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["record_count"], 1);
+
+    let raw_evidence_id: Uuid = body["raw_evidence_id"].as_str().unwrap().parse().unwrap();
+    let mut linked = stack
+        .pg
+        .list_collections_by_raw_evidence(raw_evidence_id, 100)
+        .await
+        .expect("list evidence collections");
+    let mut expected = vec![collection_a.id, collection_b.id];
+    linked.sort();
+    expected.sort();
+    assert_eq!(
+        linked, expected,
+        "沒給 collection_ids 時應反查來源掛上的兩個集合"
+    );
+
+    let outcome = normalizer(&stack)
+        .normalize_raw(raw_evidence_id)
+        .await
+        .expect("normalize");
+    let NormalizeOutcome::Created { document_ids } = outcome else {
+        panic!("預期 Created，得到 {outcome:?}");
+    };
+    assert_eq!(document_ids.len(), 1);
+    let document_id = document_ids[0];
+    let doc = stack
+        .pg
+        .get_document(document_id)
+        .await
+        .expect("get document")
+        .expect("Document");
+    assert_eq!(doc.title.as_deref(), Some(title.as_str()));
+    assert_eq!(
+        doc.attributes["publisher"],
+        json!(publisher),
+        "JSON publisher 必須寫進 Document.attributes：{}",
+        doc.attributes
+    );
+    assert_eq!(
+        doc.author.as_deref(),
+        Some(format!("Import Author {run}").as_str())
+    );
+
+    let objs_a = stack
+        .pg
+        .list_collection_objects(collection_a.id, 100)
+        .await
+        .expect("objects a");
+    let objs_b = stack
+        .pg
+        .list_collection_objects(collection_b.id, 100)
+        .await
+        .expect("objects b");
+    assert!(
+        objs_a.contains(&document_id),
+        "文件應繼承集合 A，實際 {objs_a:?}"
+    );
+    assert!(
+        objs_b.contains(&document_id),
+        "文件應繼承集合 B，實際 {objs_b:?}"
+    );
+
+    let extract = entity_worker(&stack)
+        .extract_document(document_id)
+        .await
+        .expect("extract");
+    assert!(
+        matches!(extract, ExtractOutcome::Extracted { .. }),
+        "預期 Extracted，實際 {extract:?}"
+    );
+
+    let organization = stack
+        .pg
+        .find_entity_by_normalized_name(EntityType::Organization, &publisher.to_lowercase())
+        .await
+        .expect("query org")
+        .expect("attributes.publisher 必須產生 Organization");
+    let org_rels = stack
+        .pg
+        .list_relationships_by_object(organization.id, 100)
+        .await
+        .expect("org rels");
+    assert!(
+        org_rels.iter().any(|r| r.source_object_id == document_id
+            && r.relationship_type == RelationshipType::PublishedBy),
+        "Document → Organization 必須是 published_by，實際 {org_rels:?}"
+    );
+}
+
+/// 明確給不存在的 collection_id 必須 422，且不能留下半套 RawEvidence。
+#[tokio::test]
+async fn import_unknown_collection_ids_is_422_and_stores_nothing() {
+    let stack = connect_stack().await;
+    let source = seed_source(&stack.pg, SourceType::JsonImport).await;
+    let producer = Arc::new(
+        EventProducer::connect(&stack.brokers, "core-api-import-e2e-bad-col").expect("producer"),
+    );
+    let api = build_api(&stack, producer, ImportSection::default());
+    let missing = Uuid::now_v7();
+    let request = format!(
+        r#"{{"source_id":"{}","kind":"json","collection_ids":["{missing}"]}}"#,
+        source.id
+    );
+    let (status, body) = upload(&api, &request, "payload.json", JSON_PAYLOAD.as_bytes()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains(&missing.to_string()),
+        "422 要列出缺的 id：{message}"
+    );
+    assert!(
+        message.contains("沒有寫入任何原始證據"),
+        "要講清楚這次沒落地：{message}"
+    );
+
+    let leftover = stack
+        .pg
+        .list_raw_evidence_by_source(source.id, None, 100)
+        .await
+        .expect("list evidence");
+    assert!(
+        leftover.is_empty(),
+        "422 之後這個來源底下不該有 RawEvidence：{leftover:?}"
     );
 }

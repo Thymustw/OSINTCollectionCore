@@ -36,6 +36,8 @@ fn read_paths() -> Vec<String> {
         format!("/api/v1/connectors/{id}"),
         "/api/v1/collections".into(),
         format!("/api/v1/collections/{id}"),
+        format!("/api/v1/collections/{id}/budget"),
+        format!("/api/v1/collections/{id}/discovery"),
         "/api/v1/objects".into(),
         format!("/api/v1/objects/{id}"),
         format!("/api/v1/objects/{id}/similar"),
@@ -84,6 +86,38 @@ fn write_requests() -> Vec<(&'static str, String, Value)> {
             json!({"name": "c"}),
         ),
         ("POST", "/api/v1/collections".into(), json!({"name": "col"})),
+        (
+            "POST",
+            format!("/api/v1/collections/{id}/sources"),
+            json!({"source_ids": [id]}),
+        ),
+        (
+            "DELETE",
+            format!("/api/v1/collections/{id}/sources/{id}"),
+            json!({}),
+        ),
+        (
+            "POST",
+            format!("/api/v1/collections/{id}/connectors"),
+            json!({"connector_ids": [id]}),
+        ),
+        (
+            "DELETE",
+            format!("/api/v1/collections/{id}/connectors/{id}"),
+            json!({}),
+        ),
+        (
+            "PUT",
+            format!("/api/v1/collections/{id}/budget"),
+            json!({
+                "max_candidates_per_run": 10,
+                "max_requests_per_run": 10,
+                "max_ai_calls_per_run": 10,
+                "max_depth": 2,
+                "daily_request_budget": 100,
+                "daily_ai_budget": 50
+            }),
+        ),
         ("POST", "/api/v1/objects".into(), json!({})),
         ("POST", format!("/api/v1/jobs/{id}/retry"), json!({})),
         ("POST", format!("/api/v1/entities/{id}/resolve"), json!({})),

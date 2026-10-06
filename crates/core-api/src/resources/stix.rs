@@ -70,6 +70,10 @@ const STIX_CONNECTOR_NAMESPACE: Uuid = Uuid::from_u128(0x0199_3c6a_7c3e_7a11_9c2
 pub struct StixImportRequest {
     pub source_id: Uuid,
     pub bundle: Value,
+    /// 這筆匯入要掛上哪些調查集合。省略時用來源目前掛上的集合；
+    /// 明確給空陣列代表不掛任何集合。每個 id 都必須已存在，否則 422。
+    #[serde(default)]
+    pub collection_ids: Option<Vec<Uuid>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,6 +153,12 @@ async fn import_stix_inner(
     let source = load_source(import, request.source_id).await?;
     check_source_is_stix(&source)?;
     let connector = resolve_stix_connector(import, &source).await?;
+    let collection_ids = crate::resources::collections::resolve_import_collections(
+        import.store.as_ref(),
+        source.id,
+        request.collection_ids.clone(),
+    )
+    .await?;
 
     let bundle_id = request
         .bundle
@@ -171,7 +181,7 @@ async fn import_stix_inner(
     let evidence = NewRawEvidence {
         source_id: source.id,
         connector_id: connector.id,
-        collection_id: None,
+        collection_ids,
         external_id: bundle_id,
         source_url: format!("stix://import/{}", source.id),
         retrieved_at: Utc::now(),

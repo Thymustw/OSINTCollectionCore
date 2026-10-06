@@ -20,6 +20,7 @@ pub struct ImportRecord {
     pub external_id: Option<String>,
     pub language: Option<String>,
     pub author: Option<String>,
+    pub publisher: Option<String>,
 }
 
 impl ImportRecord {
@@ -57,6 +58,7 @@ impl ImportRecord {
             Field::ExternalId => self.external_id = Some(owned),
             Field::Language => self.language = Some(owned),
             Field::Author => self.author = Some(owned),
+            Field::Publisher => self.publisher = Some(owned),
             Field::PublishedAt => {
                 self.published_at = parse_timestamp(&owned);
                 self.published_at_raw = Some(owned);

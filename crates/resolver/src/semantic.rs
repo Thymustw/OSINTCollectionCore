@@ -489,7 +489,46 @@ mod tests {
         ) -> Result<Vec<ObjectId>, StorageError> {
             Self::unsupported("list_collection_objects")
         }
-        async fn insert_raw_evidence(&self, _: &RawEvidence) -> Result<(), StorageError> {
+        async fn list_collections_by_source(
+            &self,
+            _: SourceId,
+            _: u32,
+        ) -> Result<Vec<CollectionId>, StorageError> {
+            Self::unsupported("list_collections_by_source")
+        }
+        async fn list_collections_by_connector(
+            &self,
+            _: ConnectorId,
+            _: u32,
+        ) -> Result<Vec<CollectionId>, StorageError> {
+            Self::unsupported("list_collections_by_connector")
+        }
+        async fn list_collections_by_raw_evidence(
+            &self,
+            _: RawEvidenceId,
+            _: u32,
+        ) -> Result<Vec<CollectionId>, StorageError> {
+            Self::unsupported("list_collections_by_raw_evidence")
+        }
+        async fn unlink_collection_source(
+            &self,
+            _: CollectionId,
+            _: SourceId,
+        ) -> Result<bool, StorageError> {
+            Self::unsupported("unlink_collection_source")
+        }
+        async fn unlink_collection_connector(
+            &self,
+            _: CollectionId,
+            _: ConnectorId,
+        ) -> Result<bool, StorageError> {
+            Self::unsupported("unlink_collection_connector")
+        }
+        async fn insert_raw_evidence(
+            &self,
+            _: &RawEvidence,
+            _: &[CollectionId],
+        ) -> Result<(), StorageError> {
             Self::unsupported("insert_raw_evidence")
         }
         async fn get_raw_evidence(

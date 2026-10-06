@@ -27,7 +27,7 @@ use core_model::RawEvidence;
 use core_security::{Permission, Principal};
 
 use crate::error::ApiError;
-use crate::resources::{objects, storage_error, store};
+use crate::resources::{LINK_PAGE, objects, storage_error, store};
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +72,13 @@ pub async fn get_raw(
             "序列化 RawEvidence 失敗：{err}。請看 osint-api 記錄檔"
         ))
     })?;
+    let collection_ids = store
+        .list_collections_by_raw_evidence(id, LINK_PAGE)
+        .await
+        .map_err(storage_error)?;
+    value["collection_ids_truncated"] = serde_json::json!(collection_ids.len() as u32 >= LINK_PAGE);
+    value["collection_ids"] = serde_json::to_value(&collection_ids)
+        .map_err(|err| ApiError::internal(format!("序列化 collection_ids 失敗：{err}")))?;
 
     if query.body {
         let body = fetch_body(&state, &evidence).await?;

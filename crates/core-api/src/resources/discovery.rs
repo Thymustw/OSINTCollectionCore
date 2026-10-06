@@ -251,6 +251,18 @@ pub async fn collection_discovery(
 ) -> Result<Json<CursorPage<Candidate>>, ApiError> {
     principal.role.require(Permission::Read)?;
     let store = store(&state)?;
+    // 集合不存在要 404，不能回 200 空頁——否則「打錯 id」與「這個調查還沒有候選」
+    // 看起來一樣，呼叫端會以為 Discovery 沒跑。
+    if store
+        .get_collection(id)
+        .await
+        .map_err(storage_error)?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!(
+            "找不到 Collection `{id}`。請用 GET /api/v1/collections 確認 id"
+        )));
+    }
     let (after, limit) = Pagination {
         cursor: query.cursor.clone(),
         limit: query.limit,

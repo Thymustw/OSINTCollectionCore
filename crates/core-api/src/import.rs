@@ -81,6 +81,10 @@ pub struct ImportRequest {
     pub object_type: Option<DocumentType>,
     #[serde(default)]
     pub mapping: FieldMapping,
+    /// 這筆匯入要掛上哪些調查集合。省略時用來源目前掛上的集合；
+    /// 明確給空陣列代表不掛任何集合。每個 id 都必須已存在，否則 422。
+    #[serde(default)]
+    pub collection_ids: Option<Vec<Uuid>>,
 }
 
 /// multipart 解出來的原料。
@@ -191,6 +195,12 @@ async fn handle(
     let source = load_source(import, request.source_id).await?;
     check_source_matches_kind(&source, request.kind)?;
     let connector = resolve_connector(import, &source, &request).await?;
+    let collection_ids = crate::resources::collections::resolve_import_collections(
+        import.store.as_ref(),
+        source.id,
+        request.collection_ids.clone(),
+    )
+    .await?;
 
     let spec = ImportSpec {
         kind: request.kind,
@@ -231,7 +241,7 @@ async fn handle(
     let evidence = NewRawEvidence {
         source_id: source.id,
         connector_id: connector.id,
-        collection_id: None,
+        collection_ids,
         external_id: request.external_id.clone(),
         source_url,
         retrieved_at: Utc::now(),
@@ -740,6 +750,7 @@ mod tests {
             content_type: None,
             object_type: None,
             mapping: FieldMapping::default(),
+            collection_ids: None,
         };
         let url = resolve_source_url(&request, ImportKind::Csv, Some("a.csv")).unwrap();
         assert_eq!(url, "import://csv/a.csv");

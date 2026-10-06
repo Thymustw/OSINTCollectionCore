@@ -69,7 +69,7 @@ flowchart LR
 | 雜湊值 `hash` | MD5／SHA-1／SHA-256 | 從文字自動抽取 |
 | 帳號 `account` | GitHub／Twitter／Telegram 帳號 | 從文字裡的網址抽取 |
 | 人員 `person` | 文章作者 | 從作者欄位 |
-| 組織 `organization` | 某家公司、某個駭客組織 | 目前只從 STIX 匯入 |
+| 組織 `organization` | 某家公司、某個駭客組織 | 從發布單位／feed 標題／網站名稱等結構化欄位；STIX 的 `identity` |
 
 完整清單與規則見 [實體類型](../reference/entity-types.md)。
 
@@ -95,8 +95,12 @@ flowchart LR
 
 ## Collection（調查集合）
 
-**一次調查的範圍。** 例如「Acme Router 攻擊事件調查」。Discovery 發現的新目標會掛在某個
-Collection 底下，並受這個 Collection 的預算限制（每天最多發現幾個、最多往外擴幾層）。
+**一次調查的範圍。** 例如「Acme Router 攻擊事件調查」。一份來源或連接器可以同時屬於多個
+集合；之後收集或匯入的原始證據與文件會繼承當時掛上的集合。Discovery 發現的新目標也會掛在
+某個 Collection 底下，並受這個 Collection 的預算限制（每天最多發現幾個、最多往外擴幾層）。
+
+把來源加進集合**不會回填**已經落地的舊資料——只影響之後收進來的。這是刻意的：回填等於改寫
+「這筆資料當時屬於哪個調查」。
 
 ## Seed 與 Candidate（種子與候選）
 

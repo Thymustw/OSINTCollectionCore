@@ -569,6 +569,28 @@ async fn collection_discovery_lists_only_that_collection() {
     assert!(!ids.iter().any(|id| *id == orphan.id.to_string()), "{resp}");
 }
 
+#[tokio::test]
+async fn collection_discovery_missing_collection_is_404() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let missing = Uuid::now_v7();
+    let (status, resp) = send(
+        &api.app,
+        get(
+            &format!("/api/v1/collections/{missing}/discovery"),
+            &api.viewer,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{resp}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("找不到 Collection")),
+        "打錯 id 不該看起來像「這個調查還沒有候選」：{resp}"
+    );
+}
+
 // ---------------------------------------------------------------- ai runs
 
 #[tokio::test]

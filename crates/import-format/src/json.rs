@@ -242,6 +242,13 @@ mod tests {
     }
 
     #[test]
+    fn publisher_alias_is_picked_up() {
+        let body = r#"[{"title":"t","vendor":"Example Press"}]"#;
+        let out = parse_json(body.as_bytes(), &spec()).unwrap();
+        assert_eq!(out.records[0].publisher.as_deref(), Some("Example Press"));
+    }
+
+    #[test]
     fn ndjson_is_accepted() {
         let body = b"{\"title\":\"one\"}\n\n{\"title\":\"two\"}\n";
         let out = parse_json(body, &spec()).unwrap();

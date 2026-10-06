@@ -48,13 +48,13 @@
 
 **影響：** 如果你上傳一篇文章，裡面提到「攻擊者來自 Phantom Group」，「Phantom Group」不會變成一個組織實體。
 
-### 從收集或匯入進來的資料，不會產生組織實體
+### REST API 收集不會產生文件
 
-**現況：** 系統有「從發布單位、廠商、網站名稱等欄位取出組織名稱」的處理邏輯，但目前**沒有任何收集或匯入方式會把這些資訊填進去**——RSS、網頁、REST API、JSON、CSV 都一樣。所以即使來源資料寫明了發布單位（例如 JSON 裡的 `publisher` 欄位），也不會變成組織實體。
+**現況：** REST API connector 把遠端回應存成一筆原始證據，但**不拆成文件**。後續的正規化、實體抽取、搜尋索引都建立在文件上，所以這條路徑收進來的資料不會出現在文件列表、搜尋結果，也不會抽出組織實體。
 
-**影響：** 無法用「這個組織發布過哪些公告」來查詢一般收集到的資料。
+**影響：** 不能把 REST API 當成「會自動變成可搜尋情報」的來源。要從 JSON／CSV 產生文件，請改走 [手動匯入](../usage/import.md)。
 
-**替代做法：** 目前唯一會產生組織實體的方式是 **STIX 匯入**——STIX 資料裡的組織（`identity`）會直接成為組織實體。見 [STIX 匯入匯出](../usage/stix.md)。系統沒有提供手動建立實體或關聯的 API。
+**替代做法：** JSON／CSV 匯入、RSS／Atom、靜態網頁、STIX 匯入都會產生文件。RSS 的 feed 標題、網頁的 `og:site_name`、匯入的 `publisher`（及 `vendor`／`organization` 等別名）會寫進文件屬性並抽出成組織實體。文章內文裡提到的組織名仍然不會被自動識別（見上一節）。
 
 ---
 
@@ -82,13 +82,13 @@
 
 ### Discovery 的每日 AI 配額欄位設定了但尚未生效
 
-**現況：** Discovery Budget 裡的 `max_ai_calls_per_run`、`daily_ai_budget` 這兩個配額欄位在介面和資料庫 schema 都存在，但目前沒有任何執行路徑會消耗它們（確認方式：`grep -rn "try_consume_daily_ai_budget" crates/ --include="*.rs"` 在生產路徑零命中）。真正會被消耗的配額只有 `max_candidates_per_run`、`daily_request_budget`、`max_depth`。
+**現況：** Discovery Budget 裡的 `max_ai_calls_per_run`、`daily_ai_budget` 這兩個配額欄位在介面和資料庫結構都存在，但目前沒有任何執行流程會消耗它們。真正會被消耗的配額只有 `max_candidates_per_run`、`daily_request_budget`、`max_depth`。
 
 **影響：** 就算把 `daily_ai_budget` 設為 0，目前也不會阻止任何 AI 呼叫。
 
 ### 資源壓力感知永遠回報「正常」
 
-**現況：** AI Gateway 的 Admission Controller 有「資源壓力升高時降級低優先權請求」的邏輯，但目前唯一的壓力訊號實作（`StaticPressure`）永遠回報正常狀態（確認：`crates/ai-gateway/src/admission.rs` 的 `StaticPressure::current()` 直接回傳 `ResourcePressure::Normal`）。
+**現況：** AI Gateway 的 Admission Controller 有「資源壓力升高時降級低優先權請求」的邏輯，但目前唯一的壓力訊號來源永遠回報「正常」，還沒有接上真實的 GPU／記憶體監控。
 
 **影響：** 自動降級機制（高壓力擋 P2+ 請求）在目前部署下永遠不會觸發。要手動控制 AI 並發量，需要調整設定檔裡的 `auto_approval.llm.max_concurrent`。
 
@@ -114,7 +114,7 @@
 
 ### Kafka 連線目前沒有 TLS 或 SASL 認證
 
-**現況：** `rust-rdkafka` 在這個部署以 `--disable-ssl` 編譯（確認：`Cargo.toml` 第 101 行，`rdkafka` 的 features 只有 `["tokio", "libz"]`，不含 ssl 相關功能）。Redpanda 連線是明文，沒有傳輸層加密，也沒有身分認證。
+**現況：** 服務與訊息佇列（Redpanda）之間的連線是明文，沒有傳輸層加密（TLS），也沒有身分認證（SASL）。用來連線的 Kafka 函式庫目前編譯時沒有開啟加密支援。
 
 **影響：** 在同一個網路上的任何程式都可以連線到 Redpanda 端口，讀取或寫入事件。
 
@@ -140,11 +140,11 @@
 
 ### 物件儲存健康檢查只確認閘道存活
 
-**現況：** SeaweedFS 的健康檢查（`GET /status`）只確認 S3 閘道的 HTTP 端口有人接，不驗證底層的 filer 或 master 服務是否存活（確認：`docker/docker-compose.yml` 的 `seaweedfs` healthcheck 使用 `curl -sf http://127.0.0.1:8333/status`，此端點固定回 200）。
+**現況：** SeaweedFS 的健康檢查（`GET /status`）只確認 S3 閘道的 HTTP 端口有人接，不驗證底層的 filer 或 master 服務是否存活——這個端點固定回 200。
 
 **影響：** 健康檢查全綠不代表物件讀寫正常。若 filer 已掛，上傳原始證據的請求會失敗，但健康狀態仍顯示為健康。
 
-**確認物件層是否真的可用：** 嘗試實際上傳一筆資料，或執行 `cargo test -p storage-s3`。
+**確認物件層是否真的可用：** 實際匯入一筆資料，確認回應成功且查得到。
 
 ---
 
@@ -152,7 +152,7 @@
 
 ### 跨服務自動背壓尚未實作
 
-**現況：** 系統有監控指標 `osint_queue_depth` 可以反映下游積壓，但收集器的主迴圈是固定間隔執行，不會讀取這個指標來降速（確認：`grep -rn queue_depth crates/collector/src/ | wc -l` 回傳 0）。
+**現況：** 系統有監控指標 `osint_queue_depth` 可以反映下游積壓，但收集器的主迴圈是固定間隔執行，不會讀取這個指標來降速。
 
 **影響：** 當下游（例如 OpenSearch）處理速度跟不上收集速度時，Redpanda 的積壓會增加，但收集器不會自動放慢。
 
@@ -161,6 +161,18 @@
 ---
 
 ## 資料完整性的已知邊界
+
+### 匯入時檔名相同、又沒有 `url`，不同內容會被當成重複
+
+**現況：** JSON／CSV 匯入的紀錄沒有 `url` 欄位時，系統把文件網址設成 `import://json/{檔名}`。
+去重是用網址判斷「是不是同一篇」，所以兩次匯入只要檔名相同，第二次的文件會被判成第一次的重複，
+即使內容完全不同。
+
+**影響：** 被判成重複的文件不會抽出任何實體，而且**沒有錯誤訊息**——資料看起來匯入成功，
+但裡面的 CVE、IP、組織都不會出現。
+
+**目前替代做法：** 每筆紀錄帶唯一的 `url`，或每次匯入用不同檔名，或在匯入請求裡填 `source_url`。
+見 [匯入資料](../usage/import.md)。
 
 ### Graph Expansion 重跑同一個實體可能產生重複候選
 
@@ -172,13 +184,13 @@
 
 ### Candidate 核准的 URL 只驗格式，不驗 scheme
 
-**現況：** 核准候選時，URL 驗證只確認能解析成合法的絕對 URL，`javascript:` 或 `data:` 這類有 scheme 的不透明 URL 不會被擋下（確認：`crates/core-api/src/resources/discovery.rs` 第 318–319 行的已知邊界說明）。
+**現況：** 核准候選時，URL 驗證只確認能解析成合法的絕對 URL，`javascript:` 或 `data:` 這類有 scheme 的不透明 URL 不會被擋下。
 
 **影響：** 若有不受信任的資料來源被誤判為候選，核准時應額外確認 URL scheme。
 
 ### STIX 匯出對關係超過 100 條的實體會靜默略過部分關係
 
-**現況：** `EXPORT_TRAVERSAL_LIMIT = 100`（確認：`crates/stix-worker/src/export.rs` 第 38 行）。任何一個 Entity 若參與超過 100 條關係，匯出時只會取前 100 條，多出來的靜默略過，不會報錯。
+**現況：** STIX 匯出時，每個實體最多只取 100 條關係。任何一個實體若參與超過 100 條關係，匯出時只會取前 100 條，多出來的靜默略過，不會報錯。
 
 **影響：** 核心關聯超過 100 條的高度連結實體（例如知名 CVE）在 STIX 匯出時，接收方只會看到部分關係。
 
@@ -186,8 +198,20 @@
 
 ## Collection 的歸屬
 
-### 收集的資料目前不附掛到任何 Collection
+### 把來源加進集合，不會回填已經落地的舊資料
 
-**現況：** Collector（主動收集）、`/api/v1/import`（手動匯入）、STIX 匯入這三條路徑在建立 RawEvidence 時，`collection_id` 都寫成 `None`（確認：`crates/collector/src/runner.rs` 第 263 行）。
+**現況：** 一筆原始證據可以同時屬於多個調查集合（`raw_evidence_collections`）。收集時會把來源 ∪ 連接器目前掛上的集合寫進去；匯入時可用 `collection_ids` 指定，省略則用來源目前掛上的集合。之後才把來源／連接器加進另一個集合，**只影響之後收進來的資料**，不會回頭改已經落地的歸屬。
 
-**影響：** 即使建立了 Collection，已收集的資料也不會自動歸屬到它。Discovery 的 per-collection 配額和 Timeline 功能，目前無法依 Collection 篩選收集進來的資料。
+**影響：** 「這個來源現在屬於這個調查」不等於「這個來源過去收進來的每一筆都屬於這個調查」。那是刻意的：回填等於改寫歷史歸屬，會讓「這筆資料當時屬於哪個調查」變得不可信。
+
+**替代做法：** 若要把舊資料納入新調查，請另外匯入或重新收集。集合建立後可用 `POST /api/v1/collections/{id}/sources` 與對應的連接器端點增減關聯。
+
+### 一個來源／連接器最多屬於 50 個集合
+
+**現況：** `POST /collections`（帶 `source_ids`／`connector_ids`）與 `POST /collections/{id}/sources`、`POST /collections/{id}/connectors` 在寫入任何關聯之前，會檢查每個來源／連接器目前掛了幾個集合。已掛上的重送算冪等、不會被擋；要新增且已達 50 個則整筆 422，已寫入的關聯不會被改。
+
+**原因：** 收集時取來源∪連接器目前掛上的集合，兩邊各最多讀 100 筆。寫入端把每邊卡在 50，聯集最多 100，等於讀取上限，才不會再靜默截掉第 101 個。
+
+**影響：** 一個來源不能同時出現在第 51 個調查集合。請先從較不相關的集合拿掉它（`DELETE /api/v1/collections/{id}/sources/{source_id}`，連接器則是 `.../connectors/{connector_id}`）。
+
+**已知限制：** 兩個並發請求可能同時通過檢查而讓實際數量略超過 50。要讓聯集超過 100 需要大量並發；這是已知、可接受的競態。

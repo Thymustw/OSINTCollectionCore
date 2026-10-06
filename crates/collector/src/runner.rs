@@ -257,10 +257,25 @@ impl CollectorRunner {
         let fetcher = GuardedFetcher::new(guard, limiter);
         let sink = StoreEvidenceSink::new(self.store.clone(), self.objects.clone());
         let checkpoints = RelationalCheckpointStore::new(self.store.clone());
+        // 寫入端把每個來源／連接器卡在 50 個集合（core-api
+        // `MAX_COLLECTIONS_PER_SOURCE`／`MAX_COLLECTIONS_PER_CONNECTOR`），
+        // 來源∪連接器最多 100，剛好是這邊 `limit=100` 能一次讀完的量。
+        // 不要改成翻頁：超過 100 是寫入端的 bug，不是讀取端該消化的。
+        let mut collection_ids = self
+            .store
+            .list_collections_by_source(source.id, 100)
+            .await?;
+        collection_ids.extend(
+            self.store
+                .list_collections_by_connector(connector.id, 100)
+                .await?,
+        );
+        collection_ids.sort();
+        collection_ids.dedup();
         let ctx = CollectContext {
             source: source.clone(),
             connector: running.clone(),
-            collection_id: None,
+            collection_ids,
             checkpoint: ConnectorCheckpoint::from_value(&connector.checkpoint),
             now,
         };

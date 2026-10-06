@@ -742,24 +742,26 @@ mod tests {
             .unwrap();
         let evidence_id = Uuid::now_v7();
         store
-            .insert_raw_evidence(&RawEvidence {
-                id: evidence_id,
-                source_id,
-                connector_id,
-                collection_id: None,
-                external_id: Some(source_name.into()),
-                source_url: format!("https://example.invalid/{source_name}"),
-                retrieved_at: ts(),
-                content_type: Some("text/plain".into()),
-                mime_type: Some("text/plain".into()),
-                content_length: Some(32),
-                sha256: format!("{:0<64}", evidence_id.simple()),
-                storage_path: format!("s3://raw-evidence/{evidence_id}"),
-                http_status: Some(200),
-                http_headers: json!({}),
-                metadata: json!({}),
-                collector_version: "0.1.0".into(),
-            })
+            .insert_raw_evidence(
+                &RawEvidence {
+                    id: evidence_id,
+                    source_id,
+                    connector_id,
+                    external_id: Some(source_name.into()),
+                    source_url: format!("https://example.invalid/{source_name}"),
+                    retrieved_at: ts(),
+                    content_type: Some("text/plain".into()),
+                    mime_type: Some("text/plain".into()),
+                    content_length: Some(32),
+                    sha256: format!("{:0<64}", evidence_id.simple()),
+                    storage_path: format!("s3://raw-evidence/{evidence_id}"),
+                    http_status: Some(200),
+                    http_headers: json!({}),
+                    metadata: json!({}),
+                    collector_version: "0.1.0".into(),
+                },
+                &[],
+            )
             .await
             .unwrap();
         let document_id = Uuid::now_v7();

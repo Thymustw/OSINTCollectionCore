@@ -80,6 +80,11 @@ pub const AUDIT_SOURCE_UPDATE: &str = "source.update";
 pub const AUDIT_CONNECTOR_CREATE: &str = "connector.create";
 pub const AUDIT_CONNECTOR_UPDATE: &str = "connector.update";
 pub const AUDIT_COLLECTION_CREATE: &str = "collection.create";
+pub const AUDIT_COLLECTION_LINK_SOURCE: &str = "collection.link_source";
+pub const AUDIT_COLLECTION_UNLINK_SOURCE: &str = "collection.unlink_source";
+pub const AUDIT_COLLECTION_LINK_CONNECTOR: &str = "collection.link_connector";
+pub const AUDIT_COLLECTION_UNLINK_CONNECTOR: &str = "collection.unlink_connector";
+pub const AUDIT_COLLECTION_BUDGET_UPDATE: &str = "collection.budget.update";
 pub const AUDIT_OBJECT_CREATE: &str = "object.create";
 pub use discovery::{
     AUDIT_CANDIDATE_APPROVE, AUDIT_CANDIDATE_REJECT, AUDIT_DISCOVERY_RUN, AUDIT_SEED_CREATE,

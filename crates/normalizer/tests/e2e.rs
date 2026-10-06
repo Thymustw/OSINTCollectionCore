@@ -525,7 +525,6 @@ async fn unknown_content_type_is_skipped_not_panic() {
         id,
         source_id: source.id,
         connector_id: connector.id,
-        collection_id: None,
         external_id: Some("pdf-1".into()),
         source_url: "http://127.0.0.1/file.pdf".into(),
         retrieved_at: now,
@@ -541,7 +540,7 @@ async fn unknown_content_type_is_skipped_not_panic() {
     };
     stack
         .pg
-        .insert_raw_evidence(&evidence)
+        .insert_raw_evidence(&evidence, &[])
         .await
         .expect("insert evidence");
 

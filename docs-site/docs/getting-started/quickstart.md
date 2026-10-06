@@ -226,7 +226,7 @@ CVE-2026-31337
 CVE-2026-31338
 ```
 
-把 `entity_type=vulnerability` 換成 `ip`、`domain`、`url`、`email`、`person`，就能看其他類型。
+把 `entity_type=vulnerability` 換成 `ip`、`domain`、`url`、`email`、`person`、`organization`，就能看其他類型。
 從這兩篇公告，系統總共會抽出：
 
 | 類型 | 抽出的值 | 出現在幾篇 |
@@ -240,6 +240,7 @@ CVE-2026-31338
 | 網址 | `https://advisories.example.com/acme-2026-0928` | 1 篇 |
 | Email | `psirt@acme-example.com` | 1 篇 |
 | 人員 | `Acme PSIRT`、`Example Research Team`（來自作者欄位） | 各 1 篇 |
+| 組織 | `Acme Security Response`、`Example Threat Intel`（來自發布單位欄位） | 各 1 篇 |
 
 **粗體的三個就是兩篇報告的交集**——雖然來自不同來源、不同日期，但系統已經知道它們提到了
 同一個漏洞、同一個攻擊 IP、同一個 C2。
@@ -267,10 +268,10 @@ CVE-2026-31337 — 出現在 2 篇文件
 
 每一筆都能再往回追到原始的匯入檔案、匯入時間與匯入者——這就是「完整來源證據鏈」。
 
-!!! note "組織名稱不會自動抽出"
-    範例資料裡的 `publisher`（發布單位）欄位**不會**變成組織實體。系統只從文字裡抽有固定格式
-    的指標（CVE、IP 這類）；人名來自作者欄位；組織實體目前只有 STIX 匯入會產生。詳見
-    [實體類型](../reference/entity-types.md)。
+!!! note "發布單位會變成組織實體；內文裡的組織名不會"
+    範例資料裡的 `publisher`（發布單位）會寫進文件屬性，抽出成組織實體，並與文件建立
+    `published_by` 關聯。系統**不會**從內文自由文字辨識組織名（「攻擊者來自 Phantom Group」
+    不會自動變成實體）。人名來自作者欄位。詳見 [實體類型](../reference/entity-types.md)。
 
 ---
 
@@ -339,6 +340,10 @@ MATCH (a:Entity)-[r]->(b:Entity) RETURN a, r, b LIMIT 100
     「哪篇文件提到了哪個 CVE」這類**文件與實體之間**的關係，**不會**出現在圖上——
     文件本身不是圖上的節點。所以第 6 步看到的「兩篇報告共用同一個 CVE」，
     在圖上看不到兩篇報告被連起來。
+
+    同樣的道理，第 6 步抽出的**組織**（`Acme Security Response` 等）也**不會**出現在圖上：
+    它和文件之間是「文件由某組織發布」的關係，屬於文件與實體之間，不是實體與實體之間。
+    組織有被正確抽出，用 `entity_type=organization` 的 API 查得到。
 
     要查「這個 CVE 出現在哪些文件」，用第 6.3 步的 API。
 

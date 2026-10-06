@@ -45,8 +45,9 @@ normalizer 做——與 pull 路徑同一條線。
 | `source_id` | 是 | UUID。`source_type` 必須與 `kind` 相符 |
 | `kind` | 是 | `manual`／`json`／`csv` |
 | `connector_id` | 否 | 指定既有 connector；未填則自動配置 |
+| `collection_ids` | 否 | 省略＝來源目前掛的集合；明確給 `[]`＝不掛任何集合。id 不存在 → 422 且不寫任何資料。一次最多 100 筆 |
 | `title`／`description` | 否 | 寫進 `metadata.upload`（給人看的說明） |
-| `source_url` | 否 | 未填時合成 `import://{kind}/{filename}` |
+| `source_url` | 否 | 未填時合成 `import://{kind}/{filename}`。這條會當 Document 的 `canonical_url` 後援：同一檔名的多次 JSON／CSV 匯入會被 Stage 2 判成重複，entity-worker 不抽重複件上的 Organization。要獨立進抽取管線請給逐筆 `url`，或每次用不同檔名／填這欄 |
 | `external_id` | 否 | 寫進 RawEvidence `external_id` |
 | `content_type` | 否 | **只有 `kind=manual` 會用**。未填則依內容 sniff |
 | `object_type` | 否 | 產出的 Document 型別，預設 `report` |
@@ -100,6 +101,9 @@ curl -sS -X POST http://127.0.0.1:18080/api/v1/import \
 | `external_id` | external_id, id, guid, uuid |
 | `language` | language, lang |
 | `author` | author, creator, byline |
+| `publisher` | publisher, vendor, organization, organisation, source_name |
+
+`publisher` 會寫進 `Document.attributes.publisher`，entity-worker 抽出 Organization 並建 `published_by`。空字串與 `null` 不寫。也可用 `mapping.publisher` 覆寫來源鍵名。
 
 - **CSV**：值是 header 名稱。指定的 header 不存在 → 422 並列出可用 header
   （不靜默忽略，否則會得到「匯入成功但每筆都空白」）。

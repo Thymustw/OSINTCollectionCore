@@ -203,7 +203,6 @@ async fn seed_import(
         id: raw_id,
         source_id: source.id,
         connector_id: connector.id,
-        collection_id: None,
         external_id: Some(raw_id.to_string()),
         source_url: format!("http://127.0.0.1/stix-e2e/{raw_id}"),
         retrieved_at: now,
@@ -219,7 +218,7 @@ async fn seed_import(
     };
     stack
         .pg
-        .insert_raw_evidence(&evidence)
+        .insert_raw_evidence(&evidence, &[])
         .await
         .expect("raw evidence");
     let job = jobs(stack)

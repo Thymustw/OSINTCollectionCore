@@ -14,7 +14,9 @@ use crate::evidence::NewRawEvidence;
 pub struct CollectContext {
     pub source: Source,
     pub connector: Connector,
-    pub collection_id: Option<CollectionId>,
+    /// 這次收集寫出的原始證據要掛上哪些調查集合。
+    /// collector 用來源 ∪ 連接器的反查結果填；空代表不屬於任何集合。
+    pub collection_ids: Vec<CollectionId>,
     pub checkpoint: ConnectorCheckpoint,
     pub now: DateTime<Utc>,
 }
@@ -42,6 +44,8 @@ pub struct ParsedItem {
     pub title: Option<String>,
     pub published_at: Option<DateTime<Utc>>,
     pub summary: Option<String>,
+    /// 作者（RSS entry author、網頁 `<meta name="author">`）。空代表原始資料沒有。
+    pub author: Option<String>,
     pub attributes: Value,
 }
 

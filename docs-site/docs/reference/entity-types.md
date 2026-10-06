@@ -32,7 +32,7 @@
 
 ## 自動抽取規則詳細說明
 
-抽取器（`entity-worker`）在文件的標題、摘要、本文掃描正規表示式。以下規則來自 `crates/entity-worker/src/extract.rs`。
+抽取器（`entity-worker`）在文件的標題、摘要、本文掃描正規表示式。以下是目前實作的抽取規則。
 
 ### CVE（vulnerability）
 
@@ -84,20 +84,24 @@
 
 ### 組織（organization）
 
-**目前只有 STIX 匯入會產生組織實體**（STIX 的 `identity` 物件且 `identity_class` 為
-`organization`）。見 [STIX 匯入匯出](../usage/stix.md)。
+從文件屬性的結構化欄位取得（不從自由文字抽取），鍵名依序為 `publisher`、
+`organization`、`organisation`、`vendor`、`feed_title`、`site_name`。這些鍵由
+上游在整理文件時寫入：
 
-!!! warning "一般收集與匯入不會產生組織實體"
-    系統有「從文件的發布單位、廠商、網站名稱欄位取出組織名稱」的處理邏輯，會讀取文件
-    屬性中的 `publisher`、`organization`、`organisation`、`vendor`、`feed_title`、`site_name`。
-    但目前**沒有任何收集或匯入方式會把這些欄位填進文件屬性**，所以這條路實際上不會觸發：
+| 來源 | 寫入的鍵 | 取自 |
+|---|---|---|
+| JSON／CSV 匯入 | `publisher` | `publisher`／`vendor`／`organization`／`organisation`／`source_name`（可用 `mapping.publisher` 覆寫） |
+| RSS／Atom | `feed_title` | feed 層標題 |
+| 靜態網頁 | `site_name` | `og:site_name` |
+| STIX 匯入 | （直接建實體） | `identity` 且 `identity_class` 為 `organization`。見 [STIX 匯入匯出](../usage/stix.md) |
 
-    - JSON／CSV 匯入：來源資料裡的 `publisher` 等欄位不會被帶進文件屬性——不論寫在頂層，
-      還是寫在巢狀的 `attributes` 物件裡都一樣（兩種寫法都實測過）。
-    - RSS、網頁、REST API 收集：同樣不會填入。
+抽出後會建立 `published_by` 關聯。空字串與 `null` 不會寫進屬性，因此也不會變成假的組織實體。
 
-    系統也沒有提供手動建立實體或關聯的 API（`POST /api/v1/objects` 固定回 501，沒有
-    `POST /api/v1/entities`）。
+!!! warning "REST API 收集不會產生文件，因此也不會產生組織實體"
+    REST API connector 只把回應存成原始證據，不拆成文件。沒有文件就沒有屬性可抽，
+    組織抽取這條路不會觸發。系統也沒有提供手動建立實體或關聯的 API
+    （`POST /api/v1/objects` 固定回 501，沒有 `POST /api/v1/entities`）。
+    文章內文裡提到的組織名同樣不會被自動識別，見 [目前的限制](../architecture/limitations.md)。
 
 ---
 

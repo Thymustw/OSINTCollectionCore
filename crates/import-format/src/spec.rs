@@ -99,6 +99,8 @@ pub struct FieldMapping {
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
 }
 
 /// 邏輯欄位。
@@ -112,11 +114,12 @@ pub enum Field {
     ExternalId,
     Language,
     Author,
+    Publisher,
 }
 
 impl Field {
     /// 全部邏輯欄位，順序固定（錯誤訊息與測試都依賴這個順序）。
-    pub const ALL: [Field; 8] = [
+    pub const ALL: [Field; 9] = [
         Field::Title,
         Field::Body,
         Field::Summary,
@@ -125,6 +128,7 @@ impl Field {
         Field::ExternalId,
         Field::Language,
         Field::Author,
+        Field::Publisher,
     ];
 
     #[must_use]
@@ -138,6 +142,7 @@ impl Field {
             Self::ExternalId => "external_id",
             Self::Language => "language",
             Self::Author => "author",
+            Self::Publisher => "publisher",
         }
     }
 
@@ -153,6 +158,13 @@ impl Field {
             Self::ExternalId => &["external_id", "id", "guid", "uuid"],
             Self::Language => &["language", "lang"],
             Self::Author => &["author", "creator", "byline"],
+            Self::Publisher => &[
+                "publisher",
+                "vendor",
+                "organization",
+                "organisation",
+                "source_name",
+            ],
         }
     }
 }
@@ -170,6 +182,7 @@ impl FieldMapping {
             Field::ExternalId => &self.external_id,
             Field::Language => &self.language,
             Field::Author => &self.author,
+            Field::Publisher => &self.publisher,
         };
         value.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }

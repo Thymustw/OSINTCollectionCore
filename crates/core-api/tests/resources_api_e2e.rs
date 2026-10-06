@@ -24,9 +24,9 @@ use core_config::ImportSection;
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_model::{
-    Connector, Document, DocumentType, DuplicateGroup, Entity, EntityAlias, EntityExtraction,
-    EntityIdentifier, EntityType, Provenance, RawEvidence, Relationship, RelationshipEvidence,
-    RelationshipType, ResolutionCandidate, Source, SourceType,
+    Collection, Connector, Document, DocumentType, DuplicateGroup, Entity, EntityAlias,
+    EntityExtraction, EntityIdentifier, EntityType, Provenance, RawEvidence, Relationship,
+    RelationshipEvidence, RelationshipType, ResolutionCandidate, Source, SourceType,
 };
 use core_observability::MetricsRegistry;
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
@@ -306,6 +306,20 @@ async fn find_by_cursor(app: &Router, token: &str, base: &str, id: Uuid) -> Opti
 
 // ---------------------------------------------------------------- seed helpers
 
+fn new_collection() -> Collection {
+    let now = Utc::now();
+    Collection {
+        id: Uuid::now_v7(),
+        workspace_id: None,
+        name: format!("e2e-cap-{}", Uuid::now_v7()),
+        description: None,
+        status: "active".into(),
+        priority: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 fn new_source(source_type: SourceType) -> Source {
     let now = Utc::now();
     Source {
@@ -384,7 +398,6 @@ fn new_raw_evidence(
         id: Uuid::now_v7(),
         source_id,
         connector_id,
-        collection_id: None,
         external_id: None,
         source_url: "https://example.invalid/raw".into(),
         retrieved_at: Utc::now(),
@@ -850,6 +863,493 @@ async fn collection_create_links_and_detail() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// 集合建立後再增減來源／連接器，以及 budget 的預設／覆寫。
+///
+/// 新增關聯**不回填**舊資料——這支只驗「掛上／拿掉當下的清單」，不驗歷史證據。
+#[tokio::test]
+async fn collection_link_unlink_and_budget() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+    let source = new_source(SourceType::Rss);
+    stack.pg.put_source(&source).await.expect("seed source");
+    let connector = new_connector(source.id, true);
+    stack
+        .pg
+        .put_connector(&connector)
+        .await
+        .expect("seed connector");
+
+    let (status, created, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/collections",
+            &api.operator,
+            &json!({"name": "e2e link-unlink"}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    assert!(created["source_ids"].as_array().unwrap().is_empty());
+
+    // --- 掛來源 ---
+    let (status, linked, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/collections/{id}/sources"),
+            &api.operator,
+            &json!({"source_ids": [source.id]}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{linked}");
+    assert_eq!(linked["source_ids"], json!([source.id]));
+    assert!(
+        api.audit.entries().iter().any(|e| {
+            e.action == core_api::AUDIT_COLLECTION_LINK_SOURCE
+                && e.resource_id == Some(id.to_string())
+                && e.outcome == "success"
+        }),
+        "掛來源要留稽核"
+    );
+
+    // 同一個來源再掛一次：ON CONFLICT，清單不變。
+    let (status, again, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/collections/{id}/sources"),
+            &api.operator,
+            &json!({"source_ids": [source.id]}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["source_ids"], json!([source.id]));
+
+    let missing_source = Uuid::now_v7();
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/collections/{id}/sources"),
+            &api.operator,
+            &json!({"source_ids": [missing_source]}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&missing_source.to_string()) && m.contains("沒有寫入")),
+        "422 要列出缺的 id 並講清楚這次沒寫：{body}"
+    );
+
+    // --- 拿掉來源：第一次 204，再打一次仍 204（冪等）---
+    let (status, _, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "DELETE",
+            &format!("/api/v1/collections/{id}/sources/{}", source.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "DELETE",
+            &format!("/api/v1/collections/{id}/sources/{}", source.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, detail, _) = send(
+        &api.app,
+        get(&format!("/api/v1/collections/{id}"), &api.viewer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert!(detail["source_ids"].as_array().unwrap().is_empty());
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "DELETE",
+            &format!(
+                "/api/v1/collections/{}/sources/{}",
+                Uuid::now_v7(),
+                source.id
+            ),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "DELETE",
+            &format!("/api/v1/collections/{id}/sources/{}", Uuid::now_v7()),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // --- 連接器同上 ---
+    let (status, linked, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/collections/{id}/connectors"),
+            &api.operator,
+            &json!({"connector_ids": [connector.id]}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{linked}");
+    assert_eq!(linked["connector_ids"], json!([connector.id]));
+    let (status, _, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "DELETE",
+            &format!("/api/v1/collections/{id}/connectors/{}", connector.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "DELETE",
+            &format!("/api/v1/collections/{id}/connectors/{}", connector.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // --- budget：沒設過是保守預設 ---
+    let (status, budget, _) = send(
+        &api.app,
+        get(&format!("/api/v1/collections/{id}/budget"), &api.viewer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{budget}");
+    assert_eq!(
+        budget["is_default"], true,
+        "沒寫過 budget 必須標 is_default"
+    );
+    assert_eq!(budget["max_candidates_per_run"], 200);
+    assert_eq!(budget["max_depth"], 3);
+
+    let (status, written, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "PUT",
+            &format!("/api/v1/collections/{id}/budget"),
+            &api.operator,
+            &json!({
+                "max_candidates_per_run": 11,
+                "max_requests_per_run": 22,
+                "max_ai_calls_per_run": 33,
+                "max_depth": 4,
+                "daily_request_budget": 111,
+                "daily_ai_budget": 55
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{written}");
+    assert_eq!(written["is_default"], false);
+    assert_eq!(written["max_candidates_per_run"], 11);
+    assert_eq!(written["max_requests_per_run"], 22);
+    assert_eq!(written["max_ai_calls_per_run"], 33);
+    assert_eq!(written["max_depth"], 4);
+    assert_eq!(written["daily_request_budget"], 111);
+    assert_eq!(written["daily_ai_budget"], 55);
+    assert!(
+        api.audit.entries().iter().any(|e| {
+            e.action == core_api::AUDIT_COLLECTION_BUDGET_UPDATE
+                && e.resource_id == Some(id.to_string())
+                && e.outcome == "success"
+        }),
+        "改 budget 要留稽核"
+    );
+
+    // created_at 以 round-trip 後的值為準：Postgres timestamptz 是微秒精度，
+    // PUT 回應裡的 in-memory `Utc::now()` 可能還帶奈秒。
+    let (status, stored, _) = send(
+        &api.app,
+        get(&format!("/api/v1/collections/{id}/budget"), &api.viewer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stored}");
+    let created_at = stored["created_at"].as_str().unwrap().to_string();
+
+    // 再 PUT 一次：created_at 不可被覆寫。
+    let (status, updated, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "PUT",
+            &format!("/api/v1/collections/{id}/budget"),
+            &api.operator,
+            &json!({
+                "max_candidates_per_run": 12,
+                "max_requests_per_run": 22,
+                "max_ai_calls_per_run": 33,
+                "max_depth": 4,
+                "daily_request_budget": 111,
+                "daily_ai_budget": 55
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["max_candidates_per_run"], 12);
+    assert_eq!(updated["created_at"], created_at);
+
+    let (status, reread, _) = send(
+        &api.app,
+        get(&format!("/api/v1/collections/{id}/budget"), &api.viewer),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reread}");
+    assert_eq!(reread["is_default"], false);
+    assert_eq!(reread["max_candidates_per_run"], 12);
+
+    let missing = Uuid::now_v7();
+    let (status, body, _) = send(
+        &api.app,
+        get(
+            &format!("/api/v1/collections/{missing}/budget"),
+            &api.viewer,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "PUT",
+            &format!("/api/v1/collections/{missing}/budget"),
+            &api.operator,
+            &json!({
+                "max_candidates_per_run": 1,
+                "max_requests_per_run": 1,
+                "max_ai_calls_per_run": 1,
+                "max_depth": 1,
+                "daily_request_budget": 1,
+                "daily_ai_budget": 1
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+/// 一個來源／連接器最多屬於 50 個集合：第 51 個回 422 且不寫入；已掛上的重送仍成功。
+#[tokio::test]
+async fn collection_membership_cap_rejects_the_51st_and_is_idempotent() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+    let source = new_source(SourceType::Rss);
+    stack.pg.put_source(&source).await.expect("seed source");
+    let connector = new_connector(source.id, true);
+    stack
+        .pg
+        .put_connector(&connector)
+        .await
+        .expect("seed connector");
+
+    // 寫入端上限 50；用 store 直接掛滿，測的是 API 檢查而不是建立 50 次的 HTTP。
+    const CAP: usize = 50;
+    let mut seeded = Vec::with_capacity(CAP);
+    for _ in 0..CAP {
+        let collection = new_collection();
+        stack
+            .pg
+            .put_collection(&collection)
+            .await
+            .expect("seed collection");
+        stack
+            .pg
+            .link_collection_source(collection.id, source.id)
+            .await
+            .expect("seed source link");
+        stack
+            .pg
+            .link_collection_connector(collection.id, connector.id)
+            .await
+            .expect("seed connector link");
+        seeded.push(collection.id);
+    }
+
+    let (status, extra, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/collections",
+            &api.operator,
+            &json!({"name": "e2e cap-51st"}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{extra}");
+    let extra_id: Uuid = extra["id"].as_str().unwrap().parse().unwrap();
+
+    // 1. 來源已掛滿 50：第 51 個 POST .../sources 回 422，關聯沒寫入。
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/collections/{extra_id}/sources"),
+            &api.operator,
+            &json!({"source_ids": [source.id]}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains(&source.id.to_string()) && message.contains("50"),
+        "422 要列出超限的來源 id 與上限：{body}"
+    );
+    let linked = stack
+        .pg
+        .list_collection_sources(extra_id, 100)
+        .await
+        .expect("list extra sources");
+    assert!(
+        linked.is_empty(),
+        "超限拒絕後第 51 個集合不該掛上來源，實際 {linked:?}"
+    );
+    let by_source = stack
+        .pg
+        .list_collections_by_source(source.id, 100)
+        .await
+        .expect("list by source");
+    assert_eq!(by_source.len(), CAP, "來源側仍應剛好 {CAP} 個集合");
+    assert!(
+        !by_source.contains(&extra_id),
+        "第 51 個集合不該出現在來源反查"
+    );
+    assert!(
+        api.audit.entries().iter().any(|e| {
+            e.action == core_api::AUDIT_COLLECTION_LINK_SOURCE
+                && e.resource_id == Some(extra_id.to_string())
+                && e.outcome == "rejected"
+        }),
+        "超限拒絕要留 rejected 稽核"
+    );
+
+    // 2. 已掛上的集合重送同一個來源：冪等，不被上限擋。
+    let already = seeded[0];
+    let (status, again, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/collections/{already}/sources"),
+            &api.operator,
+            &json!({"source_ids": [source.id]}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    let again_sources = again["source_ids"].as_array().expect("source_ids array");
+    assert!(
+        again_sources.iter().any(|v| v == &json!(source.id)),
+        "冪等重送後來源仍應掛著：{again}"
+    );
+
+    // 3. 連接器同上：已掛滿 50，第 51 個回 422 且不寫入。
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/collections/{extra_id}/connectors"),
+            &api.operator,
+            &json!({"connector_ids": [connector.id]}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains(&connector.id.to_string()) && message.contains("50"),
+        "422 要列出超限的連接器 id 與上限：{body}"
+    );
+    let linked = stack
+        .pg
+        .list_collection_connectors(extra_id, 100)
+        .await
+        .expect("list extra connectors");
+    assert!(
+        linked.is_empty(),
+        "超限拒絕後第 51 個集合不該掛上連接器，實際 {linked:?}"
+    );
+
+    // create_inner 同一條路：指定 id 帶已滿的來源，422 且那筆 collection 沒被建立。
+    let attempted = Uuid::now_v7();
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            "/api/v1/collections",
+            &api.operator,
+            &json!({
+                "id": attempted,
+                "name": "e2e cap-create",
+                "source_ids": [source.id],
+            }),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        stack
+            .pg
+            .get_collection(attempted)
+            .await
+            .expect("get attempted")
+            .is_none(),
+        "create_inner 超限時不可以留下半成品 collection"
+    );
+
+    for id in seeded.iter().chain(std::iter::once(&extra_id)) {
+        stack
+            .pg
+            .delete_collection(*id)
+            .await
+            .unwrap_or_else(|err| panic!("cleanup collection {id}: {err}"));
+    }
+    stack
+        .pg
+        .delete_connector(connector.id)
+        .await
+        .unwrap_or_else(|err| panic!("cleanup connector: {err}"));
+    stack
+        .pg
+        .delete_source(source.id)
+        .await
+        .unwrap_or_else(|err| panic!("cleanup source: {err}"));
+}
+
 // ---------------------------------------------------------------- objects
 
 /// 預設排除重複；`include_duplicates=true` 才含。
@@ -996,7 +1496,7 @@ async fn object_detail_carries_the_provenance_chain() {
     let evidence = new_raw_evidence(source.id, connector.id, &key, 5);
     stack
         .pg
-        .insert_raw_evidence(&evidence)
+        .insert_raw_evidence(&evidence, &[])
         .await
         .expect("seed raw");
 
@@ -1303,7 +1803,11 @@ async fn raw_metadata_and_body() {
         .await
         .expect("put object");
     let evidence = new_raw_evidence(source.id, connector.id, &key, text.len() as i64);
-    stack.pg.insert_raw_evidence(&evidence).await.expect("seed");
+    stack
+        .pg
+        .insert_raw_evidence(&evidence, &[])
+        .await
+        .expect("seed");
 
     // 預設只回 metadata。
     let (status, body, _) = send(
@@ -1314,6 +1818,12 @@ async fn raw_metadata_and_body() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["source_id"], source.id.to_string());
     assert_eq!(body["storage_path"], key);
+    assert_eq!(
+        body["collection_ids"],
+        json!([]),
+        "沒掛集合時 collection_ids 應是空陣列，不是缺欄：{body}"
+    );
+    assert_eq!(body["collection_ids_truncated"], false);
     assert!(
         body.get("body").is_none(),
         "沒要 body 就不該去物件儲存拉內容：{body}"
@@ -1341,7 +1851,11 @@ async fn raw_metadata_and_body() {
         .await
         .expect("put object");
     let evidence = new_raw_evidence(source.id, connector.id, &key, binary.len() as i64);
-    stack.pg.insert_raw_evidence(&evidence).await.expect("seed");
+    stack
+        .pg
+        .insert_raw_evidence(&evidence, &[])
+        .await
+        .expect("seed");
 
     let (status, body, _) = send(
         &api.app,
@@ -1364,7 +1878,11 @@ async fn raw_metadata_and_body() {
     let key = format!("raw/e2e/{}", Uuid::now_v7());
     stack.s3.put(&key, &big, None).await.expect("put object");
     let evidence = new_raw_evidence(source.id, connector.id, &key, big.len() as i64);
-    stack.pg.insert_raw_evidence(&evidence).await.expect("seed");
+    stack
+        .pg
+        .insert_raw_evidence(&evidence, &[])
+        .await
+        .expect("seed");
 
     let (status, body, _) = send(
         &api.app,
@@ -1385,7 +1903,11 @@ async fn raw_metadata_and_body() {
     stack.s3.put(&key, &big, None).await.expect("put object");
     let mut evidence = new_raw_evidence(source.id, connector.id, &key, 0);
     evidence.content_length = None;
-    stack.pg.insert_raw_evidence(&evidence).await.expect("seed");
+    stack
+        .pg
+        .insert_raw_evidence(&evidence, &[])
+        .await
+        .expect("seed");
     let (status, _, _) = send(
         &api.app,
         get(

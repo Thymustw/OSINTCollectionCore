@@ -118,8 +118,11 @@ curl -s -X POST $API/import \
 | `source_url` | 否 | 未填時自動合成 `import://{kind}/{filename}` |
 | `external_id` | 否 | 填入 Raw Evidence 的 `external_id` |
 | `content_type` | 否 | 只有 `kind=manual` 會用。未填時依內容自動偵測 |
+| `collection_ids` | 否 | 這筆匯入要掛上哪些調查集合。省略＝來源目前掛的集合；明確給 `[]`＝不掛任何集合。id 不存在 → 422 且不寫任何資料。一次最多 100 筆 |
 
 欄位名打錯（例如 `objecttype`）會回 `400`，不會被靜默忽略。
+
+一份來源可以同時屬於多個調查集合；一個來源／連接器最多屬於 50 個集合，超過回 422。原因：收集時來源∪連接器各最多讀 100 筆，寫入端把每邊卡在 50 才能一次讀完。省略 `collection_ids` 時，這筆匯入會掛上來源目前掛著的**全部**集合（在上限之內就是完整清單）。之後才把來源加進另一個集合，**不會**回頭改已經落地的舊資料——回填等於改寫「這筆當時屬於哪個調查」。
 
 ---
 
@@ -198,6 +201,24 @@ CSV 第一列必須是 header，之後每列一筆記錄。
 | `external_id` | `external_id`, `id`, `guid`, `uuid` |
 | `language` | `language`, `lang` |
 | `author` | `author`, `creator`, `byline` |
+| `publisher` | `publisher`, `vendor`, `organization`, `organisation`, `source_name` |
+
+`publisher` 會寫進文件屬性，後續抽出成組織實體（`published_by` 關聯）。空字串與 `null` 不會寫進去。也可用 `mapping.publisher` 覆寫來源鍵名。
+
+!!! warning "每筆紀錄都要給 `url`，或每次匯入用不同檔名"
+    沒有 `url` 的紀錄，文件網址會自動設成 `import://json/{檔名}`。系統用網址判斷「是不是同一篇文章」，
+    所以**兩次匯入只要檔名相同**（例如都叫 `data.json`）、紀錄又沒有 `url`，第二次的文件就會被
+    判成第一次的重複——**即使內容完全不同**。
+
+    被判成重複的文件**不會抽出任何實體**（CVE、IP、網域、組織全部都不會），而且**不會有錯誤訊息**。
+
+    避免方式（任選一種）：
+
+    - 每筆紀錄都帶一個唯一的 `url` 欄位
+    - 每次匯入用不同的檔名
+    - 在 `request` 裡填 `source_url`
+
+    這是目前已知的限制，見 [目前的限制](../architecture/limitations.md)。
 
 如果你的資料用不同的鍵名，用 `mapping` 告訴系統：
 

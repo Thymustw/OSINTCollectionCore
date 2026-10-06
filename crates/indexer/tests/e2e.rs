@@ -241,7 +241,6 @@ async fn seed_document(
         id: raw_id,
         source_id: source.id,
         connector_id: connector.id,
-        collection_id: None,
         external_id: Some(raw_id.to_string()),
         source_url: format!("http://127.0.0.1/indexer-e2e/{raw_id}"),
         retrieved_at: now,
@@ -255,7 +254,7 @@ async fn seed_document(
         metadata: json!({}),
         collector_version: "0.1.0".into(),
     };
-    pg.insert_raw_evidence(&evidence).await.expect("raw");
+    pg.insert_raw_evidence(&evidence, &[]).await.expect("raw");
 
     let document = Document {
         id: Uuid::now_v7(),

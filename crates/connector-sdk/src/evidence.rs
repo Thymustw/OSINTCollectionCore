@@ -21,7 +21,9 @@ pub trait EvidenceSink: Send + Sync {
 pub struct NewRawEvidence {
     pub source_id: SourceId,
     pub connector_id: ConnectorId,
-    pub collection_id: Option<CollectionId>,
+    /// 這筆證據當下屬於哪些調查集合。空代表不屬於任何集合。
+    /// 由 `insert_raw_evidence` 在同一個交易裡寫進 `raw_evidence_collections`。
+    pub collection_ids: Vec<CollectionId>,
     pub external_id: Option<String>,
     pub source_url: String,
     pub retrieved_at: DateTime<Utc>,
@@ -86,7 +88,6 @@ where
             id,
             source_id: evidence.source_id,
             connector_id: evidence.connector_id,
-            collection_id: evidence.collection_id,
             external_id: evidence.external_id,
             source_url: evidence.source_url,
             retrieved_at: evidence.retrieved_at,
@@ -100,7 +101,11 @@ where
             metadata: evidence.metadata,
             collector_version: evidence.collector_version,
         };
-        match self.relational.insert_raw_evidence(&record).await {
+        match self
+            .relational
+            .insert_raw_evidence(&record, &evidence.collection_ids)
+            .await
+        {
             Ok(()) => Ok(record),
             Err(err) => {
                 let _ = self.objects.delete(&record.storage_path).await;

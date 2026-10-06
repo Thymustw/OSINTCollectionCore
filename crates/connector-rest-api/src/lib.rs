@@ -473,7 +473,7 @@ where
         let evidence = NewRawEvidence {
             source_id: ctx.source.id,
             connector_id: ctx.connector.id,
-            collection_id: ctx.collection_id,
+            collection_ids: ctx.collection_ids.clone(),
             external_id: Some(start_url(&ctx.source, &cfg)?.to_string()),
             source_url: fetched.url.to_string(),
             retrieved_at: ctx.now,

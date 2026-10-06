@@ -142,7 +142,6 @@ mod tests {
             id: id(),
             source_id: id(),
             connector_id: id(),
-            collection_id: Some(id()),
             external_id: Some("CVE-2026-0001".into()),
             source_url: "https://example.invalid/cve".into(),
             retrieved_at: ts(),

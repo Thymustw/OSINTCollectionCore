@@ -115,7 +115,6 @@ pub fn raw_evidence(row: &PgRow) -> Result<RawEvidence, StorageError> {
         id: get(row, "id")?,
         source_id: get(row, "source_id")?,
         connector_id: get(row, "connector_id")?,
-        collection_id: get(row, "collection_id")?,
         external_id: get(row, "external_id")?,
         source_url: get(row, "source_url")?,
         retrieved_at: get(row, "retrieved_at")?,

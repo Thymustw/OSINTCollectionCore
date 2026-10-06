@@ -127,6 +127,9 @@ Cargo.toml 與 deny/audit 面，而且要各自維護一份連線池與 `map_sql
 | `source.create` / `source.update` | `source` | 成功與失敗都寫 |
 | `connector.create` / `connector.update` | `connector` | 成功與失敗都寫 |
 | `collection.create` | `collection` | 成功與失敗都寫 |
+| `collection.link_source` / `collection.unlink_source` | `collection` | 成功與失敗都寫（`POST`／`DELETE .../sources`） |
+| `collection.link_connector` / `collection.unlink_connector` | `collection` | 成功與失敗都寫 |
+| `collection.budget.update` | `collection` | 成功與失敗都寫（`PUT .../budget`） |
 | `object.create` | `object` | 每次（V0.1 一律是 `rejected` + 501，見 ADR-006） |
 | `entity.resolve` | `entity` | 成功與失敗都寫；`metadata` 含 `auto_merged_pairs`、`auto_merged_history_ids`（ADR-012） |
 | `entity.resolve_graph_context` | `entity` | 成功與失敗都寫 |

@@ -204,7 +204,6 @@ pub fn raw_evidence(row: &SqliteRow) -> Result<RawEvidence, StorageError> {
         id: uuid_from(row, "id")?,
         source_id: uuid_from(row, "source_id")?,
         connector_id: uuid_from(row, "connector_id")?,
-        collection_id: opt_uuid(row, "collection_id")?,
         external_id: get_opt_str(row, "external_id")?,
         source_url: get_str(row, "source_url")?,
         retrieved_at: ts(row, "retrieved_at")?,

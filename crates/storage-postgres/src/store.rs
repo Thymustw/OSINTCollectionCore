@@ -279,6 +279,55 @@ impl PostgresCanonicalStore {
             }
         }
     }
+
+    /// 寫入 raw_evidence 列與 `raw_evidence_collections` 關聯。呼叫端必須保證
+    /// 已經在交易裡（或 `collection_ids` 為空，沒有半套狀態可寫）。
+    async fn insert_raw_evidence_and_links(
+        &self,
+        evidence: &RawEvidence,
+        collection_ids: &[CollectionId],
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO raw_evidence (
+                id, source_id, connector_id, external_id, source_url, retrieved_at,
+                content_type, mime_type, content_length, sha256, storage_path, http_status,
+                http_headers, metadata, collector_version
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            "#,
+        )
+        .bind(evidence.id)
+        .bind(evidence.source_id)
+        .bind(evidence.connector_id)
+        .bind(&evidence.external_id)
+        .bind(&evidence.source_url)
+        .bind(evidence.retrieved_at)
+        .bind(&evidence.content_type)
+        .bind(&evidence.mime_type)
+        .bind(evidence.content_length)
+        .bind(&evidence.sha256)
+        .bind(&evidence.storage_path)
+        .bind(evidence.http_status)
+        .bind(&evidence.http_headers)
+        .bind(&evidence.metadata)
+        .bind(&evidence.collector_version)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        for collection_id in collection_ids {
+            self.link(
+                r#"
+                INSERT INTO raw_evidence_collections (raw_evidence_id, collection_id)
+                VALUES ($1, $2)
+                ON CONFLICT DO NOTHING
+                "#,
+                evidence.id,
+                *collection_id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -819,36 +868,116 @@ impl RelationalStore for PostgresCanonicalStore {
         .await
     }
 
-    async fn insert_raw_evidence(&self, evidence: &RawEvidence) -> Result<(), StorageError> {
-        sqlx::query(
+    async fn list_collections_by_source(
+        &self,
+        source_id: SourceId,
+        limit: u32,
+    ) -> Result<Vec<CollectionId>, StorageError> {
+        self.linked_ids(
             r#"
-            INSERT INTO raw_evidence (
-                id, source_id, connector_id, collection_id, external_id, source_url, retrieved_at,
-                content_type, mime_type, content_length, sha256, storage_path, http_status,
-                http_headers, metadata, collector_version
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            SELECT collection_id AS id FROM collection_sources
+            WHERE source_id = $1
+            ORDER BY collection_id ASC
+            LIMIT $2
             "#,
+            source_id,
+            limit,
         )
-        .bind(evidence.id)
-        .bind(evidence.source_id)
-        .bind(evidence.connector_id)
-        .bind(evidence.collection_id)
-        .bind(&evidence.external_id)
-        .bind(&evidence.source_url)
-        .bind(evidence.retrieved_at)
-        .bind(&evidence.content_type)
-        .bind(&evidence.mime_type)
-        .bind(evidence.content_length)
-        .bind(&evidence.sha256)
-        .bind(&evidence.storage_path)
-        .bind(evidence.http_status)
-        .bind(&evidence.http_headers)
-        .bind(&evidence.metadata)
-        .bind(&evidence.collector_version)
+        .await
+    }
+
+    async fn list_collections_by_connector(
+        &self,
+        connector_id: ConnectorId,
+        limit: u32,
+    ) -> Result<Vec<CollectionId>, StorageError> {
+        self.linked_ids(
+            r#"
+            SELECT collection_id AS id FROM collection_connectors
+            WHERE connector_id = $1
+            ORDER BY collection_id ASC
+            LIMIT $2
+            "#,
+            connector_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_collections_by_raw_evidence(
+        &self,
+        raw_evidence_id: RawEvidenceId,
+        limit: u32,
+    ) -> Result<Vec<CollectionId>, StorageError> {
+        self.linked_ids(
+            r#"
+            SELECT collection_id AS id FROM raw_evidence_collections
+            WHERE raw_evidence_id = $1
+            ORDER BY collection_id ASC
+            LIMIT $2
+            "#,
+            raw_evidence_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn unlink_collection_source(
+        &self,
+        collection_id: CollectionId,
+        source_id: SourceId,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "DELETE FROM collection_sources WHERE collection_id = $1 AND source_id = $2",
+        )
+        .bind(collection_id)
+        .bind(source_id)
         .execute(self.conn().await?.as_mut())
         .await
         .map_err(map_sqlx)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn unlink_collection_connector(
+        &self,
+        collection_id: CollectionId,
+        connector_id: ConnectorId,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "DELETE FROM collection_connectors WHERE collection_id = $1 AND connector_id = $2",
+        )
+        .bind(collection_id)
+        .bind(connector_id)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn insert_raw_evidence(
+        &self,
+        evidence: &RawEvidence,
+        collection_ids: &[CollectionId],
+    ) -> Result<(), StorageError> {
+        if self.tx.is_some() || collection_ids.is_empty() {
+            return self
+                .insert_raw_evidence_and_links(evidence, collection_ids)
+                .await;
+        }
+        // 證據與關聯必須同一個交易：分開寫會出現「證據落地、集合歸屬沒寫」的半套狀態。
+        // 已經在交易裡（`self.tx`）就直接寫；否則自己開一條。
+        let tx = TransactionalStore::begin(self).await?;
+        match tx
+            .store()
+            .insert_raw_evidence(evidence, collection_ids)
+            .await
+        {
+            Ok(()) => tx.commit().await,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
     }
 
     async fn get_raw_evidence(

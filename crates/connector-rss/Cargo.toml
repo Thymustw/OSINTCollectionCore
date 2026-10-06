@@ -18,7 +18,10 @@ url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+core-observability = { workspace = true }
 core-security = { workspace = true }
+entity-worker = { path = "../entity-worker" }
+normalizer = { path = "../normalizer" }
 storage-core = { workspace = true }
 storage-postgres = { path = "../storage-postgres" }
 storage-s3 = { path = "../storage-s3" }

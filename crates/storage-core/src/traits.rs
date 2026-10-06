@@ -125,9 +125,54 @@ pub trait RelationalStore: HealthProvider {
         collection_id: CollectionId,
         limit: u32,
     ) -> Result<Vec<ObjectId>, StorageError>;
+    /// 這個 Source 被哪些 Collection 掛上，依 `collection_id` 升序，`limit` 夾在 1..=100。
+    ///
+    /// collector／匯入用它算出「這筆原始證據屬於哪些調查」。
+    /// 一個來源可屬於多個集合，所以是清單不是單一 id。
+    async fn list_collections_by_source(
+        &self,
+        source_id: SourceId,
+        limit: u32,
+    ) -> Result<Vec<CollectionId>, StorageError>;
+    /// 同 [`RelationalStore::list_collections_by_source`]，對象是 Connector。
+    async fn list_collections_by_connector(
+        &self,
+        connector_id: ConnectorId,
+        limit: u32,
+    ) -> Result<Vec<CollectionId>, StorageError>;
+    /// 這筆原始證據寫入時被歸到哪些集合。依 `collection_id` 升序，`limit` 夾在 1..=100。
+    async fn list_collections_by_raw_evidence(
+        &self,
+        raw_evidence_id: RawEvidenceId,
+        limit: u32,
+    ) -> Result<Vec<CollectionId>, StorageError>;
+    /// 從集合拿掉一個 Source。回 `true` 代表真的刪到一列，`false` 代表本來就沒掛上。
+    ///
+    /// 只影響之後收進來的資料，不回填已經落地的原始證據／文件——回填等於改寫
+    /// 「這筆資料當時屬於哪個調查」，會讓歸屬紀錄不可信。
+    async fn unlink_collection_source(
+        &self,
+        collection_id: CollectionId,
+        source_id: SourceId,
+    ) -> Result<bool, StorageError>;
+    /// 同 [`RelationalStore::unlink_collection_source`]，對象是 Connector。
+    async fn unlink_collection_connector(
+        &self,
+        collection_id: CollectionId,
+        connector_id: ConnectorId,
+    ) -> Result<bool, StorageError>;
 
     /// Raw Evidence 寫入後不可變。重複主鍵回 `Conflict`，不可變成 update。
-    async fn insert_raw_evidence(&self, evidence: &RawEvidence) -> Result<(), StorageError>;
+    ///
+    /// `collection_ids` 是這筆證據當下屬於哪些調查集合，在**同一個交易**裡
+    /// 寫進 `raw_evidence_collections`。空切片代表不屬於任何集合（合法）。
+    /// 重複的 id 會被去重；不存在的 collection_id 會因 FK 讓整筆寫入失敗，
+    /// 不會留下「證據寫了、關聯沒寫」的半套狀態。
+    async fn insert_raw_evidence(
+        &self,
+        evidence: &RawEvidence,
+        collection_ids: &[CollectionId],
+    ) -> Result<(), StorageError>;
     async fn get_raw_evidence(
         &self,
         id: RawEvidenceId,

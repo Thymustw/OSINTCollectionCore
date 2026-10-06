@@ -252,7 +252,7 @@ impl Normalizer {
                 body: body_text,
                 summary,
                 language: None,
-                author: None,
+                author: item.author.clone(),
                 published_at: item.published_at,
                 modified_at: None,
                 observed_at: now,
@@ -262,11 +262,11 @@ impl Normalizer {
                 normalized_content_hash: Some(content_hash),
                 confidence: 0.8,
                 labels: Vec::new(),
-                attributes: json!({
-                    "raw_evidence_id": evidence.id,
-                    "external_id": item.external_id,
-                    "feed_type": item.attributes.get("feed_type"),
-                }),
+                attributes: document_attributes(
+                    evidence.id,
+                    item.attributes.clone(),
+                    &[("external_id", item.external_id.as_deref().map(|s| json!(s)))],
+                ),
                 // dedup 欄位由 deduplicator 填。normalizer 不做去重判斷，
                 // 也不要在這裡猜一個值——空值就是「還沒判斷過」的唯一表示法。
                 external_key: None,
@@ -303,8 +303,17 @@ impl Normalizer {
         // index 決定勝負：輸的那一邊整個交易回滾，它寫的 Document 不會留下來。
         let tx = self.store.begin().await?;
         let db = tx.store();
+        // 一筆原始證據最多 100 個集合（寫入端不變量：來源 50 + 連接器 50，
+        // 見 core-api `MAX_COLLECTIONS_PER_SOURCE`／`MAX_COLLECTIONS_PER_CONNECTOR`），
+        // 所以 `limit=100` 就是完整清單。不要改成翻頁。
+        let collection_ids = db
+            .list_collections_by_raw_evidence(evidence.id, 100)
+            .await?;
         for doc in &documents {
             db.put_document(doc).await?;
+            for collection_id in &collection_ids {
+                db.link_collection_object(*collection_id, doc.id).await?;
+            }
             let prov = Provenance {
                 id: Uuid::now_v7(),
                 subject_id: doc.id,
@@ -480,18 +489,28 @@ fn build_import_documents(
                 normalized_content_hash: Some(content_hash),
                 confidence: 0.8,
                 labels: Vec::new(),
-                attributes: json!({
-                    "raw_evidence_id": evidence.id,
-                    "external_id": record.external_id,
-                    "import_kind": spec.kind.as_str(),
-                    "record_index": record.index,
-                    // 解析不出時間時保留原字串，之後要補格式才有依據。
-                    "published_at_raw": record
-                        .published_at
-                        .is_none()
-                        .then_some(record.published_at_raw)
-                        .flatten(),
-                }),
+                attributes: document_attributes(
+                    evidence.id,
+                    json!({}),
+                    &[
+                        (
+                            "external_id",
+                            record.external_id.as_deref().map(|s| json!(s)),
+                        ),
+                        ("import_kind", Some(json!(spec.kind.as_str()))),
+                        ("record_index", Some(json!(record.index))),
+                        (
+                            "published_at_raw",
+                            record
+                                .published_at
+                                .is_none()
+                                .then_some(record.published_at_raw.clone())
+                                .flatten()
+                                .map(|s| json!(s)),
+                        ),
+                        ("publisher", record.publisher.as_deref().map(|s| json!(s))),
+                    ],
+                ),
                 // 同上：dedup 欄位由 deduplicator 填。
                 external_key: None,
                 simhash: None,
@@ -500,6 +519,27 @@ fn build_import_documents(
         })
         .collect();
     Ok(documents)
+}
+
+/// 組 Document.attributes：只寫有值的鍵，不寫 null／空字串。
+/// entity-worker 讀 publisher／feed_title／site_name 時，空字串會變成假的組織實體。
+fn document_attributes(evidence_id: Uuid, extra: Value, pairs: &[(&str, Option<Value>)]) -> Value {
+    let mut map = match extra {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    map.insert("raw_evidence_id".into(), json!(evidence_id));
+    for (key, value) in pairs {
+        if let Some(value) = value {
+            map.insert((*key).to_string(), value.clone());
+        }
+    }
+    map.retain(|_, value| match value {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        _ => true,
+    });
+    Value::Object(map)
 }
 
 fn document_ids_from(prov: &Provenance) -> Vec<Uuid> {

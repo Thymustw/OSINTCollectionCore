@@ -5,7 +5,7 @@ use std::time::Duration;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use tower::ServiceBuilder;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -64,6 +64,26 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/collections",
             post(resources::collections::create_collection),
+        )
+        .route(
+            "/api/v1/collections/{id}/sources",
+            post(resources::collections::link_sources),
+        )
+        .route(
+            "/api/v1/collections/{id}/sources/{source_id}",
+            delete(resources::collections::unlink_source),
+        )
+        .route(
+            "/api/v1/collections/{id}/connectors",
+            post(resources::collections::link_connectors),
+        )
+        .route(
+            "/api/v1/collections/{id}/connectors/{connector_id}",
+            delete(resources::collections::unlink_connector),
+        )
+        .route(
+            "/api/v1/collections/{id}/budget",
+            put(resources::collections::put_budget),
         )
         // V0.1 一律回 501（SPEC §14 的可追溯鏈）。仍然掛在 require_write 底下：
         // 未認證／viewer 應該先拿到 401／403，而不是先看到 501——
@@ -140,6 +160,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/v1/collections/{id}",
             get(resources::collections::get_collection),
+        )
+        .route(
+            "/api/v1/collections/{id}/budget",
+            get(resources::collections::get_budget),
         )
         .route("/api/v1/objects", get(resources::objects::list_objects))
         .route("/api/v1/objects/{id}", get(resources::objects::get_object))

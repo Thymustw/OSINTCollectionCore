@@ -24,6 +24,8 @@ pub struct ExtractedPage {
     pub title: Option<String>,
     pub description: Option<String>,
     pub body_text: String,
+    pub site_name: Option<String>,
+    pub author: Option<String>,
 }
 
 /// Static Web connector。
@@ -152,7 +154,7 @@ where
         let evidence = NewRawEvidence {
             source_id: ctx.source.id,
             connector_id: ctx.connector.id,
-            collection_id: ctx.collection_id,
+            collection_ids: ctx.collection_ids.clone(),
             external_id: Some(url.clone()),
             source_url: fetched.url.to_string(),
             retrieved_at: ctx.now,
@@ -215,16 +217,20 @@ pub fn parse_html(body: &[u8]) -> Result<Vec<ParsedItem>, ConnectorError> {
                     .into(),
         });
     }
+    let mut attributes = serde_json::Map::new();
+    attributes.insert("body_text".into(), json!(page.body_text));
+    attributes.insert("connector_type".into(), json!("static_web"));
+    if let Some(site_name) = &page.site_name {
+        attributes.insert("site_name".into(), json!(site_name));
+    }
     Ok(vec![ParsedItem {
         external_id: None,
         url: None,
         title: page.title,
         published_at: None,
         summary: page.description,
-        attributes: json!({
-            "body_text": page.body_text,
-            "connector_type": "static_web",
-        }),
+        author: page.author,
+        attributes: serde_json::Value::Object(attributes),
     }])
 }
 
@@ -239,10 +245,14 @@ pub fn extract_page(body: &[u8]) -> ExtractedPage {
         .or_else(|| meta_content(&document, "og:description"))
         .or_else(|| meta_content(&document, "twitter:description"));
     let body_text = visible_text(&document);
+    let site_name = meta_content(&document, "og:site_name");
+    let author = meta_content(&document, "author");
     ExtractedPage {
         title,
         description,
         body_text,
+        site_name,
+        author,
     }
 }
 
@@ -336,6 +346,8 @@ mod tests {
 <head>
   <title>CVE-2026-0001 advisory</title>
   <meta name="description" content="fixture page">
+  <meta property="og:site_name" content="NVD">
+  <meta name="author" content="Jane Doe">
 </head>
 <body>
   <script>alert(1)</script>
@@ -352,6 +364,8 @@ mod tests {
         let page = extract_page(HTML.as_bytes());
         assert_eq!(page.title.as_deref(), Some("CVE-2026-0001 advisory"));
         assert_eq!(page.description.as_deref(), Some("fixture page"));
+        assert_eq!(page.site_name.as_deref(), Some("NVD"));
+        assert_eq!(page.author.as_deref(), Some("Jane Doe"));
         assert!(page.body_text.contains("This is the main body text."));
         assert!(
             !page.body_text.contains("alert"),
@@ -366,6 +380,8 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title.as_deref(), Some("CVE-2026-0001 advisory"));
         assert_eq!(items[0].summary.as_deref(), Some("fixture page"));
+        assert_eq!(items[0].author.as_deref(), Some("Jane Doe"));
+        assert_eq!(items[0].attributes["site_name"], "NVD");
         assert!(
             items[0].attributes["body_text"]
                 .as_str()

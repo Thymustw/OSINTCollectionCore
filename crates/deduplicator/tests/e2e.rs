@@ -289,7 +289,6 @@ async fn seed_document(
         id: raw_id,
         source_id: source.id,
         connector_id: connector.id,
-        collection_id: None,
         external_id: external_id.map(str::to_string),
         source_url: source_url.into(),
         retrieved_at: now,
@@ -303,7 +302,7 @@ async fn seed_document(
         metadata: json!({}),
         collector_version: "0.1.0".into(),
     };
-    pg.insert_raw_evidence(&evidence).await.expect("raw");
+    pg.insert_raw_evidence(&evidence, &[]).await.expect("raw");
 
     let document = Document {
         id: Uuid::now_v7(),
@@ -864,6 +863,84 @@ async fn stage_5_semantic_interface_is_wired_but_unsupported_by_default() {
         group.model.as_deref(),
         Some("intfloat/multilingual-e5-small-int8"),
         "Stage 5 命中必須把實際模型名寫進 DuplicateGroup.model"
+    );
+}
+
+/// Stage 5 的最近鄰來自 OpenSearch 向量索引——可重建的投影，可能殘留 PostgreSQL
+/// 已刪除的 Document。命中這種「幽靈」時不可以把它當 canonical：寫進 `duplicate_of`
+/// 會撞 `documents_duplicate_of_fkey`，這份 Document 卡住、後面的實體抽取全部不跑。
+///
+/// 2026-10-06 在真實容器重現過：e2e 腳本清掉的文件仍留在 osint-documents 索引，
+/// 下一次匯入相似內容時 deduplicator 每次都 FK 失敗，組織實體永遠抽不出來。
+#[tokio::test]
+async fn stage_5_hit_on_document_missing_from_postgres_is_not_a_duplicate() {
+    use async_trait::async_trait;
+    use deduplicator::{SemanticDuplicateDetector, SemanticOutcome};
+
+    struct GhostSemantic {
+        ghost: Uuid,
+    }
+
+    #[async_trait]
+    impl SemanticDuplicateDetector for GhostSemantic {
+        fn detector_id(&self) -> &'static str {
+            "ghost-test-detector"
+        }
+        async fn detect(
+            &self,
+            _document: &Document,
+        ) -> Result<SemanticOutcome, deduplicator::DeduplicatorError> {
+            Ok(SemanticOutcome::Hit {
+                canonical_object_id: self.ghost,
+                similarity: 0.99,
+                model: "intfloat/multilingual-e5-small-int8".into(),
+            })
+        }
+    }
+
+    let stack = connect_stack().await;
+    let run = Uuid::now_v7();
+    let source = seed_source(&stack.pg, None, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+    let doc = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        None,
+        &format!("http://127.0.0.1/ghost/{run}"),
+        &format!("Ghost heading {run}"),
+        &short_body(run, "stage five ghost"),
+    )
+    .await;
+
+    // 一個 PostgreSQL 裡不存在的 id，模擬搜尋索引殘留。
+    let ghost = Uuid::now_v7();
+    assert!(
+        stack.pg.get_document(ghost).await.expect("get").is_none(),
+        "前提：ghost id 不能剛好存在"
+    );
+
+    let service = dedup(&stack, None).with_semantic_detector(Arc::new(GhostSemantic { ghost }));
+    let outcome = service
+        .dedup_document(doc.id)
+        .await
+        .expect("命中幽靈不可以讓整份 Document 處理失敗");
+    assert_eq!(
+        outcome,
+        DedupOutcome::Canonical {
+            document_id: doc.id
+        },
+        "最近鄰在 PostgreSQL 不存在時，這份應該是 canonical，不是重複"
+    );
+    let stored = stack
+        .pg
+        .get_document(doc.id)
+        .await
+        .expect("get")
+        .expect("doc");
+    assert_eq!(
+        stored.duplicate_of, None,
+        "不可以把 duplicate_of 指向不存在的列"
     );
 }
 

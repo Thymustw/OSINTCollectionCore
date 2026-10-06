@@ -86,8 +86,11 @@ async fn show(ctx: &Context, id: Uuid, want_body: bool, max_bytes: usize) -> Res
         None
     };
 
+    let collection_ids = store.list_collections_by_raw_evidence(id, 100).await?;
+
     if ctx.format == Format::Json {
         let mut value = serde_json::to_value(&evidence)?;
+        value["collection_ids"] = serde_json::to_value(&collection_ids)?;
         if let Some(bytes) = &body {
             let rendered = render_body(bytes, max_bytes);
             value["_body"] = serde_json::json!({
@@ -101,16 +104,20 @@ async fn show(ctx: &Context, id: Uuid, want_body: bool, max_bytes: usize) -> Res
         return print_json(&value);
     }
 
+    let collections = if collection_ids.is_empty() {
+        "-".into()
+    } else {
+        collection_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     print_detail(vec![
         ("id", evidence.id.to_string()),
         ("source_id", evidence.source_id.to_string()),
         ("connector_id", evidence.connector_id.to_string()),
-        (
-            "collection_id",
-            evidence
-                .collection_id
-                .map_or_else(|| "-".into(), |v| v.to_string()),
-        ),
+        ("collection_ids", collections),
         ("external_id", opt(evidence.external_id.as_deref())),
         ("source_url", evidence.source_url.clone()),
         ("retrieved_at", ts(Some(evidence.retrieved_at))),

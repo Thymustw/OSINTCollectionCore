@@ -14,7 +14,7 @@ use connector_sdk::{
 };
 use core_model::{Connector, RawEvidence, Source};
 use feed_rs::model::{FeedType, Text};
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// RSS／Atom connector。
 pub struct RssConnector<E, C> {
@@ -98,7 +98,7 @@ where
         let evidence = NewRawEvidence {
             source_id: ctx.source.id,
             connector_id: ctx.connector.id,
-            collection_id: ctx.collection_id,
+            collection_ids: ctx.collection_ids.clone(),
             external_id: Some(url.clone()),
             source_url: fetched.url.to_string(),
             retrieved_at: ctx.now,
@@ -174,6 +174,12 @@ pub fn parse_feed(body: &[u8]) -> Result<Vec<ParsedItem>, ConnectorError> {
         FeedType::JSON => "json_feed",
         FeedType::RSS0 | FeedType::RSS1 | FeedType::RSS2 => "rss",
     };
+    let feed_title = feed
+        .title
+        .as_ref()
+        .map(text_value)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let items = feed
         .entries
         .into_iter()
@@ -187,13 +193,24 @@ pub fn parse_feed(body: &[u8]) -> Result<Vec<ParsedItem>, ConnectorError> {
                 .or_else(|| entry.content.as_ref().and_then(|c| c.body.clone()));
             let published_at: Option<DateTime<Utc>> =
                 entry.published.map(|ts| ts.with_timezone(&Utc));
+            let author = entry
+                .authors
+                .first()
+                .map(|person| person.name.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let mut attributes = serde_json::Map::new();
+            attributes.insert("feed_type".into(), json!(feed_kind));
+            if let Some(feed_title) = &feed_title {
+                attributes.insert("feed_title".into(), json!(feed_title));
+            }
             ParsedItem {
                 external_id: Some(entry.id),
                 url,
                 title,
                 published_at,
                 summary,
-                attributes: json!({ "feed_type": feed_kind }),
+                author,
+                attributes: Value::Object(attributes),
             }
         })
         .collect();
@@ -209,7 +226,7 @@ mod tests {
     use super::*;
 
     const RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0">
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
     <title>Test Feed</title>
     <link>http://127.0.0.1/feed</link>
@@ -220,6 +237,7 @@ mod tests {
       <guid>CVE-2026-0001</guid>
       <pubDate>Wed, 10 Sep 2026 12:00:00 GMT</pubDate>
       <description>test item</description>
+      <dc:creator>Example Press</dc:creator>
     </item>
   </channel>
 </rss>
@@ -236,6 +254,7 @@ mod tests {
     <link href="http://127.0.0.1/atom-1"/>
     <updated>2026-09-10T12:00:00Z</updated>
     <summary>atom summary</summary>
+    <author><name>Atom Author</name></author>
   </entry>
 </feed>
 "#;
@@ -247,6 +266,8 @@ mod tests {
         assert_eq!(items[0].title.as_deref(), Some("CVE-2026-0001"));
         assert_eq!(items[0].external_id.as_deref(), Some("CVE-2026-0001"));
         assert_eq!(items[0].attributes["feed_type"], "rss");
+        assert_eq!(items[0].attributes["feed_title"], "Test Feed");
+        assert_eq!(items[0].author.as_deref(), Some("Example Press"));
     }
 
     #[test]
@@ -255,6 +276,8 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title.as_deref(), Some("Atom Item"));
         assert_eq!(items[0].attributes["feed_type"], "atom");
+        assert_eq!(items[0].attributes["feed_title"], "Atom Fixture");
+        assert_eq!(items[0].author.as_deref(), Some("Atom Author"));
     }
 
     #[test]

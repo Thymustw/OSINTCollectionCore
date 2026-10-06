@@ -335,7 +335,6 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         id: Uuid::now_v7(),
         source_id: source.id,
         connector_id: connector.id,
-        collection_id: Some(collection.id),
         external_id: Some("CVE-2026-0001".into()),
         source_url: "https://example.invalid/cve".into(),
         retrieved_at: fixture_ts(),
@@ -349,7 +348,9 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         metadata: json!({"feed": "nvd"}),
         collector_version: "0.1.0".into(),
     };
-    store.insert_raw_evidence(&evidence).await?;
+    store
+        .insert_raw_evidence(&evidence, &[collection.id])
+        .await?;
     let got = store
         .get_raw_evidence(evidence.id)
         .await?
@@ -358,7 +359,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         })?;
     assert_eq_debug("raw_evidence", &evidence, &got);
 
-    let again = store.insert_raw_evidence(&evidence).await;
+    let again = store.insert_raw_evidence(&evidence, &[collection.id]).await;
     match again {
         Err(StorageError::Conflict { .. }) => {}
         other => {
@@ -638,6 +639,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
     );
     assert_extraction_queries(store, &extraction).await?;
     assert_list_sources_by_entity(store).await?;
+    assert_evidence_collections(store).await?;
 
     assert_v0_2_resolution_queries(store, &entity, source.id).await?;
     assert_v0_3_discovery_queries(store, &collection, &entity).await?;
@@ -921,7 +923,6 @@ pub async fn assert_list_sources_by_entity<S: RelationalStore>(
             id: Uuid::now_v7(),
             source_id: source.id,
             connector_id: connector.id,
-            collection_id: None,
             external_id: Some(suffix.into()),
             source_url: format!("https://example.invalid/{suffix}"),
             retrieved_at: fixture_ts(),
@@ -935,7 +936,7 @@ pub async fn assert_list_sources_by_entity<S: RelationalStore>(
             metadata: json!({}),
             collector_version: "0.1.0".into(),
         };
-        store.insert_raw_evidence(&evidence).await?;
+        store.insert_raw_evidence(&evidence, &[]).await?;
         let document = Document {
             id: Uuid::now_v7(),
             object_type: DocumentType::Advisory,
@@ -1090,6 +1091,307 @@ pub async fn assert_list_sources_by_entity<S: RelationalStore>(
                 "沒有 extraction 的 entity 應回空陣列，實際 {} 筆：{empty:?}",
                 empty.len()
             ),
+        });
+    }
+    Ok(())
+}
+
+/// 原始證據 ↔ 集合多對多：寫入／反查／unlink／刪文件會清掉 `collection_objects`。
+pub async fn assert_evidence_collections<S: RelationalStore>(
+    store: &S,
+) -> Result<(), StorageError> {
+    let suffix = Uuid::now_v7().simple().to_string();
+    let source = Source {
+        id: Uuid::now_v7(),
+        name: format!("ev-col-src-{suffix}"),
+        source_type: SourceType::Rss,
+        platform: None,
+        base_url: Some("https://example.invalid/ev-col".into()),
+        description: None,
+        language: None,
+        country: None,
+        enabled: true,
+        collection_policy: json!({}),
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+        last_seen: None,
+    };
+    store.put_source(&source).await?;
+    let connector = Connector {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        name: format!("ev-col-conn-{suffix}"),
+        connector_type: "rss".into(),
+        version: "0.1.0".into(),
+        enabled: true,
+        configuration: json!({}),
+        credential_reference: None,
+        schedule: None,
+        rate_limit: json!({}),
+        timeout: json!({}),
+        proxy_reference: None,
+        checkpoint: json!({}),
+        last_run: None,
+        last_success: None,
+        status: "idle".into(),
+        error_count: 0,
+    };
+    store.put_connector(&connector).await?;
+    let collection_a = Collection {
+        id: Uuid::now_v7(),
+        workspace_id: None,
+        name: format!("ev-col-a-{suffix}"),
+        description: None,
+        status: "active".into(),
+        priority: 1,
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+    };
+    let collection_b = Collection {
+        id: Uuid::now_v7(),
+        workspace_id: None,
+        name: format!("ev-col-b-{suffix}"),
+        description: None,
+        status: "active".into(),
+        priority: 1,
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+    };
+    store.put_collection(&collection_a).await?;
+    store.put_collection(&collection_b).await?;
+    store
+        .link_collection_source(collection_a.id, source.id)
+        .await?;
+    store
+        .link_collection_source(collection_b.id, source.id)
+        .await?;
+    store
+        .link_collection_connector(collection_a.id, connector.id)
+        .await?;
+
+    let by_source = store.list_collections_by_source(source.id, 100).await?;
+    if by_source.len() != 2
+        || !by_source.contains(&collection_a.id)
+        || !by_source.contains(&collection_b.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("list_collections_by_source 應對到兩個集合，實際 {by_source:?}"),
+        });
+    }
+    let by_connector = store
+        .list_collections_by_connector(connector.id, 100)
+        .await?;
+    if by_connector != vec![collection_a.id] {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "list_collections_by_connector 應只含 {}，實際 {by_connector:?}",
+                collection_a.id
+            ),
+        });
+    }
+
+    let evidence = RawEvidence {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        connector_id: connector.id,
+        external_id: Some(format!("ev-col-{suffix}")),
+        source_url: format!("https://example.invalid/ev-col/{suffix}"),
+        retrieved_at: fixture_ts(),
+        content_type: Some("text/plain".into()),
+        mime_type: Some("text/plain".into()),
+        content_length: Some(4),
+        sha256: format!("{:0<64}", Uuid::now_v7().simple()),
+        storage_path: format!("s3://raw-evidence/ev-col/{suffix}"),
+        http_status: Some(200),
+        http_headers: json!({}),
+        metadata: json!({}),
+        collector_version: "0.1.0".into(),
+    };
+    // 重複 id 應被去重，不能寫兩列或失敗。
+    store
+        .insert_raw_evidence(
+            &evidence,
+            &[collection_a.id, collection_b.id, collection_a.id],
+        )
+        .await?;
+    let linked = store
+        .list_collections_by_raw_evidence(evidence.id, 100)
+        .await?;
+    if linked.len() != 2 || !linked.contains(&collection_a.id) || !linked.contains(&collection_b.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "insert_raw_evidence 應把證據掛上兩個集合（重複 id 去重），實際 {linked:?}"
+            ),
+        });
+    }
+
+    let unlinked = RawEvidence {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        connector_id: connector.id,
+        external_id: Some(format!("ev-col-none-{suffix}")),
+        source_url: format!("https://example.invalid/ev-col/none/{suffix}"),
+        retrieved_at: fixture_ts(),
+        content_type: Some("text/plain".into()),
+        mime_type: Some("text/plain".into()),
+        content_length: Some(4),
+        sha256: format!("{:0<64}", Uuid::now_v7().simple()),
+        storage_path: format!("s3://raw-evidence/ev-col/none/{suffix}"),
+        http_status: Some(200),
+        http_headers: json!({}),
+        metadata: json!({}),
+        collector_version: "0.1.0".into(),
+    };
+    store.insert_raw_evidence(&unlinked, &[]).await?;
+    if !store
+        .list_collections_by_raw_evidence(unlinked.id, 100)
+        .await?
+        .is_empty()
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "空的 collection_ids 應讓證據不屬於任何集合".into(),
+        });
+    }
+
+    let missing_id = Uuid::now_v7();
+    let doomed = RawEvidence {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        connector_id: connector.id,
+        external_id: Some(format!("ev-col-fk-{suffix}")),
+        source_url: format!("https://example.invalid/ev-col/fk/{suffix}"),
+        retrieved_at: fixture_ts(),
+        content_type: Some("text/plain".into()),
+        mime_type: Some("text/plain".into()),
+        content_length: Some(4),
+        sha256: format!("{:0<64}", Uuid::now_v7().simple()),
+        storage_path: format!("s3://raw-evidence/ev-col/fk/{suffix}"),
+        http_status: Some(200),
+        http_headers: json!({}),
+        metadata: json!({}),
+        collector_version: "0.1.0".into(),
+    };
+    match store.insert_raw_evidence(&doomed, &[missing_id]).await {
+        Err(StorageError::ConstraintViolation { .. }) => {}
+        other => {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "不存在的 collection_id 應回 ConstraintViolation，實際是 {other:?}"
+                ),
+            });
+        }
+    }
+    if store.get_raw_evidence(doomed.id).await?.is_some() {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "FK 失敗後不該留下「證據寫了、關聯沒寫」的半套狀態".into(),
+        });
+    }
+
+    if !store
+        .unlink_collection_source(collection_b.id, source.id)
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "unlink_collection_source 對已掛上的來源應回 true".into(),
+        });
+    }
+    if store
+        .unlink_collection_source(collection_b.id, source.id)
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "unlink_collection_source 對已經拿掉的來源應回 false".into(),
+        });
+    }
+    let after_unlink = store.list_collections_by_source(source.id, 100).await?;
+    if after_unlink != vec![collection_a.id] {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "unlink 之後 list_collections_by_source 應只剩 {}，實際 {after_unlink:?}",
+                collection_a.id
+            ),
+        });
+    }
+    if !store
+        .unlink_collection_connector(collection_a.id, connector.id)
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "unlink_collection_connector 對已掛上的連接器應回 true".into(),
+        });
+    }
+    if store
+        .unlink_collection_connector(collection_a.id, connector.id)
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "unlink_collection_connector 對已經拿掉的連接器應回 false".into(),
+        });
+    }
+
+    let document = Document {
+        id: Uuid::now_v7(),
+        object_type: DocumentType::Advisory,
+        schema_version: "1.0".into(),
+        title: Some(format!("ev-col-doc-{suffix}")),
+        body: Some("body".into()),
+        summary: None,
+        language: None,
+        author: None,
+        published_at: None,
+        modified_at: None,
+        observed_at: fixture_ts(),
+        collected_at: fixture_ts(),
+        source_url: None,
+        canonical_url: None,
+        normalized_content_hash: None,
+        confidence: 0.9,
+        labels: vec![],
+        attributes: json!({}),
+        external_key: None,
+        simhash: None,
+        duplicate_of: None,
+    };
+    store.put_document(&document).await?;
+    store
+        .link_collection_object(collection_a.id, document.id)
+        .await?;
+    if !store
+        .list_collection_objects(collection_a.id, 100)
+        .await?
+        .contains(&document.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "剛寫入的 collection_objects 讀不到".into(),
+        });
+    }
+    if !store.delete_document(document.id).await? {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "刪剛寫入的 document 應回 true".into(),
+        });
+    }
+    if store
+        .list_collection_objects(collection_a.id, 100)
+        .await?
+        .contains(&document.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "刪文件後 collection_objects 應被 FK CASCADE 清掉".into(),
         });
     }
     Ok(())

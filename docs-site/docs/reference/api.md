@@ -1,6 +1,6 @@
 # API 端點總覽
 
-這一頁列出所有 `/api/v1/*` 路由。路由清單直接對照 `crates/core-api/src/routes.rs` 整理，未依賴其他文件。
+這一頁列出所有 `/api/v1/*` 路由，直接依照程式裡實際註冊的路由整理。
 
 ---
 
@@ -111,7 +111,7 @@ Authorization: Bearer <token>
 | `GET` | `/api/v1/objects/{id}` | viewer | 取得單一文件 |
 | `GET` | `/api/v1/objects/{id}/similar` | viewer | 列出與指定文件相似的文件 |
 | `POST` | `/api/v1/objects` | operator | 固定回 **501 Not Implemented**（請改用 `/api/v1/import`） |
-| `GET` | `/api/v1/raw/{id}` | viewer | 取得原始證據（SHA-256、來源 URL、收集時間等） |
+| `GET` | `/api/v1/raw/{id}` | viewer | 取得原始證據（SHA-256、來源 URL、收集時間、`collection_ids`）。清單上限 100，超過時 `collection_ids_truncated` 為 true |
 
 ---
 
@@ -181,9 +181,15 @@ Authorization: Bearer <token>
 | 方法 | 路徑 | 角色 | 說明 |
 |---|---|---|---|
 | `GET` | `/api/v1/collections` | viewer | 列出所有調查集合 |
-| `GET` | `/api/v1/collections/{id}` | viewer | 取得單一調查集合 |
-| `POST` | `/api/v1/collections` | operator | 建立調查集合 |
-| `GET` | `/api/v1/collections/{id}/discovery` | viewer | 取得調查集合的 Discovery 摘要 |
+| `GET` | `/api/v1/collections/{id}` | viewer | 取得單一調查集合（含來源／連接器／文件 id 清單） |
+| `POST` | `/api/v1/collections` | operator | 建立調查集合（可同時掛上 `source_ids`／`connector_ids`，一次各最多 100 筆）。一個來源／連接器最多屬於 50 個集合，超過回 422 且不建立任何東西 |
+| `POST` | `/api/v1/collections/{id}/sources` | operator | 把來源掛上這個集合。**不回填**已經落地的舊資料，只影響之後收進來的。一個來源最多屬於 50 個集合，超過回 422（收集時一次只讀得完 100 個集合，寫入端把來源與連接器各卡在 50）；已掛上的重送仍成功 |
+| `DELETE` | `/api/v1/collections/{id}/sources/{source_id}` | operator | 拿掉來源。集合或來源不存在 → 404；本來就沒掛上 → 204（冪等） |
+| `POST` | `/api/v1/collections/{id}/connectors` | operator | 把連接器掛上這個集合。同樣不回填舊資料。一個連接器最多屬於 50 個集合，超過回 422；已掛上的重送仍成功 |
+| `DELETE` | `/api/v1/collections/{id}/connectors/{connector_id}` | operator | 拿掉連接器。語意同上 |
+| `GET` | `/api/v1/collections/{id}/budget` | viewer | 取得 Discovery 配額。沒設過時回保守預設，並標 `is_default: true` |
+| `PUT` | `/api/v1/collections/{id}/budget` | operator | 覆寫 Discovery 配額。之後 `is_default` 為 `false` |
+| `GET` | `/api/v1/collections/{id}/discovery` | viewer | 列出這個調查集合的候選。集合不存在 → 404（不是 200 空頁） |
 
 ### 種子（Seed）
 
@@ -268,4 +274,4 @@ Authorization: Bearer <token>
 
 ## 路由數量統計
 
-`crates/core-api/src/routes.rs` 共有 **73 個** `.route(` 呼叫。其中 `/api/v1/tokens` 那行同時註冊了 `POST` 與 `GET` 兩個方法（`.route("/api/v1/tokens", post(...).get(...))`），因此對應到 **74 個** HTTP 方法+路徑組合。本頁列出全部，含 3 個公開探針端點（`/health`、`/ready`、`/metrics`）。
+共 **74 個** HTTP 方法+路徑組合，本頁列出全部，含 3 個公開探針端點（`/health`、`/ready`、`/metrics`）。
