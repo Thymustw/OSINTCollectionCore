@@ -42,7 +42,7 @@
 # 對 rdkafka 的註解，刻意不用 cmake-build），需要的就是這組工具鏈；換成 -slim
 # 會在 rdkafka-sys 的 build script 掛掉。
 ARG RUST_IMAGE=rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa
-ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 # ===========================================================================
 # builder
@@ -93,10 +93,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # 這條記在 docs/operations/OPERATIONS.md。
 FROM ${RUNTIME_IMAGE} AS runtime-base
 
+# `perl-base` 要明確升級：它是 Essential 套件，base image 內建、install 不會碰它。
+# 2026-10-06 CI 的 trivy CRITICAL gate 擋下 perl-base 5.36.0-7+deb12u3 的
+# CVE-2026-13221／CVE-2026-42496／CVE-2026-8376（修補版 deb12u4）。實測當天
+# 上游最新的 bookworm-slim digest（上面那個）裡仍是 deb12u3——換 digest 不夠。
+# 刻意只升這一個套件而不是 `apt-get upgrade`：變動範圍明確，掃描結果對得上。
+# 上游 digest 內建 deb12u4 之後，這行可以拿掉（`--only-upgrade` 對已最新的套件是 no-op）。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+ && apt-get install -y --no-install-recommends --only-upgrade perl-base \
  && rm -rf /var/lib/apt/lists/*
 
 # non-root（DEVSECOPS 要求）。uid/gid 固定 10001，不靠 useradd 自動配號——
