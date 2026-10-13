@@ -284,4 +284,10 @@ curl -s -X POST $API/connectors \
     直接填明文會回 `400`。
 
 支援的自動抓取類型：`rss`、`atom`、`static_web`、`rest_api`。
+
+`schedule` 是 5 欄 cron（例如 `0 */6 * * *`）。**沒有填 `schedule`（或填空白）的
+connector 目前不會被執行**——collector 只排程有合法 cron 的連接器，系統也還沒有
+公開的「手動觸發一次收集」API。匯入專用類型（`manual_upload`／`json_import`／
+`csv_import`／`stix_import`）走 `POST /api/v1/import`，不會被 collector 排程。
+
 詳細設定選項見 [API 參考](../reference/api.md)。

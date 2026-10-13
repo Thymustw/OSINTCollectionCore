@@ -15,13 +15,15 @@ crates/normalizer     bin: osint-normalizer
 
 ## Collector
 
-讀 `enabled=true` 的 connector，依 `schedule` cron 觸發。測試與手動觸發走 `CollectorRunner::run_connector`，不必等 cron。
+讀 `enabled=true` 的 connector，依 `schedule` cron 觸發。測試與手動觸發走 `CollectorRunner::run_connector`，不必等 cron（目前沒有公開的 HTTP 手動觸發 API）。
 
 | 項目 | 行為 |
 |---|---|
 | 已知種類 | `rss`／`atom` → `RssConnector`；`static_web` → `StaticWebConnector`；`rest_api` → `RestApiConnector` |
-| 未知 `connector_type` | 記 log 後 `SkippedUnknownType`，**不 panic**（例如尚未實作的 `manual_upload`） |
-| cron | `croner` 4.0.0（`default-features=false` + `chrono`）。從未跑過（`last_run` 空）視為到期。空／壞 schedule 在 tick 裡當 `NotDue`，手動 `run_connector` 仍可跑 |
+| 匯入專用類型 | `manual_upload`／`manual`／`json_import`／`csv_import`／`stix_import` 在 tick 直接略過、不打 warn。這些沒有可抓的 URL，不該被排程 |
+| 未知 `connector_type` | 非匯入的未知種類記 log 後 `SkippedUnknownType`，**不 panic**。同一 connector 同一原因只第一次 warn |
+| cron | `croner` 4.0.0（`default-features=false` + `chrono`）。從未跑過（`last_run` 空）視為到期。**空／空白 schedule = 未排程**，靜默略過，不是錯誤；有值但解析失敗才是錯誤 |
+| log | 真正的錯誤（schedule 解析失敗、收集失敗、未知種類）只在狀態改變時 warn／error：`connector.status=error` 且 `checkpoint.last_error` 相同 → debug。恢復成功打 info。每 tick 最多一行摘要（計數變化立刻印，穩定殘留每 5 分鐘一筆）。**log 量不可隨 connector 數無界放大** |
 | 併發 | 全域 semaphore + per-domain inflight。`tick` 用 `JoinSet`，spawn 數夾在 `global_inflight`，不可依外部輸入無界 `tokio::spawn` |
 | 速率 | SDK `DomainRateLimiter` 另外管 RPS；這層只管「同時幾個在跑」 |
 | 成功 | SDK sink 寫 RawEvidence（Postgres metadata + 物件儲存 body），更新 checkpoint／`last_run`／`last_success`，publish `raw.collected`（partition key = `source_id`） |

@@ -168,7 +168,8 @@ async fn seed_connector(pg: &PostgresCanonicalStore, source: &Source) -> Connect
         name: format!("indexer-e2e-connector-{}", Uuid::now_v7()),
         connector_type: "rss".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 測試走 run_connector，不需 collector 排程。enabled 殘留會每 tick 重打 log。
+        enabled: false,
         configuration: json!({}),
         credential_reference: None,
         schedule: None,

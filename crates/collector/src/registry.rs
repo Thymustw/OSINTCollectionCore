@@ -22,6 +22,18 @@ pub fn classify_connector_type(connector_type: &str) -> Option<KnownConnectorKin
     }
 }
 
+/// 匯入／上傳專用類型：沒有可抓的 URL，不該被 collector 排程。
+///
+/// 字串來自 `import-format::ImportKind::connector_type` 與 STIX 匯入路徑
+/// （`stix_import`）。`manual` 是部分測試殘留的舊值，與 `manual_upload` 同等處理。
+#[must_use]
+pub fn is_import_only_type(connector_type: &str) -> bool {
+    matches!(
+        connector_type.trim().to_ascii_lowercase().as_str(),
+        "manual_upload" | "manual" | "json_import" | "csv_import" | "stix_import"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +67,22 @@ mod tests {
         assert_eq!(classify_connector_type("manual_upload"), None);
         assert_eq!(classify_connector_type("json_import"), None);
         assert_eq!(classify_connector_type(""), None);
+    }
+
+    #[test]
+    fn import_only_types_are_not_scheduled() {
+        for ty in [
+            "manual_upload",
+            "MANUAL",
+            "json_import",
+            "csv_import",
+            "stix_import",
+            " stix_import ",
+        ] {
+            assert!(is_import_only_type(ty), "{ty} 應視為匯入專用");
+            assert_eq!(classify_connector_type(ty), None, "{ty} 不是可抓取種類");
+        }
+        assert!(!is_import_only_type("rss"));
+        assert!(!is_import_only_type("unknown_future_type"));
     }
 }

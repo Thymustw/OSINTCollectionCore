@@ -6,6 +6,12 @@ use std::str::FromStr;
 
 use crate::error::CollectorError;
 
+/// `schedule` 為 None／空／只含空白 → 未排程，只能手動觸發，不是錯誤。
+#[must_use]
+pub fn is_unscheduled(schedule: Option<&str>) -> bool {
+    schedule.map(str::trim).unwrap_or("").is_empty()
+}
+
 /// 解析 5 欄（或 6 欄含秒）cron。失敗不 panic。
 pub fn parse_cron(schedule: &str) -> Result<Cron, CollectorError> {
     let trimmed = schedule.trim();
@@ -42,6 +48,16 @@ mod tests {
 
     fn ts(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    #[test]
+    fn empty_or_blank_schedule_is_unscheduled_not_invalid() {
+        assert!(is_unscheduled(None));
+        assert!(is_unscheduled(Some("")));
+        assert!(is_unscheduled(Some("   \t")));
+        assert!(!is_unscheduled(Some("*/15 * * * *")));
+        // 有值但壞掉的 cron 不是「未排程」，應交給 parse_cron 當錯誤。
+        assert!(!is_unscheduled(Some("not a cron")));
     }
 
     #[test]

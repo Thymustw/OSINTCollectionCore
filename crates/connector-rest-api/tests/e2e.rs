@@ -156,7 +156,8 @@ async fn rest_api_to_raw_evidence_round_trip() {
         name: "e2e-rest-connector".into(),
         connector_type: "rest_api".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 本測試直接呼叫 connector，不需 collector 排程。
+        enabled: false,
         configuration: json!({
             "path": "/v1/items",
             "method": "GET",
@@ -250,7 +251,8 @@ async fn rest_api_rejects_inline_authorization_header() {
         name: "e2e-rest-bad-connector".into(),
         connector_type: "rest_api".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 本測試直接呼叫 connector，不需 collector 排程。
+        enabled: false,
         configuration: json!({
             "path": "/v1/items",
             "headers": { "Authorization": "Bearer leaked" }

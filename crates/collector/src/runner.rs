@@ -1,6 +1,7 @@
 //! 一次收集：組裝 connector、落地、發事件、更新 checkpoint／Job。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use connector_rest_api::RestApiConnector;
@@ -25,7 +26,8 @@ use url::Url;
 
 use crate::bounds::RunBounds;
 use crate::error::CollectorError;
-use crate::registry::{KnownConnectorKind, classify_connector_type};
+use crate::registry::{KnownConnectorKind, classify_connector_type, is_import_only_type};
+use crate::schedule::{is_due, is_unscheduled};
 
 /// 一次收集的結果（測試可直接呼叫，不必等 cron）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +38,13 @@ pub enum CollectOutcome {
     Unchanged,
     /// 未知 connector_type，已記 log，沒有 panic。
     SkippedUnknownType { connector_type: String },
-    /// 沒有 schedule 或尚未到期。
+    /// 匯入／上傳專用類型，collector 不排程。
+    SkippedImportType { connector_type: String },
+    /// `schedule` 為空，只能手動觸發（目前沒有公開的手動觸發 API）。
+    SkippedUnscheduled,
+    /// cron 字串有值但解析失敗。
+    SkippedInvalidSchedule,
+    /// 有合法 schedule 但尚未到期。
     NotDue,
 }
 
@@ -50,6 +58,8 @@ pub struct CollectorRunner {
     bounds: RunBounds,
     metrics: MetricsRegistry,
     audit: Arc<MemoryAuditLog>,
+    /// tick 摘要的上次計數與上次印出時間。容量固定（兩個欄位），不隨 connector 數成長。
+    summary: Arc<Mutex<SummaryGate>>,
 }
 
 impl CollectorRunner {
@@ -70,6 +80,7 @@ impl CollectorRunner {
             bounds,
             metrics,
             audit: Arc::new(MemoryAuditLog::new()),
+            summary: Arc::new(Mutex::new(SummaryGate::default())),
         }
     }
 
@@ -84,6 +95,9 @@ impl CollectorRunner {
     }
 
     /// 讀 enabled connector，到期的才跑。單一失敗不中斷迴圈。
+    ///
+    /// log 量不隨 connector 數線性放大：匯入類型／空 schedule 靜默略過；真正的錯誤
+    /// 只在狀態改變時 warn／error，其餘降成 debug；每 tick 最多一行摘要。
     pub async fn tick(&self, now: chrono::DateTime<Utc>) -> Vec<(uuid::Uuid, CollectOutcome)> {
         let connectors = match self.store.list_enabled_connectors().await {
             Ok(list) => list,
@@ -94,22 +108,42 @@ impl CollectorRunner {
         };
         let mut results = Vec::new();
         let mut due = Vec::new();
+        let mut counts = TickCounts::default();
         for connector in connectors {
-            match crate::schedule::is_due(
-                connector.schedule.as_deref().unwrap_or(""),
-                connector.last_run,
-                now,
-            ) {
-                Ok(true) => due.push(connector),
-                Ok(false) => results.push((connector.id, CollectOutcome::NotDue)),
-                Err(err) => {
-                    tracing::warn!(
-                        connector_id = %connector.id,
-                        error = %err,
-                        "跳過：schedule 無法解析"
-                    );
-                    results.push((connector.id, CollectOutcome::NotDue));
+            let plan = plan_tick(&connector, now);
+            log_tick_plan(&plan, &connector);
+            match plan {
+                TickPlan::SkipImport => {
+                    counts.import_skipped += 1;
+                    results.push((
+                        connector.id,
+                        CollectOutcome::SkippedImportType {
+                            connector_type: connector.connector_type,
+                        },
+                    ));
                 }
+                TickPlan::SkipUnscheduled => {
+                    counts.unscheduled += 1;
+                    results.push((connector.id, CollectOutcome::SkippedUnscheduled));
+                }
+                TickPlan::SkipUnknownType => {
+                    counts.unknown_type += 1;
+                    let message = unknown_type_message(&connector.connector_type);
+                    self.persist_skip_error(&connector, &message).await;
+                    results.push((
+                        connector.id,
+                        CollectOutcome::SkippedUnknownType {
+                            connector_type: connector.connector_type,
+                        },
+                    ));
+                }
+                TickPlan::SkipInvalidSchedule { message } => {
+                    counts.invalid_schedule += 1;
+                    self.persist_skip_error(&connector, &message).await;
+                    results.push((connector.id, CollectOutcome::SkippedInvalidSchedule));
+                }
+                TickPlan::NotDue => results.push((connector.id, CollectOutcome::NotDue)),
+                TickPlan::Run => due.push(connector),
             }
         }
 
@@ -125,22 +159,48 @@ impl CollectorRunner {
                 let runner = self.clone();
                 set.spawn(async move {
                     let id = connector.id;
+                    let recovered_from_error = connector.status == "error";
                     let outcome = runner.run_connector(connector).await;
-                    (id, outcome)
+                    (id, recovered_from_error, outcome)
                 });
             }
             let Some(joined) = set.join_next().await else {
                 break;
             };
             match joined {
-                Ok((id, Ok(outcome))) => results.push((id, outcome)),
-                Ok((id, Err(err))) => {
-                    tracing::error!(connector_id = %id, error = %err, "收集失敗，繼續下一筆");
+                Ok((id, recovered_from_error, Ok(outcome))) => {
+                    if recovered_from_error {
+                        counts.recovered += 1;
+                    }
+                    results.push((id, outcome));
+                }
+                Ok((_id, _, Err(_err))) => {
+                    // 細節已在 run_known 依狀態變化記過，這裡只累計摘要。
+                    counts.collect_failed += 1;
                 }
                 Err(err) => tracing::error!(error = %err, "收集 task join 失敗"),
             }
         }
+        self.emit_tick_summary(&counts);
         results
+    }
+
+    /// 第一次把錯誤寫進 `checkpoint.last_error`；同一內容不重寫，避免 error_count 空轉。
+    async fn persist_skip_error(&self, connector: &Connector, message: &str) {
+        if is_repeat_error(connector, message) {
+            return;
+        }
+        if let Err(err) = mark_failure(&self.store, connector, message).await {
+            tracing::debug!(
+                connector_id = %connector.id,
+                error = %err,
+                "記錄 skip 原因到 connector 失敗"
+            );
+        }
+    }
+
+    fn emit_tick_summary(&self, counts: &TickCounts) {
+        emit_tick_summary_with(self.summary.as_ref(), counts, Instant::now());
     }
 
     /// 測試與手動觸發：不管 cron 是否到期。
@@ -148,13 +208,25 @@ impl CollectorRunner {
         &self,
         connector: Connector,
     ) -> Result<CollectOutcome, CollectorError> {
+        if is_import_only_type(&connector.connector_type) {
+            // tick() 不會走到這裡；測試仍依 SkippedUnknownType 斷言。
+            tracing::debug!(
+                connector_id = %connector.id,
+                connector_type = %connector.connector_type,
+                "匯入專用 connector_type，手動觸發也不會收集"
+            );
+            return Ok(CollectOutcome::SkippedUnknownType {
+                connector_type: connector.connector_type,
+            });
+        }
         match classify_connector_type(&connector.connector_type) {
             Some(kind) => self.run_known(kind, connector).await,
             None => {
-                tracing::warn!(
-                    connector_id = %connector.id,
-                    connector_type = %connector.connector_type,
-                    "未知 connector_type，跳過（尚未實作這個種類）"
+                let message = unknown_type_message(&connector.connector_type);
+                emit_connector_problem(
+                    &connector,
+                    &message,
+                    "未知 connector_type，跳過（尚未實作這個種類）",
                 );
                 Ok(CollectOutcome::SkippedUnknownType {
                     connector_type: connector.connector_type,
@@ -188,6 +260,12 @@ impl CollectorRunner {
 
         match self.collect_known(kind, &source, &connector).await {
             Ok(outcome) => {
+                if connector.status == "error" {
+                    tracing::info!(
+                        connector_id = %connector.id,
+                        "收集恢復成功"
+                    );
+                }
                 if let Err(err) = self
                     .jobs
                     .transition(job.id, JobStatus::Completed, None)
@@ -199,6 +277,7 @@ impl CollectorRunner {
             }
             Err(err) => {
                 let message = err.to_string();
+                emit_collect_failure(&connector, &err);
                 if let Err(job_err) = self
                     .jobs
                     .transition(job.id, JobStatus::Failed, Some(message.clone()))
@@ -417,4 +496,384 @@ async fn mark_failure<S: RelationalStore>(
     next.checkpoint = checkpoint;
     store.put_connector(&next).await?;
     Ok(())
+}
+
+/// tick 對單一 connector 的處置。抽成純函式，單元測試不必連 Postgres。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TickPlan {
+    SkipImport,
+    SkipUnscheduled,
+    SkipUnknownType,
+    SkipInvalidSchedule { message: String },
+    NotDue,
+    Run,
+}
+
+fn plan_tick(connector: &Connector, now: chrono::DateTime<Utc>) -> TickPlan {
+    if is_import_only_type(&connector.connector_type) {
+        return TickPlan::SkipImport;
+    }
+    if classify_connector_type(&connector.connector_type).is_none() {
+        return TickPlan::SkipUnknownType;
+    }
+    if is_unscheduled(connector.schedule.as_deref()) {
+        return TickPlan::SkipUnscheduled;
+    }
+    match is_due(
+        connector.schedule.as_deref().unwrap_or(""),
+        connector.last_run,
+        now,
+    ) {
+        Ok(true) => TickPlan::Run,
+        Ok(false) => TickPlan::NotDue,
+        Err(err) => TickPlan::SkipInvalidSchedule {
+            message: err.to_string(),
+        },
+    }
+}
+
+fn log_tick_plan(plan: &TickPlan, connector: &Connector) {
+    match plan {
+        // 匯入類型與空 schedule 連 debug 都不打：殘留數千筆時，debug 一樣會把磁碟吃光。
+        // 計數走 tick 摘要。
+        TickPlan::SkipImport | TickPlan::SkipUnscheduled | TickPlan::NotDue | TickPlan::Run => {}
+        TickPlan::SkipUnknownType => {
+            let message = unknown_type_message(&connector.connector_type);
+            emit_connector_problem(
+                connector,
+                &message,
+                "未知 connector_type，跳過（尚未實作這個種類）",
+            );
+        }
+        TickPlan::SkipInvalidSchedule { message } => {
+            emit_connector_problem(connector, message, "跳過：schedule 無法解析");
+        }
+    }
+}
+
+fn unknown_type_message(connector_type: &str) -> String {
+    format!("未知 connector_type：{connector_type}")
+}
+
+fn recorded_error(connector: &Connector) -> Option<&str> {
+    connector
+        .checkpoint
+        .get("last_error")
+        .and_then(|v| v.as_str())
+}
+
+/// 同一 connector、同一錯誤內容、且目前已是 error：視為重複，不該再打 warn。
+fn is_repeat_error(connector: &Connector, message: &str) -> bool {
+    connector.status == "error" && recorded_error(connector) == Some(message)
+}
+
+fn emit_connector_problem(connector: &Connector, message: &str, text: &str) {
+    if is_repeat_error(connector, message) {
+        tracing::debug!(
+            connector_id = %connector.id,
+            error = %message,
+            "{text}（與上次相同，已降成 debug）"
+        );
+    } else {
+        tracing::warn!(
+            connector_id = %connector.id,
+            error = %message,
+            "{text}"
+        );
+    }
+}
+
+fn emit_collect_failure(connector: &Connector, err: &CollectorError) {
+    if is_repeat_error(connector, &err.to_string()) {
+        tracing::debug!(
+            connector_id = %connector.id,
+            error = %err,
+            "收集失敗（與上次相同，已降成 debug）"
+        );
+    } else {
+        tracing::error!(
+            connector_id = %connector.id,
+            error = %err,
+            "收集失敗，繼續下一筆"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TickCounts {
+    import_skipped: usize,
+    unscheduled: usize,
+    unknown_type: usize,
+    invalid_schedule: usize,
+    collect_failed: usize,
+    recovered: usize,
+}
+
+impl TickCounts {
+    fn notable(&self) -> bool {
+        self.import_skipped
+            + self.unscheduled
+            + self.unknown_type
+            + self.invalid_schedule
+            + self.collect_failed
+            + self.recovered
+            > 0
+    }
+}
+
+#[derive(Debug, Default)]
+struct SummaryGate {
+    last_counts: TickCounts,
+    last_emitted: Option<Instant>,
+}
+
+/// 計數變化時立刻印；穩定殘留每 5 分鐘一筆心跳。
+///
+/// tick 預設 5 秒一次。若每 tick 印一行摘要，一天 17,280 行，殘留數千個
+/// connector 時仍是無意義的心跳。變化時立刻印，操作者看得到「剛修好／剛壞掉」；
+/// 穩定殘留改成 5 分鐘一筆，避免誤以為 collector 沒在跑。
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
+fn emit_tick_summary_with(gate: &Mutex<SummaryGate>, counts: &TickCounts, now: Instant) {
+    if !counts.notable() {
+        return;
+    }
+    let mut gate = gate.lock().unwrap_or_else(|err| err.into_inner());
+    let changed = gate.last_counts != *counts;
+    let due = gate
+        .last_emitted
+        .is_none_or(|t| now.saturating_duration_since(t) >= SUMMARY_INTERVAL);
+    if !changed && !due {
+        return;
+    }
+    if counts.collect_failed + counts.invalid_schedule + counts.unknown_type > 0 {
+        tracing::warn!(
+            import_skipped = counts.import_skipped,
+            unscheduled = counts.unscheduled,
+            unknown_type = counts.unknown_type,
+            invalid_schedule = counts.invalid_schedule,
+            collect_failed = counts.collect_failed,
+            recovered = counts.recovered,
+            "本輪 tick 略過／失敗摘要"
+        );
+    } else {
+        tracing::info!(
+            import_skipped = counts.import_skipped,
+            unscheduled = counts.unscheduled,
+            recovered = counts.recovered,
+            "本輪 tick 略過摘要"
+        );
+    }
+    gate.last_counts = counts.clone();
+    gate.last_emitted = Some(now);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    fn ts(y: i32, m: u32, d: u32, h: u32, min: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+    }
+
+    fn sample_connector(
+        connector_type: &str,
+        schedule: Option<&str>,
+        status: &str,
+        last_error: Option<&str>,
+    ) -> Connector {
+        let checkpoint = match last_error {
+            Some(msg) => json!({ "last_error": msg }),
+            None => json!({}),
+        };
+        Connector {
+            id: Uuid::nil(),
+            source_id: Uuid::nil(),
+            name: "test".into(),
+            connector_type: connector_type.into(),
+            version: "0.1.0".into(),
+            enabled: true,
+            configuration: json!({}),
+            credential_reference: None,
+            schedule: schedule.map(str::to_string),
+            rate_limit: json!({}),
+            timeout: json!({}),
+            proxy_reference: None,
+            checkpoint,
+            last_run: None,
+            last_success: None,
+            status: status.into(),
+            error_count: i32::from(last_error.is_some()),
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log buf").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogBuf {
+        fn into_string(self) -> String {
+            String::from_utf8(self.0.lock().expect("log buf").clone()).unwrap_or_default()
+        }
+    }
+
+    fn capture_logs(f: impl FnOnce()) -> String {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        buf.into_string()
+    }
+
+    fn has_warn_or_above(logs: &str) -> bool {
+        logs.lines()
+            .any(|line| line.contains("WARN") || line.contains("ERROR"))
+    }
+
+    #[test]
+    fn import_types_and_empty_schedule_are_silent_skips() {
+        let now = ts(2026, 10, 13, 12, 0);
+        for ty in [
+            "manual_upload",
+            "manual",
+            "json_import",
+            "csv_import",
+            "stix_import",
+        ] {
+            let c = sample_connector(ty, Some("*/15 * * * *"), "idle", None);
+            assert_eq!(plan_tick(&c, now), TickPlan::SkipImport, "{ty}");
+            let logs = capture_logs(|| log_tick_plan(&TickPlan::SkipImport, &c));
+            assert!(
+                !has_warn_or_above(&logs),
+                "匯入類型不該打 warn 以上：{logs}"
+            );
+        }
+        let empty = sample_connector("rss", None, "idle", None);
+        assert_eq!(plan_tick(&empty, now), TickPlan::SkipUnscheduled);
+        let logs = capture_logs(|| log_tick_plan(&TickPlan::SkipUnscheduled, &empty));
+        assert!(
+            !has_warn_or_above(&logs),
+            "空 schedule 不該打 warn 以上：{logs}"
+        );
+        let blank = sample_connector("rss", Some("  "), "idle", None);
+        assert_eq!(plan_tick(&blank, now), TickPlan::SkipUnscheduled);
+    }
+
+    #[test]
+    fn same_error_on_second_tick_is_debug_not_warn() {
+        let message = "cron `???` 無效：測試。請用 5 欄（分 時 日 月 週），例如 `*/15 * * * *`";
+        let first = sample_connector("rss", Some("???"), "idle", None);
+        let logs1 = capture_logs(|| {
+            emit_connector_problem(&first, message, "跳過：schedule 無法解析");
+        });
+        assert!(logs1.contains("WARN"), "第一次應打 warn：{logs1}");
+        assert!(!logs1.contains("已降成 debug"), "{logs1}");
+
+        let second = sample_connector("rss", Some("???"), "error", Some(message));
+        let logs2 = capture_logs(|| {
+            emit_connector_problem(&second, message, "跳過：schedule 無法解析");
+        });
+        assert!(
+            !has_warn_or_above(&logs2),
+            "同一錯誤第二次不該打 warn 以上：{logs2}"
+        );
+        assert!(
+            logs2.contains("DEBUG") || logs2.contains("debug"),
+            "第二次應降成 debug：{logs2}"
+        );
+    }
+
+    #[test]
+    fn error_content_change_warns_again() {
+        let previous = sample_connector("rss", Some("???"), "error", Some("舊的錯誤"));
+        let logs = capture_logs(|| {
+            emit_connector_problem(&previous, "新的錯誤", "跳過：schedule 無法解析");
+        });
+        assert!(logs.contains("WARN"), "錯誤內容變了要再打 warn：{logs}");
+    }
+
+    #[test]
+    fn collect_failure_repeat_is_debug() {
+        let err = CollectorError::Configuration {
+            message: "Source.base_url 是空的".into(),
+        };
+        let first = sample_connector("rss", Some("*/15 * * * *"), "idle", None);
+        let logs1 = capture_logs(|| emit_collect_failure(&first, &err));
+        assert!(logs1.contains("ERROR"), "第一次收集失敗應打 error：{logs1}");
+
+        let second = sample_connector("rss", Some("*/15 * * * *"), "error", Some(&err.to_string()));
+        let logs2 = capture_logs(|| emit_collect_failure(&second, &err));
+        assert!(
+            !has_warn_or_above(&logs2),
+            "同一收集錯誤第二次不該打 error：{logs2}"
+        );
+    }
+
+    #[test]
+    fn known_type_with_valid_cron_is_run_when_never_collected() {
+        let c = sample_connector("rss", Some("*/15 * * * *"), "idle", None);
+        assert_eq!(plan_tick(&c, ts(2026, 10, 13, 12, 0)), TickPlan::Run);
+    }
+
+    #[test]
+    fn invalid_cron_is_plan_error_not_unscheduled() {
+        let c = sample_connector("rss", Some("not a cron"), "idle", None);
+        match plan_tick(&c, ts(2026, 10, 13, 12, 0)) {
+            TickPlan::SkipInvalidSchedule { message } => {
+                assert!(message.contains("5 欄"), "{message}");
+            }
+            other => panic!("應為 SkipInvalidSchedule，實際 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summary_emits_on_change_but_not_every_tick() {
+        let gate = Mutex::new(SummaryGate::default());
+        let t0 = Instant::now();
+        let counts = TickCounts {
+            unscheduled: 10,
+            ..TickCounts::default()
+        };
+        let logs1 = capture_logs(|| emit_tick_summary_with(&gate, &counts, t0));
+        assert!(
+            logs1.contains("略過摘要") || logs1.contains("INFO"),
+            "第一次應印摘要：{logs1}"
+        );
+
+        let logs2 =
+            capture_logs(|| emit_tick_summary_with(&gate, &counts, t0 + Duration::from_secs(5)));
+        assert!(logs2.is_empty(), "計數沒變且未滿 5 分鐘不該再印：{logs2}");
+
+        let changed = TickCounts {
+            unscheduled: 3,
+            ..TickCounts::default()
+        };
+        let logs3 =
+            capture_logs(|| emit_tick_summary_with(&gate, &changed, t0 + Duration::from_secs(6)));
+        assert!(!logs3.is_empty(), "計數變了要立刻印：{logs3}");
+    }
 }

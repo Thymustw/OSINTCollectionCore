@@ -162,7 +162,8 @@ async fn seed_connector(pg: &PostgresCanonicalStore, source: &Source) -> Connect
         name: format!("stix-e2e-connector-{}", Uuid::now_v7()),
         connector_type: "stix_import".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 匯入專用，且測試不走 collector 排程。enabled 殘留會每 tick 重打 log。
+        enabled: false,
         configuration: json!({}),
         credential_reference: None,
         schedule: None,

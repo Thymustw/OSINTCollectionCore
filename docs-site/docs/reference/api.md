@@ -92,6 +92,11 @@ Authorization: Bearer <token>
 | `POST` | `/api/v1/connectors` | operator | 建立連接器 |
 | `PATCH` | `/api/v1/connectors/{id}` | operator | 更新連接器（需要 `If-Match`） |
 
+自動抓取的 connector 需要合法的 5 欄 cron `schedule`（例如 `*/15 * * * *`）才會被
+collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有公開的手動觸發 API）。
+匯入專用類型（`manual_upload`／`json_import`／`csv_import`／`stix_import`）走
+`POST /api/v1/import`，不會被 collector 排程。
+
 ---
 
 ## 匯入

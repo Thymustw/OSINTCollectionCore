@@ -91,6 +91,16 @@ x-osint-depends: &osint-depends
   neo4j:
     condition: service_healthy
 
+x-osint-logging: &osint-logging
+  # 2026-10-13：collector 的 json-file log 長到 75 GB（無輪替 + 每 5 秒對數千個
+  # 測試殘留連接器重複 warn，實測約 13 GB／天）。docker 預設 json-file 沒有上限，
+  # 任何一個服務 log 失控都會吃掉這台與 VM 共用的根磁碟（CLAUDE.md §15）。
+  # 每個服務最多 3 × 50 MB；要更久的歷史請接集中式 log，不要調大這裡。
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 x-osint-build: &osint-build
   context: ..
   dockerfile: docker/Dockerfile
@@ -124,6 +134,7 @@ services:
       retries: 10
       start_period: 15s
     restart: unless-stopped
+    logging: *osint-logging
 
   # ⚠️ 這裡的 512m heap **跑不動 V0.2 的 embedding 模型**。
   # scripts/opensearch-ml-setup.sh 需要容器 2 GB + heap 1 GB，低於此值
@@ -161,6 +172,7 @@ services:
       retries: 20
       start_period: 90s
     restart: unless-stopped
+    logging: *osint-logging
 
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v26.2.2
@@ -214,6 +226,7 @@ services:
       retries: 20
       start_period: 30s
     restart: unless-stopped
+    logging: *osint-logging
 
   redis:
     image: redis:7.4-bookworm
@@ -239,6 +252,7 @@ services:
       retries: 10
       start_period: 5s
     restart: unless-stopped
+    logging: *osint-logging
 
   seaweedfs:
     # 2026-09：MinIO CE 已於 2026-02 被官方封存。CI 連續兩次在 `docker compose pull`
@@ -302,6 +316,7 @@ services:
       retries: 12
       start_period: 20s
     restart: unless-stopped
+    logging: *osint-logging
 
   # V0.2 的圖投影（SPEC_V0.2 §8 Graph Projection／§9 Graph API）。
   #
@@ -363,6 +378,7 @@ services:
       retries: 15
       start_period: 40s
     restart: unless-stopped
+    logging: *osint-logging
 
   # =========================================================================
   # 應用服務（SPEC §27 exit criteria：docker compose 可啟動整套）
@@ -393,6 +409,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-collector:
     build:
@@ -410,6 +427,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-normalizer:
     build:
@@ -427,6 +445,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-deduplicator:
     build:
@@ -444,6 +463,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-entity-worker:
     build:
@@ -461,6 +481,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-indexer:
     build:
@@ -478,6 +499,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-graph-worker:
     build:
@@ -495,6 +517,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-embedding-worker:
     build:
@@ -512,6 +535,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   osint-stix-worker:
     build:
@@ -529,6 +553,7 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
 
   # V0.3 Discovery Engine（Graph Expansion + Source Expansion）。訂閱
   # job.dispatched，只執行 job_type=discovery_run。2026-09-30 補上容器化，
@@ -549,3 +574,4 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging

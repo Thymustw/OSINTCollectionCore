@@ -122,7 +122,8 @@ async fn seed_rss_connector(
         name: format!("e2e-rss-connector-{}", Uuid::now_v7()),
         connector_type: connector_type.into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 測試走 run_connector，不需 collector 排程。enabled 殘留會每 tick 重打 log。
+        enabled: false,
         configuration: json!({ "url": feed_url }),
         credential_reference: None,
         schedule: Some("*/15 * * * *".into()),
@@ -446,7 +447,8 @@ async fn unknown_connector_type_is_skipped() {
         name: "e2e-manual-upload".into(),
         connector_type: "manual_upload".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 匯入專用；測試走 run_connector，不需 collector 排程。
+        enabled: false,
         configuration: json!({}),
         credential_reference: None,
         schedule: Some("*/15 * * * *".into()),
@@ -498,7 +500,8 @@ async fn unknown_content_type_is_skipped_not_panic() {
         name: "e2e-pdf-connector".into(),
         connector_type: "manual".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 匯入專用；測試走 run_connector，不需 collector 排程。
+        enabled: false,
         configuration: json!({}),
         credential_reference: None,
         schedule: None,
@@ -665,7 +668,8 @@ async fn seed_http_connector(
         name: format!("e2e-{connector_type}-connector-{}", Uuid::now_v7()),
         connector_type: connector_type.into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 測試走 run_connector，不需 collector 排程。enabled 殘留會每 tick 重打 log。
+        enabled: false,
         configuration,
         credential_reference: None,
         schedule: Some("*/15 * * * *".into()),

@@ -279,6 +279,11 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
             message: "剛寫入且 enabled 的 connector 沒有出現在 list_enabled_connectors".into(),
         });
     }
+    // 驗證完立刻停用：conformance 跑在共用開發 DB，留下 enabled=true
+    // 會被 collector 排程（2026-10-13 log 洪水）。後續只當 FK 用，不需排程。
+    let mut disable_after_list = connector.clone();
+    disable_after_list.enabled = false;
+    store.put_connector(&disable_after_list).await?;
     let listed = store
         .list_connectors(Some(next_uuid(connector.id)), 10)
         .await?;
@@ -905,7 +910,8 @@ pub async fn assert_list_sources_by_entity<S: RelationalStore>(
             name: format!("src-by-entity-{suffix}"),
             connector_type: "rss".into(),
             version: "0.1.0".into(),
-            enabled: true,
+            // 只當 raw_evidence 的 FK；不需 collector 排程。
+            enabled: false,
             configuration: json!({}),
             credential_reference: None,
             schedule: None,
@@ -1123,7 +1129,8 @@ pub async fn assert_evidence_collections<S: RelationalStore>(
         name: format!("ev-col-conn-{suffix}"),
         connector_type: "rss".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 只當 raw_evidence 的 FK；不需 collector 排程。
+        enabled: false,
         configuration: json!({}),
         credential_reference: None,
         schedule: None,

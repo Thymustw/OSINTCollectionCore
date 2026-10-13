@@ -715,6 +715,20 @@ async fn connector_create_validates_source_and_credentials() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // 上面 PATCH 把 connector 打開了；測完停用，避免 collector 排程殘留。
+    let mut leftover = stack
+        .pg
+        .get_connector(id)
+        .await
+        .expect("get leftover")
+        .expect("connector 還在");
+    leftover.enabled = false;
+    stack
+        .pg
+        .put_connector(&leftover)
+        .await
+        .expect("disable leftover connector");
 }
 
 /// `?enabled=` 的過濾必須在 SQL 做：停用的 connector 不能因為「不在最新一頁」而消失。
@@ -768,6 +782,15 @@ async fn connector_enabled_filter_is_applied_in_sql() {
         .await
         .is_some()
     );
+
+    // 這支必須建 enabled=true 才能驗過濾；測完立刻停用，避免 collector 排程殘留。
+    let mut leftover = enabled;
+    leftover.enabled = false;
+    stack
+        .pg
+        .put_connector(&leftover)
+        .await
+        .expect("disable leftover connector");
 }
 
 // ---------------------------------------------------------------- collections
@@ -778,7 +801,7 @@ async fn collection_create_links_and_detail() {
     let api = build_api(&stack, None);
     let source = new_source(SourceType::Rss);
     stack.pg.put_source(&source).await.expect("seed");
-    let connector = new_connector(source.id, true);
+    let connector = new_connector(source.id, false);
     stack.pg.put_connector(&connector).await.expect("seed");
 
     // 關聯不存在 → 422，而且不可以留下半成品。
@@ -872,7 +895,7 @@ async fn collection_link_unlink_and_budget() {
     let api = build_api(&stack, None);
     let source = new_source(SourceType::Rss);
     stack.pg.put_source(&source).await.expect("seed source");
-    let connector = new_connector(source.id, true);
+    let connector = new_connector(source.id, false);
     stack
         .pg
         .put_connector(&connector)
@@ -1170,7 +1193,7 @@ async fn collection_membership_cap_rejects_the_51st_and_is_idempotent() {
     let api = build_api(&stack, None);
     let source = new_source(SourceType::Rss);
     stack.pg.put_source(&source).await.expect("seed source");
-    let connector = new_connector(source.id, true);
+    let connector = new_connector(source.id, false);
     stack
         .pg
         .put_connector(&connector)
@@ -1490,7 +1513,7 @@ async fn object_detail_carries_the_provenance_chain() {
 
     let source = new_source(SourceType::Rss);
     stack.pg.put_source(&source).await.expect("seed");
-    let connector = new_connector(source.id, true);
+    let connector = new_connector(source.id, false);
     stack.pg.put_connector(&connector).await.expect("seed");
     let key = format!("raw/e2e/{}", Uuid::now_v7());
     let evidence = new_raw_evidence(source.id, connector.id, &key, 5);
@@ -1791,7 +1814,7 @@ async fn raw_metadata_and_body() {
     let api = build_api(&stack, None);
     let source = new_source(SourceType::Rss);
     stack.pg.put_source(&source).await.expect("seed");
-    let connector = new_connector(source.id, true);
+    let connector = new_connector(source.id, false);
     stack.pg.put_connector(&connector).await.expect("seed");
 
     // --- UTF-8 ---

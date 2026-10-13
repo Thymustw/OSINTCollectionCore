@@ -179,7 +179,8 @@ fn seed_source_connector(
         name: "e2e-static-web-connector".into(),
         connector_type: "static_web".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 本測試直接呼叫 connector，不需 collector 排程。
+        enabled: false,
         configuration: json!({ "url": page_url }),
         credential_reference: None,
         schedule: None,

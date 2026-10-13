@@ -130,7 +130,8 @@ async fn rss_to_raw_evidence_round_trip() {
         name: "e2e-rss-connector".into(),
         connector_type: "rss".into(),
         version: "0.1.0".into(),
-        enabled: true,
+        // 本測試直接呼叫 connector，不需 collector 排程。
+        enabled: false,
         configuration: json!({ "url": feed_url }),
         credential_reference: None,
         schedule: None,

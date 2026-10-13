@@ -80,6 +80,43 @@ make compose-down-full    # 停掉
 
 ⚠️ 容器版與 `cargo run` 版**不能同時跑**，兩者搶同一組 18080–18089。
 
+### Docker log 輪替（2026-10-13 collector 75 GB 事故）
+
+`docker/docker-compose.yml` 用 YAML anchor `x-osint-logging` 套到全部 16 個服務
+（基礎設施 6 + 應用 10）：
+
+```yaml
+x-osint-logging: &osint-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+```
+
+每個服務最多留 3 × 50 MB。docker 預設的 json-file **沒有上限**，任何一個服務
+log 失控都會吃掉這台與 VM 共用的根磁碟（CLAUDE.md §15）。
+
+2026-10-13 實測：`osint-core-osint-collector-1` 的 json-file log 長到 **75 GB**，
+約 **13 GB／天**（166 KB/s）。根因三點疊在一起：
+
+1. `tick_secs = 5`，每個 tick 掃全部 `enabled` connector。當時共用開發 DB 累積
+   6,801 個測試殘留（都還 enabled）。
+2. 對每個壞掉的 connector **每個 tick 都重寫一次 warn／error**。最近 20,000 行：
+   15,060 筆 `跳過：schedule 無法解析`（schedule 為空，被當成解析失敗）、
+   2,342 筆收集失敗、1,392 筆假 server 已關、780 筆未知 `connector_type`
+   （`manual_upload`／`json_import`／`csv_import`／`manual` 這類匯入專用類型）。
+3. 容器 log 沒有輪替。
+
+程式側已改成：匯入專用類型與空 schedule 靜默略過；真正的錯誤只在狀態改變時
+打 warn／error；每 tick 最多一行摘要（計數變化立刻印，穩定殘留每 5 分鐘一筆）。
+見 `docs/developer/collector-normalizer.md`。
+
+**測試建立的 connector 必須 `enabled=false` 或在測試結束時停用／刪掉。**
+`run_connector` 不看 `enabled`，所以走手動觸發的 e2e 不需要把 connector 打開。
+留下 `enabled=true` 的殘留，collector 一啟動就會把它們排進每個 tick。
+`raw_evidence.connector_id` 沒有 `ON DELETE CASCADE`，有證據的 connector 刪不掉，
+停用即可。
+
 ### 本機跑 vs 容器內跑：設定完全不一樣
 
 這是最容易踩的一格。同一個邏輯後端，兩邊的位址不同：
