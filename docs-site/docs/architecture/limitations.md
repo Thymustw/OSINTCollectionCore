@@ -80,11 +80,11 @@
 
 ## AI 相關的限制
 
-### Discovery 的每日 AI 配額欄位設定了但尚未生效
+### Discovery 預算有三個欄位設定了但尚未生效
 
-**現況：** Discovery Budget 裡的 `max_ai_calls_per_run`、`daily_ai_budget` 這兩個配額欄位在介面和資料庫結構都存在，但目前沒有任何執行流程會消耗它們。真正會被消耗的配額只有 `max_candidates_per_run`、`daily_request_budget`、`max_depth`。
+**現況：** Discovery Budget 裡的 `max_requests_per_run`、`max_ai_calls_per_run`、`daily_ai_budget` 這三個欄位可以設定、會存進資料庫、API 也會回傳，但目前沒有任何執行流程會讀取它們。真正會被檢查的只有 `max_candidates_per_run`、`daily_request_budget`、`max_depth`。
 
-**影響：** 就算把 `daily_ai_budget` 設為 0，目前也不會阻止任何 AI 呼叫。
+**影響：** 把這三個欄位設成很小的值，也不會限制任何東西。要控制 Discovery 的規模，請用 `max_candidates_per_run` 與 `daily_request_budget`。
 
 ### 資源壓力感知永遠回報「正常」
 
@@ -157,6 +157,30 @@
 **影響：** 當下游（例如 OpenSearch）處理速度跟不上收集速度時，Redpanda 的積壓會增加，但收集器不會自動放慢。
 
 **目前替代做法：** 手動調整 `[collector].tick_secs`（收集間隔）、`global_inflight`（全域並發上限）、`per_domain_inflight`（每網域並發上限），或暫停特定 Connector。
+
+### 收集失敗的連接器每一輪都會重試
+
+**現況：** 一個連接器收集失敗後，下一輪排程到期時會再試一次，沒有「連續失敗幾次就拉長間隔」的機制。每一次嘗試都會留下一筆工作紀錄。
+
+**影響：** 壞掉的連接器很多時，每一輪排程都要花時間逐一重試它們，正常的連接器會被拖慢；實測有數千個失敗連接器時，一輪排程約需 7 分鐘。工作紀錄也會持續增加：實測曾累積約 416 萬筆失敗紀錄、佔約 1 GB。
+
+**目前替代做法：** 確定修不好的連接器請停用（`PATCH /api/v1/connectors/{id}` 設 `enabled: false`），不要讓它留在排程裡。
+
+### 收集服務無法優雅停止
+
+**現況：** `osint-collector` 收到停止訊號後，不會在容器平台的等待時間（10 秒）內結束，最後被強制終止。
+
+**影響：** 停止或重啟服務時，正在進行的收集會被直接中斷，那一次收集要等下一輪重來。中斷當下的工作紀錄可能停在「執行中」。
+
+---
+
+## 事件
+
+### 發現引擎的事件只有定義，沒有發送
+
+**現況：** 種子建立、候選建立／核准／拒絕、Discovery 開始／完成、AI 呼叫開始／完成／失敗這 10 種事件（`seed.created`、`candidate.approved` 等）已經定義了名稱與格式，但目前沒有任何程式會發送它們。
+
+**影響：** 如果你寫了一個程式訂閱這些事件，它不會收到任何東西。要知道候選或 Discovery 的變化，目前只能定期查 API（例如 `GET /api/v1/candidates`）。
 
 ---
 

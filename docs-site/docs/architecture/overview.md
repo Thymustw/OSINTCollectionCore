@@ -119,7 +119,9 @@ SSRF 防護預設拒絕私網位址，放行需要 operator 設定 `NetworkRule`
 ### osint-deduplicator
 
 **偵測重複文件並標記，不刪除任何資料。**
-依序用五個策略比對：platform+external_id、URL 正規化、SHA-256、SimHash 相似度、語意（目前介面保留）。
+依序用五個策略比對：platform+external_id、URL 正規化、SHA-256、SimHash 相似度、語意相似度。
+第五階段（語意）用 OpenSearch 的向量搜尋找最相近的既有文件；命中後會回 PostgreSQL 確認那份文件真的存在，才判定為重複——搜尋索引可能殘留已刪除的文件。
+向量模型或 OpenSearch 連不上時，第五階段自動停用，前四階段照常運作。
 
 - 訂閱：`object.normalized`
 - 讀寫：PostgreSQL（Document 狀態、DuplicateGroup）

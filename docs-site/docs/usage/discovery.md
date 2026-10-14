@@ -134,16 +134,21 @@ entity_extractions
 
 每個 Collection 都有配額設定，防止 Discovery 無限制展開：
 
-| 欄位 | 說明 | 保守預設值 |
-|---|---|---|
-| `max_candidates_per_run` | 單次 run 最多產生幾筆候選 | 200 |
-| `max_requests_per_run` | 單次 run 最多發出幾次外部請求 | 500 |
-| `max_ai_calls_per_run` | 單次 run 最多呼叫幾次 AI | 50 |
-| `max_depth` | Discovery 展開的最大深度 | 3 |
-| `daily_request_budget` | 這個 Collection 每日最多幾次請求（跨多次 run 累計） | 5,000 |
-| `daily_ai_budget` | 每日最多幾次 AI 呼叫 | 500 |
+| 欄位 | 說明 | 保守預設值 | 目前是否生效 |
+|---|---|---|---|
+| `max_candidates_per_run` | 單次 run 最多產生幾筆候選，超過的截斷 | 200 | 生效 |
+| `max_depth` | Discovery 展開的最大深度 | 3 | 生效 |
+| `daily_request_budget` | 這個 Collection 每日最多幾次 Discovery 擴張（跨多次 run 累計，每次擴張消耗 1） | 5,000 | 生效 |
+| `max_requests_per_run` | 單次 run 最多發出幾次外部請求 | 500 | **尚未生效** |
+| `max_ai_calls_per_run` | 單次 run 最多呼叫幾次 AI | 50 | **尚未生效** |
+| `daily_ai_budget` | 每日最多幾次 AI 呼叫 | 500 | **尚未生效** |
 
 沒有明確設定時，系統退回上面的保守預設值——沒有設定不代表沒有限制。
+
+!!! warning "三個欄位目前沒有作用"
+    `max_requests_per_run`、`max_ai_calls_per_run`、`daily_ai_budget` 可以設定、會被儲存與回傳，
+    但目前沒有任何執行流程讀取它們。設成很小的值也不會限制任何東西。
+    見[目前的限制](../architecture/limitations.md)。
 
 當日 `daily_request_budget` 已用完，或 `depth + 1 > max_depth` 時，Discovery 會直接拒絕而不是部分執行。
 
