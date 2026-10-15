@@ -524,6 +524,22 @@ mod tests {
         ) -> Result<bool, StorageError> {
             Self::unsupported("unlink_collection_connector")
         }
+        async fn link_collection_members(
+            &self,
+            _: CollectionId,
+            _: &[SourceId],
+            _: &[ConnectorId],
+        ) -> Result<(), StorageError> {
+            Self::unsupported("link_collection_members")
+        }
+        async fn create_collection_with_members(
+            &self,
+            _: &Collection,
+            _: &[SourceId],
+            _: &[ConnectorId],
+        ) -> Result<(), StorageError> {
+            Self::unsupported("create_collection_with_members")
+        }
         async fn insert_raw_evidence(
             &self,
             _: &RawEvidence,
@@ -944,6 +960,13 @@ mod tests {
         }
         async fn put_candidate_evidence(&self, _: &CandidateEvidence) -> Result<(), StorageError> {
             Self::unsupported("put_candidate_evidence")
+        }
+        async fn record_candidate_discovery(
+            &self,
+            _: &Candidate,
+            _: &CandidateEvidence,
+        ) -> Result<storage_core::CandidateDiscoveryOutcome, StorageError> {
+            Self::unsupported("record_candidate_discovery")
         }
         async fn get_candidate_evidence(
             &self,

@@ -728,6 +728,76 @@ async fn stage_3_matches_on_normalized_content_hash() {
     assert_duplicate(&outcome, first.id, DedupStage::ContentHash);
 }
 
+// ---------------------------------------------------------------------------
+// KNOWN_GAPS §16：匯入合成的 `import://{kind}/{filename}` 不可當 Stage 2 的鍵
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn synthetic_import_url_with_same_filename_but_different_content_is_not_duplicate() {
+    let stack = connect_stack().await;
+    let run = Uuid::now_v7();
+    // platform = None → Stage 1 不適用；short_body → 沒有 SimHash，Stage 4 不適用。
+    // 唯一可能命中的就是 Stage 2（同一個合成 URI）——修好之前這裡會被判重複。
+    let source = seed_source(&stack.pg, None, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+    let synthetic = format!("import://json/data-{run}.json");
+
+    let first = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        None,
+        &synthetic,
+        &format!("Batch one {run}"),
+        &short_body(run, "import batch one"),
+    )
+    .await;
+    let second = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        None,
+        &synthetic,
+        &format!("Batch two {run}"),
+        &short_body(run, "import batch two"),
+    )
+    .await;
+
+    let service = dedup(&stack, None);
+    service.dedup_document(first.id).await.expect("first");
+    let outcome = service.dedup_document(second.id).await.expect("second");
+    assert!(
+        matches!(outcome, DedupOutcome::Canonical { document_id } if document_id == second.id),
+        "同檔名但內容不同的匯入不可被判成重複（合成 URI 不是文章身分），實際 {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn synthetic_import_url_with_same_content_is_still_duplicate_via_content_hash() {
+    let stack = connect_stack().await;
+    let run = Uuid::now_v7();
+    let source = seed_source(&stack.pg, None, None).await;
+    let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
+    let synthetic = format!("import://json/data-{run}.json");
+    let title = format!("Same batch {run}");
+    let body = short_body(run, "import identical batch");
+
+    let first = seed_document(
+        &stack.pg, &source, &connector, None, &synthetic, &title, &body,
+    )
+    .await;
+    let second = seed_document(
+        &stack.pg, &source, &connector, None, &synthetic, &title, &body,
+    )
+    .await;
+
+    let service = dedup(&stack, None);
+    service.dedup_document(first.id).await.expect("first");
+    let outcome = service.dedup_document(second.id).await.expect("second");
+    // 排除合成 URI 只是讓 Stage 2 不適用；內容真的一樣時 Stage 3 仍要抓到。
+    assert_duplicate(&outcome, first.id, DedupStage::ContentHash);
+}
+
 #[tokio::test]
 async fn stage_4_matches_near_duplicate_via_simhash() {
     let stack = connect_stack().await;

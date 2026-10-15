@@ -1404,6 +1404,445 @@ pub async fn assert_evidence_collections<S: RelationalStore>(
     Ok(())
 }
 
+fn conformance_err(message: String) -> StorageError {
+    StorageError::Unknown {
+        backend: "conformance",
+        message,
+    }
+}
+
+fn conformance_collection(name: String) -> Collection {
+    Collection {
+        id: Uuid::now_v7(),
+        workspace_id: None,
+        name,
+        description: None,
+        status: "active".into(),
+        priority: 1,
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+    }
+}
+
+/// 集合↔來源／連接器的**批次**關聯寫入必須是全有或全無。
+///
+/// 1. `link_collection_members` 一批全部合法 → 全部掛上；重送同一批不報錯（冪等）。
+/// 2. 一批中有一筆不存在的 source id → `ConstraintViolation`，**同批其他合法的也不能掛上**。
+/// 3. 一批中有一筆不存在的 connector id → 同上（source 與 connector 混在同一批）。
+/// 4. `create_collection_with_members` 關聯有一筆無效 → 集合本身也不存在。
+/// 5. `create_collection_with_members` 全部合法 → 集合與關聯都寫入。
+pub async fn assert_collection_member_links_atomic<S: RelationalStore>(
+    store: &S,
+) -> Result<(), StorageError> {
+    let suffix = Uuid::now_v7().simple().to_string();
+    let mut sources = Vec::new();
+    for i in 0..2 {
+        let source = Source {
+            id: Uuid::now_v7(),
+            name: format!("link-batch-src-{i}-{suffix}"),
+            source_type: SourceType::Rss,
+            platform: None,
+            base_url: Some("https://example.invalid/link-batch".into()),
+            description: None,
+            language: None,
+            country: None,
+            enabled: true,
+            collection_policy: json!({}),
+            created_at: fixture_ts(),
+            updated_at: fixture_ts(),
+            last_seen: None,
+        };
+        store.put_source(&source).await?;
+        sources.push(source.id);
+    }
+    let connector = Connector {
+        id: Uuid::now_v7(),
+        source_id: sources[0],
+        name: format!("link-batch-conn-{suffix}"),
+        connector_type: "rss".into(),
+        version: "0.1.0".into(),
+        enabled: false,
+        configuration: json!({}),
+        credential_reference: None,
+        schedule: None,
+        rate_limit: json!({}),
+        timeout: json!({}),
+        proxy_reference: None,
+        checkpoint: json!({}),
+        last_run: None,
+        last_success: None,
+        status: "idle".into(),
+        error_count: 0,
+    };
+    store.put_connector(&connector).await?;
+
+    // 1. 全部合法。
+    let ok = conformance_collection(format!("link-batch-ok-{suffix}"));
+    store.put_collection(&ok).await?;
+    store
+        .link_collection_members(ok.id, &sources, &[connector.id])
+        .await?;
+    store
+        .link_collection_members(ok.id, &sources, &[connector.id])
+        .await?;
+    let linked = store.list_collection_sources(ok.id, 100).await?;
+    if linked.len() != 2 || !sources.iter().all(|s| linked.contains(s)) {
+        return Err(conformance_err(format!(
+            "link_collection_members 應掛上兩個來源（重送冪等），實際 {linked:?}"
+        )));
+    }
+    if store.list_collection_connectors(ok.id, 100).await? != vec![connector.id] {
+        return Err(conformance_err(
+            "link_collection_members 應掛上 connector".into(),
+        ));
+    }
+
+    // 2. 一批中夾一筆不存在的 source。
+    let partial = conformance_collection(format!("link-batch-partial-{suffix}"));
+    store.put_collection(&partial).await?;
+    let missing = Uuid::now_v7();
+    match store
+        .link_collection_members(partial.id, &[sources[0], missing, sources[1]], &[])
+        .await
+    {
+        Err(StorageError::ConstraintViolation { .. }) => {}
+        other => {
+            return Err(conformance_err(format!(
+                "批次中有不存在的 source id 應回 ConstraintViolation，實際 {other:?}"
+            )));
+        }
+    }
+    let after = store.list_collection_sources(partial.id, 100).await?;
+    if !after.is_empty() {
+        return Err(conformance_err(format!(
+            "批次失敗後不可留下部分關聯（同批合法的也要回滾），實際 {after:?}"
+        )));
+    }
+
+    // 3. source 合法、connector 不存在，混在同一批。
+    match store
+        .link_collection_members(partial.id, &sources, &[Uuid::now_v7()])
+        .await
+    {
+        Err(StorageError::ConstraintViolation { .. }) => {}
+        other => {
+            return Err(conformance_err(format!(
+                "批次中有不存在的 connector id 應回 ConstraintViolation，實際 {other:?}"
+            )));
+        }
+    }
+    if !store
+        .list_collection_sources(partial.id, 100)
+        .await?
+        .is_empty()
+    {
+        return Err(conformance_err(
+            "connector 寫入失敗時，同批的 source 關聯也必須回滾".into(),
+        ));
+    }
+
+    // 4. 建集合 + 關聯，有一筆無效 → 集合也不存在。
+    let doomed = conformance_collection(format!("link-batch-doomed-{suffix}"));
+    match store
+        .create_collection_with_members(&doomed, &[sources[0], Uuid::now_v7()], &[])
+        .await
+    {
+        Err(StorageError::ConstraintViolation { .. }) => {}
+        other => {
+            return Err(conformance_err(format!(
+                "create_collection_with_members 關聯無效應回 ConstraintViolation，實際 {other:?}"
+            )));
+        }
+    }
+    if store.get_collection(doomed.id).await?.is_some() {
+        return Err(conformance_err(
+            "create_collection_with_members 失敗後不可留下集合本身".into(),
+        ));
+    }
+    if store
+        .list_collections_by_source(sources[0], 100)
+        .await?
+        .contains(&doomed.id)
+    {
+        return Err(conformance_err(
+            "create_collection_with_members 失敗後不可留下關聯".into(),
+        ));
+    }
+
+    // 5. 全部合法。
+    let created = conformance_collection(format!("link-batch-created-{suffix}"));
+    store
+        .create_collection_with_members(&created, &sources, &[connector.id])
+        .await?;
+    if store.get_collection(created.id).await?.is_none()
+        || store.list_collection_sources(created.id, 100).await?.len() != 2
+        || store.list_collection_connectors(created.id, 100).await? != vec![connector.id]
+    {
+        return Err(conformance_err(
+            "create_collection_with_members 成功後集合與關聯都要讀得到".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Candidate 自然鍵 `(collection_id, candidate_type, normalized_value)` 查重
+/// （`record_candidate_discovery`）。
+///
+/// 1. 第一次寫入 → `created = true`、`evidence_added = true`。
+/// 2. 同自然鍵、新 id、同一份證據 → 沿用既有候選，`created = false`、
+///    `evidence_added = false`；候選數與證據數都不變。
+/// 3. 同自然鍵、不同證據 → 附加到既有候選（`evidence.candidate_id` 被改指既有候選）。
+/// 4. 既有候選已 `rejected` → 再次發現後仍是 `rejected`、不新增候選，只附加證據。
+/// 5. 不同集合的同值 → 各自一筆（自然鍵包含 collection_id）。
+/// 6. 不同 candidate_type 的同值 → 各自一筆。
+/// 7. 直接用 `put_candidate` 寫同自然鍵、不同 id → `Conflict`（唯一索引真的存在，
+///    不是只有應用層在擋）。
+pub async fn assert_candidate_natural_key<S: RelationalStore>(
+    store: &S,
+) -> Result<(), StorageError> {
+    let suffix = Uuid::now_v7().simple().to_string();
+    let col_a = conformance_collection(format!("cand-nk-a-{suffix}"));
+    let col_b = conformance_collection(format!("cand-nk-b-{suffix}"));
+    store.put_collection(&col_a).await?;
+    store.put_collection(&col_b).await?;
+    let value = format!("cand-nk-{suffix}");
+
+    let make = |collection_id: Uuid, candidate_type: CandidateType| Candidate {
+        id: Uuid::now_v7(),
+        candidate_type,
+        value: value.clone(),
+        normalized_value: value.to_lowercase(),
+        collection_id: Some(collection_id),
+        discovered_by: "conformance".into(),
+        discovery_method: "graph_expansion".into(),
+        confidence: 0.4,
+        score: 0.4,
+        status: CandidateStatus::Pending,
+        depth: 1,
+        created_at: fixture_ts(),
+        reviewed_at: None,
+    };
+    let evidence = |reason: &str| CandidateEvidence {
+        id: Uuid::now_v7(),
+        // 刻意放一個不相干的 id：契約是「以實際落地的候選為準」。
+        candidate_id: Uuid::now_v7(),
+        object_id: None,
+        entity_id: None,
+        relationship_id: None,
+        raw_evidence_id: None,
+        reason: reason.into(),
+        weight: 0.4,
+        created_at: fixture_ts(),
+    };
+    let count_in = |collection_id: Uuid| async move {
+        store
+            .list_candidates_by_collection(collection_id, None, None, 100)
+            .await
+            .map(|v| v.len())
+    };
+
+    // 1.
+    let first = store
+        .record_candidate_discovery(&make(col_a.id, CandidateType::Entity), &evidence("r1"))
+        .await?;
+    if !first.created || !first.evidence_added {
+        return Err(conformance_err(format!(
+            "第一次寫入應新建候選與證據，實際 {first:?}"
+        )));
+    }
+
+    // 2. 重跑同一個發現。
+    let again = store
+        .record_candidate_discovery(&make(col_a.id, CandidateType::Entity), &evidence("r1"))
+        .await?;
+    if again.created || again.evidence_added || again.candidate_id != first.candidate_id {
+        return Err(conformance_err(format!(
+            "同自然鍵同證據應沿用既有候選且不重複附加證據，實際 {again:?}（既有 {}）",
+            first.candidate_id
+        )));
+    }
+    if count_in(col_a.id).await? != 1 {
+        return Err(conformance_err("重跑後候選數應仍為 1".into()));
+    }
+    let ev = store
+        .list_candidate_evidence_by_candidate(first.candidate_id, 100)
+        .await?;
+    if ev.len() != 1 {
+        return Err(conformance_err(format!(
+            "重跑後證據數應仍為 1，實際 {ev:?}"
+        )));
+    }
+
+    // 3. 同自然鍵、不同證據。
+    let more = store
+        .record_candidate_discovery(&make(col_a.id, CandidateType::Entity), &evidence("r2"))
+        .await?;
+    if more.created || !more.evidence_added || more.candidate_id != first.candidate_id {
+        return Err(conformance_err(format!(
+            "不同證據應附加到既有候選，實際 {more:?}"
+        )));
+    }
+    let ev = store
+        .list_candidate_evidence_by_candidate(first.candidate_id, 100)
+        .await?;
+    if ev.len() != 2 || ev.iter().any(|e| e.candidate_id != first.candidate_id) {
+        return Err(conformance_err(format!(
+            "附加的證據必須指向既有候選，實際 {ev:?}"
+        )));
+    }
+
+    // 4. 已拒絕的不復活。
+    store
+        .update_candidate_status(first.candidate_id, CandidateStatus::Rejected, fixture_ts())
+        .await?;
+    let revived = store
+        .record_candidate_discovery(&make(col_a.id, CandidateType::Entity), &evidence("r3"))
+        .await?;
+    let status = store
+        .get_candidate(first.candidate_id)
+        .await?
+        .map(|c| c.status);
+    if revived.created
+        || revived.candidate_id != first.candidate_id
+        || status != Some(CandidateStatus::Rejected)
+        || count_in(col_a.id).await? != 1
+    {
+        return Err(conformance_err(format!(
+            "被拒的候選再次被發現應維持 rejected、不新增，實際 outcome={revived:?} status={status:?}"
+        )));
+    }
+    if !revived.evidence_added {
+        return Err(conformance_err("被拒的候選再次被發現仍要附加新證據".into()));
+    }
+
+    // 5. 不同集合。
+    let other_col = store
+        .record_candidate_discovery(&make(col_b.id, CandidateType::Entity), &evidence("r1"))
+        .await?;
+    if !other_col.created || other_col.candidate_id == first.candidate_id {
+        return Err(conformance_err(format!(
+            "不同集合的同值應各自一筆候選，實際 {other_col:?}"
+        )));
+    }
+
+    // 6. 不同 candidate_type。
+    let other_type = store
+        .record_candidate_discovery(&make(col_a.id, CandidateType::Source), &evidence("r1"))
+        .await?;
+    if !other_type.created || count_in(col_a.id).await? != 2 {
+        return Err(conformance_err(format!(
+            "不同 candidate_type 的同值應各自一筆候選，實際 {other_type:?}"
+        )));
+    }
+
+    // 7. 唯一索引在 DB 層真的存在。
+    match store
+        .put_candidate(&make(col_a.id, CandidateType::Entity))
+        .await
+    {
+        Err(StorageError::Conflict { .. }) => {}
+        other => {
+            return Err(conformance_err(format!(
+                "直接寫入同自然鍵、不同 id 的候選應撞唯一索引回 Conflict，實際 {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 候選已存在時，兩個寫入者**同時**對它附加同一份證據：兩邊都不能回錯，
+/// 最後只能多一列證據，且恰好一邊回 `evidence_added`。
+///
+/// 只給有真正併發寫入的後端用（Postgres）。`rounds` 輪各自用新的自然鍵，
+/// 用來提高撞上競態的機率——單輪通過不代表沒有競態。
+pub async fn assert_candidate_discovery_concurrent<S>(
+    store: &S,
+    rounds: usize,
+) -> Result<(), StorageError>
+where
+    S: RelationalStore + Clone + Send + Sync + 'static,
+{
+    let suffix = Uuid::now_v7().simple().to_string();
+    let col = conformance_collection(format!("cand-conc-{suffix}"));
+    store.put_collection(&col).await?;
+
+    for round in 0..rounds {
+        let value = format!("cand-conc-{suffix}-{round}");
+        let make = || Candidate {
+            id: Uuid::now_v7(),
+            candidate_type: CandidateType::Entity,
+            value: value.clone(),
+            normalized_value: value.clone(),
+            collection_id: Some(col.id),
+            discovered_by: "conformance".into(),
+            discovery_method: "graph_expansion".into(),
+            confidence: 0.4,
+            score: 0.4,
+            status: CandidateStatus::Pending,
+            depth: 1,
+            created_at: fixture_ts(),
+            reviewed_at: None,
+        };
+        let evidence = || CandidateEvidence {
+            id: Uuid::now_v7(),
+            candidate_id: Uuid::now_v7(),
+            object_id: None,
+            entity_id: None,
+            relationship_id: None,
+            raw_evidence_id: None,
+            reason: "concurrent".into(),
+            weight: 0.4,
+            created_at: fixture_ts(),
+        };
+        // 先讓候選存在：「新建候選」那條路被唯一索引排隊（輸家等贏家 commit，
+        // 那時證據已一併 commit），不會出現重複證據。競態只在「候選已存在、
+        // 兩邊同時附加同一份新證據」時發生——兩邊都走 DO NOTHING，沒有東西讓它們互等。
+        let seed = store
+            .record_candidate_discovery(
+                &make(),
+                &CandidateEvidence {
+                    reason: "seed".into(),
+                    ..evidence()
+                },
+            )
+            .await?;
+        if !seed.created {
+            return Err(conformance_err(format!(
+                "第 {round} 輪 seed 應新建候選，實際 {seed:?}"
+            )));
+        }
+        let (a, b) = (store.clone(), store.clone());
+        let (ca, ea, cb, eb) = (make(), evidence(), make(), evidence());
+        let (ra, rb) = tokio::join!(
+            tokio::spawn(async move { a.record_candidate_discovery(&ca, &ea).await }),
+            tokio::spawn(async move { b.record_candidate_discovery(&cb, &eb).await }),
+        );
+        let ra = ra.map_err(|e| conformance_err(format!("第 {round} 輪任務 panic：{e}")))??;
+        let rb = rb.map_err(|e| conformance_err(format!("第 {round} 輪任務 panic：{e}")))??;
+
+        if ra.candidate_id != seed.candidate_id
+            || rb.candidate_id != seed.candidate_id
+            || ra.created
+            || rb.created
+            || (ra.evidence_added as u8 + rb.evidence_added as u8) != 1
+        {
+            return Err(conformance_err(format!(
+                "第 {round} 輪併發附加同一份證據：兩邊都應沿用 seed 候選、恰好一邊附加證據，實際 a={ra:?} b={rb:?}"
+            )));
+        }
+        let ev = store
+            .list_candidate_evidence_by_candidate(ra.candidate_id, 100)
+            .await?;
+        if ev.len() != 2 {
+            return Err(conformance_err(format!(
+                "第 {round} 輪 seed + 併發寫入同一份證據後應只有 2 列證據，實際 {}",
+                ev.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// SPEC §15／§16 的查詢能力：Stage 1～4 的候選查詢 + duplicate group 的兩個反查。
 ///
 /// 每次呼叫用新的 UUID 當鍵（`external_key`／`canonical_url`／content hash 都含 UUID），

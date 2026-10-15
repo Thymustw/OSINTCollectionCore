@@ -575,6 +575,10 @@ fn sniff_content_type(body: &[u8]) -> &'static str {
 }
 
 /// `RawEvidence.source_url` 不可為空。沒有真實 URL 時合成一個看得懂的 `import://` URI。
+///
+/// 合成 URI 只是「從哪個匯入來的」標記，不是文章身分：deduplicator 的 Stage 2
+/// 會用 `core_model::url_norm::is_synthetic_import_url` 認出它並跳過，
+/// 所以同檔名、不同內容的兩次匯入不會被判成重複（`docs/KNOWN_GAPS.md` §16）。
 fn resolve_source_url(
     request: &ImportRequest,
     kind: ImportKind,
@@ -594,7 +598,8 @@ fn resolve_source_url(
         return Ok(url.to_string());
     }
     Ok(format!(
-        "import://{}/{}",
+        "{}{}/{}",
+        core_model::url_norm::IMPORT_URL_PREFIX,
         kind.as_str(),
         filename.unwrap_or("upload")
     ))

@@ -77,6 +77,37 @@ const TRACKING_PARAMS: &[&str] = &[
 /// 逐一列舉永遠會漏，用前綴比對。
 const TRACKING_PREFIXES: &[&str] = &["utm_", "pk_", "mtm_", "matomo_"];
 
+/// `POST /api/v1/import` 在呼叫端沒給 `source_url` 時合成的 URI 前綴
+/// （`import://{kind}/{filename}`）。
+///
+/// 放在這裡而不是 core-api：產生端（core-api）與判斷端（deduplicator）必須認同一個
+/// 字串，各寫一份的話只要一邊改了，Stage 2 就會靜默地又開始拿合成 URI 去重。
+pub const IMPORT_URL_PREFIX: &str = "import://";
+
+/// 這個 URL 是不是匯入時合成的 `import://` URI。
+///
+/// 合成 URI 只由「匯入類型 + 檔名」組成，**不代表「同一篇文章」**：兩次匯入同名檔案
+/// （例如都叫 `data.json`）內容可以完全不同。所以它不能當 Stage 2（canonical URL）的
+/// 去重鍵——2026-10-15 前就是因為拿它去重，第二批資料被判成重複、實體抽取靜默跳過
+/// （`docs/KNOWN_GAPS.md` §16）。
+#[must_use]
+pub fn is_synthetic_import_url(raw: &str) -> bool {
+    raw.trim_start()
+        .get(..IMPORT_URL_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(IMPORT_URL_PREFIX))
+}
+
+/// 能解析成絕對 URL，而且 scheme 是 `http` 或 `https`。
+///
+/// [`canonicalize`] 只驗「是不是合法絕對 URL」：`url` crate 把 `javascript:alert(1)`／
+/// `data:text/html,x`／`mailto:a@b.c` 這類 opaque URL 也視為合法，`canonicalize`
+/// 會回 `Some`。需要「這是一個可以抓取的網頁位址」語意的地方（例如核准 Url candidate）
+/// 要另外呼叫這個函式。scheme 由 `url` crate 轉小寫，`HTTPS://` 也算。
+#[must_use]
+pub fn is_http_or_https(raw: &str) -> bool {
+    Url::parse(raw.trim()).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
 /// 判斷一個 query 參數名是不是追蹤參數。
 #[must_use]
 pub fn is_tracking_param(name: &str) -> bool {
@@ -326,6 +357,43 @@ mod tests {
             canonicalize("/relative/path"),
             None,
             "相對路徑沒有 host，無法當 canonical 身分"
+        );
+    }
+
+    #[test]
+    fn only_http_and_https_are_web_urls() {
+        assert!(is_http_or_https("https://example.com"));
+        assert!(is_http_or_https("HTTP://example.com/a"));
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "mailto:a@b.c",
+            "ftp://x",
+            "path-without-scheme",
+            "",
+        ] {
+            assert!(!is_http_or_https(bad), "`{bad}` 不該被當成 http(s) 網址");
+        }
+        // 這正是需要獨立檢查的理由：canonicalize 會接受 opaque URL。
+        assert!(canonicalize("javascript:alert(1)").is_some());
+    }
+
+    #[test]
+    fn synthetic_import_url_is_recognised() {
+        assert!(is_synthetic_import_url("import://json/data.json"));
+        assert!(
+            is_synthetic_import_url("IMPORT://csv/x.csv"),
+            "scheme 不分大小寫"
+        );
+        assert!(is_synthetic_import_url("  import://manual/upload"));
+        assert!(!is_synthetic_import_url(
+            "https://example.invalid/import://x"
+        ));
+        assert!(!is_synthetic_import_url("stix://import/abc"));
+        assert!(!is_synthetic_import_url("imp"), "比前綴短的字串不可 panic");
+        assert!(
+            !is_synthetic_import_url("匯入://json/x"),
+            "非 ASCII 不可切壞字元邊界"
         );
     }
 

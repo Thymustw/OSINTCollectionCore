@@ -143,6 +143,32 @@ V0.3 migration `0016_v0_3_evidence_collections.sql` 把 `raw_evidence.collection
 再補 `collection_objects_object_id_idx`（`collection_objects (object_id)`）：
 PK 前綴是 `collection_id`，刪文件時用 `object_id` 找關聯列走不到 PK。
 
+`0018_v0_3_candidate_natural_key.sql`（2026-10-15）在
+`candidates (collection_id, candidate_type, normalized_value) WHERE collection_id IS NOT NULL`
+建唯一索引 `uq_candidates_natural_key`。建索引前先合併既有重複：每組保留一筆 survivor
+（優先非 `pending`——人工審過的結論不能被合併丟掉——其次 `created_at`、`id` 最小），
+其他列的 `candidate_evidence` 改指 survivor 後刪掉。
+⚠️ 限制：同一組裡若同時有 `approved` 與 `rejected` 兩筆，只會留下較舊的那筆，另一個人工結論
+會隨候選列一起刪掉（證據保留、改指 survivor）。migration 檔頭「人工判斷過的結論不能被合併丟掉」
+只對「已審 vs pending」成立。實務上要先有重複候選且兩筆都被審過才會觸發；開發 DB 套用時沒有重複。
+（migration 檔本身不改註解：已套用的 migration 改任何字元都會讓 sqlx checksum 對不上。）Postgres 版用 window function，
+SQLite 版用相關子查詢（不綁 SQLite 最低版本）。
+
+候選寫入要走 `record_candidate_discovery(candidate, evidence)`，不要直接 `put_candidate`：
+
+| 情況 | 行為 |
+|---|---|
+| 自然鍵不存在 | 寫入候選（用它自己的 id）＋證據 |
+| 自然鍵已存在 | 不改既有候選任何欄位（含 `rejected`／`approved` 狀態），證據改指既有候選後附加 |
+| 同一候選上已有一模一樣的證據（object／entity／relationship／raw_evidence／reason 全同） | 不再附加（重跑冪等） |
+| `collection_id = NULL` | 不查重，等同 `put_candidate` + `put_candidate_evidence` |
+
+併發：候選本身靠 `INSERT … ON CONFLICT DO NOTHING` 不會撞唯一索引；證據表沒有內容唯一約束，所以 Postgres 實作在查證據前先 `SELECT … FOR UPDATE` 鎖住候選列，兩個 worker 同時重跑同一實體時證據寫入會排隊，不會各寫一列。競態只出現在「候選已存在」時（候選新建那條路已被唯一索引排隊）；2026-10-15 實測拿掉鎖後 `postgres_candidate_discovery_concurrent_writers_do_not_duplicate_evidence` 連 3 次都在第 1 輪失敗，加回後 3 次通過。SQLite 不需要（前面的 INSERT 已取得整庫寫鎖）。
+
+整段在同一個交易裡；回 `CandidateDiscoveryOutcome { candidate_id, created, evidence_added }`。
+直接用 `put_candidate` 寫同自然鍵、不同 id 會撞唯一索引回 `Conflict`。
+conformance：`assert_candidate_natural_key`；併發（只有 Postgres 呼叫）：`assert_candidate_discovery_concurrent`。
+
 Collection 的三個關聯反查（`GET /api/v1/collections/{id}` 用，只夾 `limit`、不帶 cursor）：
 
 | 方法 | 排序 | 來源表 |
@@ -154,6 +180,19 @@ Collection 的三個關聯反查（`GET /api/v1/collections/{id}` 用，只夾 `
 | `list_collections_by_connector(connector_id, limit)` | `collection_id ASC` | `collection_connectors` 反查 |
 | `list_collections_by_raw_evidence(raw_evidence_id, limit)` | `collection_id ASC` | `raw_evidence_collections` |
 | `unlink_collection_source` / `unlink_collection_connector` | — | 回 `bool`：有刪到列為 true |
+
+批次寫入（2026-10-15 加入）：
+
+| 方法 | 契約 |
+|---|---|
+| `link_collection_members(collection_id, source_ids, connector_ids)` | 整批**同一個交易**。任一筆撞 FK → `ConstraintViolation`、整批回滾（同批合法的也不掛）。已掛上／重複 id 不算錯 |
+| `create_collection_with_members(collection, source_ids, connector_ids)` | `put_collection` + 上面那個，**同一個交易**。關聯失敗時集合本身也不留下 |
+
+core-api 拿到的是 `dyn RelationalStore`（沒有 `TransactionalStore`），所以交易包在 adapter 裡，
+做法同 `insert_raw_evidence`：handle 已綁交易就直接寫，否則自己 `begin` 一條。
+`POST /collections`、`POST /collections/{id}/sources`、`POST /collections/{id}/connectors`
+都走這兩個方法；逐筆 `link_collection_source` 只剩測試與單筆用途。
+conformance：`assert_collection_member_links_atomic`。
 
 `GET /api/v1/raw/{id}` 把 `list_collections_by_raw_evidence(..., LINK_PAGE)` 的結果掛上
 `collection_ids`；滿 100 筆時 `collection_ids_truncated` 為 true。寫入端

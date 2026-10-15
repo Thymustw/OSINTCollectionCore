@@ -68,10 +68,22 @@ entity_extractions.entity_id
 計數器**（對 `budget.max_candidates_per_run` 截斷），不另外開配額、也不
 額外消耗 `daily_request_budget`。
 
+## 重跑冪等（2026-10-15）
+
+候選寫入走 `RelationalStore::record_candidate_discovery`，以
+`(collection_id, candidate_type, normalized_value)` 查重（migration `0018`，契約見
+`storage-adapters.md`）。同一個 Entity 對同一個 collection 重跑：
+
+- 不新增候選；新證據附加到既有候選，一模一樣的證據不重複附加。
+- 既有候選已 `rejected`：**不復活、不新增，只附加證據**（`approved` 同理，狀態不變）。
+- `written` 仍是「這次處理的候選數」（套 `max_candidates_per_run`），結果訊息另外列
+  「新增 N 筆、沿用既有 M 筆」。
+
+測試：`rerunning_same_entity_does_not_duplicate_candidates`、
+`rediscovered_rejected_candidate_stays_rejected_and_gains_evidence`。
+
 ## 已知限制
 
-- **沒有查重**：同一個 Entity 對同一個 collection 重複跑會產生重複的
-  Candidate 列。刻意先不做。
 - 觸發點是 Entity（`POST /entities/{id}/discover` 或帶 `entity_id` 的
   `discovery_run` Job），不是 Seed。組織 seed 要先被解析成 Entity 才能走
   這條路。

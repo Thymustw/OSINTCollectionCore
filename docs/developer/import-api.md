@@ -47,7 +47,7 @@ normalizer 做——與 pull 路徑同一條線。
 | `connector_id` | 否 | 指定既有 connector；未填則自動配置 |
 | `collection_ids` | 否 | 省略＝來源目前掛的集合；明確給 `[]`＝不掛任何集合。id 不存在 → 422 且不寫任何資料。一次最多 100 筆 |
 | `title`／`description` | 否 | 寫進 `metadata.upload`（給人看的說明） |
-| `source_url` | 否 | 未填時合成 `import://{kind}/{filename}`。這條會當 Document 的 `canonical_url` 後援：同一檔名的多次 JSON／CSV 匯入會被 Stage 2 判成重複，entity-worker 不抽重複件上的 Organization。要獨立進抽取管線請給逐筆 `url`，或每次用不同檔名／填這欄 |
+| `source_url` | 否 | 未填時合成 `import://{kind}/{filename}`（前綴常數 `core_model::url_norm::IMPORT_URL_PREFIX`）。紀錄沒有 `url` 時它會成為 Document 的 `source_url`／`canonical_url`，但 deduplicator 以 `url_norm::is_synthetic_import_url` 認出它、**不當 Stage 2 的鍵**（2026-10-15 起；之前同檔名、不同內容會被誤判重複，見 KNOWN_GAPS §16）。內容相同的仍由 Stage 3／4 判為重複 |
 | `external_id` | 否 | 寫進 RawEvidence `external_id` |
 | `content_type` | 否 | **只有 `kind=manual` 會用**。未填則依內容 sniff |
 | `object_type` | 否 | 產出的 Document 型別，預設 `report` |

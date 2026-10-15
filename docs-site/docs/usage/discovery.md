@@ -256,6 +256,21 @@ evidence: Entity `CVE-2026-31337` 透過 raw evidence 關聯到 Source `快速�
 
 ---
 
+## 重跑同一個實體
+
+對同一個實體、同一個 Collection 重複執行 Discovery 是安全的：
+
+- **同一個候選不會出現兩次。** 判斷「同一個」的依據是：同一個 Collection、同一種候選類型、
+  正規化後的值相同。重跑時找到的候選如果已經存在，不會新增一筆，只會把這次的發現證據
+  附加到既有候選上；證據內容完全相同時也不會重複附加。
+- **已經被拒絕的候選不會復活。** 被拒絕（`rejected`）的候選再次被發現時，狀態維持 `rejected`、
+  不會新增一筆，只附加新的證據——你可以在候選詳細資料的 `evidence` 看到它又被發現了，
+  但不需要重新審一次。已核准的候選同理，狀態不變。
+- **不同 Collection 各自一筆。** 同一個值在兩個 Collection 都被發現，會是兩個獨立的候選，
+  因為核准與否是各個調查自己的判斷。
+
+執行結果訊息會顯示這次「新增」與「沿用既有」各幾筆。
+
 ## 核准與拒絕候選
 
 ### 核准
@@ -271,8 +286,13 @@ curl -s -X POST "$API/candidates/$CANDIDATE_ID/approve" \
 
 回傳更新後的 Candidate，`status` 變為 `approved`。
 
-!!! warning "核准 URL 型候選前會驗證格式"
-    `candidate_type = url` 的候選，核准前系統會先驗證 `value` 是合法的絕對 URL（有 host）。格式不合法時回傳 400，請改用拒絕。
+!!! warning "核准 URL 型候選前會驗證格式與 scheme"
+    `candidate_type = url` 的候選，核准前系統會先驗證兩件事，任一不過都回傳 400、候選維持原狀態：
+
+    - `value` 是合法的絕對 URL
+    - scheme 是 `http` 或 `https`——`javascript:`、`data:`、`mailto:`、`ftp:` 等其他 scheme 一律不核准
+
+    這類候選請改用拒絕。
 
 ### 拒絕
 
@@ -310,7 +330,6 @@ for r in items[:3]:
 
 ## 目前的限制
 
-1. **不查重**：同一個實體對同一個 Collection 重複執行 Discovery，會產生重複的候選。
-2. **觸發點是實體，不是 Seed**：要執行 Discovery，必須先有 Entity id。Seed 需要先被解析成 Entity 才能當起點。
-3. **只找已收進系統的資料**：不主動上網抓取，圖擴張只看 1-hop 鄰居。
-4. **目標類型不可調整**：圖擴張只回傳 `vulnerability`、`repository`、`software`、`product` 四種型別，無法透過 API 改變。
+1. **觸發點是實體，不是 Seed**：要執行 Discovery，必須先有 Entity id。Seed 需要先被解析成 Entity 才能當起點。
+2. **只找已收進系統的資料**：不主動上網抓取，圖擴張只看 1-hop 鄰居。
+3. **目標類型不可調整**：圖擴張只回傳 `vulnerability`、`repository`、`software`、`product` 四種型別，無法透過 API 改變。

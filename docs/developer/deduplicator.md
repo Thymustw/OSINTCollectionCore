@@ -70,6 +70,13 @@ Acceptance B 會在去重後**逐筆數** 10 筆 RawEvidence 是否都還讀得�
 正規化結果會**寫回 `documents.canonical_url`**。normalizer 原本只是把 `source_url`
 原封不動複製過去，那個值沒有正規化過。`source_url` 保持原始觀測值，不被覆蓋。
 
+`source_url` 是匯入合成的 `import://{kind}/{filename}`（`url_norm::is_synthetic_import_url`）
+時 **Stage 2 不適用**（2026-10-15 起）：合成 URI 只代表「從哪個檔案匯入」，同檔名的兩次匯入
+內容可以完全不同，拿它去重會把第二批判成重複、靜默跳過實體抽取（KNOWN_GAPS §16）。
+內容真的相同時由 Stage 3／4 判定。注意 Stage 2 的鍵是從 `source_url` 重算的，不讀
+`documents.canonical_url`，所以排除必須在 deduplicator 這端做。
+測試：`tests/e2e.rs` 的 `synthetic_import_url_*` 兩個。
+
 解析不出合法絕對 URL 時回 `None`（Stage 2 對這份不適用），**不退回原字串**：
 那會讓「正規化過的」與「沒正規化的」混在同一欄比對，Stage 2 會靜默比不中。
 

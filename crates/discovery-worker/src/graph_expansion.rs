@@ -9,8 +9,11 @@
 //! 跟目前這次調查有沒有關聯，值得納入嗎」（discovery/擴張範圍）——
 //! 鄰居本身就是候選，不比對 2-hop Jaccard 相似度。
 //!
-//! **已知限制**：這一版沒有查重——同一個 Entity 對同一個 collection
-//! 重複跑會產生重複的 Candidate 列。刻意先不做，不是沒發現。
+//! **重跑冪等（2026-10-15 起）**：寫入一律走
+//! `RelationalStore::record_candidate_discovery`，以
+//! `(collection_id, candidate_type, normalized_value)` 為自然鍵查重。同一個 Entity
+//! 對同一個 collection 重跑不會新增候選；新的證據附加到既有候選上，一模一樣的
+//! 證據不重複附加。既有候選已被拒絕（`rejected`）時**不復活、不新增**，只附加證據。
 
 use chrono::Utc;
 use core_model::{
@@ -211,8 +214,11 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
     .await
     .map_err(|e| e.to_string())?;
 
+    // `written` 是這次**處理**的候選數（新建＋沿用既有），用來套 max_candidates_per_run；
+    // `created` 才是真正新增的列數。重跑同一個實體時 created 應為 0。
     let cap = budget.max_candidates_per_run as usize;
     let mut written = 0usize;
+    let mut created = 0usize;
     for (candidate, evidence) in &pairs {
         if written >= cap {
             tracing::warn!(
@@ -222,14 +228,13 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
             );
             break;
         }
-        store
-            .put_candidate(candidate)
+        let outcome = store
+            .record_candidate_discovery(candidate, evidence)
             .await
             .map_err(|e| e.to_string())?;
-        store
-            .put_candidate_evidence(evidence)
-            .await
-            .map_err(|e| e.to_string())?;
+        if outcome.created {
+            created += 1;
+        }
         written += 1;
     }
 
@@ -297,21 +302,22 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
                 weight: SOURCE_EXPANSION_SCORE,
                 created_at: now,
             };
-            store
-                .put_candidate(&candidate)
+            let outcome = store
+                .record_candidate_discovery(&candidate, &evidence)
                 .await
                 .map_err(|e| e.to_string())?;
-            store
-                .put_candidate_evidence(&evidence)
-                .await
-                .map_err(|e| e.to_string())?;
+            if outcome.created {
+                created += 1;
+            }
             written += 1;
         }
     }
 
     Ok(format!(
-        "graph_expansion 完成：Entity `{entity_id}` 找到 {} 個鄰居、{source_found} 個關聯 Source，寫入 {written} 筆 Candidate",
-        pairs.len()
+        "graph_expansion 完成：Entity `{entity_id}` 找到 {} 個鄰居、{source_found} 個關聯 Source，\
+         寫入 {written} 筆 Candidate（新增 {created} 筆、沿用既有 {} 筆）",
+        pairs.len(),
+        written - created
     ))
 }
 
@@ -617,6 +623,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(usage.requests_used, 1, "配額真的要消耗");
+    }
+
+    /// 同一個實體對同一個集合跑兩次：候選數與證據數都不變（回歸：重跑曾產生重複候選）。
+    #[tokio::test]
+    async fn rerunning_same_entity_does_not_duplicate_candidates() {
+        let h = open_harness().await;
+        let (entity_id, collection_id, graph) = seed_single_neighbor(&h.store).await;
+        seed_source_path(&h.store, entity_id, "NVD Feed").await;
+        h.store
+            .put_collection_budget(&budget(collection_id, 10, 3))
+            .await
+            .unwrap();
+        let params = parameters(entity_id, collection_id, 0);
+
+        let first = run_graph_expansion(&h.store, &graph, Some(&params))
+            .await
+            .expect("第一次");
+        assert!(first.contains("新增 2 筆"), "summary：{first}");
+        let after_first = h
+            .store
+            .list_candidates_by_collection(collection_id, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(after_first.len(), 2, "{after_first:?}");
+
+        let second = run_graph_expansion(&h.store, &graph, Some(&params))
+            .await
+            .expect("第二次");
+        assert!(
+            second.contains("新增 0 筆") && second.contains("沿用既有 2 筆"),
+            "summary：{second}"
+        );
+        let after_second = h
+            .store
+            .list_candidates_by_collection(collection_id, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(after_second.len(), 2, "重跑不可新增候選：{after_second:?}");
+        for candidate in &after_second {
+            let evidence = h
+                .store
+                .list_candidate_evidence_by_candidate(candidate.id, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                evidence.len(),
+                1,
+                "同一份證據不可重複附加（{}）：{evidence:?}",
+                candidate.value
+            );
+        }
+    }
+
+    /// 被拒絕的候選再次被發現：不復活、不新增，只附加新證據。
+    #[tokio::test]
+    async fn rediscovered_rejected_candidate_stays_rejected_and_gains_evidence() {
+        let h = open_harness().await;
+        let (entity_id, collection_id, graph) = seed_single_neighbor(&h.store).await;
+        h.store
+            .put_collection_budget(&budget(collection_id, 10, 3))
+            .await
+            .unwrap();
+        run_graph_expansion(
+            &h.store,
+            &graph,
+            Some(&parameters(entity_id, collection_id, 0)),
+        )
+        .await
+        .expect("第一次");
+        let candidates = h
+            .store
+            .list_candidates_by_collection(collection_id, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let rejected_id = candidates[0].id;
+        h.store
+            .update_candidate_status(rejected_id, CandidateStatus::Rejected, ts())
+            .await
+            .unwrap();
+
+        // 換一個來源實體（C）也連到 B：同一個候選值、不同的證據。
+        let c = entity(3, "C");
+        h.store.put_entity(&c).await.unwrap();
+        graph.upsert_node(&node(3, "C")).await.unwrap();
+        graph.upsert_edge(&edge(2, 3, 2)).await.unwrap();
+        run_graph_expansion(&h.store, &graph, Some(&parameters(c.id, collection_id, 0)))
+            .await
+            .expect("從 C 再發現 B");
+
+        let after = h
+            .store
+            .list_candidates_by_collection(collection_id, None, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "被拒的候選不可因再次發現而新增一筆：{after:?}"
+        );
+        assert_eq!(after[0].id, rejected_id);
+        assert_eq!(
+            after[0].status,
+            CandidateStatus::Rejected,
+            "人工拒絕的結論不可被機器重跑推翻"
+        );
+        let evidence = h
+            .store
+            .list_candidate_evidence_by_candidate(rejected_id, 100)
+            .await
+            .unwrap();
+        assert_eq!(evidence.len(), 2, "新的發現證據要附加上去：{evidence:?}");
     }
 
     #[tokio::test]

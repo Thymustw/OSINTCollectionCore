@@ -162,6 +162,33 @@ pub trait RelationalStore: HealthProvider {
         connector_id: ConnectorId,
     ) -> Result<bool, StorageError>;
 
+    /// 一次把多個 Source／Connector 掛到集合上，**全部在同一個交易裡**。
+    ///
+    /// 任何一筆失敗（例如 id 不存在撞 FK → `ConstraintViolation`）整批回滾，
+    /// 不會留下「掛了一半」的狀態。已經掛上的組合不算錯（`ON CONFLICT DO NOTHING`），
+    /// 重複 id 也不算錯。兩個切片都空 = 什麼都不做。
+    ///
+    /// 為什麼不讓呼叫端逐筆呼叫 `link_collection_source`：core-api 拿到的是
+    /// `dyn RelationalStore`（沒有 `TransactionalStore`），逐筆寫在中途出錯時
+    /// 前面寫的關聯不會消失，回應卻是錯誤——呼叫端不知道有半成品存在。
+    async fn link_collection_members(
+        &self,
+        collection_id: CollectionId,
+        source_ids: &[SourceId],
+        connector_ids: &[ConnectorId],
+    ) -> Result<(), StorageError>;
+
+    /// 寫入（upsert）一筆 Collection 並掛上 Source／Connector，**同一個交易**。
+    ///
+    /// 語意 = `put_collection` + [`RelationalStore::link_collection_members`]，
+    /// 但任何一步失敗都不會留下「集合建了、關聯只掛一半」或「集合建了、關聯沒掛」。
+    async fn create_collection_with_members(
+        &self,
+        collection: &Collection,
+        source_ids: &[SourceId],
+        connector_ids: &[ConnectorId],
+    ) -> Result<(), StorageError>;
+
     /// Raw Evidence 寫入後不可變。重複主鍵回 `Conflict`，不可變成 update。
     ///
     /// `collection_ids` 是這筆證據當下屬於哪些調查集合，在**同一個交易**裡
@@ -797,6 +824,33 @@ pub trait RelationalStore: HealthProvider {
         reviewed_at: DateTime<Utc>,
     ) -> Result<bool, StorageError>;
 
+    /// Discovery 寫入候選的唯一正確入口：依**自然鍵**查重，同一個發現不會變成兩筆候選。
+    ///
+    /// 自然鍵 = `(collection_id, candidate_type, normalized_value)`，由 migration
+    /// `0018_v0_3_candidate_natural_key.sql` 的 partial unique index 保證
+    /// （只對 `collection_id IS NOT NULL` 的列；沒有集合的候選不查重，見下方）。
+    ///
+    /// 行為（**整段在同一個交易裡**）：
+    ///
+    /// - 自然鍵不存在 → 寫入 `candidate`（用它自己的 `id`），再寫 `evidence`。
+    /// - 自然鍵已存在 → **不動既有候選的任何欄位**（status／score／depth／created_at
+    ///   都保留），把 `evidence.candidate_id` 改指向既有候選後附加上去。
+    ///   既有候選是 `rejected` 時也一樣：**不復活、不新增**，只附加證據——
+    ///   人工已經判斷過的結論不該被機器重跑推翻，但「它又被發現了」這個事實仍值得留下。
+    /// - 同一候選上已經有一模一樣的證據（`object_id`／`entity_id`／`relationship_id`／
+    ///   `raw_evidence_id`／`reason` 全同）→ 不再附加。重跑同一個實體因此完全冪等，
+    ///   不會每跑一次就多一列證據。
+    /// - `candidate.collection_id` 是 `None` → 不查重，等同 `put_candidate` +
+    ///   `put_candidate_evidence`（仍在同一交易）。Discovery worker 一定帶集合，
+    ///   沒有集合的候選只出現在測試或手動 fixture。
+    ///
+    /// 傳進來的 `evidence.candidate_id` 會被忽略，以實際落地的候選 id 為準。
+    async fn record_candidate_discovery(
+        &self,
+        candidate: &Candidate,
+        evidence: &CandidateEvidence,
+    ) -> Result<CandidateDiscoveryOutcome, StorageError>;
+
     /// 依主鍵 upsert 一筆 Candidate Evidence（SPEC_V0.3 §7）。
     async fn put_candidate_evidence(
         &self,
@@ -878,6 +932,17 @@ pub trait RelationalStore: HealthProvider {
         collection_id: CollectionId,
         date: NaiveDate,
     ) -> Result<DailyUsage, StorageError>;
+}
+
+/// [`RelationalStore::record_candidate_discovery`] 的結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidateDiscoveryOutcome {
+    /// 實際落地（或既有）的候選 id。
+    pub candidate_id: CandidateId,
+    /// `true`：這次新建了候選；`false`：沿用自然鍵相同的既有候選。
+    pub created: bool,
+    /// `true`：這次有附加證據；`false`：同一份證據早已存在，沒有再寫。
+    pub evidence_added: bool,
 }
 
 /// [`RelationalStore::try_consume_daily_request_budget`]／

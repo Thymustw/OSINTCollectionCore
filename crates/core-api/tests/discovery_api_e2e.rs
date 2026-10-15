@@ -429,8 +429,8 @@ async fn approve_url_candidate_with_non_absolute_value_is_400() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
     // 沒有 scheme、無法解析成絕對 URL——`canonicalize` 回 `None` → 400。
-    // （刻意不用 `javascript:...`：`url` crate 把這類有 scheme 的 opaque URL
-    // 視為 can-be-a-base，canonicalize 會接受；那不是這道關卡的攔截對象。）
+    // （`javascript:` 這類 opaque URL 是第二道 scheme 白名單擋的，見下面
+    // `approve_url_candidate_with_non_http_scheme_is_400`。）
     let candidate = put_url_candidate_fixture(&stack, "path-without-scheme".into()).await;
 
     let (status, resp) = send(
@@ -473,6 +473,47 @@ async fn approve_url_candidate_with_valid_absolute_url_succeeds() {
     .await;
     assert_eq!(status, StatusCode::OK, "{resp}");
     assert_eq!(resp["status"], json!("approved"), "{resp}");
+}
+
+/// `url` crate 把這些都當成合法 URL（canonicalize 回 `Some`），所以只靠格式檢查
+/// 會被核准。scheme 白名單（只收 http/https）必須把它們全部擋成 400、狀態不變。
+#[tokio::test]
+async fn approve_url_candidate_with_non_http_scheme_is_400() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    for value in [
+        "javascript:alert(1)",
+        "data:text/html,x",
+        "mailto:a@b.c",
+        "ftp://x",
+    ] {
+        let candidate = put_url_candidate_fixture(&stack, value.into()).await;
+        let (status, resp) = send(
+            &api.app,
+            post(
+                &format!("/api/v1/candidates/{}/approve", candidate.id),
+                &api.operator,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "`{value}`：{resp}");
+        assert!(
+            resp["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("http/https")),
+            "訊息要講清楚只接受 http/https（`{value}`）：{resp}"
+        );
+        let (_, get_resp) = send(
+            &api.app,
+            get(&format!("/api/v1/candidates/{}", candidate.id), &api.viewer),
+        )
+        .await;
+        assert_eq!(
+            get_resp["status"],
+            json!("pending"),
+            "被拒後不可改狀態（`{value}`）：{get_resp}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -667,11 +708,21 @@ async fn ops_discovery_returns_backlog_and_recent_ai_runs() {
         "剛核准的 candidate {} 應被計入：{resp}",
         pending.id
     );
-    assert_eq!(
-        resp["candidate_backlog"]["saturated"],
-        json!(false),
-        "{resp}"
-    );
+    // 不能斷言 saturated == false：candidates 是共用開發 DB 上的全域計數，
+    // 每跑一次這個檔就累積十幾筆 pending，跑幾次就必然碰到 100 的上限
+    // （2026-10-15 實測 pending 185 筆時這裡確定性失敗）。改斷言 saturated
+    // 與計數一致：任何一個狀態數到上限 100 時必須亮，否則不能亮。
+    let backlog = &resp["candidate_backlog"];
+    let any_at_cap = [
+        "pending",
+        "approved",
+        "auto_approved",
+        "rejected",
+        "expired",
+    ]
+    .iter()
+    .any(|k| backlog[*k].as_u64() == Some(100));
+    assert_eq!(backlog["saturated"], json!(any_at_cap), "{resp}");
     let recent_ids: Vec<&str> = resp["ai_run_recent"]
         .as_array()
         .unwrap()

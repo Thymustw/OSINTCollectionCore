@@ -23,9 +23,9 @@ use sqlx::sqlite::{
 use storage_core::codec::encode_enum;
 use storage_core::conformance::assert_sqlite_path_safe;
 use storage_core::{
-    BudgetConsumption, CapabilityDescriptor, DailyUsage, EmbeddedStore, HealthProvider,
-    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
-    TransactionalStore,
+    BudgetConsumption, CandidateDiscoveryOutcome, CapabilityDescriptor, DailyUsage, EmbeddedStore,
+    HealthProvider, RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth,
+    Transaction, TransactionalStore,
 };
 use uuid::Uuid;
 
@@ -960,6 +960,65 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
         .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn link_collection_members(
+        &self,
+        collection_id: CollectionId,
+        source_ids: &[SourceId],
+        connector_ids: &[ConnectorId],
+    ) -> Result<(), StorageError> {
+        if self.tx.is_some() || source_ids.len() + connector_ids.len() <= 1 {
+            // 已在交易裡，或只有一筆（單一 INSERT 本身就是原子的）。
+            for source_id in source_ids {
+                self.link_collection_source(collection_id, *source_id)
+                    .await?;
+            }
+            for connector_id in connector_ids {
+                self.link_collection_connector(collection_id, *connector_id)
+                    .await?;
+            }
+            return Ok(());
+        }
+        // 理由同 storage-postgres：逐筆寫在中途撞 FK 會留下「掛了一半」。
+        let tx = TransactionalStore::begin(self).await?;
+        match tx
+            .store()
+            .link_collection_members(collection_id, source_ids, connector_ids)
+            .await
+        {
+            Ok(()) => tx.commit().await,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn create_collection_with_members(
+        &self,
+        collection: &Collection,
+        source_ids: &[SourceId],
+        connector_ids: &[ConnectorId],
+    ) -> Result<(), StorageError> {
+        if self.tx.is_some() {
+            self.put_collection(collection).await?;
+            return self
+                .link_collection_members(collection.id, source_ids, connector_ids)
+                .await;
+        }
+        let tx = TransactionalStore::begin(self).await?;
+        match tx
+            .store()
+            .create_collection_with_members(collection, source_ids, connector_ids)
+            .await
+        {
+            Ok(()) => tx.commit().await,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
     }
 
     async fn insert_raw_evidence(
@@ -2739,6 +2798,128 @@ impl RelationalStore for SqliteEmbeddedStore {
                 .await
                 .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn record_candidate_discovery(
+        &self,
+        candidate: &Candidate,
+        evidence: &CandidateEvidence,
+    ) -> Result<CandidateDiscoveryOutcome, StorageError> {
+        if self.tx.is_none() {
+            // 理由同 storage-postgres：四步要同一個交易。SQLite 只有一個寫入者，
+            // 交易內的「查自然鍵 → 寫」不會被另一個寫入插隊。
+            let tx = TransactionalStore::begin(self).await?;
+            return match tx
+                .store()
+                .record_candidate_discovery(candidate, evidence)
+                .await
+            {
+                Ok(outcome) => {
+                    tx.commit().await?;
+                    Ok(outcome)
+                }
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    Err(err)
+                }
+            };
+        }
+
+        let (candidate_id, created) = match candidate.collection_id {
+            None => {
+                self.put_candidate(candidate).await?;
+                (candidate.id, true)
+            }
+            Some(collection_id) => {
+                let candidate_type = encode_enum(&candidate.candidate_type)?;
+                let inserted = sqlx::query(
+                    r#"
+                    INSERT INTO candidates (
+                        id, candidate_type, value, normalized_value, collection_id, discovered_by,
+                        discovery_method, confidence, score, status, depth, created_at, reviewed_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT DO NOTHING
+                    "#,
+                )
+                .bind(uuid_text(candidate.id))
+                .bind(&candidate_type)
+                .bind(&candidate.value)
+                .bind(&candidate.normalized_value)
+                .bind(uuid_text(collection_id))
+                .bind(&candidate.discovered_by)
+                .bind(&candidate.discovery_method)
+                .bind(candidate.confidence)
+                .bind(candidate.score)
+                .bind(encode_enum(&candidate.status)?)
+                .bind(candidate.depth)
+                .bind(rfc3339(candidate.created_at))
+                .bind(opt_rfc3339(candidate.reviewed_at))
+                .execute(self.conn().await?.as_mut())
+                .await
+                .map_err(map_sqlx)?;
+                if inserted.rows_affected() > 0 {
+                    (candidate.id, true)
+                } else {
+                    let row = sqlx::query(
+                        r#"
+                        SELECT id FROM candidates
+                        WHERE collection_id = ? AND candidate_type = ? AND normalized_value = ?
+                        "#,
+                    )
+                    .bind(uuid_text(collection_id))
+                    .bind(&candidate_type)
+                    .bind(&candidate.normalized_value)
+                    .fetch_optional(self.conn().await?.as_mut())
+                    .await
+                    .map_err(map_sqlx)?;
+                    let row = row.ok_or_else(|| StorageError::Conflict {
+                        message: format!(
+                            "candidate `{}` 寫入被略過，但用自然鍵讀不到既有列——\
+                             代表撞到的是主鍵（同一個 id、不同自然鍵）。請確認呼叫端每次用新的 id",
+                            candidate.id
+                        ),
+                    })?;
+                    (mapping::uuid_column(&row, "id")?, false)
+                }
+            }
+        };
+
+        // `IS` 是 SQLite 的 NULL-safe 等號（等同 Postgres 的 IS NOT DISTINCT FROM）。
+        let (exists,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM candidate_evidence
+                WHERE candidate_id = ?
+                  AND object_id IS ?
+                  AND entity_id IS ?
+                  AND relationship_id IS ?
+                  AND raw_evidence_id IS ?
+                  AND reason = ?
+            )
+            "#,
+        )
+        .bind(uuid_text(candidate_id))
+        .bind(opt_uuid_text(evidence.object_id))
+        .bind(opt_uuid_text(evidence.entity_id))
+        .bind(opt_uuid_text(evidence.relationship_id))
+        .bind(opt_uuid_text(evidence.raw_evidence_id))
+        .bind(&evidence.reason)
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        let exists = exists != 0;
+        if !exists {
+            let attached = CandidateEvidence {
+                candidate_id,
+                ..evidence.clone()
+            };
+            self.put_candidate_evidence(&attached).await?;
+        }
+        Ok(CandidateDiscoveryOutcome {
+            candidate_id,
+            created,
+            evidence_added: !exists,
+        })
     }
 
     async fn put_candidate_evidence(

@@ -279,24 +279,13 @@ async fn create_inner(
         created_at: now,
         updated_at: now,
     };
-    store
-        .put_collection(&collection)
-        .await
-        .map_err(storage_error)?;
-
+    // 集合與它的關聯在同一個交易裡寫（storage adapter 負責）：上面的存在性檢查
+    // 與實際寫入之間，來源／連接器可能被刪掉；那時整批回滾，不會留下沒掛完的集合。
     // 關聯寫入是 `ON CONFLICT DO NOTHING`，重複 id 不會失敗。
-    for source_id in &body.source_ids {
-        store
-            .link_collection_source(collection.id, *source_id)
-            .await
-            .map_err(storage_error)?;
-    }
-    for connector_id in &body.connector_ids {
-        store
-            .link_collection_connector(collection.id, *connector_id)
-            .await
-            .map_err(storage_error)?;
-    }
+    store
+        .create_collection_with_members(&collection, &body.source_ids, &body.connector_ids)
+        .await
+        .map_err(|err| link_write_error(err, "這次沒有建立任何東西"))?;
 
     let source_ids = store
         .list_collection_sources(collection.id, LINK_PAGE)
@@ -328,6 +317,25 @@ async fn load(state: &AppState, id: CollectionId) -> Result<Collection, ApiError
                 "找不到 Collection `{id}`。請用 GET /api/v1/collections 確認 id"
             ))
         })
+}
+
+/// 批次寫關聯失敗時的錯誤轉換。
+///
+/// 寫入前已經逐一確認過來源／連接器存在，所以走到這裡的 FK 違反只可能是
+/// 「檢查完、寫入前」被別的請求刪掉了。storage adapter 已整批回滾，
+/// 回 422（與預先檢查的「不存在」同一個狀態碼），並明講沒有寫入任何東西——
+/// 直接丟 DB 的 FK 訊息出去，呼叫端看不出要做什麼，也不知道有沒有寫進一半。
+fn link_write_error(err: storage_core::StorageError, nothing_written: &str) -> ApiError {
+    match err {
+        storage_core::StorageError::ConstraintViolation { message } => {
+            tracing::warn!(%message, "集合關聯批次寫入撞到約束，已整批回滾");
+            ApiError::unprocessable(format!(
+                "有來源或連接器在檢查後、寫入前被刪除（或 id 不存在），整批已回滾；\
+                 {nothing_written}。請用 GET /api/v1/sources、GET /api/v1/connectors 確認 id 後重試"
+            ))
+        }
+        other => storage_error(other),
+    }
 }
 
 fn check_link_count(field: &str, count: usize) -> Result<(), ApiError> {
@@ -608,12 +616,11 @@ async fn link_sources_inner(
         "這次沒有寫入任何關聯",
     )
     .await?;
-    for source_id in &body.source_ids {
-        store
-            .link_collection_source(collection_id, *source_id)
-            .await
-            .map_err(storage_error)?;
-    }
+    // 整批同一個交易：中途失敗不留下「掛了一半」。
+    store
+        .link_collection_members(collection_id, &body.source_ids, &[])
+        .await
+        .map_err(|err| link_write_error(err, "這次沒有寫入任何關聯"))?;
     detail_of(state, collection_id).await
 }
 
@@ -775,12 +782,11 @@ async fn link_connectors_inner(
         "這次沒有寫入任何關聯",
     )
     .await?;
-    for connector_id in &body.connector_ids {
-        store
-            .link_collection_connector(collection_id, *connector_id)
-            .await
-            .map_err(storage_error)?;
-    }
+    // 整批同一個交易：中途失敗不留下「掛了一半」。
+    store
+        .link_collection_members(collection_id, &[], &body.connector_ids)
+        .await
+        .map_err(|err| link_write_error(err, "這次沒有寫入任何關聯"))?;
     detail_of(state, collection_id).await
 }
 

@@ -322,16 +322,19 @@ pub async fn get_candidate(
 /// 讀不到代表出現了沒設計到的併發狀況，用 500 讓它明確可見，不要吞掉。
 ///
 /// `validate_url` 只在 approve 路徑開 `true`：核准一筆 `candidate_type == Url`
-/// 的 candidate 之前，先確認它的 `value` 能被 `url_norm::canonicalize` 正規化
-/// 成有明確身分的絕對 URL（§26「unsafe model-generated URL/action」的其中一道
-/// 關卡）。reject 永遠放行——拒絕一個格式不合格的 candidate 不該被這道檢查擋住
-/// （見下面的 `reject_candidate`）。
+/// 的 candidate 之前做兩道檢查（§26「unsafe model-generated URL/action」的關卡），
+/// 任一不過都回 400、狀態不變：
 ///
-/// **已知界線**：`canonicalize` 只擋「無法解析成絕對 URL」的字串——`javascript:`／
-/// `data:` 這類有 scheme 的 opaque URL（cannot-be-a-base）會被 `url` crate 接受、
-/// canonicalize 會回 `Some`。所以這道關卡**不攔**這類危險 scheme，只驗格式、不驗
-/// scheme 安全。若要連它們一起擋，需要在這裡外加 http/https scheme 白名單
-/// （目前刻意不做，維持本關卡的最小範圍）。
+/// 1. `value` 能被 `url_norm::canonicalize` 正規化成絕對 URL。
+/// 2. scheme 必須是 `http` 或 `https`（[`approvable_url_scheme`]）。
+///
+/// 第 2 道是 2026-10-15 補上的：`url` crate 把 `javascript:`／`data:`／`mailto:`
+/// 這類 opaque URL（cannot-be-a-base）視為合法，`canonicalize` 會回 `Some`——
+/// 只有第 1 道時它們會被核准。`ftp:` 等有 host 的非 web scheme 也一併擋掉：
+/// 核准的 URL 之後是給收集端抓取的，那端只支援 http(s)。
+///
+/// reject 永遠放行——拒絕一個格式不合格的 candidate 不該被這道檢查擋住
+/// （見下面的 `reject_candidate`）。
 async fn set_candidate_status(
     state: &AppState,
     id: Uuid,
@@ -358,6 +361,16 @@ async fn set_candidate_status(
                 url_norm::short(&candidate.value),
             )));
         }
+        if candidate.candidate_type == CandidateType::Url
+            && !approvable_url_scheme(&candidate.value)
+        {
+            return Err(ApiError::bad_request(format!(
+                "Candidate `{id}`（candidate_type=Url）的 value `{}` 不是 http/https 網址，\
+拒絕核准。只接受 http:// 或 https:// 開頭的網址；javascript:、data:、mailto:、ftp: \
+等其他 scheme 一律不核准。若這筆不該保留，請改用 reject",
+                url_norm::short(&candidate.value),
+            )));
+        }
     }
     let updated = store
         .update_candidate_status(id, status, Utc::now())
@@ -373,6 +386,12 @@ async fn set_candidate_status(
             "update_candidate_status 回 true 但緊接著讀不到這筆 candidate，這是不該發生的併發狀態",
         )
     })
+}
+
+/// 核准 Url candidate 時允許的 scheme：只有 `http`／`https`
+/// （判斷本身在 `url_norm::is_http_or_https`，與正規化共用同一個解析器）。
+fn approvable_url_scheme(value: &str) -> bool {
+    url_norm::is_http_or_https(value)
 }
 
 /// `POST /api/v1/candidates/{id}/approve`。operator 以上。

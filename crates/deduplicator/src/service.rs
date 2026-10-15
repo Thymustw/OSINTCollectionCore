@@ -382,11 +382,26 @@ impl Deduplicator {
             _ => None,
         };
 
-        let canonical_url = document
+        // 匯入時合成的 `import://{kind}/{filename}` 不是文章身分，只是「從哪個檔案來」：
+        // 同檔名、不同內容的兩次匯入會撞同一個 URI。拿它當 Stage 2 的鍵會把第二批
+        // 判成第一批的重複、跳過實體抽取，而且沒有任何錯誤（KNOWN_GAPS §16）。
+        // 排除後，真的內容相同的匯入仍會被 Stage 3（內容雜湊）／Stage 4 抓到。
+        //
+        // 在這裡排除、而不是讓 normalizer 不填 canonical_url：Stage 2 的鍵是從
+        // `source_url` 重新算的（不讀 `document.canonical_url`），只改 normalizer 不會生效。
+        let synthetic = document
             .source_url
             .as_deref()
-            .and_then(url_norm::canonicalize);
-        if canonical_url.is_none() {
+            .is_some_and(url_norm::is_synthetic_import_url);
+        let canonical_url = if synthetic {
+            None
+        } else {
+            document
+                .source_url
+                .as_deref()
+                .and_then(url_norm::canonicalize)
+        };
+        if canonical_url.is_none() && !synthetic {
             if let Some(raw) = document.source_url.as_deref() {
                 tracing::debug!(
                     document_id = %document.id,

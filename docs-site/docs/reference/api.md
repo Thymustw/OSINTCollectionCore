@@ -187,10 +187,10 @@ collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有�
 |---|---|---|---|
 | `GET` | `/api/v1/collections` | viewer | 列出所有調查集合 |
 | `GET` | `/api/v1/collections/{id}` | viewer | 取得單一調查集合（含來源／連接器／文件 id 清單） |
-| `POST` | `/api/v1/collections` | operator | 建立調查集合（可同時掛上 `source_ids`／`connector_ids`，一次各最多 100 筆）。一個來源／連接器最多屬於 50 個集合，超過回 422 且不建立任何東西 |
-| `POST` | `/api/v1/collections/{id}/sources` | operator | 把來源掛上這個集合。**不回填**已經落地的舊資料，只影響之後收進來的。一個來源最多屬於 50 個集合，超過回 422（收集時一次只讀得完 100 個集合，寫入端把來源與連接器各卡在 50）；已掛上的重送仍成功 |
+| `POST` | `/api/v1/collections` | operator | 建立調查集合（可同時掛上 `source_ids`／`connector_ids`，一次各最多 100 筆）。集合與關聯一起寫入，全有或全無：任何一個 id 不存在或超過上限都回 422 且不建立任何東西。一個來源／連接器最多屬於 50 個集合 |
+| `POST` | `/api/v1/collections/{id}/sources` | operator | 把來源掛上這個集合。**不回填**已經落地的舊資料，只影響之後收進來的。一個來源最多屬於 50 個集合，超過回 422（收集時一次只讀得完 100 個集合，寫入端把來源與連接器各卡在 50）；已掛上的重送仍成功。整批全有或全無：任何一個 id 不存在 → 422 且這批一個都不掛 |
 | `DELETE` | `/api/v1/collections/{id}/sources/{source_id}` | operator | 拿掉來源。集合或來源不存在 → 404；本來就沒掛上 → 204（冪等） |
-| `POST` | `/api/v1/collections/{id}/connectors` | operator | 把連接器掛上這個集合。同樣不回填舊資料。一個連接器最多屬於 50 個集合，超過回 422；已掛上的重送仍成功 |
+| `POST` | `/api/v1/collections/{id}/connectors` | operator | 把連接器掛上這個集合。同樣不回填舊資料。一個連接器最多屬於 50 個集合，超過回 422；已掛上的重送仍成功。整批全有或全無（同上） |
 | `DELETE` | `/api/v1/collections/{id}/connectors/{connector_id}` | operator | 拿掉連接器。語意同上 |
 | `GET` | `/api/v1/collections/{id}/budget` | viewer | 取得 Discovery 配額。沒設過時回保守預設，並標 `is_default: true` |
 | `PUT` | `/api/v1/collections/{id}/budget` | operator | 覆寫 Discovery 配額。之後 `is_default` 為 `false` |
@@ -216,7 +216,7 @@ collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有�
 |---|---|---|---|
 | `GET` | `/api/v1/candidates` | viewer | 列出所有候選 |
 | `GET` | `/api/v1/candidates/{id}` | viewer | 取得單一候選 |
-| `POST` | `/api/v1/candidates/{id}/approve` | operator | 核准候選 |
+| `POST` | `/api/v1/candidates/{id}/approve` | operator | 核准候選。`candidate_type = url` 的候選，`value` 必須是 `http`／`https` 的絕對 URL，否則 400 且狀態不變 |
 | `POST` | `/api/v1/candidates/{id}/reject` | operator | 拒絕候選 |
 
 ### AI Run

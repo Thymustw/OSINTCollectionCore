@@ -19,9 +19,9 @@ use sqlx::Row;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
-    BudgetConsumption, CanonicalStore, CapabilityDescriptor, DailyUsage, HealthProvider,
-    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
-    TransactionalStore,
+    BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor, DailyUsage,
+    HealthProvider, RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth,
+    Transaction, TransactionalStore,
 };
 
 use crate::error::map_sqlx;
@@ -952,6 +952,66 @@ impl RelationalStore for PostgresCanonicalStore {
         .await
         .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn link_collection_members(
+        &self,
+        collection_id: CollectionId,
+        source_ids: &[SourceId],
+        connector_ids: &[ConnectorId],
+    ) -> Result<(), StorageError> {
+        if self.tx.is_some() || source_ids.len() + connector_ids.len() <= 1 {
+            // 已在交易裡，或只有一筆（單一 INSERT 本身就是原子的）。
+            for source_id in source_ids {
+                self.link_collection_source(collection_id, *source_id)
+                    .await?;
+            }
+            for connector_id in connector_ids {
+                self.link_collection_connector(collection_id, *connector_id)
+                    .await?;
+            }
+            return Ok(());
+        }
+        // 多筆關聯必須同一個交易：逐筆寫在中途撞 FK 會留下「掛了一半」。
+        let tx = TransactionalStore::begin(self).await?;
+        match tx
+            .store()
+            .link_collection_members(collection_id, source_ids, connector_ids)
+            .await
+        {
+            Ok(()) => tx.commit().await,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
+    async fn create_collection_with_members(
+        &self,
+        collection: &Collection,
+        source_ids: &[SourceId],
+        connector_ids: &[ConnectorId],
+    ) -> Result<(), StorageError> {
+        if self.tx.is_some() {
+            self.put_collection(collection).await?;
+            return self
+                .link_collection_members(collection.id, source_ids, connector_ids)
+                .await;
+        }
+        // 集合本身與它的關聯同一個交易：關聯寫失敗時集合也不留下。
+        let tx = TransactionalStore::begin(self).await?;
+        match tx
+            .store()
+            .create_collection_with_members(collection, source_ids, connector_ids)
+            .await
+        {
+            Ok(()) => tx.commit().await,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
     }
 
     async fn insert_raw_evidence(
@@ -2722,6 +2782,140 @@ impl RelationalStore for PostgresCanonicalStore {
                 .await
                 .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn record_candidate_discovery(
+        &self,
+        candidate: &Candidate,
+        evidence: &CandidateEvidence,
+    ) -> Result<CandidateDiscoveryOutcome, StorageError> {
+        if self.tx.is_none() {
+            // 查自然鍵 → 寫候選 → 查證據 → 寫證據，四步要同一個交易：
+            // 中途失敗不能留下「候選建了、證據沒寫」（Acceptance C 會答不出為什麼）。
+            let tx = TransactionalStore::begin(self).await?;
+            return match tx
+                .store()
+                .record_candidate_discovery(candidate, evidence)
+                .await
+            {
+                Ok(outcome) => {
+                    tx.commit().await?;
+                    Ok(outcome)
+                }
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    Err(err)
+                }
+            };
+        }
+
+        let (candidate_id, created) = match candidate.collection_id {
+            None => {
+                self.put_candidate(candidate).await?;
+                (candidate.id, true)
+            }
+            Some(collection_id) => {
+                let candidate_type = encode_enum(&candidate.candidate_type)?;
+                // 不帶衝突目標的 DO NOTHING 同時涵蓋 PK 與自然鍵唯一索引。
+                // 併發的另一個交易先插入同鍵時，這裡會等它 commit 後回 0 列，
+                // 接著的 SELECT（READ COMMITTED，新快照）讀得到那一筆。
+                let inserted = sqlx::query(
+                    r#"
+                    INSERT INTO candidates (
+                        id, candidate_type, value, normalized_value, collection_id, discovered_by,
+                        discovery_method, confidence, score, status, depth, created_at, reviewed_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                    ON CONFLICT DO NOTHING
+                    "#,
+                )
+                .bind(candidate.id)
+                .bind(&candidate_type)
+                .bind(&candidate.value)
+                .bind(&candidate.normalized_value)
+                .bind(collection_id)
+                .bind(&candidate.discovered_by)
+                .bind(&candidate.discovery_method)
+                .bind(candidate.confidence)
+                .bind(candidate.score)
+                .bind(encode_enum(&candidate.status)?)
+                .bind(candidate.depth)
+                .bind(candidate.created_at)
+                .bind(candidate.reviewed_at)
+                .execute(self.conn().await?.as_mut())
+                .await
+                .map_err(map_sqlx)?;
+                if inserted.rows_affected() > 0 {
+                    (candidate.id, true)
+                } else {
+                    let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
+                        r#"
+                        SELECT id FROM candidates
+                        WHERE collection_id = $1 AND candidate_type = $2 AND normalized_value = $3
+                        "#,
+                    )
+                    .bind(collection_id)
+                    .bind(&candidate_type)
+                    .bind(&candidate.normalized_value)
+                    .fetch_optional(self.conn().await?.as_mut())
+                    .await
+                    .map_err(map_sqlx)?;
+                    let (id,) = existing.ok_or_else(|| StorageError::Conflict {
+                        message: format!(
+                            "candidate `{}` 寫入被略過，但用自然鍵讀不到既有列——\
+                             代表撞到的是主鍵（同一個 id、不同自然鍵）。請確認呼叫端每次用新的 id",
+                            candidate.id
+                        ),
+                    })?;
+                    (id, false)
+                }
+            }
+        };
+
+        // 鎖住候選列再查證據：candidate_evidence 沒有內容唯一約束（欄位可為 NULL），
+        // 不鎖的話兩個 worker 同時對同一實體重跑，兩邊 EXISTS 都看不到對方未 commit
+        // 的證據，各寫一列，「完全冪等」的契約就破了。鎖到交易結束，同一候選的證據
+        // 寫入因此排隊；不同候選互不影響。（SQLite 不需要：上面的 INSERT 已取得
+        // 整個資料庫的寫鎖。）
+        sqlx::query("SELECT 1 FROM candidates WHERE id = $1 FOR UPDATE")
+            .bind(candidate_id)
+            .execute(self.conn().await?.as_mut())
+            .await
+            .map_err(map_sqlx)?;
+
+        let (exists,): (bool,) = sqlx::query_as(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM candidate_evidence
+                WHERE candidate_id = $1
+                  AND object_id IS NOT DISTINCT FROM $2
+                  AND entity_id IS NOT DISTINCT FROM $3
+                  AND relationship_id IS NOT DISTINCT FROM $4
+                  AND raw_evidence_id IS NOT DISTINCT FROM $5
+                  AND reason = $6
+            )
+            "#,
+        )
+        .bind(candidate_id)
+        .bind(evidence.object_id)
+        .bind(evidence.entity_id)
+        .bind(evidence.relationship_id)
+        .bind(evidence.raw_evidence_id)
+        .bind(&evidence.reason)
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        if !exists {
+            let attached = CandidateEvidence {
+                candidate_id,
+                ..evidence.clone()
+            };
+            self.put_candidate_evidence(&attached).await?;
+        }
+        Ok(CandidateDiscoveryOutcome {
+            candidate_id,
+            created,
+            evidence_added: !exists,
+        })
     }
 
     async fn put_candidate_evidence(
