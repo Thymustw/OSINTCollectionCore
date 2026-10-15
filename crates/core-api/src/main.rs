@@ -3,6 +3,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
@@ -15,7 +17,7 @@ use core_config::AppConfig;
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::{MetricsRegistry, init_tracing};
-use core_security::{AuditLog, JwtService, MemoryApiTokenStore, MemoryAuditLog};
+use core_security::{AuditLog, JwtService};
 use merge::MergeService;
 use resolver::{GraphContextResolver, ResolverService};
 use storage_core::conformance::{
@@ -72,105 +74,79 @@ async fn run() -> Result<(), String> {
     // admission metrics；後面 AppState 也用這一份，不要 new 第二次。
     let metrics = MetricsRegistry::new();
 
-    let mut shared_store: Option<SharedStore> = None;
     let mut shared_objects: Option<SharedObjects> = None;
-    // 具體型別的 Postgres store，給 GraphContextResolver 用。
-    // `shared_store` 是型別擦除過的 `Arc<dyn RelationalStore>`，裝不進
-    // `GraphContextResolver<PostgresCanonicalStore, _>`。
-    let mut pg_store: Option<PostgresCanonicalStore> = None;
     // `/api/v1/ops/health` 要敲的後端。**用具體型別建**：
     // `Arc<dyn RelationalStore>` 沒辦法直接當成 `Arc<dyn HealthProvider>`
     // （trait object 之間不能互轉），而這裡手上正好有具體的 store。
     let mut health_checks: Vec<Arc<dyn ReadyCheck>> = Vec::new();
     let mut missing: Vec<&'static str> = Vec::new();
-    // 預設是記憶體版。Postgres 接上後就換成落地版——**不要**把這裡當成常態：
-    // 記憶體 audit 在重啟時整批消失，記憶體 token store 會讓發出去的 token 失效。
-    // 沒換成功時下面會發一條 warn，那是唯一的訊號。
-    let mut audit: Arc<dyn AuditLog> = Arc::new(MemoryAuditLog::new());
-    let mut tokens: SharedTokenStore = Arc::new(MemoryApiTokenStore::new());
 
-    let (jobs, merge, resolver, auto_approval, import, ready) = match connect_postgres(&cfg).await {
-        Ok(store) => {
-            let ready = ReadyProbe::new(vec![Arc::new(PostgresReady {
-                store: store.clone(),
-            })]);
-            // 稽核與 token 落到 `audit_log` / `api_tokens`（migration 0006）。
-            // 兩者共用 canonical store 的連線池，不另開池。
-            audit = Arc::new(PostgresAuditLog::new(&store));
-            tokens = Arc::new(PostgresApiTokenStore::new(&store));
+    // 連不上就整個行程結束（見 connect_postgres_with_retry）。舊版在這裡失敗時會降級成
+    // 記憶體版稽核與 token、`/ready` 回 always-ready——那個狀態已經不存在。
+    let store = connect_postgres_with_retry(&cfg).await?;
+    // 稽核與 token 落到 `audit_log` / `api_tokens`（migration 0006）。
+    // 兩者共用 canonical store 的連線池，不另開池。
+    let audit: Arc<dyn AuditLog> = Arc::new(PostgresAuditLog::new(&store));
+    let tokens: SharedTokenStore = Arc::new(PostgresApiTokenStore::new(&store));
+    // 一份 Arc 給所有 handler 用（AppState.store 與 ImportState.store 是同一個）。
+    let shared: SharedStore = Arc::new(store.clone());
+    let shared_store: Option<SharedStore> = Some(shared.clone());
 
-            // 一份 Arc 給所有 handler 用（AppState.store 與 ImportState.store 是同一個）。
-            let shared: SharedStore = Arc::new(store.clone());
-            shared_store = Some(shared.clone());
+    let ready = ReadyProbe::new(vec![Arc::new(PostgresReady {
+        store: store.clone(),
+    })]);
+    health_checks.push(Arc::new(BackendCheck::new(
+        "postgres",
+        Arc::new(store.clone()),
+    )));
+
+    // 匯入另外需要物件儲存。物件儲存沒接上時只有 /api/v1/import 回 503，
+    // 其他路由照常——沒有理由讓查詢功能陪著一起掛掉。
+    let import = match connect_objects(&cfg).await {
+        Ok(objects) => {
+            shared_objects = Some(Arc::new(objects.clone()));
             health_checks.push(Arc::new(BackendCheck::new(
-                "postgres",
-                Arc::new(store.clone()),
+                "object_store",
+                Arc::new(objects.clone()),
             )));
-
-            // 匯入另外需要物件儲存。物件儲存沒接上時只有 /api/v1/import 回 503，
-            // 其他路由照常——沒有理由讓查詢功能陪著一起掛掉。
-            let import = match connect_objects(&cfg).await {
-                Ok(objects) => {
-                    shared_objects = Some(Arc::new(objects.clone()));
-                    health_checks.push(Arc::new(BackendCheck::new(
-                        "object_store",
-                        Arc::new(objects.clone()),
-                    )));
-                    Some(Arc::new(ImportState {
-                        store: shared,
-                        // sink 用**具體型別**組裝：`StoreEvidenceSink<R, O>` 要求
-                        // `R: RelationalStore`，而 `Arc<dyn RelationalStore>` 本身
-                        // 沒有實作那個 trait（沒有 blanket impl）。這裡手上正好有
-                        // 具體的 store，不需要為此加一層 wrapper。
-                        sink: Arc::new(StoreEvidenceSink::new(store.clone(), objects)),
-                        producer: producer.clone(),
-                    }))
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "物件儲存未連上；POST /api/v1/import 會回 503");
-                    missing.push("object_store");
-                    None
-                }
-            };
-            let jobs = Some(Arc::new(JobService::new(store.clone(), producer.clone())));
-            let merge = Some(Arc::new(MergeService::new(store.clone(), producer.clone())));
-            // MockEmbeddingProvider::unsupported() 讓 semantic_similarity 誠實回空，
-            // 不是假裝已接上。graph_context 不在 ResolverService 上，見下方
-            // 獨立的 graph_resolver。
-            let resolver = Some(Arc::new(ResolverService::new(
-                store.clone(),
-                MockEmbeddingProvider::unsupported(),
-            )));
-            let auto_approval = Some(Arc::new(assemble_auto_approval(
-                store.clone(),
-                producer.clone(),
-                &cfg.auto_approval,
-                metrics.clone(),
-            )));
-            pg_store = Some(store);
-            (jobs, merge, resolver, auto_approval, import, ready)
+            Some(Arc::new(ImportState {
+                store: shared,
+                // sink 用**具體型別**組裝：`StoreEvidenceSink<R, O>` 要求
+                // `R: RelationalStore`，而 `Arc<dyn RelationalStore>` 本身
+                // 沒有實作那個 trait（沒有 blanket impl）。這裡手上正好有
+                // 具體的 store，不需要為此加一層 wrapper。
+                sink: Arc::new(StoreEvidenceSink::new(store.clone(), objects)),
+                producer: producer.clone(),
+            }))
         }
         Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "Postgres 未連上；/jobs、/api/v1/import 與 /api/v1/tokens 會回 503，\
-                 /health 仍可用。稽核與 API token 這次只存在記憶體裡，重啟即遺失"
-            );
-            missing.push("postgres");
+            tracing::warn!(error = %err, "物件儲存未連上；POST /api/v1/import 會回 503");
             missing.push("object_store");
-            (None, None, None, None, None, ReadyProbe::always_ready())
+            None
         }
     };
+    let jobs = Some(Arc::new(JobService::new(store.clone(), producer.clone())));
+    let merge = Some(Arc::new(MergeService::new(store.clone(), producer.clone())));
+    // MockEmbeddingProvider::unsupported() 讓 semantic_similarity 誠實回空，
+    // 不是假裝已接上。graph_context 不在 ResolverService 上，見下方
+    // 獨立的 graph_resolver。
+    let resolver = Some(Arc::new(ResolverService::new(
+        store.clone(),
+        MockEmbeddingProvider::unsupported(),
+    )));
+    let auto_approval = Some(Arc::new(assemble_auto_approval(
+        store.clone(),
+        producer.clone(),
+        &cfg.auto_approval,
+        metrics.clone(),
+    )));
 
     // graph_resolver、graph、graph_projection 共用**同一次** `connect_graph`——不要連兩次。
     // `Neo4jStore` 是 Clone（連線池 handle），clone 很便宜。
     // 三者跟 resolver 都是獨立的可用性：Neo4j 沒接上只讓
     // POST /entities/{id}/resolve/graph-context、/graph/* 讀取路由與 /ops/graph 回 503，
     // resolve_entity 的另外幾個方法不受影響。
-    // Postgres 沒接上時 graph_resolver 也是 None：沒有 canonical store 就沒辦法 persist candidate。
-    // graph 讀取端只需要 Neo4j，理論上 Postgres 掛了仍可查圖；但目前 connect_graph
-    // 只在有 pg_store 時呼叫一次，兩邊一起 None——不要為了這個分叉再開第二次連線。
-    let (graph_resolver, graph, graph_projection) = if let Some(store) = pg_store {
+    let (graph_resolver, graph, graph_projection) = {
         match connect_graph(&cfg).await {
             Ok(neo4j) => {
                 // Bolt 健康檢查用同一個 clone，不要再開第二次連線。
@@ -201,11 +177,6 @@ async fn run() -> Result<(), String> {
                 (None, None, None)
             }
         }
-    } else {
-        // 沒有 Postgres 就不會連 Bolt。HTTP 探活下面仍可能獨立掛上，
-        // 但 `neo4j_bolt` 必須列進 not_configured，否則它會從清單上消失。
-        missing.push("neo4j_bolt");
-        (None, None, None)
     };
 
     // 搜尋接不上時只有 POST /api/v1/search 回 503，其他路由照常——
@@ -459,6 +430,44 @@ fn assemble_auto_approval(
         )),
         max_auto_merges_per_resolve: section.max_auto_merges_per_resolve,
     }
+}
+
+/// 啟動時連 Postgres，有上限的退避重試；全部失敗就回錯誤讓行程結束。
+///
+/// 2026-10-15 實測：主機重開機時 Docker 依 `restart: unless-stopped` 把所有容器
+/// **同時**拉起——compose 的 `depends_on: service_healthy` 只在 `docker compose up`
+/// 時生效，開機自動重啟不看它。osint-api 在 Postgres 還在初始化時連了一次、失敗，
+/// 舊版就永久降級成記憶體版稽核與 token、`/ready` 回 always-ready，健康檢查一直是綠的，
+/// 直到有人手動重啟。worker 沒這個問題，因為它們連不上就 crash、被 Docker 重啟後再試。
+///
+/// 所以這裡比照 worker：重試涵蓋「依賴還在開機」的窗口，真的連不上就退出交給 Docker，
+/// 不再有「看起來活著、其實沒有資料庫」的狀態。
+async fn connect_postgres_with_retry(cfg: &AppConfig) -> Result<PostgresCanonicalStore, String> {
+    // 1+2+4+8+8+8+8+8+8 ≈ 55 秒。Postgres 冷開機實測數秒內 healthy，這個窗口是它的數倍。
+    const DELAYS_SECS: [u64; 9] = [1, 2, 4, 8, 8, 8, 8, 8, 8];
+    let mut last_err = String::new();
+    for (attempt, delay) in std::iter::once(0).chain(DELAYS_SECS).enumerate() {
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        match connect_postgres(cfg).await {
+            Ok(store) => {
+                if attempt > 0 {
+                    tracing::info!(attempt, "Postgres 重試後連上");
+                }
+                return Ok(store);
+            }
+            Err(err) => {
+                tracing::warn!(attempt, error = %err, "Postgres 尚未連上，稍後重試");
+                last_err = err;
+            }
+        }
+    }
+    Err(format!(
+        "Postgres 重試 {} 次仍連不上，osint-api 結束（交給 Docker 重啟）。\
+         沒有資料庫就沒有稽核與 token 持久化，不以降級模式對外服務。最後錯誤：{last_err}",
+        DELAYS_SECS.len() + 1
+    ))
 }
 
 async fn connect_postgres(cfg: &AppConfig) -> Result<PostgresCanonicalStore, String> {

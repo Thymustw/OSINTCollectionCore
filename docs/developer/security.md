@@ -36,7 +36,7 @@ Claims：`sub`、`role`、`iss`、`iat`、`exp`、`jti`。
 
 | 實作 | 位置 | 用途 |
 |---|---|---|
-| `MemoryApiTokenStore` | `core-security` | 測試、以及 Postgres 沒接上時的降級 |
+| `MemoryApiTokenStore` | `core-security` | 測試。osint-api 已不再降級使用（2026-10-15 起連不上 Postgres 就結束行程，見 `docs/operations/OPERATIONS.md`） |
 | `PostgresApiTokenStore` | `storage-postgres::security` | 生產。表是 `api_tokens`（migration 0006） |
 
 `osint-api` 連上 Postgres 就用 PG 版；**連不上時會退回記憶體版並發一條 warn**——
@@ -95,7 +95,7 @@ Phase 6a 之前 admin 那一欄沒有任何守護對象——`Permission::Admin`
 
 | 實作 | 位置 | 用途 |
 |---|---|---|
-| `MemoryAuditLog` | `core-security` | 測試、connector-sdk 的 SSRF 稽核、降級 |
+| `MemoryAuditLog` | `core-security` | 測試、connector-sdk 的 SSRF 稽核。osint-api 已不再降級使用 |
 | `PostgresAuditLog` | `storage-postgres::security` | 生產。表是 `audit_log`（migration 0006） |
 
 ### 為什麼 PG 實作放在 `storage-postgres`

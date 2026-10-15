@@ -149,6 +149,8 @@ cargo test -p core-events --test redpanda_roundtrip -- --nocapture
 
 會 produce 一則、consume 回來比對 id／payload。測試用一次性 topic `osint.conformance.<uuid>`，不寫進共用的 `job.dispatched`（unique group + `auto.offset.reset=earliest` 會先吃到歷史訊息）。
 
+**一次性 topic 測完一定要刪。** 測試開頭會先刪掉所有殘留的 `osint.conformance.*`，結尾再刪自己這次的 topic（刪除函式只接受這個前綴）。原因：本機 Redpanda 以 `--memory 256M --smp 1` 啟動，partition 總數受記憶體限制（`topic_memory_per_partition`）。2026-10-15 實測累積 119 個未刪的測試 topic（144 個 partition）後，**任何新 topic 都建不出來**——`rpk topic create` 回 `INVALID_PARTITIONS: Can not increase partition count due to memory limit`，但 producer 端只看得到 `MessageTimedOut`，完全看不出原因。正式服務的 topic 受同一個上限。producer 一直 `MessageTimedOut` 而 Redpanda 又是 healthy 時，先用 `docker exec osint-core-redpanda-1 rpk topic create <名稱>` 看是不是這個錯誤。
+
 `EventConsumer::next_envelope` 會在逾時內重試 `UnknownTopicOrPartition`：consumer 先 subscribe、topic 由第一次 produce 自動建立時，librdkafka 可能先回這個暫時性錯誤。
 
 `rdkafka` 以 mklove `./configure` + `libz` 編譯，**不開 `cmake-build` / `ssl-vendored`**。
