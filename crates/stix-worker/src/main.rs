@@ -250,7 +250,7 @@ async fn consume_loop(
                             }
                         }
                         processed += 1;
-                        if processed % LAG_PROBE_EVERY == 0 {
+                        if processed.is_multiple_of(LAG_PROBE_EVERY) {
                             update_queue_depth(consumer, metrics);
                         }
                     }

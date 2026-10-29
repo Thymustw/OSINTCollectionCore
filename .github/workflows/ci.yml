@@ -293,12 +293,12 @@ jobs:
     name: SBOM + scan (neo4j)
     runs-on: ubuntu-latest
     steps:
-      - run: docker pull neo4j:5.26.30-community
+      - run: docker pull neo4j:5.26.32-community
       - name: Generate CycloneDX SBOM
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
-          image-ref: neo4j:5.26.30-community
+          image-ref: neo4j:5.26.32-community
           format: cyclonedx
           output: sbom-neo4j.cdx.json
           exit-code: "0"
@@ -313,7 +313,7 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
-          image-ref: neo4j:5.26.30-community
+          image-ref: neo4j:5.26.32-community
           scanners: vuln
           severity: HIGH
           ignore-unfixed: true
@@ -323,7 +323,7 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
-          image-ref: neo4j:5.26.30-community
+          image-ref: neo4j:5.26.32-community
           scanners: vuln
           severity: CRITICAL
           ignore-unfixed: true

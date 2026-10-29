@@ -388,7 +388,7 @@ async fn apply_backpressure(
     bounds: IndexBounds,
     flushes: u32,
 ) {
-    if flushes % LAG_PROBE_EVERY != 0 {
+    if !flushes.is_multiple_of(LAG_PROBE_EVERY) {
         return;
     }
     let lag = match consumer.consumer_lag(LAG_TIMEOUT) {

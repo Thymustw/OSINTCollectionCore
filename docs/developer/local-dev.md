@@ -15,7 +15,7 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up 
 | redpanda | redpandadata/redpanda:v26.2.2 | 9092, 8081, 8082, 9644 | 同左 |
 | redis | redis:7.4-bookworm | 6379 | 6379 |
 | seaweedfs | chrislusf/seaweedfs:4.48 | 8333 | 8333（不 remap） |
-| neo4j | neo4j:5.26.30-community | 7474, 7687 | 同左 |
+| neo4j | neo4j:5.26.32-community | 7474, 7687 | 同左 |
 
 `docker-compose.dev.yml` 的記憶體上限：postgres 1GB、**opensearch 3GB（heap 1536m）**、
 redpanda 512MB、redis 256MB、seaweedfs 512MB（延用自 MinIO，未重新量測）、**neo4j 1GB（heap 512m + pagecache 256m）**，
@@ -188,7 +188,7 @@ curl -s http://127.0.0.1:7474/     # 200 + discovery JSON
 
 | 項目 | 值 |
 |---|---|
-| Image | `neo4j:5.26.30-community`（釘版，2026-09-12 於 Docker Hub 確認存在） |
+| Image | `neo4j:5.26.32-community`（釘版；2026-10-29 由 5.26.30 升級，修 trivy CRITICAL CVE-2026-90037，見 ADR-010） |
 | HTTP | 7474（探活 + Browser `http://127.0.0.1:7474/browser/`） |
 | Bolt | 7687 |
 | Volume | `osint-core_neo4j-data`（`make disk` 會列出來） |
@@ -243,7 +243,7 @@ docker exec osint-core-neo4j-1 cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETUR
 回應長這樣（實測）：
 
 ```json
-{"name":"neo4j","healthy":true,"message":"HTTP 200 OK，Neo4j 5.26.30 community"}
+{"name":"neo4j","healthy":true,"message":"HTTP 200 OK，Neo4j 5.26.32 community"}
 ```
 
 ⚠️ **這只證明 HTTP 埠活著，不證明 Bolt 可連或資料庫可寫。**

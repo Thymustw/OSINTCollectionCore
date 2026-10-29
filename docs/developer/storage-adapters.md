@@ -27,7 +27,7 @@ crates/storage-core          capability traits、StorageError、health、conform
 crates/storage-postgres      CanonicalStore + RelationalStore（sqlx 0.9、rustls-ring）
 crates/storage-sqlite        EmbeddedStore + RelationalStore（sqlx 0.9 sqlite）
 crates/storage-opensearch    SearchStore + EmbeddingProvider（opensearch 2.4.0、rustls-tls；ml-commons `_predict`）
-crates/storage-redis         KeyValueStore（redis =1.2.2；workspace rust-version 1.85）
+crates/storage-redis         KeyValueStore（redis =1.2.2；workspace rust-version 1.87）
 crates/storage-s3            ObjectStore（object_store 0.14.1 aws + reqwest/rustls）
 crates/storage-neo4j         GraphStore + ProjectionStore（neo4rs 0.8.0）
 ```
@@ -345,7 +345,7 @@ cargo test --workspace --all-targets -- --nocapture
 - sqlx：`runtime-tokio` + `tls-rustls-ring`，不開 native-tls。
 - OpenSearch client：`rustls-tls`。
 - object_store：`default-features = false` + `aws`。`aws` 會開 `reqwest/rustls` 與 `aws-lc-rs`，不開 native-tls。crate 預設的 `fs` feature 關掉，因為我們只接 S3 相容後端。
-- redis：精確 `=1.2.2`。`1.3+` 的 rust-version 是 1.88，超過 workspace `1.85.0`。
+- redis：精確 `=1.2.2`。`1.3+` 的 rust-version 是 1.88，超過 workspace `1.87.0`。
 - rdkafka：`cmake-build` + `libz`，不開 `ssl-vendored`（見 `docs/developer/events.md`）。
 
 ## `storage-postgres` 也實作 core-security 的兩個能力介面（Phase 6a）

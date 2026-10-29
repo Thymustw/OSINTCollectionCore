@@ -327,9 +327,10 @@ services:
   # binary，GPL 的傳染性不及於 Rust code。決策與備案見
   # docs/adr/ADR-010-neo4j-community-edition.md。
   #
-  # ⚠️ tag 釘到具體的 5.26.30-community，不是 `5-community`。
-  # 2026-09-12 用 Docker Hub v2 API 確認過這個 tag 存在（2026-09-09 推送，
-  # amd64 347.4 MB）。浮動 tag 會讓「同一份 compose 在兩台機器起出不同版本」
+  # ⚠️ tag 釘到具體的 5.26.32-community，不是 `5-community`。
+  # 2026-10-29 由 5.26.30 升級：舊映像的 linux-libc-dev 6.12.107 有 trivy
+  # CRITICAL（CVE-2026-90037）擋住 CI；本 tag 2026-10-28 重建，實查 dpkg 為
+  # 6.12.113（修補版 6.12.111）。見 ADR-010。浮動 tag 會讓「同一份 compose 在兩台機器起出不同版本」
   # 變成無聲的差異——2026-09 MinIO CE 從 Docker Hub 消失、quay.io 後來又
   # 對匿名 pull 回 401，才被發現沒人定期確認 tag 還在。已改用 SeaweedFS，
   # 見 ADR-015。
@@ -340,7 +341,7 @@ services:
   # 留著這行比留空白更能擋下「順手加一個 APOC」——那會多拉數十 MB、
   # 多一組 GPL 之外的授權要審，還會讓 Cypher 查詢意外依賴非標準函式。
   neo4j:
-    image: neo4j:5.26.30-community
+    image: neo4j:5.26.32-community
     hostname: neo4j
     environment:
       # 帳號從 .env 讀。Community 版**初始使用者只能是 `neo4j`**，

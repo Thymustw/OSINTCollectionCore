@@ -183,7 +183,7 @@ async fn run() -> Result<(), String> {
                             tracing::warn!(error = %err, "commit offset 失敗");
                         }
                         processed += 1;
-                        if processed % LAG_PROBE_EVERY == 0 {
+                        if processed.is_multiple_of(LAG_PROBE_EVERY) {
                             update_queue_depth(&consumer, &metrics);
                         }
                     }

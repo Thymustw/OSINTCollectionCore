@@ -1,6 +1,6 @@
 # Repository layout（V0.3：35 個 crate；resolver／merge／ai-gateway／stix-adapter 目前是函式庫；十個服務 binary 都在 compose 的 `app` profile）
 
-Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.85.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 stable channel。
+Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.87.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 stable channel。
 
 ```text
 Cargo.toml

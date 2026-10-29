@@ -9,5 +9,4 @@ ignore = [
     "RUSTSEC-2023-0071", # rsa (Marvin Attack)，經 jsonwebtoken 帶入，5.9 MEDIUM，90 天到期
     "RUSTSEC-2026-0009", # time stack exhaustion，經 rust-s3 帶入，6.8 MEDIUM，90 天到期
     "RUSTSEC-2026-0387", # crypto-bigint 0.5 時序，經 jsonwebtoken→p256（只用 HS256），2026-11-28 到期
-    "RUSTSEC-2026-0385", # ctutils 時序，修正版需 Rust 1.87 > MSRV 1.85，2026-11-28 到期
 ]

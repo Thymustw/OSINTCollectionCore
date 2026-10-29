@@ -122,7 +122,7 @@ async fn consume_loop(
                 Ok(envelope) => {
                     handle_envelope(jobs, store, graph, &envelope).await;
                     processed += 1;
-                    if processed % LAG_PROBE_EVERY == 0 {
+                    if processed.is_multiple_of(LAG_PROBE_EVERY) {
                         update_queue_depth(consumer, metrics);
                     }
                     if let Err(err) = consumer.commit_last() {
