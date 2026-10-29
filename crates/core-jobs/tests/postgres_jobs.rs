@@ -62,6 +62,42 @@ async fn create_transition_list() {
 }
 
 #[tokio::test]
+async fn cancelled_persists_error_and_completed_at() {
+    load_workspace_dotenv();
+    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
+    let store = PostgresCanonicalStore::connect(&dsn, 5)
+        .await
+        .expect("連 Postgres");
+    store.migrate().await.expect("migrate");
+    let jobs = JobService::new(store.clone(), None);
+
+    let created = jobs.create("collect", None, None).await.expect("create");
+    let _ = jobs
+        .transition(created.id, JobStatus::Running, None)
+        .await
+        .expect("queued → running");
+    let cancelled = jobs
+        .transition(
+            created.id,
+            JobStatus::Cancelled,
+            Some("collector 停止時中斷".into()),
+        )
+        .await
+        .expect("running → cancelled");
+    assert_eq!(cancelled.status, JobStatus::Cancelled);
+    assert_eq!(
+        cancelled.error.as_deref(),
+        Some("collector 停止時中斷"),
+        "Cancelled 也要寫入 error，否則 abort 收尾的原因看不見"
+    );
+    assert!(
+        cancelled.completed_at.is_some(),
+        "Cancelled 是終態，必須設 completed_at，否則保留期限清不到"
+    );
+    let _ = storage_core::RelationalStore::delete_job(&store, created.id).await;
+}
+
+#[tokio::test]
 async fn merge_parameters_preserves_existing_fields() {
     load_workspace_dotenv();
     let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");

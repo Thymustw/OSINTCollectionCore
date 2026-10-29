@@ -23,9 +23,10 @@ use sqlx::sqlite::{
 use storage_core::codec::encode_enum;
 use storage_core::conformance::assert_sqlite_path_safe;
 use storage_core::{
-    BudgetConsumption, CandidateDiscoveryOutcome, CapabilityDescriptor, DailyUsage, EmbeddedStore,
-    HealthProvider, RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth,
-    Transaction, TransactionalStore,
+    BudgetConsumption, CandidateDiscoveryOutcome, CapabilityDescriptor, ConnectorRunStateUpdate,
+    DailyUsage, EmbeddedStore, HealthProvider, JobPurgeFilter, RECLAIM_ORPHAN_COLLECT_JOB_ERROR,
+    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
+    TransactionalStore,
 };
 use uuid::Uuid;
 
@@ -740,6 +741,50 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
+    }
+
+    async fn update_connector_run_state(
+        &self,
+        id: ConnectorId,
+        update: &ConnectorRunStateUpdate,
+    ) -> Result<bool, StorageError> {
+        update.validate()?;
+        let (mode, checkpoint) = update.checkpoint_sql_parts();
+        let checkpoint_text = checkpoint.map(json_text);
+        let result = sqlx::query(
+            r#"
+            UPDATE connectors SET
+                status = COALESCE(?2, status),
+                last_run = COALESCE(?3, last_run),
+                last_success = COALESCE(?4, last_success),
+                error_count = COALESCE(?5, error_count),
+                checkpoint = CASE ?6
+                    WHEN 'replace' THEN ?7
+                    WHEN 'merge' THEN json_patch(
+                        CASE
+                            WHEN json_valid(checkpoint)
+                                 AND json_type(checkpoint) = 'object'
+                                THEN checkpoint
+                            ELSE '{}'
+                        END,
+                        COALESCE(?7, '{}')
+                    )
+                    ELSE checkpoint
+                END
+            WHERE id = ?1
+            "#,
+        )
+        .bind(uuid_text(id))
+        .bind(update.status.as_deref())
+        .bind(opt_rfc3339(update.last_run))
+        .bind(opt_rfc3339(update.last_success))
+        .bind(update.error_count.map(i64::from))
+        .bind(mode)
+        .bind(checkpoint_text)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError> {
@@ -1744,6 +1789,124 @@ impl RelationalStore for SqliteEmbeddedStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::job).collect()
+    }
+
+    async fn list_jobs_by_status_and_type(
+        &self,
+        status: JobStatus,
+        job_type: &str,
+        after: Option<JobId>,
+        limit: u32,
+    ) -> Result<Vec<Job>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM jobs
+            WHERE status = ?1 AND type = ?2 AND (?3 IS NULL OR id < ?3)
+            ORDER BY id DESC
+            LIMIT ?4
+            "#,
+        )
+        .bind(encode_enum(&status)?)
+        .bind(job_type)
+        .bind(opt_uuid_text(after))
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::job).collect()
+    }
+
+    async fn purge_jobs(&self, filter: &JobPurgeFilter) -> Result<u64, StorageError> {
+        filter.validate()?;
+        let statuses = filter.encoded_statuses()?;
+        let statuses_json =
+            serde_json::to_string(&statuses).map_err(|err| StorageError::Unknown {
+                backend: "sqlite",
+                message: format!("序列化 purge statuses 失敗：{err}"),
+            })?;
+        let result = sqlx::query(
+            r#"
+            DELETE FROM jobs
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE type = ?1
+                  AND status IN (SELECT value FROM json_each(?2))
+                  AND completed_at IS NOT NULL
+                  AND completed_at < ?3
+                ORDER BY completed_at
+                LIMIT ?4
+            )
+            "#,
+        )
+        .bind(&filter.job_type)
+        .bind(statuses_json)
+        .bind(rfc3339(filter.older_than))
+        .bind(i64::from(filter.limit))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn count_purgeable_jobs(&self, filter: &JobPurgeFilter) -> Result<u64, StorageError> {
+        filter.validate_scope()?;
+        let statuses = filter.encoded_statuses()?;
+        let statuses_json =
+            serde_json::to_string(&statuses).map_err(|err| StorageError::Unknown {
+                backend: "sqlite",
+                message: format!("序列化 purge statuses 失敗：{err}"),
+            })?;
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM jobs
+            WHERE type = ?1
+              AND status IN (SELECT value FROM json_each(?2))
+              AND completed_at IS NOT NULL
+              AND completed_at < ?3
+            "#,
+        )
+        .bind(&filter.job_type)
+        .bind(statuses_json)
+        .bind(rfc3339(filter.older_than))
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    async fn reclaim_orphan_collect_runs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(u64, u64), StorageError> {
+        let failed = encode_enum(&JobStatus::Failed)?;
+        let running = encode_enum(&JobStatus::Running)?;
+        let jobs = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = ?1, completed_at = ?2, error = ?3
+            WHERE type = 'collect' AND status = ?4
+            "#,
+        )
+        .bind(&failed)
+        .bind(rfc3339(now))
+        .bind(RECLAIM_ORPHAN_COLLECT_JOB_ERROR)
+        .bind(&running)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+
+        let connectors = sqlx::query(
+            r#"
+            UPDATE connectors
+            SET status = 'idle'
+            WHERE status = 'running'
+            "#,
+        )
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok((jobs.rows_affected(), connectors.rows_affected()))
     }
 
     async fn find_document_ids_by_external_key(

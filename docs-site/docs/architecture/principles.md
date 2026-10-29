@@ -92,11 +92,10 @@
 
 **為什麼：** 沒有背壓，一個慢的環節（例如 AI 服務暫時變慢）會讓整個管線的佇列暴增，最終導致 OOM 或資料遺失。
 
-**怎麼做到：** Redpanda 的 consumer lag 會累積作為天然的背壓緩衝。`osint-indexer` 在 bulk lag 超過門檻時，在批次之間插入延遲，避免 OpenSearch 被壓垮。
+**怎麼做到：** Redpanda 的 consumer lag 會累積作為天然的背壓緩衝。收集器查正規化服務在 `raw.collected` 上的積壓：到門檻時本輪併發降為 1，再高就本輪不派新工作（查詢失敗照常收集）。`osint-indexer` 在自己的 bulk lag 超過門檻時，在批次之間插入延遲，避免搜尋引擎被壓垮——那是服務內部的節奏，不會讓收集器降速。
 
-!!! warning "跨服務自動背壓尚未完整實作"
-    目前背壓只在 indexer 內部生效。收集器不會依據下游積壓量自動降低採集速率，
-    需要手動調整設定（`tick_secs`、`global_inflight`）。詳見[目前的限制](limitations.md)。
+!!! warning "主機壓力與 AI 壓力尚未接上"
+    這次只完成「下游積壓 → 收集器」。主機 CPU／記憶體／磁碟壓力，以及 AI 的資源壓力訊號，目前不會驅動自動降級。詳見[目前的限制](limitations.md)。
 
 ---
 

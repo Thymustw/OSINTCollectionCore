@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use core_model::{Connector, ConnectorId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use storage_core::RelationalStore;
+use storage_core::{CheckpointUpdate, ConnectorRunStateUpdate, RelationalStore};
 
 use crate::ConnectorError;
 
@@ -83,13 +83,27 @@ where
         connector: &Connector,
         checkpoint: &ConnectorCheckpoint,
     ) -> Result<(), ConnectorError> {
-        let mut next = connector.clone();
-        next.checkpoint = checkpoint.to_value();
-        self.store
-            .put_connector(&next)
+        let marked = self
+            .store
+            .update_connector_run_state(
+                connector.id,
+                &ConnectorRunStateUpdate {
+                    checkpoint: CheckpointUpdate::Merge(checkpoint.to_value()),
+                    ..ConnectorRunStateUpdate::default()
+                },
+            )
             .await
             .map_err(|err| ConnectorError::Storage {
                 message: err.to_string(),
-            })
+            })?;
+        if !marked {
+            return Err(ConnectorError::Storage {
+                message: format!(
+                    "找不到 connector `{}`，無法寫入 checkpoint。請確認已寫入 connectors 表",
+                    connector.id
+                ),
+            });
+        }
+        Ok(())
     }
 }

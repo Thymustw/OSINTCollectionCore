@@ -34,7 +34,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use storage_core::conformance::{load_workspace_dotenv, required_env, verify_not_opencti_s3};
 use storage_core::{ObjectStore, RelationalStore};
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{DisableConnectorsOnDrop, PostgresCanonicalStore};
 use storage_s3::S3ObjectStore;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -47,6 +47,7 @@ struct Stack {
     s3: S3ObjectStore,
     bucket: String,
     brokers: String,
+    dsn: String,
 }
 
 async fn connect_stack() -> Stack {
@@ -80,6 +81,7 @@ async fn connect_stack() -> Stack {
         s3,
         bucket,
         brokers,
+        dsn,
     }
 }
 
@@ -211,6 +213,8 @@ fn build_api_with_backends(
         stix_config: core_config::StixSection::default(),
         auto_approval_max_concurrent: 2,
         object_bucket: stack.bucket.clone(),
+        collector: core_config::CollectorSection::default(),
+        retention_jobs: core_config::RetentionJobsConfig::default(),
         rate_limiter: RateLimiter::new(1_000),
     };
     TestApi {
@@ -643,6 +647,8 @@ async fn connector_create_validates_source_and_credentials() {
     assert_eq!(created["version"], "0.1.0", "沒給 version 要有預設值");
     assert_eq!(created["status"], "idle");
     let etag = etag.expect("ETag");
+    // 下面 PATCH 會把 enabled 打開。guard 在 panic 時也會停用。
+    let _guard = DisableConnectorsOnDrop::from_dsn(&stack.dsn).tracking(id);
 
     // 重複 id → 409
     let (status, body, _) = send(
@@ -740,6 +746,9 @@ async fn connector_enabled_filter_is_applied_in_sql() {
     stack.pg.put_source(&source).await.expect("seed source");
     let enabled = new_connector(source.id, true);
     let disabled = new_connector(source.id, false);
+    // 這支必須建 enabled=true 才能驗過濾。schedule 預設是 None，tick 不會排程，
+    // 但 panic 時仍不該留下 enabled 列；guard 在 Drop 時停用。
+    let _guard = DisableConnectorsOnDrop::from_dsn(&stack.dsn).tracking(enabled.id);
     stack.pg.put_connector(&enabled).await.expect("seed");
     stack.pg.put_connector(&disabled).await.expect("seed");
 
@@ -2105,6 +2114,129 @@ async fn job_retry_only_from_failed_and_is_audited() {
             .iter()
             .all(|j| j["status"] == "failed"),
         "status 過濾回來的不可以有別的狀態：{body}"
+    );
+}
+
+#[tokio::test]
+async fn connector_reset_backoff_clears_error_count_and_is_audited() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+    let source = new_source(SourceType::Rss);
+    stack.pg.put_source(&source).await.expect("seed source");
+    // reset-backoff 不看 enabled；走 run_connector 也不看。打開且有排程會被 tick 撿走。
+    let mut connector = new_connector(source.id, false);
+    connector.schedule = Some("*/15 * * * *".into());
+    connector.error_count = 4;
+    connector.status = "error".into();
+    connector.last_run = Some(Utc::now() - chrono::Duration::hours(1));
+    connector.checkpoint = json!({"last_error": "e2e 故意失敗"});
+    stack
+        .pg
+        .put_connector(&connector)
+        .await
+        .expect("seed connector");
+
+    // viewer 不可以重設 → 403（middleware 擋，handler 不會寫 connector.backoff_reset）
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/ops/connectors/{}/reset-backoff", connector.id),
+            &api.viewer,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // 不存在 → 404
+    let missing = Uuid::now_v7();
+    let (status, body, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/ops/connectors/{missing}/reset-backoff"),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("ops/connectors"),
+        "404 要指出下一步：{body}"
+    );
+
+    // operator 重設 → 200，error_count=0、status=idle、backing_off=false
+    let (status, health, _) = send(
+        &api.app,
+        with_peer(json_request(
+            "POST",
+            &format!("/api/v1/ops/connectors/{}/reset-backoff", connector.id),
+            &api.operator,
+            &json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{health}");
+    assert_eq!(health["id"], connector.id.to_string());
+    assert_eq!(health["error_count"], 0);
+    assert_eq!(health["status"], "idle");
+    assert_eq!(health["backing_off"], false);
+    assert_eq!(
+        health["last_error"], "e2e 故意失敗",
+        "不清 checkpoint.last_error"
+    );
+
+    let got = stack
+        .pg
+        .get_connector(connector.id)
+        .await
+        .expect("get")
+        .expect("connector");
+    assert_eq!(got.error_count, 0);
+    assert_eq!(got.status, "idle");
+    assert_eq!(
+        got.checkpoint.get("last_error").and_then(|v| v.as_str()),
+        Some("e2e 故意失敗")
+    );
+
+    let resets: Vec<_> = api
+        .audit
+        .entries()
+        .into_iter()
+        .filter(|e| {
+            e.action == core_api::AUDIT_CONNECTOR_BACKOFF_RESET
+                && e.resource_id == Some(connector.id.to_string())
+        })
+        .collect();
+    assert_eq!(
+        resets.len(),
+        1,
+        "成功那次要留痕；viewer 403 走 authz.denied：{resets:?}"
+    );
+    assert_eq!(resets[0].outcome, "success");
+    assert_eq!(resets[0].ip.as_deref(), Some("203.0.113.9"));
+    assert_eq!(resets[0].metadata["original_error_count"], 4);
+
+    let rejected: Vec<_> = api
+        .audit
+        .entries()
+        .into_iter()
+        .filter(|e| e.action == core_api::AUDIT_CONNECTOR_BACKOFF_RESET && e.outcome == "rejected")
+        .collect();
+    assert_eq!(
+        rejected.len(),
+        1,
+        "不存在的 id 也要留 rejected：{rejected:?}"
+    );
+
+    assert!(
+        api.audit
+            .entries()
+            .iter()
+            .any(|e| e.action == core_api::AUDIT_AUTHZ_DENIED),
+        "viewer 被擋下來也要留痕"
     );
 }
 

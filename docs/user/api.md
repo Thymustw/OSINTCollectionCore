@@ -362,6 +362,13 @@ curl -s $API/ops/discovery -H "Authorization: Bearer $TOKEN"
 # 這個 API 行程用了多少記憶體與 CPU
 curl -s $API/ops/metrics -H "Authorization: Bearer $TOKEN"
 
+# 哪些連接器沒在採集、是不是還在失敗退避
+curl -s $API/ops/connectors -H "Authorization: Bearer $TOKEN"
+
+# 來源修好後立刻結束退避（operator；不清上次錯誤訊息）
+curl -s -X POST $API/ops/connectors/$CONNECTOR_ID/reset-backoff \
+  -H "Authorization: Bearer $TOKEN"
+
 # 哪些工作失敗了
 curl -s "$API/jobs?status=failed" -H "Authorization: Bearer $TOKEN"
 

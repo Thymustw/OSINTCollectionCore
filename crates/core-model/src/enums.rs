@@ -87,6 +87,30 @@ pub enum JobStatus {
     Cancelled,
 }
 
+impl JobStatus {
+    /// 保留期限允許清除的狀態。
+    ///
+    /// 狀態機裡 `failed` 還能轉 `retrying`，但 purge 把它當終態：
+    /// `/ops/dlq` 只列 failed job，failed 留 30 天後可刪（使用者裁決）。
+    #[must_use]
+    pub fn is_purge_eligible(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    /// 資料庫／API 使用的 snake_case 名稱。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Retrying => "retrying",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 // ===== V0.2 =====
 
 /// Resolution candidate 的審核狀態（SPEC_V0.2 §5）。

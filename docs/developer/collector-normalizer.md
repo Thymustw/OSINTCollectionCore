@@ -27,8 +27,9 @@ crates/normalizer     bin: osint-normalizer
 | 併發 | 全域 semaphore + per-domain inflight。`tick` 用 `JoinSet`，spawn 數夾在 `global_inflight`，不可依外部輸入無界 `tokio::spawn` |
 | 速率 | SDK `DomainRateLimiter` 另外管 RPS；這層只管「同時幾個在跑」 |
 | 成功 | SDK sink 寫 RawEvidence（Postgres metadata + 物件儲存 body），更新 checkpoint／`last_run`／`last_success`，publish `raw.collected`（partition key = `source_id`） |
-| 失敗 | `error_count` +1、publish `raw.failed`、單一 connector 失敗不中斷迴圈 |
-| Job | 每次收集建 `job_type=collect`、`correlation_id=connector.id`。Job 轉態失敗只 warn，不中止收集 |
+| 失敗 | `error_count` +1、publish `raw.failed`、單一 connector 失敗不中斷迴圈。之後依 `error_count` 指數退避，本輪到期但仍在窗內 → `BackingOff`（不派、不改 `last_run`） |
+| 公平性 | 到期清單依 `(error_count 升冪, last_success 新到舊且 NULL 最後, id)` 排序；每 tick 對 `error_count>0` 最多派 `max_retry_per_tick` 個，超出 → `RetryDeferred` |
+| Job | 每次收集建 `job_type=collect`、`correlation_id=connector.id`。Job 轉態失敗只 warn，不中止收集。退避中與延後的本輪不建 job |
 
 預設 `[collector]`（`config/default.toml`）：
 
@@ -37,7 +38,50 @@ bind = "127.0.0.1:18081"
 tick_secs = 5
 global_inflight = 4
 per_domain_inflight = 1
+backoff_base_secs = 300
+backoff_max_secs = 43200
+max_retry_per_tick = 8
+shutdown_drain_secs = 20
+
+[collector.backpressure]
+enabled = true
+throttle_lag = 5000
+pause_lag = 50000
+lag_check_interval_secs = 30
+probe_timeout_ms = 3000
 ```
+
+`backoff_base_secs = 0` 關閉退避（公平性上限仍生效）。`max` 必須 ≥ `base`，
+`max_retry_per_tick` 必須 ≥ 1，否則設定載入失敗。算法在
+`connector_sdk::retry_backoff`：`min(base × 2^(n−1), max)`，再套由
+`connector_id` 雜湊決定的 ±10% jitter（可重現，不用亂數）。
+下次可執行時間是 cron 下一個時點與 `last_run + retry_backoff` 的較晚者。
+
+立刻結束退避：`POST /api/v1/ops/connectors/{id}/reset-backoff`（operator），
+只把 `error_count` 設 0；`status` 若是 `error` 改 `idle`。不清 `checkpoint.last_error`。
+PATCH connector body **不能**改 `error_count`。
+
+**`connector.timeout` 目前不生效。** fetch 走 `SourcePolicy` 的固定 connect 5s／
+request 30s，欄位會存進 DB 但 collector 沒讀。
+
+`shutdown_drain_secs` 是收到停止訊號後等待 in-flight 自然結束的最長秒數，必須 ≥ 1。
+compose `stop_grace_period` 必須比這個值再多 5 秒以上（目前 30s）。逾時 abort，
+job 標成 cancelled（`error`＝「collector 停止時中斷」）、connector 回到 idle，
+`error_count` 不加。drain 期間 `/health` 維持 200、`/ready` 回 503。啟動時
+`reclaim_orphan_collect_runs` 回收上次 SIGKILL 留下的 running collect job
+（標 failed，才能進 `/ops/dlq`）與 running connector（改 idle）。單一副本前提。
+細節見 `docs/KNOWN_GAPS.md` §18 步驟 4 與 `docs/operations/OPERATIONS.md` §4。
+
+`[collector.backpressure]`：查 `[normalizer].consumer_group` 在 `raw.collected`
+上的 lag。`throttle_lag < pause_lag`、間隔與逾時必須 > 0，否則設定載入失敗。
+`enabled=false` 完全不查 broker。pause 時 `/ready` **不**變 503（暫停派工不是
+不就緒）。⚠️ `throttle_lag`／`pause_lag` 預設是推測值，未做容量測試。
+細節見 `docs/KNOWN_GAPS.md` §18 步驟 5。
+
+殘留：大量 connector **第一次**同時失敗時（`error_count` 都還是 0），退避與
+`max_retry_per_tick` 在第一輪都幫不上忙。jobs 保留期限已做（步驟 3）、優雅停止
+已做（步驟 4）、下游 lag 背壓已做（步驟 5，見 `docs/KNOWN_GAPS.md` §18）。
+主機 CPU／RAM／disk 壓力歸 V0.4 Resource Guard，目前不會讓 collector 因主機壓力降速。
 
 本機常見情境：8080 可能被其他本機服務占用（例如另一套安全/情資平台），health 不要綁 8080。
 
@@ -167,16 +211,20 @@ cargo test -p core-api --test import_e2e
 
 ## 已知限制
 
-1. **collector 不會依下游 lag 自動降速（V0.2）。**
-   indexer／normalizer／deduplicator／entity-worker 都會把自己的 consumer lag
-   寫進 `osint_queue_depth` gauge，但 **collector 不讀它**——
-   `crates/collector/src/` 完全沒有引用 `queue_depth`，主迴圈是固定
-   `[collector].tick_secs` 的排程 tick。
+1. **下游 lag → collector 已接上（2026-10-29 步驟 5）；看的不是 `osint_queue_depth`。**
+   每 tick 開始查 `[normalizer].consumer_group` 在 `raw.collected` 上的 lag
+   （`LagSource`／`BrokerLagSource`，`GroupLagProbe` 包在 `spawn_blocking`）。
+   `throttle_lag` 時本輪併發降為 1，`pause_lag` 時本輪不派、不改
+   `last_run`／`error_count`／`status`。查詢失敗或逾時 fail-open（照常收集，
+   記 `osint_collector_lag_probe_failures_total`，只在狀態變化時寫 log）。
+   `enabled=false` 完全不查。
 
-   也就是說 V0.1 的 backpressure **只在單一服務內部成立**（indexer 會在
-   lag 高時於自己的批次之間插入延遲），跨服務那一段還沒有實作。
-   `RESOURCE_BUDGET.md` §8／§14 描述的是目標狀態，不是現況。
+   ⚠️ `throttle_lag=5000`、`pause_lag=50000` **是推測值，未做容量測試。**
+   調整前看 collector `/metrics` 的 `osint_collector_downstream_lag`。
 
-   在 V0.2 接上之前，壓住採集量的手段是**手動**的：調小 `tick_secs`
-   的相反方向（調大）、降 `global_inflight`／`per_domain_inflight`，
-   或把 connector 的 `enabled` 關掉。
+   indexer／normalizer／deduplicator／entity-worker 仍把自己的 lag 寫進
+   `osint_queue_depth`，那個 gauge **仍然只有人寫、沒有人讀**。indexer 自己的
+   批次延遲是服務內部的事，不會讓 collector 降速。
+
+   **還沒做的**：主機 CPU／RAM／disk 壓力（V0.4 Resource Guard）。
+   `RESOURCE_BUDGET.md` §8／§14 描述的目標狀態，主機壓力那一段仍未達成。

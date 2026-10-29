@@ -47,11 +47,45 @@ Phase 6a 起 `AuditLog` 落地到 Postgres 的 `audit_log` 表。哪些動作會
 | `GET /api/v1/ops/graph` | viewer+ | 圖投影 lag／rebuild | 運維的人 |
 | `GET /api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog、最近 AI Run | 運維的人 |
 
-`/api/v1/ops/*` 另有五條（與上表不是「健康／指標」的分工關係，所以不列在表內）：
-`GET /ops/connectors`（連接器狀態）、`GET /ops/queues`（佇列／consumer lag）、
-`GET /ops/dlq`（dead letter）、`GET /ops/failed-events`（失敗事件列表）、
-`POST /ops/failed-events/{id}/replay`（重送，operator 以上）。完整清單以
-`crates/core-api/src/routes.rs` 為準。
+`/api/v1/ops/*` 另有七條（與上表不是「健康／指標」的分工關係，所以不列在表內）：
+`GET /ops/connectors`（連接器狀態，含 `backing_off`／`next_attempt_at`／`last_error`）、
+`POST /ops/connectors/{id}/reset-backoff`（結束失敗退避，operator 以上）、
+`GET /ops/queues`（佇列／consumer lag）、`GET /ops/dlq`（dead letter，`?type=` 依 job type 過濾）、
+`POST /ops/jobs/purge`（清除終態 job，admin；`dry_run` 只計數）、
+`GET /ops/failed-events`（失敗事件列表）、`POST /ops/failed-events/{id}/replay`
+（重送，operator 以上）。完整清單以 `crates/core-api/src/routes.rs` 為準。
+
+### collector 退避 metrics
+
+`osint-collector` 的 `/metrics`（health 埠）另輸出：
+
+| 名稱 | 類型 | 意義 |
+|---|---|---|
+| `osint_collector_connectors_backing_off` | gauge | 本輪因 cron 到期但仍在退避窗內而略過的連接器數。**不是**「目前處於退避中的連接器總數」：剛失敗、cron 下個時點還沒到的算 NotDue，不計入，所以失敗後到下一個 cron 時點之前會顯示 0（2026-10-28 實測：04:09 開始大量失敗，04:15 時點過後才從 0 跳到 368）。要看哪些連接器在退避中，用 `GET /api/v1/ops/connectors` 的 `backing_off` 欄位 |
+| `osint_collector_backoff_skipped_total` | counter | 同上，累計（只計 `BackingOff`，不含公平性延後的 `RetryDeferred`） |
+| `osint_collector_tick_duration_ms` | gauge | 最近一次 tick 耗時（毫秒） |
+| `osint_collector_shutdown_cancelled_total` | counter | 優雅停止時 drain 逾時、被 abort 收尾的 in-flight 筆數 |
+| `osint_collector_orphans_reclaimed_total` | counter | 啟動時 `reclaim_orphan_collect_runs` 收回的 job＋connector 數 |
+| `osint_collector_downstream_lag` | gauge | 最近一次**成功**查到的 normalizer `raw.collected` lag。fail-open 時保留上次成功值，不寫 0 |
+| `osint_collector_backpressure_state` | gauge | 0=normal、1=throttle（本輪併發 1）、2=pause（本輪不派）。`enabled=false` 時固定 0 |
+| `osint_collector_lag_probe_failures_total` | counter | lag 探針失敗或逾時次數（fail-open，不擋收集） |
+| `osint_collector_backpressure_skipped_total` | counter | 因 pause 本輪略過、未改 `last_run`／`error_count`／`status` 的連接器數 |
+
+設定見 `[collector] backoff_base_secs`／`backoff_max_secs`／`max_retry_per_tick`／`shutdown_drain_secs`，
+以及 `[collector.backpressure]`（`throttle_lag`／`pause_lag`／`lag_check_interval_secs`／`probe_timeout_ms`）。
+pause **不會**讓 `/ready` 變 503。
+
+drain 期間 `/health` 維持 200（liveness）、`/ready` 回 503（readiness）。若 liveness 也 503，編排器會 SIGKILL。訊號 helper 是 `core_observability::shutdown_signal`（目前只有 collector 接上）。
+
+### jobs 保留期限 metric
+
+`osint-api` 的 `/metrics` 另輸出：
+
+| 名稱 | 類型 | 意義 |
+|---|---|---|
+| `osint_jobs_purged_total` | counter | 實際刪除的 job 列數（dry-run 不計）。排程與手動端點共用；`MetricsRegistry` extra counter 不支援 label，所以不分來源 |
+
+設定見 `[retention.jobs]`。
 
 ### 為什麼 Redis／Redpanda 不放進 `/ready`
 

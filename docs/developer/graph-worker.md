@@ -80,7 +80,7 @@ payload 裡的 `relationship_type` **刻意不用**。直接拿事件當內容�
 
 `GraphStore` 沒有 bulk API。indexer 那套 `BatchController`／`FlushReason` 在這裡沒有意義——一則事件處理完就可以決定要不要 commit offset。
 
-consumer lag 仍寫進 `osint_queue_depth` gauge（給人／Prometheus 看）。graph-worker **自己不降速**：逐筆寫 Neo4j，沒有「一次送太大」的問題。跨服務的 backpressure 仍是 V0.2 後續項目。
+consumer lag 仍寫進 `osint_queue_depth` gauge（給人／Prometheus 看）。graph-worker **自己不降速**：逐筆寫 Neo4j，沒有「一次送太大」的問題。collector 的跨服務背壓看的是 **normalizer** 在 `raw.collected` 上的 lag，不讀這個 gauge。
 
 ## offset 只在成功或「優雅跳過」之後才提交
 

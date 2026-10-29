@@ -51,6 +51,9 @@ pub struct AppConfig {
     pub auto_approval: AutoApprovalSection,
     #[serde(default)]
     pub stix: StixSection,
+    /// 資料保留期限。形狀預留給其他表（failed_events／audit_log），目前只實作 jobs。
+    #[serde(default)]
+    pub retention: RetentionSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,13 +209,138 @@ impl Default for AuthSection {
     }
 }
 
-/// collector 排程與併發上限。
+/// collector 排程、併發上限與失敗退避。
+///
+/// `backoff_base_secs`／`backoff_max_secs` 的數字與
+/// `connector_sdk::{DEFAULT_BASE_SECS, DEFAULT_MAX_SECS}` 對齊。
+/// 這個 crate 不依賴 connector-sdk，兩邊各寫一份，改預設時請一起改。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectorSection {
     pub bind: String,
     pub tick_secs: u64,
     pub global_inflight: u32,
     pub per_domain_inflight: u32,
+    /// 指數退避基準（秒）。`0` = 關閉退避（公平性上限 `max_retry_per_tick` 仍生效）。
+    /// 與 `connector_sdk::DEFAULT_BASE_SECS` 對齊。
+    #[serde(default = "default_backoff_base_secs")]
+    pub backoff_base_secs: u64,
+    /// 指數退避上限（秒）。必須 ≥ `backoff_base_secs`。
+    /// 與 `connector_sdk::DEFAULT_MAX_SECS` 對齊。
+    #[serde(default = "default_backoff_max_secs")]
+    pub backoff_max_secs: u64,
+    /// 每一輪 tick 最多派幾個 `error_count > 0` 的連接器。必須 ≥ 1。
+    #[serde(default = "default_max_retry_per_tick")]
+    pub max_retry_per_tick: u32,
+    /// 收到停止訊號後，等待進行中收集自然結束的最長秒數。必須 ≥ 1。
+    /// 逾時就 abort，把剩餘 job 標成 cancelled。compose `stop_grace_period`
+    /// 必須比這個值再多 5 秒以上，否則 Docker 會先 SIGKILL。
+    #[serde(default = "default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
+    /// 下游 lag 背壓閘門。舊設定檔沒有這一段時用預設（開啟、推測門檻）。
+    #[serde(default)]
+    pub backpressure: CollectorBackpressureConfig,
+}
+
+fn default_backoff_base_secs() -> u64 {
+    300
+}
+
+fn default_backoff_max_secs() -> u64 {
+    43_200
+}
+
+fn default_max_retry_per_tick() -> u32 {
+    8
+}
+
+fn default_shutdown_drain_secs() -> u64 {
+    20
+}
+
+/// collector 看 **normalizer** 在 `raw.collected` 上的 consumer lag，決定本輪要不要派工。
+///
+/// `throttle_lag`／`pause_lag` 預設 5000／50000 是**推測值，未做容量測試**。
+/// 調整前請先看 `osint_collector_downstream_lag` 的實際分佈。
+///
+/// 這條路徑只做「下游 lag → collector」。主機 CPU／RAM／disk 壓力歸 V0.4
+/// Resource Guard，本設定不會讀那些訊號。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollectorBackpressureConfig {
+    /// `false` 時完全不查 broker。
+    #[serde(default = "default_backpressure_enabled")]
+    pub enabled: bool,
+    /// lag ≥ 此值且 < `pause_lag` 時，本輪併發降為 1。
+    #[serde(default = "default_throttle_lag")]
+    pub throttle_lag: u64,
+    /// lag ≥ 此值時，本輪不派新工作。必須 > `throttle_lag`。
+    #[serde(default = "default_pause_lag")]
+    pub pause_lag: u64,
+    /// 兩次真的查 broker 的最短間隔（秒）。必須 > 0。
+    #[serde(default = "default_lag_check_interval_secs")]
+    pub lag_check_interval_secs: u64,
+    /// 單次 lag 查詢的外層逾時（毫秒）。必須 > 0。逾時走 fail-open。
+    #[serde(default = "default_probe_timeout_ms")]
+    pub probe_timeout_ms: u64,
+}
+
+fn default_backpressure_enabled() -> bool {
+    true
+}
+
+fn default_throttle_lag() -> u64 {
+    5_000
+}
+
+fn default_pause_lag() -> u64 {
+    50_000
+}
+
+fn default_lag_check_interval_secs() -> u64 {
+    30
+}
+
+fn default_probe_timeout_ms() -> u64 {
+    3_000
+}
+
+impl Default for CollectorBackpressureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_backpressure_enabled(),
+            throttle_lag: default_throttle_lag(),
+            pause_lag: default_pause_lag(),
+            lag_check_interval_secs: default_lag_check_interval_secs(),
+            probe_timeout_ms: default_probe_timeout_ms(),
+        }
+    }
+}
+
+impl CollectorBackpressureConfig {
+    /// 檢查門檻／間隔是否自洽。失敗訊息會說明怎麼改。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.throttle_lag >= self.pause_lag {
+            return Err(format!(
+                "[collector.backpressure].throttle_lag（{}）必須 < pause_lag（{}）。\
+                 請把 throttle_lag 調低或把 pause_lag 調高",
+                self.throttle_lag, self.pause_lag
+            ));
+        }
+        if self.lag_check_interval_secs < 1 {
+            return Err(format!(
+                "[collector.backpressure].lag_check_interval_secs 必須 > 0（目前是 {}）。\
+                 設 30 表示每 30 秒才查一次 broker；設 0 會讓每 tick 都打 Redpanda",
+                self.lag_check_interval_secs
+            ));
+        }
+        if self.probe_timeout_ms < 1 {
+            return Err(format!(
+                "[collector.backpressure].probe_timeout_ms 必須 > 0（目前是 {}）。\
+                 設 3000 表示查詢超過 3 秒就放棄並照常收集（fail-open）",
+                self.probe_timeout_ms
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for CollectorSection {
@@ -222,7 +350,41 @@ impl Default for CollectorSection {
             tick_secs: 5,
             global_inflight: 4,
             per_domain_inflight: 1,
+            backoff_base_secs: default_backoff_base_secs(),
+            backoff_max_secs: default_backoff_max_secs(),
+            max_retry_per_tick: default_max_retry_per_tick(),
+            shutdown_drain_secs: default_shutdown_drain_secs(),
+            backpressure: CollectorBackpressureConfig::default(),
         }
+    }
+}
+
+impl CollectorSection {
+    /// 檢查退避／公平性欄位是否自洽。失敗訊息會說明怎麼改。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.backoff_max_secs < self.backoff_base_secs {
+            return Err(format!(
+                "[collector].backoff_max_secs（{}）必須 ≥ backoff_base_secs（{}）。\
+                 請把 max 調高或把 base 調低；設 backoff_base_secs = 0 可關閉退避",
+                self.backoff_max_secs, self.backoff_base_secs
+            ));
+        }
+        if self.max_retry_per_tick < 1 {
+            return Err(format!(
+                "[collector].max_retry_per_tick 必須 ≥ 1（目前是 {}）。\
+                 設 1 表示每輪最多派一個失敗重試；這個上限不能關掉",
+                self.max_retry_per_tick
+            ));
+        }
+        if self.shutdown_drain_secs < 1 {
+            return Err(format!(
+                "[collector].shutdown_drain_secs 必須 ≥ 1（目前是 {}）。\
+                 設 1 表示收到停止訊號後最多等 1 秒就中斷進行中的收集；\
+                 compose stop_grace_period 必須比這個值再多 5 秒以上",
+                self.shutdown_drain_secs
+            ));
+        }
+        self.backpressure.validate()
     }
 }
 
@@ -319,8 +481,9 @@ pub struct IndexerSection {
     /// consumer lag 超過這個值就在批次之間插入延遲，並把 lag 寫進
     /// `osint_queue_depth` gauge。
     ///
-    /// 注意：那個 gauge 在 V0.1 **沒有任何程式讀它**，collector 不會自動降速
-    /// （跨服務 backpressure 是 V0.2）。這個門檻只影響 indexer 自己的節奏。
+    /// 這個門檻**只影響 indexer 自己的節奏**。collector 的跨服務背壓看的是
+    /// **normalizer** 在 `raw.collected` 上的 lag（`[collector.backpressure]`），
+    /// 不會讀這個 gauge，也不會因為 indexer lag 降速。
     pub lag_threshold: u64,
     /// 降速時的基礎延遲（毫秒）。實際延遲會依超出門檻的倍數放大，最多 8 倍。
     pub backpressure_sleep_ms: u64,
@@ -763,6 +926,109 @@ impl Default for AutoApprovalLlmSection {
     }
 }
 
+/// 資料保留期限。目前只實作 `[retention.jobs]`；之後加表時在這裡加欄位，
+/// 不要另開頂層區段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RetentionSection {
+    #[serde(default)]
+    pub jobs: RetentionJobsConfig,
+}
+
+/// `[retention.jobs]`：定期清除終態 collect job。
+///
+/// 天數 `0` = 該規則不刪。其他 job type 不在這份設定裡，不會被排程清掉。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionJobsConfig {
+    #[serde(default = "default_retention_jobs_enabled")]
+    pub enabled: bool,
+    /// 背景任務間隔（秒）。必須 ≥ 60。
+    #[serde(default = "default_retention_interval_secs")]
+    pub interval_secs: u64,
+    /// 單次 DELETE 最多幾列。必須 ≥ 1。
+    #[serde(default = "default_retention_batch")]
+    pub batch: u32,
+    /// 批次之間暫停（毫秒）。`0` = 不暫停。
+    #[serde(default = "default_retention_batch_pause_ms")]
+    pub batch_pause_ms: u64,
+    /// 每次 `run_once` 最多跑幾批。必須 ≥ 1。預設 200 × batch 5000 = 單次最多 100 萬列。
+    #[serde(default = "default_retention_max_batches_per_run")]
+    pub max_batches_per_run: u32,
+    #[serde(default = "default_collect_completed_days")]
+    pub collect_completed_days: u32,
+    #[serde(default = "default_collect_failed_days")]
+    pub collect_failed_days: u32,
+    #[serde(default = "default_collect_cancelled_days")]
+    pub collect_cancelled_days: u32,
+}
+
+fn default_retention_jobs_enabled() -> bool {
+    true
+}
+fn default_retention_interval_secs() -> u64 {
+    3600
+}
+fn default_retention_batch() -> u32 {
+    5000
+}
+fn default_retention_batch_pause_ms() -> u64 {
+    200
+}
+fn default_retention_max_batches_per_run() -> u32 {
+    200
+}
+fn default_collect_completed_days() -> u32 {
+    7
+}
+fn default_collect_failed_days() -> u32 {
+    30
+}
+fn default_collect_cancelled_days() -> u32 {
+    7
+}
+
+impl Default for RetentionJobsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retention_jobs_enabled(),
+            interval_secs: default_retention_interval_secs(),
+            batch: default_retention_batch(),
+            batch_pause_ms: default_retention_batch_pause_ms(),
+            max_batches_per_run: default_retention_max_batches_per_run(),
+            collect_completed_days: default_collect_completed_days(),
+            collect_failed_days: default_collect_failed_days(),
+            collect_cancelled_days: default_collect_cancelled_days(),
+        }
+    }
+}
+
+impl RetentionJobsConfig {
+    /// 檢查批次／間隔是否自洽。失敗訊息會說明怎麼改。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.interval_secs < 60 {
+            return Err(format!(
+                "[retention.jobs].interval_secs 必須 ≥ 60（目前是 {}）。\
+                 請調高間隔；背景任務不該每分鐘對 jobs 表做 DELETE",
+                self.interval_secs
+            ));
+        }
+        if self.batch < 1 {
+            return Err(format!(
+                "[retention.jobs].batch 必須 ≥ 1（目前是 {}）。\
+                 單次 DELETE 至少一列；要關掉請設 enabled = false",
+                self.batch
+            ));
+        }
+        if self.max_batches_per_run < 1 {
+            return Err(format!(
+                "[retention.jobs].max_batches_per_run 必須 ≥ 1（目前是 {}）。\
+                 這是單次執行的批次上限，避免一次跑太久",
+                self.max_batches_per_run
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 設定載入失敗。訊息會指出缺哪個檔／哪個鍵，以及建議怎麼修。
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -772,6 +1038,10 @@ pub enum ConfigError {
         "工作區根目錄找不到 config/default.toml（從 {cwd} 往上找也沒有）。請在 repo 根目錄執行，或設定 OSINT_CONFIG_FILE"
     )]
     DefaultConfigMissing { cwd: String },
+    #[error("{0}")]
+    InvalidCollector(String),
+    #[error("{0}")]
+    InvalidRetention(String),
 }
 
 impl AppConfig {
@@ -807,7 +1077,17 @@ impl AppConfig {
         );
 
         let cfg = builder.build()?;
-        Ok(cfg.try_deserialize()?)
+        let parsed: AppConfig = cfg.try_deserialize()?;
+        parsed
+            .collector
+            .validate()
+            .map_err(ConfigError::InvalidCollector)?;
+        parsed
+            .retention
+            .jobs
+            .validate()
+            .map_err(ConfigError::InvalidRetention)?;
+        Ok(parsed)
     }
 }
 
@@ -877,6 +1157,15 @@ mod tests {
         assert_eq!(cfg.collector.bind, "127.0.0.1:18081");
         assert_eq!(cfg.collector.global_inflight, 4);
         assert_eq!(cfg.collector.per_domain_inflight, 1);
+        assert_eq!(cfg.collector.backoff_base_secs, 300);
+        assert_eq!(cfg.collector.backoff_max_secs, 43_200);
+        assert_eq!(cfg.collector.max_retry_per_tick, 8);
+        assert_eq!(cfg.collector.shutdown_drain_secs, 20);
+        assert!(cfg.collector.backpressure.enabled);
+        assert_eq!(cfg.collector.backpressure.throttle_lag, 5_000);
+        assert_eq!(cfg.collector.backpressure.pause_lag, 50_000);
+        assert_eq!(cfg.collector.backpressure.lag_check_interval_secs, 30);
+        assert_eq!(cfg.collector.backpressure.probe_timeout_ms, 3_000);
         assert_eq!(cfg.normalizer.bind, "127.0.0.1:18082");
         assert_eq!(cfg.normalizer.consumer_group, "osint-normalizer");
         assert_eq!(cfg.deduplicator.bind, "127.0.0.1:18083");
@@ -957,6 +1246,14 @@ mod tests {
         assert!(cfg.auto_approval.thresholds_are_sane());
         assert_eq!(cfg.stix.max_bundle_bytes, 50 * 1024 * 1024);
         assert_eq!(cfg.stix.max_objects, 10_000);
+        assert!(cfg.retention.jobs.enabled);
+        assert_eq!(cfg.retention.jobs.interval_secs, 3600);
+        assert_eq!(cfg.retention.jobs.batch, 5000);
+        assert_eq!(cfg.retention.jobs.batch_pause_ms, 200);
+        assert_eq!(cfg.retention.jobs.max_batches_per_run, 200);
+        assert_eq!(cfg.retention.jobs.collect_completed_days, 7);
+        assert_eq!(cfg.retention.jobs.collect_failed_days, 30);
+        assert_eq!(cfg.retention.jobs.collect_cancelled_days, 7);
     }
 
     #[test]
@@ -971,6 +1268,227 @@ mod tests {
         assert_eq!(cfg.app.environment, "test-override");
         assert_eq!(cfg.storage.canonical.pool_max, 3);
         clear_osint_overrides();
+    }
+
+    #[test]
+    fn collector_backoff_fields_missing_use_serde_defaults() {
+        // 舊設定檔只有 bind／tick／inflight 時仍能載入，不可讓整份 [collector] 解析失敗。
+        let section: CollectorSection = serde_json::from_str(
+            r#"{"bind":"127.0.0.1:18081","tick_secs":5,"global_inflight":4,"per_domain_inflight":1}"#,
+        )
+        .unwrap();
+        assert_eq!(section.backoff_base_secs, 300);
+        assert_eq!(section.backoff_max_secs, 43_200);
+        assert_eq!(section.max_retry_per_tick, 8);
+        assert_eq!(section.shutdown_drain_secs, 20);
+        assert!(section.backpressure.enabled);
+        assert_eq!(section.backpressure.throttle_lag, 5_000);
+        assert_eq!(section.backpressure.pause_lag, 50_000);
+        assert_eq!(section.backpressure.lag_check_interval_secs, 30);
+        assert_eq!(section.backpressure.probe_timeout_ms, 3_000);
+        assert!(section.validate().is_ok());
+    }
+
+    #[test]
+    fn collector_validate_rejects_max_below_base() {
+        let section = CollectorSection {
+            backoff_base_secs: 300,
+            backoff_max_secs: 10,
+            ..Default::default()
+        };
+        let err = section.validate().expect_err("max < base 應失敗");
+        assert!(
+            err.contains("backoff_max_secs"),
+            "訊息要指出是哪個鍵：{err}"
+        );
+        assert!(
+            err.contains("調高") || err.contains("調低"),
+            "訊息要告訴下一步怎麼改：{err}"
+        );
+    }
+
+    #[test]
+    fn collector_validate_rejects_zero_max_retry() {
+        let section = CollectorSection {
+            max_retry_per_tick: 0,
+            ..Default::default()
+        };
+        let err = section
+            .validate()
+            .expect_err("max_retry_per_tick = 0 應失敗");
+        assert!(err.contains("max_retry_per_tick"), "{err}");
+        assert!(err.contains("≥ 1") || err.contains(">= 1"), "{err}");
+    }
+
+    #[test]
+    fn collector_validate_rejects_zero_shutdown_drain() {
+        let section = CollectorSection {
+            shutdown_drain_secs: 0,
+            ..Default::default()
+        };
+        let err = section
+            .validate()
+            .expect_err("shutdown_drain_secs = 0 應失敗");
+        assert!(err.contains("shutdown_drain_secs"), "{err}");
+        assert!(err.contains("≥ 1") || err.contains(">= 1"), "{err}");
+        assert!(
+            err.contains("stop_grace_period"),
+            "訊息要提到 compose grace 必須比 drain 長：{err}"
+        );
+    }
+
+    #[test]
+    fn collector_backpressure_validate_rejects_throttle_not_below_pause() {
+        let section = CollectorSection {
+            backpressure: CollectorBackpressureConfig {
+                throttle_lag: 50_000,
+                pause_lag: 5_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = section
+            .validate()
+            .expect_err("throttle_lag >= pause_lag 應失敗");
+        assert!(err.contains("throttle_lag"), "{err}");
+        assert!(err.contains("pause_lag"), "{err}");
+        assert!(
+            err.contains("調低") || err.contains("調高"),
+            "訊息要告訴下一步怎麼改：{err}"
+        );
+    }
+
+    #[test]
+    fn collector_backpressure_validate_rejects_zero_interval() {
+        let section = CollectorSection {
+            backpressure: CollectorBackpressureConfig {
+                lag_check_interval_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = section
+            .validate()
+            .expect_err("lag_check_interval_secs = 0 應失敗");
+        assert!(err.contains("lag_check_interval_secs"), "{err}");
+        assert!(err.contains("> 0"), "{err}");
+    }
+
+    #[test]
+    fn collector_backpressure_validate_rejects_zero_probe_timeout() {
+        let section = CollectorSection {
+            backpressure: CollectorBackpressureConfig {
+                probe_timeout_ms: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = section.validate().expect_err("probe_timeout_ms = 0 應失敗");
+        assert!(err.contains("probe_timeout_ms"), "{err}");
+        assert!(err.contains("fail-open") || err.contains("> 0"), "{err}");
+    }
+
+    #[test]
+    fn load_from_rejects_invalid_collector_backpressure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let path = std::env::temp_dir().join("osint-core-config-bad-collector-bp.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "[collector.backpressure]\nthrottle_lag = 90000\npause_lag = 1000"
+        )
+        .unwrap();
+        drop(f);
+        let err = AppConfig::load_from(Some(&workspace_default()), Some(&path)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("throttle_lag") && msg.contains("pause_lag"),
+            "載入失敗要指出哪個鍵：{msg}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_from_rejects_invalid_collector() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let path = std::env::temp_dir().join("osint-core-config-bad-collector.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "[collector]\nbackoff_base_secs = 300\nbackoff_max_secs = 1"
+        )
+        .unwrap();
+        drop(f);
+        let err = AppConfig::load_from(Some(&workspace_default()), Some(&path)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("backoff_max_secs"),
+            "載入失敗要指出哪個鍵：{msg}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retention_jobs_validate_rejects_short_interval() {
+        let cfg = RetentionJobsConfig {
+            interval_secs: 59,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("interval < 60 應失敗");
+        assert!(err.contains("interval_secs"), "{err}");
+        assert!(err.contains("≥ 60") || err.contains(">= 60"), "{err}");
+    }
+
+    #[test]
+    fn retention_jobs_validate_rejects_zero_batch() {
+        let cfg = RetentionJobsConfig {
+            batch: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("batch = 0 應失敗");
+        assert!(err.contains("batch"), "{err}");
+        assert!(err.contains("≥ 1") || err.contains(">= 1"), "{err}");
+    }
+
+    #[test]
+    fn retention_jobs_validate_rejects_zero_max_batches() {
+        let cfg = RetentionJobsConfig {
+            max_batches_per_run: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("max_batches_per_run = 0 應失敗");
+        assert!(err.contains("max_batches_per_run"), "{err}");
+    }
+
+    #[test]
+    fn load_from_rejects_invalid_retention() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let path = std::env::temp_dir().join("osint-core-config-bad-retention.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "[retention.jobs]\ninterval_secs = 1").unwrap();
+        drop(f);
+        let err = AppConfig::load_from(Some(&workspace_default()), Some(&path)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("interval_secs"), "載入失敗要指出哪個鍵：{msg}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_retention_section_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        let parsed: AppConfig = {
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            value.as_object_mut().unwrap().remove("retention");
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(parsed.retention, RetentionSection::default());
+        assert!(parsed.retention.jobs.enabled);
+        assert_eq!(parsed.retention.jobs.collect_failed_days, 30);
     }
 
     #[test]

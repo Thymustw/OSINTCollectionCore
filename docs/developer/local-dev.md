@@ -113,9 +113,28 @@ log 失控都會吃掉這台與 VM 共用的根磁碟（CLAUDE.md §15）。
 
 **測試建立的 connector 必須 `enabled=false` 或在測試結束時停用／刪掉。**
 `run_connector` 不看 `enabled`，所以走手動觸發的 e2e 不需要把 connector 打開。
-留下 `enabled=true` 的殘留，collector 一啟動就會把它們排進每個 tick。
+留下 `enabled=true` 且 `schedule` 非空的殘留，collector 一啟動就會把它們排進每個 tick。
 `raw_evidence.connector_id` 沒有 `ON DELETE CASCADE`，有證據的 connector 刪不掉，
 停用即可。
+
+慣例（2026-10-29 起）：
+
+1. **預設不啟用。** fixture 寫 `enabled: false`；不需要 cron 就不要填 `schedule`。
+   需要 `enabled=true` 的只有：經由 `tick()`／`list_enabled_connectors` 觸發，或
+   正在測 enabled 過濾／PATCH enabled 本身。
+2. **真的要打開時用 `DisableConnectorsOnDrop`。** 把 id 交給
+   `storage_postgres::DisableConnectorsOnDrop`（Drop 時 `UPDATE enabled=FALSE`）。
+   函式結尾的 `put_connector` 停用在 panic 時不會跑；Drop 會。SQLite
+   conformance 用一次性檔案，不需要 guard。
+   這個型別與 `acquire_collect_state_test_lock` 都在 storage-postgres 的
+   `test-support` feature 後面，正式 binary 不含。新 crate 的測試要用時，在
+   `[dev-dependencies]` 加
+   `storage-postgres = { path = "../storage-postgres", features = ["test-support"] }`
+   （目前開啟的有 storage-postgres 自己、collector、core-api）。
+3. **守門測試** `no_stale_enabled_scheduled_test_connectors`
+   （`crates/storage-postgres/tests/no_stale_enabled_test_connectors.rs`）：
+   開發 DB 裡不該有「enabled、有排程、名稱像測試、UUID v7 已超過 5 分鐘」的
+   connector。失敗訊息會列出名稱，並說明用前綴 grep 哪支測試沒收尾。
 
 ### 本機跑 vs 容器內跑：設定完全不一樣
 

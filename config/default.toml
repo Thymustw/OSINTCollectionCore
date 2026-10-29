@@ -65,6 +65,34 @@ bind = "127.0.0.1:18081"
 tick_secs = 5
 global_inflight = 4
 per_domain_inflight = 1
+# 連續失敗後的指數退避：min(base × 2^(n−1), max)，再套 ±10% 可重現 jitter。
+# 單位秒。base = 0 關閉退避（公平性上限 max_retry_per_tick 仍生效）。
+# 數字與 connector_sdk::DEFAULT_BASE_SECS／DEFAULT_MAX_SECS 對齊。
+backoff_base_secs = 300
+backoff_max_secs = 43200
+# 每一輪 tick 最多派幾個 error_count > 0 的連接器。必須 ≥ 1。
+max_retry_per_tick = 8
+# 收到停止訊號後，等待進行中收集自然結束的最長秒數。必須 ≥ 1。
+# 健康探針的單次 fetch 遠小於 20 秒；逾時就 abort in-flight。
+# compose `stop_grace_period` 必須 > drain + 5 秒，否則 Docker 會先 SIGKILL。
+shutdown_drain_secs = 20
+
+# 下游 lag 背壓閘門（fail-open）。
+# 查的是 [normalizer].consumer_group 在 raw.collected 上的 consumer lag，
+# **不是** indexer 的 lag，也不是 osint_queue_depth。
+# enabled=false 時完全不查 broker。
+# 查詢失敗或逾時 → 照常收集，只記 metric；狀態變化才寫 log。
+#
+# ⚠️ throttle_lag=5000、pause_lag=50000 是推測值，未做容量測試。
+# 調整前請先看 osint-collector /metrics 的 osint_collector_downstream_lag
+# 實際分佈，不要靠感覺微調。
+# 這次只完成「下游 lag → collector」；主機 CPU／RAM／disk 壓力歸 V0.4 Resource Guard。
+[collector.backpressure]
+enabled = true
+throttle_lag = 5000
+pause_lag = 50000
+lag_check_interval_secs = 30
+probe_timeout_ms = 3000
 
 [normalizer]
 bind = "127.0.0.1:18082"
@@ -112,7 +140,9 @@ max_field_bytes = 262144
 # 暫時性 bulk 失敗（429／503）的重試次數。永久性失敗（400 mapping 不符）不重試。
 bulk_max_retries = 3
 # consumer lag 超過此值就在批次之間插入延遲，並把 lag 寫進 osint_queue_depth
-# 讓上游採集端降速。設計理由見 crates/indexer/src/batch.rs。
+# 給人／Prometheus 看。這個門檻只影響 indexer 自己的節奏，不會讓上游降速。
+# collector 的跨服務背壓看的是 normalizer 在 raw.collected 上的 lag
+# （[collector.backpressure]），與這裡無關。設計理由見 crates/indexer/src/batch.rs。
 lag_threshold = 5000
 backpressure_sleep_ms = 200
 
@@ -232,3 +262,26 @@ max_tokens = 512
 temperature = 0.0
 # entity resolution 是結構化輸入上的二元判斷，預設關閉推理以省 token。
 enable_reasoning = false
+
+# jobs 保留期限。只清 collect 類終態；其他 job type（stix_export／graph_rebuild…）
+# 不在這份規則裡，不會被排程刪。failed_events／audit_log 也不做——
+# 前者清掉就丟失可重放 envelope（ADR-008），後者是 append-only
+# （migration 0006 的 DB 角色只該有 INSERT+SELECT）。
+#
+# 天數 0 = 該規則不刪。時間欄位是 completed_at（結束後保留 N 天），
+# 不是 created_at：40 天前建立、昨天才失敗的 collect job，failed 還要再留
+# 30 天給 /ops/dlq 查。
+#
+# 容量推算（不是實測穩態）：先前開發 DB 4,161,451 筆 collect|failed ≈ 1062 MB
+# → 約 255 B/列。退避修好後，6,801 個永久失敗 connector 若都走到
+# backoff_max（12 小時）≈ 2 次失敗／天 → 約 13,600 列/天；failed 留 30 天
+# ≈ 41 萬列 ≈ 100 MB。completed／cancelled 各留 7 天，量更小。
+[retention.jobs]
+enabled = true
+interval_secs = 3600
+batch = 5000
+batch_pause_ms = 200
+max_batches_per_run = 200
+collect_completed_days = 7
+collect_failed_days = 30
+collect_cancelled_days = 7

@@ -22,6 +22,215 @@ use serde_json::Value;
 use crate::error::StorageError;
 use crate::health::HealthProvider;
 
+/// `connectors.checkpoint` 的部分更新方式。
+///
+/// collector 對 checkpoint 有兩種寫法：成功時用 HTTP 快取欄位**替換**一組鍵、
+/// 失敗時只**合併** `last_error`。若只提供替換，呼叫端就得先讀再寫，中間若有
+/// 另一個 collector 更新 etag，`last_error` 寫回會把 etag 蓋掉。
+///
+/// `Merge` 在 PostgreSQL 是 `jsonb ||`、SQLite 是 `json_patch`，都在單一
+/// `UPDATE` 裡完成，不另外 SELECT。頂層鍵合併；JSON `null` 的語意見
+/// [`CheckpointUpdate::Merge`]。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum CheckpointUpdate {
+    /// 不改 `checkpoint`。
+    #[default]
+    Unchanged,
+    /// 整個 JSON 替換。
+    Replace(Value),
+    /// 合併頂層鍵，其他鍵保留。
+    ///
+    /// JSON `null`：PostgreSQL `||` 會把該鍵設成 `null`；SQLite `json_patch`
+    /// 會刪掉該鍵。對 `serde` 的 `Option` 欄位兩者都是 `None`，呼叫端不要依賴
+    /// 「鍵還在、值是 null」。
+    Merge(Value),
+}
+
+/// connector 執行狀態的部分更新。每個欄位 `None`／[`CheckpointUpdate::Unchanged`]
+/// 代表不改。
+///
+/// 這是給 collector 標記 running／成功／失敗用的，**不要**拿來改
+/// `enabled`／`schedule`／`configuration`——那些走 `put_connector`
+/// （API PATCH 的整列編輯）。
+///
+/// `last_run`／`last_success` 的 `None` 是「不改」，沒有「清成 SQL NULL」的路徑；
+/// collector 從來不會清這兩個欄位。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConnectorRunStateUpdate {
+    pub status: Option<String>,
+    pub last_run: Option<DateTime<Utc>>,
+    pub last_success: Option<DateTime<Utc>>,
+    pub error_count: Option<i32>,
+    pub checkpoint: CheckpointUpdate,
+}
+
+impl ConnectorRunStateUpdate {
+    /// `Replace`／`Merge` 的值必須是 JSON 物件，否則回 [`StorageError::ConstraintViolation`]。
+    pub fn validate(&self) -> Result<(), StorageError> {
+        match &self.checkpoint {
+            CheckpointUpdate::Unchanged => Ok(()),
+            CheckpointUpdate::Replace(value) | CheckpointUpdate::Merge(value) => {
+                if value.is_object() {
+                    Ok(())
+                } else {
+                    Err(StorageError::ConstraintViolation {
+                        message: format!(
+                            "connector checkpoint 更新必須是 JSON 物件，實際是 {}。\
+                             請改傳 object，例如 `{{\"last_error\": \"...\"}}`",
+                            json_value_kind(value)
+                        ),
+                    })
+                }
+            }
+        }
+    }
+
+    /// 把這次更新套到記憶體中的 connector。給 trait 預設實作與測試替身用。
+    pub fn apply_to(&self, connector: &mut Connector) {
+        if let Some(status) = &self.status {
+            connector.status = status.clone();
+        }
+        if let Some(last_run) = self.last_run {
+            connector.last_run = Some(last_run);
+        }
+        if let Some(last_success) = self.last_success {
+            connector.last_success = Some(last_success);
+        }
+        if let Some(error_count) = self.error_count {
+            connector.error_count = error_count;
+        }
+        match &self.checkpoint {
+            CheckpointUpdate::Unchanged => {}
+            CheckpointUpdate::Replace(value) => connector.checkpoint = value.clone(),
+            CheckpointUpdate::Merge(patch) => {
+                connector.checkpoint = merge_json_objects(&connector.checkpoint, patch);
+            }
+        }
+    }
+
+    /// adapter 組 SQL 用：模式字串 + 可選的 JSON 值。
+    #[must_use]
+    pub fn checkpoint_sql_parts(&self) -> (&'static str, Option<&Value>) {
+        match &self.checkpoint {
+            CheckpointUpdate::Unchanged => ("unchanged", None),
+            CheckpointUpdate::Replace(value) => ("replace", Some(value)),
+            CheckpointUpdate::Merge(value) => ("merge", Some(value)),
+        }
+    }
+}
+
+/// 合併 JSON 物件的頂層鍵。`patch` 的鍵覆寫 `base`；`null` 值會寫入該鍵
+/// （不是刪除），對齊 PostgreSQL `jsonb ||`。`base` 不是物件時從空物件開始。
+#[must_use]
+pub fn merge_json_objects(base: &Value, patch: &Value) -> Value {
+    let mut out = match base {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let Value::Object(patch_map) = patch {
+        for (key, value) in patch_map {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(out)
+}
+
+/// `reclaim_orphan_collect_runs` 寫進 `jobs.error` 的固定訊息。
+///
+/// 被 SIGKILL 時不知道寫到哪一步，所以用 Failed 不是 Cancelled，
+/// 讓 `/ops/dlq` 看得到。步驟 3 的保留期限靠 `completed_at`。
+pub const RECLAIM_ORPHAN_COLLECT_JOB_ERROR: &str = "collector 非正常結束（啟動回收）";
+
+/// `purge_jobs`／`count_purgeable_jobs` 的過濾條件。
+///
+/// 單次 `purge_jobs` 只刪一批（`<= limit`）。迴圈與批次間 sleep 由呼叫端
+/// （`core_jobs::JobRetention`）負責，adapter 不做無界刪除。
+///
+/// 時間欄位是 `completed_at`（不是 `created_at`）：「結束後保留 N 天」以結束
+/// 時間為準。`completed_at IS NULL` 的列不會被選中——那是沒走 JobService
+/// 狀態機的資料異常，不該靜默清掉。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobPurgeFilter {
+    pub job_type: String,
+    pub statuses: Vec<JobStatus>,
+    pub older_than: DateTime<Utc>,
+    /// 單次最多刪幾列。`count_purgeable_jobs` 忽略這個欄位。
+    pub limit: u32,
+}
+
+impl JobPurgeFilter {
+    /// 驗證 type／status。`count_purgeable_jobs` 走這條（不受 limit 限制）。
+    pub fn validate_scope(&self) -> Result<(), StorageError> {
+        if self.job_type.trim().is_empty() {
+            return Err(StorageError::ConstraintViolation {
+                message: "purge 的 job_type 不可為空。請指定種類（例如 collect），\
+                     或省略 body 改套用 [retention.jobs] 的規則"
+                    .into(),
+            });
+        }
+        if self.statuses.is_empty() {
+            return Err(StorageError::ConstraintViolation {
+                message: "purge 的 statuses 不可為空。只允許終態 completed／failed／cancelled；\
+                     請指定至少一個，或省略 body 改套用 [retention.jobs] 的規則"
+                    .into(),
+            });
+        }
+        for status in &self.statuses {
+            if !status.is_purge_eligible() {
+                return Err(StorageError::ConstraintViolation {
+                    message: format!(
+                        "purge 不可刪 `{}` 狀態的 job（queued／running／retrying 仍在進行中）。\
+                         只允許 completed／failed／cancelled",
+                        status.as_str()
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// 驗證 type／status／limit。`purge_jobs` 走這條。
+    pub fn validate(&self) -> Result<(), StorageError> {
+        self.validate_scope()?;
+        if self.limit < 1 {
+            return Err(StorageError::ConstraintViolation {
+                message: format!(
+                    "purge 的 limit 必須 ≥ 1（目前是 {}）。單次只刪一批，迴圈由呼叫端負責",
+                    self.limit
+                ),
+            });
+        }
+        if self.limit > 100_000 {
+            return Err(StorageError::ConstraintViolation {
+                message: format!(
+                    "purge 的 limit 不可超過 100000（目前是 {}）。請改小批次、多跑幾輪",
+                    self.limit
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// 把 status 編成資料庫用的 snake_case 字串。呼叫前應先 `validate_scope`。
+    pub fn encoded_statuses(&self) -> Result<Vec<String>, StorageError> {
+        self.statuses
+            .iter()
+            .map(crate::codec::encode_enum)
+            .collect()
+    }
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// 關聯式 CRUD（PostgreSQL canonical 與 SQLite embedded 共用語意，效能不要求相同）。
 ///
 /// `put_*` 是依主鍵 upsert。`insert_raw_evidence` 只插入；同一 `id` 再寫必須失敗。
@@ -78,6 +287,32 @@ pub trait RelationalStore: HealthProvider {
         after: Option<ConnectorId>,
         limit: u32,
     ) -> Result<Vec<Connector>, StorageError>;
+
+    /// 只更新 connector 的執行狀態欄位，不動 `enabled`／`schedule`／`configuration`
+    /// 等 operator 可 PATCH 的欄位。
+    ///
+    /// 回 `true` 代表改到一列，`false` 代表 id 不存在——比照
+    /// [`RelationalStore::update_candidate_status`]。
+    ///
+    /// # 預設實作
+    ///
+    /// 預設是 `get_connector` + 改欄位 + `put_connector`，**沒有部分更新的保證**：
+    /// 兩個呼叫之間若有人 PATCH `enabled`，這次寫回會把 `enabled` 蓋回去。
+    /// 只給測試替身用（resolver 的 MemoryStore）。生產 adapter 必須覆寫成
+    /// 單一 `UPDATE ... SET`，只動有給值的欄位。
+    async fn update_connector_run_state(
+        &self,
+        id: ConnectorId,
+        update: &ConnectorRunStateUpdate,
+    ) -> Result<bool, StorageError> {
+        update.validate()?;
+        let Some(mut connector) = self.get_connector(id).await? else {
+            return Ok(false);
+        };
+        update.apply_to(&mut connector);
+        self.put_connector(&connector).await?;
+        Ok(true)
+    }
 
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError>;
     async fn get_collection(&self, id: CollectionId) -> Result<Option<Collection>, StorageError>;
@@ -393,6 +628,84 @@ pub trait RelationalStore: HealthProvider {
         after: Option<JobId>,
         limit: u32,
     ) -> Result<Vec<Job>, StorageError>;
+
+    /// 同 [`RelationalStore::list_jobs_by_status`]，再依 `job_type` 過濾。
+    /// 過濾必須在 SQL 裡做，理由同 `list_jobs_by_status`。
+    ///
+    /// # 預設實作
+    ///
+    /// 回 [`StorageError::UnsupportedCapability`]。測試替身（resolver 的
+    /// MemoryStore）不必覆寫；生產 adapter 必須覆寫成 SQL 過濾。
+    async fn list_jobs_by_status_and_type(
+        &self,
+        _status: JobStatus,
+        _job_type: &str,
+        _after: Option<JobId>,
+        _limit: u32,
+    ) -> Result<Vec<Job>, StorageError> {
+        Err(StorageError::UnsupportedCapability {
+            backend: "relational",
+            capability: "list_jobs_by_status_and_type",
+        })
+    }
+
+    /// 刪一批符合條件的 job。單次最多 `filter.limit` 列，由舊到新
+    /// （`ORDER BY completed_at`）。回實際刪除列數。
+    ///
+    /// `filter.validate()` 在程式層執行：statuses 為空或含非終態時回
+    /// [`StorageError::ConstraintViolation`]，不能只靠呼叫端自律。
+    ///
+    /// # 預設實作
+    ///
+    /// 先 validate，再回 [`StorageError::UnsupportedCapability`]。
+    /// resolver 三個 MemoryStore 不必改。
+    async fn purge_jobs(&self, filter: &JobPurgeFilter) -> Result<u64, StorageError> {
+        filter.validate()?;
+        Err(StorageError::UnsupportedCapability {
+            backend: "relational",
+            capability: "purge_jobs",
+        })
+    }
+
+    /// 符合條件、可被 purge 的列數。**不受 `filter.limit` 限制**（dry-run 要看
+    /// 全部，不是一批）。仍走 `validate_scope`：非終態回 ConstraintViolation。
+    ///
+    /// # 預設實作
+    ///
+    /// 同 [`RelationalStore::purge_jobs`]。
+    async fn count_purgeable_jobs(&self, filter: &JobPurgeFilter) -> Result<u64, StorageError> {
+        filter.validate_scope()?;
+        Err(StorageError::UnsupportedCapability {
+            backend: "relational",
+            capability: "count_purgeable_jobs",
+        })
+    }
+
+    /// 把上次非正常結束留下的 collect 工作收回來。
+    ///
+    /// **單一副本前提**：compose 目前 collector 只有一個副本。這支方法會把
+    /// **所有** `jobs.type='collect' AND status='running'` 標成 failed、
+    /// **所有** `connectors.status='running'` 標成 idle。多副本時會誤收
+    /// 別的副本正在跑的工作，屆時要改成 lease。
+    ///
+    /// Job 用 Failed 不用 Cancelled：被 SIGKILL 時不知道寫到哪一步，
+    /// Failed 才能出現在 `/ops/dlq`。必須設 `completed_at`，步驟 3 的
+    /// 保留期限靠它。`error_count` 不加——被中斷不是來源的錯，不該觸發退避。
+    ///
+    /// 回 `(jobs_reclaimed, connectors_reclaimed)`。
+    ///
+    /// # 預設實作
+    ///
+    /// 回 [`StorageError::UnsupportedCapability`]。測試替身不必覆寫。
+    async fn reclaim_orphan_collect_runs(
+        &self,
+        _now: DateTime<Utc>,
+    ) -> Result<(u64, u64), StorageError> {
+        Err(StorageError::UnsupportedCapability {
+            backend: "relational",
+            capability: "reclaim_orphan_collect_runs",
+        })
+    }
 
     /// Dedup Stage 1 候選：`documents.external_key` 完全相同、且 `id` **嚴格小於 `before`**
     /// 的 Document，依 `id` 升序（最舊在前）。`limit` 由 adapter 夾在 1..=100，不可無界。
@@ -1863,6 +2176,38 @@ mod tests {
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_757_000_000 + secs, 0).unwrap()
+    }
+
+    #[test]
+    fn merge_json_objects_overwrites_top_level_keys_and_keeps_the_rest() {
+        let base = serde_json::json!({"etag": "abc", "last_error": "舊的"});
+        let patch = serde_json::json!({"last_error": "新的", "etag": null});
+        let merged = merge_json_objects(&base, &patch);
+        assert_eq!(merged["etag"], serde_json::Value::Null);
+        assert_eq!(merged["last_error"], "新的");
+    }
+
+    #[test]
+    fn merge_json_objects_starts_from_empty_when_base_is_not_object() {
+        let merged = merge_json_objects(&serde_json::json!([]), &serde_json::json!({"a": 1}));
+        assert_eq!(merged, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn run_state_update_validate_rejects_non_object_checkpoint() {
+        let update = ConnectorRunStateUpdate {
+            checkpoint: CheckpointUpdate::Merge(serde_json::json!(["not", "object"])),
+            ..ConnectorRunStateUpdate::default()
+        };
+        let err = update.validate().expect_err("非物件應拒絕");
+        assert!(
+            matches!(err, StorageError::ConstraintViolation { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("JSON 物件"),
+            "錯誤要指出下一步：{err}"
+        );
     }
 
     #[test]

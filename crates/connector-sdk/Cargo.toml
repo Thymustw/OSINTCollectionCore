@@ -11,6 +11,7 @@ description = "Connector trait、SSRF Guard、NetworkRule 白名單、rate limit
 async-trait = { workspace = true }
 chrono = { workspace = true }
 core-model = { workspace = true }
+croner = { workspace = true }
 core-security = { workspace = true }
 hex = { workspace = true }
 ipnet = { workspace = true }

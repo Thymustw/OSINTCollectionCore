@@ -42,5 +42,6 @@ storage-s3 = { path = "../storage-s3" }
 stix-adapter = { workspace = true }
 stix-worker = { path = "../stix-worker" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 uuid = { workspace = true }

@@ -41,7 +41,7 @@
 | 服務 | 宿主埠 | 角色 | 在資料流中的位置 |
 |---|---|---|---|
 | `osint-api` | 18080 | HTTP API 入口，也負責匯入解析 | 收 HTTP 請求 → 寫入 PostgreSQL → 發布事件 |
-| `osint-collector` | 18081 | 定期抓取已設定的資料來源 | 定時觸發 → 從外部 URL 抓取 → 寫 Raw Evidence |
+| `osint-collector` | 18081 | 定期抓取已設定的資料來源。下游積壓到門檻時會降速或本輪不派；停止時會等進行中的收集結束（預設最多 20 秒），等不及才中斷 | 定時觸發 → 從外部 URL 抓取 → 寫 Raw Evidence |
 | `osint-normalizer` | 18082 | 把原始證據整理成統一格式的文件 | 訂閱 `raw.collected` → 正規化 → 發布 `object.normalized` |
 | `osint-deduplicator` | 18083 | 偵測並標記重複文件 | 訂閱 `object.normalized` → 比對 → 發布 `dedup.completed` |
 | `osint-entity-worker` | 18084 | 從文件抽取實體與關聯 | 訂閱 `dedup.completed` → 抽取 → 發布 `entity.extracted` |

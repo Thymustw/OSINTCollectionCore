@@ -261,15 +261,17 @@ collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有�
 
 ## 維運（Ops）
 
-需要 viewer 以上，但 replay 需要 operator：
+需要 viewer 以上；重送失敗事件與結束退避需要 operator；清除 Job 需要 admin：
 
 | 方法 | 路徑 | 角色 | 說明 |
 |---|---|---|---|
 | `GET` | `/api/v1/ops/health` | viewer | 各後端（PostgreSQL、OpenSearch、Neo4j 等）連線狀態 |
 | `GET` | `/api/v1/ops/metrics` | viewer | 行程資源用量 |
-| `GET` | `/api/v1/ops/connectors` | viewer | Connector 採集狀態 |
+| `GET` | `/api/v1/ops/connectors` | viewer | Connector 採集狀態（含 `backing_off`、`next_attempt_at`、`last_error`） |
+| `POST` | `/api/v1/ops/connectors/{id}/reset-backoff` | operator | 把失敗次數歸零，立刻結束退避。不清上次錯誤訊息 |
 | `GET` | `/api/v1/ops/queues` | viewer | 各消費者的 Kafka lag |
-| `GET` | `/api/v1/ops/dlq` | viewer | 失敗 Job 列表（目前不設獨立 DLQ topic） |
+| `GET` | `/api/v1/ops/dlq` | viewer | 失敗 Job 列表（`?type=` 依種類過濾；目前不設獨立 DLQ topic） |
+| `POST` | `/api/v1/ops/jobs/purge` | admin | 清除已結束的 Job。`{}` 套用 `[retention.jobs]`；自訂需同時給 `job_type`、`statuses`、`older_than_days`。`dry_run` 只計數。非終態回 422 |
 | `GET` | `/api/v1/ops/failed-events` | viewer | 處理失敗的事件記錄 |
 | `POST` | `/api/v1/ops/failed-events/{id}/replay` | operator | 重送指定的失敗事件 |
 | `GET` | `/api/v1/ops/graph` | viewer | 圖投影 lag 與最近 rebuild 狀態 |
@@ -279,4 +281,4 @@ collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有�
 
 ## 路由數量統計
 
-共 **74 個** HTTP 方法+路徑組合，本頁列出全部，含 3 個公開探針端點（`/health`、`/ready`、`/metrics`）。
+共 **76 個** HTTP 方法+路徑組合，本頁列出全部，含 3 個公開探針端點（`/health`、`/ready`、`/metrics`）。

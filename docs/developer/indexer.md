@@ -291,20 +291,19 @@ checkpoint 與重建狀態是**可觀測性，不是資料路徑**：文件已�
 OpenSearch（bulk 佇列滿、CPU 吃滿），這時候更用力送只會換到更多 429 與重試，
 對這台共用工作站上的其他 VM 也不友善。
 
-### 跨服務的 backpressure 在 V0.1 還沒有
+### 跨服務的 backpressure：collector 看的是 normalizer，不是 indexer
 
-要讓 lag 真的變小，得讓**上游降低採集速率**——indexer 這一端做不到。
+要讓 **indexer 自己的** lag 真的變小，得讓上游降低採集速率——indexer 這一端
+做不到。collector 的跨服務背壓（2026-10-29 步驟 5）查的是 **normalizer** 在
+`raw.collected` 上的 lag（`[collector.backpressure]`），**不會**讀 indexer
+lag，也不會讀 `osint_queue_depth`。
 
-⚠️ **`osint_queue_depth` 目前只有人寫、沒有人讀。** indexer（以及 normalizer／
-deduplicator／entity-worker）會把自己的 consumer lag 寫進這個 gauge，但
-**collector 不會讀它**：`crates/collector/src/` 完全沒有引用 `queue_depth`，
-主迴圈是固定 `tick_secs` 的排程 tick。也就是說 gauge 現在的用途只有
+⚠️ **`osint_queue_depth` 仍然只有人寫、沒有人讀。** indexer（以及 normalizer／
+deduplicator／entity-worker）會把自己的 consumer lag 寫進這個 gauge，用途只有
 「給人／Prometheus 看」，不是一條自動生效的控制迴路。
 
-**自動依 `osint_queue_depth` 降低採集速率是 V0.2 項目**，V0.1 沒有實作。
-在那之前要壓住採集量只能手動調 `[collector].tick_secs`／`global_inflight`／
-`per_domain_inflight`，或把 connector 停用。`RESOURCE_BUDGET.md` §8／§14 描述的是
-**應該達成的目標狀態**，不是 V0.1 已經有的行為。
+主機 CPU／RAM／disk 壓力歸 V0.4 Resource Guard，目前不會讓 collector 因主機
+壓力降速。`RESOURCE_BUDGET.md` §8／§14 描述的目標狀態，主機壓力那一段仍未達成。
 
 延遲上限刻意壓在 1.6 秒（8 × 200ms）：`core-events` 的 `session.timeout.ms` 是
 10 秒，睡太久會讓 consumer 被 broker 踢出 group，反而讓 lag 更糟。
@@ -405,7 +404,7 @@ V0.1 沒有可查詢的進度 endpoint；長時間重建請看 log 或 `/metrics
 
 | metric | 意義 |
 |---|---|
-| `osint_queue_depth` | consumer lag。**V0.1 沒有任何程式讀它**（見上），只給人／Prometheus 看 |
+| `osint_queue_depth` | consumer lag。**仍然只有人寫、沒有人讀**（見上），只給人／Prometheus 看。collector 看的是 normalizer lag，不是這個 gauge |
 | `osint_indexer_indexed_total` | 成功寫進 index 的文件數 |
 | `osint_indexer_skipped_duplicate_total` | 因為是 duplicate 而跳過 |
 | `osint_indexer_bulk_retry_total` | 暫時性失敗的重試次數 |

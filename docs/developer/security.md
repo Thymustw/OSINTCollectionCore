@@ -124,8 +124,10 @@ Cargo.toml 與 deny/audit 面，而且要各自維護一份連線池與 `map_sql
 |---|---|---|
 | `import.upload` | `source` | 成功與失敗都寫 |
 | `job.create` / `job.transition` / `job.dispatch` / `job.retry` | `job` | 成功與失敗都寫 |
+| `jobs.purge` | `job` | 手動 `POST /ops/jobs/purge` 成功與失敗都寫（actor 是呼叫者）。背景排程**有刪才寫**，actor=`system`、`metadata.source=scheduler` |
 | `source.create` / `source.update` | `source` | 成功與失敗都寫 |
 | `connector.create` / `connector.update` | `connector` | 成功與失敗都寫 |
+| `connector.backoff_reset` | `connector` | `POST /ops/connectors/{id}/reset-backoff` 成功與失敗都寫；`metadata` 含 `original_error_count` |
 | `collection.create` | `collection` | 成功與失敗都寫 |
 | `collection.link_source` / `collection.unlink_source` | `collection` | 成功與失敗都寫（`POST`／`DELETE .../sources`） |
 | `collection.link_connector` / `collection.unlink_connector` | `collection` | 成功與失敗都寫 |

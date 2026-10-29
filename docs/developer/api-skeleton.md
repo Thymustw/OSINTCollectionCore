@@ -66,9 +66,11 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | POST | `/api/v1/jobs/{id}/retry` | operator | 200 | 只對 `failed` |
 | GET | `/api/v1/ops/health` | viewer | 200／503 | 七個後端名稱聚合（`neo4j` HTTP + `neo4j_bolt` Cypher） |
 | GET | `/api/v1/ops/metrics` | viewer | 200 | 行程資源用量（RAM／CPU／Disk） |
-| GET | `/api/v1/ops/connectors` | viewer | 200 | connector 採集健康。`?unhealthy=`、`?stale_after_secs=`、`?limit=` |
+| GET | `/api/v1/ops/connectors` | viewer | 200 | connector 採集健康。`?unhealthy=`、`?stale_after_secs=`、`?limit=`。含 `backing_off`／`next_attempt_at`／`last_error` |
+| POST | `/api/v1/ops/connectors/{id}/reset-backoff` | operator | 200／404 | 把 `error_count` 歸零結束退避。`status=error` 改 `idle`（`running` 不改）。不清 `checkpoint.last_error`。稽核 `connector.backoff_reset` |
 | GET | `/api/v1/ops/queues` | viewer | 200／503 | consumer group lag。沒接 Redpanda 回 503 |
-| GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`。沒接 Postgres 回 503 |
+| GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`、`?type=`（job type，例如 `collect`）。沒接 Postgres 回 503 |
+| POST | `/api/v1/ops/jobs/purge` | admin | 200／422／503 | 清除終態 job。`{}` 套用 `[retention.jobs]`；自訂需同時給 `job_type`、`statuses`、`older_than_days`。`dry_run` 只計數。非終態 422。稽核 `jobs.purge` |
 | GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
 | GET | `/api/v1/ops/failed-events` | viewer | 200／503 | 永久失敗事件清單（ADR-008）。`?topic=`、`?unreplayed_only=`、`?cursor=`、`?limit=`。沒接 Postgres 回 503 |
 | POST | `/api/v1/ops/failed-events/{id}/replay` | operator | 200／404／500／503 | 把失敗事件的原始 envelope 重發回原 topic 並標記已重放。envelope 壞掉回 500，broker 不可用回 503 |
@@ -554,6 +556,7 @@ curl -s "http://127.0.0.1:18080/api/v1/entities/$ENTITY_ID/timeline?limit=20" \
 | `/api/v1/ops/health` | viewer+ | 整套系統哪一塊壞了（給運維的人） |
 | `/api/v1/ops/metrics` | viewer+ | **這個行程**的資源用量（RAM／CPU／Disk） |
 | `/api/v1/ops/connectors` | viewer+ | 哪個 connector 沒在採集，以及為什麼 |
+| `POST /api/v1/ops/connectors/{id}/reset-backoff` | operator | 立刻結束失敗退避（`error_count=0`） |
 | `/api/v1/ops/queues` | viewer+ | 哪個 consumer group 落後 |
 | `/api/v1/ops/dlq` | viewer+ | 有哪些失敗的 Job（V0.1 沒有 DLQ topic） |
 | `/api/v1/ops/failed-events` | viewer+ | 有哪些**事件**永久失敗（ADR-008，跟上面的 Job 層級是兩回事） |
@@ -613,7 +616,10 @@ SPEC §31 的 "connector health"。viewer 以上。沒接 Postgres 回 503。
     "last_run": "2026-09-12T03:00:00Z", "last_success": "2026-09-10T03:00:00Z",
     "since_last_success_secs": 172800,
     "healthy": false,
-    "reason": "連續錯誤 3 次（connector.status = `error`）。請看 osint-collector 的記錄檔，或用 GET /api/v1/connectors/{id} 查設定"
+    "reason": "連續錯誤 3 次（connector.status = `error`）。請看 osint-collector 的記錄檔，或用 GET /api/v1/connectors/{id} 查設定；確定來源已修好可用 POST /api/v1/ops/connectors/{id}/reset-backoff 立刻重試",
+    "backing_off": true,
+    "next_attempt_at": "2026-09-12T03:20:00Z",
+    "last_error": "連線被拒"
   }],
   "scanned": 12, "unhealthy_count": 1, "truncated": false, "stale_after_secs": 86400
 }
@@ -621,7 +627,13 @@ SPEC §31 的 "connector health"。viewer 以上。沒接 Postgres 回 503。
 
 - **`reason` 是這個視圖存在的理由**：只回 `healthy: false` 等於要運維自己猜是
   「錯誤累積」還是「根本沒在跑」，那兩件事的下一步完全不同。判定順序是
-  錯誤 → 從來沒成功過 → 太久沒成功，只回最能指出下一步的那一條。
+  停用 → 卡在 running（`status=running` 且 `last_run` 超過 1 小時）→
+  正在跑未卡住（算健康；第一次收集時 `last_success` 本來就是 None）→ 錯誤 →
+  從來沒成功過 → 太久沒成功，只回最能指出下一步的那一條。
+- **`backing_off`／`next_attempt_at`／`last_error`**：現在是否仍在失敗退避窗內、
+  下次 collector 會嘗試的時間（未排程是 `null`）、`checkpoint.last_error`
+  （成功恢復後不一定會清）。立刻結束退避走
+  `POST /api/v1/ops/connectors/{id}/reset-backoff`（operator；`running` 不改 status）。
 - **停用的 connector 不算不健康**（那是人刻意關掉的），但仍然會列出來：
   「為什麼沒有資料」最常見的答案就是它被關掉了。
 - **從來沒跑過**（`last_run` 也是 `null`）也不算故障：新建的 connector
@@ -631,6 +643,15 @@ SPEC §31 的 "connector health"。viewer 以上。沒接 Postgres 回 503。
   改以硬上限 1000 筆掃描 + `truncated: true` 誠實標示掃不完的情況。
 - `scanned`／`unhealthy_count` 是**過濾前**的數字，所以帶 `unhealthy=true`
   時仍然看得出母體多大。
+
+## `POST /ops/connectors/{id}/reset-backoff`
+
+operator 以上。把 `error_count` 設 0，讓退避立刻結束。`status` 若是 `error`
+改 `idle`（`running` 不改，這條路解不了卡在 running）。不清
+`checkpoint.last_error`。不存在回 404。成功與失敗都寫稽核
+`connector.backoff_reset`（`metadata.original_error_count`）。
+
+PATCH connector body **不能**改 `error_count`。要立刻重試走這條，不要整列覆寫。
 
 ## `GET /ops/queues`（consumer group lag）
 
@@ -663,9 +684,10 @@ SPEC §31 的 "queue summary"。viewer 以上。
 - `topic_exists: false` 與 `lag: 0` 是兩回事：前者代表 topic 還沒被建出來
   （通常是沒有人 produce 過），後者代表真的追上了。
 
-> ⚠️ 這裡的 lag 是**給人看的**。V0.1 **沒有**任何程式讀它來自動降速——
-> collector 不會依 `osint_queue_depth` 調整採集速率（見
-> `docs/developer/collector-normalizer.md` 的「已知限制」）。跨服務 backpressure 是 V0.2。
+> ⚠️ 這裡的 lag 是**給人看的**。collector 的自動背壓**不讀** `osint_queue_depth`，
+> 而是自己查 `[normalizer].consumer_group` 在 `raw.collected` 上的 lag
+> （`[collector.backpressure]`，見 `docs/developer/collector-normalizer.md`）。
+> `/ops/queues` 仍是給人／面板看的快照。
 
 ## `GET /ops/graph`（圖投影 lag／rebuild）
 
@@ -717,13 +739,13 @@ curl -s http://127.0.0.1:18080/api/v1/ops/graph \
 ## `GET /ops/dlq`（失敗紀錄）
 
 SPEC §31 的 "basic DLQ view"。viewer 以上。沒接 Postgres 回 503。
-`?limit=` 預設與上限都是 100。
+`?limit=` 預設與上限都是 100。`?type=` 依 job type 過濾（例如 `collect`）；省略則列所有 failed job。
 
 ```json
 {
   "dlq_topic": null,
-  "note": "V0.1 沒有 DLQ topic：消費失敗的事件只會留在記錄檔…",
-  "failed_jobs": [{"id": "0199...", "job_type": "collect", "status": "failed", "…": "…"}],
+  "note": "沒有獨立 DLQ topic：…這裡列的是 `failed` 狀態的 Job（可用 ?type=collect 過濾）。collect 類 failed 預設保留 30 天…可用 POST /api/v1/ops/jobs/purge 手動清除（admin）。",
+  "failed_jobs": [{"id": "0199...", "type": "collect", "status": "failed", "…": "…"}],
   "failed_job_count": 3,
   "truncated": false
 }
@@ -738,6 +760,39 @@ SPEC §31 的 "basic DLQ view"。viewer 以上。沒接 Postgres 回 503。
 
 失敗的 Job 可以用 `POST /api/v1/jobs/{id}/retry`（operator 以上）重試；
 會轉成 `retrying` 而不是 `queued`（見上方 Jobs 一節），且成功與被拒都會寫稽核。
+
+collect 類 failed 預設保留 30 天、completed／cancelled 7 天，之後由 `[retention.jobs]`
+清除；其他 job type 不會被排程清掉。手動清除見下方 `POST /ops/jobs/purge`。
+
+## `POST /ops/jobs/purge`（清除終態 job）
+
+admin。沒接 Postgres 回 503。非終態 status（queued／running／retrying）回 **422**
+（全域 `ConstraintViolation` 是 400，這個 handler 自己轉——「還在跑的 job 不能刪」是語意錯誤）。
+
+body 全部省略（`{}`）時套用 `[retention.jobs]` 的規則。自訂範圍必須**同時**給
+`job_type`、`statuses`、`older_than_days`；只給其中幾個回 422。`dry_run: true` 只計數、不刪。
+`limit` 省略時用設定的 `batch`。
+
+```bash
+# 先看會刪幾筆
+curl -s -X POST http://127.0.0.1:18080/api/v1/ops/jobs/purge \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"dry_run": true}'
+
+# 自訂：只清某個 type 的 failed
+curl -s -X POST http://127.0.0.1:18080/api/v1/ops/jobs/purge \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"job_type":"collect","statuses":["failed"],"older_than_days":30}'
+```
+
+回應是 `PurgeReport`：`dry_run`／`deleted`／`counted`／`batches`／`truncated`／`rules`。
+達到 `max_batches_per_run` 就停，`truncated: true` 表示可能還有列沒清。
+
+成功與失敗都寫稽核 `jobs.purge`（actor 是呼叫者）。`deleted > 0` 才累加
+`osint_jobs_purged_total`。排程路徑見 `docs/developer/jobs.md`。
+
+刻意不做：`failed_events`（清掉就丟失可重放 envelope，ADR-008）、`audit_log`
+（append-only，migration 0006 的 DB 角色只該有 INSERT+SELECT）。
 
 ## `GET /ops/failed-events` / `POST /ops/failed-events/{id}/replay`（ADR-008）
 

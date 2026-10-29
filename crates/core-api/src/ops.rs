@@ -7,9 +7,13 @@
 //! * `GET /ops/metrics`：本行程的資源用量（RSS、CPU 時間、執行緒數、
 //!   以及工作目錄所在檔案系統的容量／剩餘空間）。
 //! * `GET /ops/connectors`：每個 connector 的採集健康（SPEC §31「connector health」）。
+//! * `POST /ops/connectors/{id}/reset-backoff`：把 `error_count` 歸零，讓退避立刻結束。operator 以上。
 //! * `GET /ops/queues`：四個 consumer group 的 lag（SPEC §31「queue summary」）。
 //! * `GET /ops/dlq`：失敗的 Job 清單（SPEC §31「basic DLQ view」）。
-//!   **V0.1 沒有 DLQ topic**，回應裡的 `dlq_topic: null` 就是這件事的宣告。
+//!   **沒有獨立 DLQ topic**，回應裡的 `dlq_topic: null` 就是這件事的宣告。
+//!   `?type=` 可依 job type 過濾。
+//! * `POST /ops/jobs/purge`：admin。手動跑 jobs 保留期限（可 dry-run）。
+//!   空 body `{}` 套用 `[retention.jobs]`；自訂需同時給 job_type／statuses／older_than_days。
 //! * `GET /ops/graph`：圖投影 lag 與 rebuild 狀態。沒接 Neo4j 回 503。
 //! * `GET /ops/failed-events`：永久失敗的事件清單（ADR-008）。支援依 topic、
 //!   是否已重放過濾，cursor 分頁（SPEC §31）。
@@ -42,11 +46,14 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
+use connector_sdk::{BackoffConfig, is_backing_off, next_attempt_at};
+use core_jobs::JobRetention;
+use core_model::JobStatus;
 use core_observability::{CheckResult, ReadyStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use storage_core::HealthProvider;
+use storage_core::{ConnectorRunStateUpdate, HealthProvider, JobPurgeFilter, StorageError};
 use uuid::Uuid;
 
 use core_security::{Permission, Principal};
@@ -60,6 +67,9 @@ use crate::state::AppState;
 
 /// 稽核 action。字串會進稽核表，改動等於改稽核查詢條件（比照 `jobs.rs` 的常數）。
 pub const AUDIT_FAILED_EVENT_REPLAY: &str = "failed_event.replay";
+pub const AUDIT_CONNECTOR_BACKOFF_RESET: &str = "connector.backoff_reset";
+/// 背景任務 actor 是 `"system"`；手動端點 actor 是呼叫者。
+pub const AUDIT_JOBS_PURGE: &str = "jobs.purge";
 
 /// 把任何 `HealthProvider`（storage adapter）包成一個具名的 ops 檢查。
 ///
@@ -331,6 +341,11 @@ pub async fn metrics(
 /// 而一個一直亮紅燈的面板等於沒有面板。要抓更短週期的 connector 請傳
 /// `?stale_after_secs=`。
 const DEFAULT_STALE_AFTER_SECS: i64 = 86_400;
+/// `status == "running"` 且 `last_run` 早於這麼久，視為卡在 running。
+///
+/// 單次 collect 不該超過一小時；還停在 running 多半是 collector 被 SIGKILL
+/// 中斷後沒把狀態改回。
+const STUCK_RUNNING_AFTER_SECS: i64 = 3_600;
 
 /// `GET /ops/connectors` 一次最多掃描幾筆 connector。
 ///
@@ -376,6 +391,12 @@ pub struct ConnectorHealth {
     /// **這一欄是這個視圖存在的理由**：只回一個 `healthy: false` 等於要運維
     /// 自己去猜是「錯誤累積」還是「根本沒在跑」，那兩件事的下一步完全不同。
     pub reason: Option<String>,
+    /// 現在是否仍在失敗退避視窗內（與 cron 是否到期無關）。
+    pub backing_off: bool,
+    /// 下次 collector 會嘗試執行的時間。未排程時是 `null`。
+    pub next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `checkpoint.last_error`。成功恢復後不一定會清掉，只是「上次失敗原因」。
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -411,6 +432,7 @@ pub async fn connectors(
     let limit = query.limit.unwrap_or(100).clamp(1, MAX_CONNECTOR_SCAN);
     let only_unhealthy = query.unhealthy.unwrap_or(false);
     let now = chrono::Utc::now();
+    let backoff = backoff_from_state(&state);
 
     let mut after: Option<uuid::Uuid> = None;
     let mut scanned = 0_usize;
@@ -429,7 +451,7 @@ pub async fn connectors(
         let page_len = page.len();
         for connector in page {
             scanned += 1;
-            let health = connector_health(&connector, now, stale_after_secs);
+            let health = connector_health(&connector, now, stale_after_secs, &backoff);
             if !health.healthy {
                 unhealthy_count += 1;
             }
@@ -455,29 +477,60 @@ pub async fn connectors(
     }))
 }
 
+fn backoff_from_state(state: &AppState) -> BackoffConfig {
+    BackoffConfig::from_secs(
+        state.collector.backoff_base_secs,
+        state.collector.backoff_max_secs,
+    )
+}
+
 /// 判定一個 connector 健不健康。純函式，才測得到各種組合。
 ///
-/// 判定順序刻意是「錯誤 → 從來沒成功 → 太久沒成功」，
-/// 因為 `reason` 只回一條，要回最能指出下一步的那一條。
+/// 判定順序刻意是「停用 → 卡在 running → 正在跑（未卡住，算健康）→ 錯誤 →
+/// 從來沒成功 → 太久沒成功」，因為 `reason` 只回一條，要回最能指出下一步的那一條。
 fn connector_health(
     connector: &core_model::Connector,
     now: chrono::DateTime<chrono::Utc>,
     stale_after_secs: i64,
+    cfg: &BackoffConfig,
 ) -> ConnectorHealth {
     let since_last_success_secs = connector
         .last_success
         .map(|at| (now - at).num_seconds().max(0));
+    let last_error = connector
+        .checkpoint
+        .get("last_error")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let backing_off = is_backing_off(connector, now, cfg);
+    let next_attempt_at = next_attempt_at(connector, now, cfg);
 
     // 停用的 connector 不算不健康：那是人刻意關掉的，不是故障。
     // 但仍然列出來（而且 `enabled: false` 看得見）——「為什麼沒有資料」
     // 最常見的答案就是它被關掉了。
+    let stuck_running_secs = (connector.status == "running")
+        .then_some(connector.last_run)
+        .flatten()
+        .map(|at| (now - at).num_seconds());
     let reason = if !connector.enabled {
+        None
+    } else if stuck_running_secs.is_some_and(|secs| secs > STUCK_RUNNING_AFTER_SECS) {
+        let secs = stuck_running_secs.unwrap_or(0);
+        Some(format!(
+            "status 仍是 running，且 last_run 已超過 {secs} 秒（門檻 {STUCK_RUNNING_AFTER_SECS} 秒）。\
+             單次收集不該這麼久，多半是 collector 被強制終止後沒把狀態改回。\
+             下一輪到期時仍會再派；若持續如此請重啟 osint-collector"
+        ))
+    } else if connector.status == "running" {
+        // 正在跑、還沒超過卡住門檻：第一次收集時 last_success 本來就是 None，
+        // 不能落到「跑過但從來沒成功」。
         None
     } else if connector.error_count > 0 {
         Some(format!(
             "連續錯誤 {} 次（connector.status = `{}`）。請看 osint-collector 的記錄檔，\
-             或用 GET /api/v1/connectors/{} 查設定",
-            connector.error_count, connector.status, connector.id
+             或用 GET /api/v1/connectors/{} 查設定；確定來源已修好可用 \
+             POST /api/v1/ops/connectors/{}/reset-backoff 立刻重試",
+            connector.error_count, connector.status, connector.id, connector.id
         ))
     } else if connector.last_run.is_some() && connector.last_success.is_none() {
         Some("跑過但從來沒有成功過。多半是 URL、憑證或 SSRF allow-list 設定問題".into())
@@ -506,6 +559,123 @@ fn connector_health(
         since_last_success_secs,
         healthy: reason.is_none(),
         reason,
+        backing_off,
+        next_attempt_at,
+        last_error,
+    }
+}
+
+/// `POST /api/v1/ops/connectors/{id}/reset-backoff`。operator 以上。
+///
+/// 只把 `error_count` 設 0；`status` 若是 `error` 改 `idle`（`running` 不改）。
+/// 不清 `checkpoint.last_error`。成功與失敗都寫稽核。
+pub async fn reset_connector_backoff(
+    State(state): State<AppState>,
+    principal: Principal,
+    ip: ClientIp,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<ConnectorHealth>, ApiError> {
+    principal.role.require(Permission::Write)?;
+    let result = async {
+        let store = store(&state)?;
+        let connector = store
+            .get_connector(id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    format!(
+                        "connector {id} 不存在。請先查 GET /api/v1/ops/connectors 拿一個有效的 id"
+                    ),
+                )
+            })?;
+        let original_error_count = connector.error_count;
+        let new_status = if connector.status == "error" {
+            Some("idle".to_string())
+        } else {
+            None
+        };
+        let marked = store
+            .update_connector_run_state(
+                id,
+                &ConnectorRunStateUpdate {
+                    status: new_status,
+                    error_count: Some(0),
+                    ..ConnectorRunStateUpdate::default()
+                },
+            )
+            .await
+            .map_err(storage_error)?;
+        if !marked {
+            return Err(ApiError::internal(format!(
+                "connector {id} 在讀取後消失，無法重設退避。請重查 GET /api/v1/ops/connectors"
+            )));
+        }
+        let updated = store
+            .get_connector(id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "重設退避成功但重讀 {id} 讀不到列。請確認 connectors 表沒有被外部刪除"
+                ))
+            })?;
+        let health = connector_health(
+            &updated,
+            Utc::now(),
+            DEFAULT_STALE_AFTER_SECS,
+            &backoff_from_state(&state),
+        );
+        Ok((health, original_error_count))
+    }
+    .await;
+    audit_backoff_reset(&state, &principal, &ip, id, &result).await;
+    result.map(|(health, _)| Json(health))
+}
+
+async fn audit_backoff_reset(
+    state: &AppState,
+    principal: &Principal,
+    ip: &ClientIp,
+    id: Uuid,
+    result: &Result<(ConnectorHealth, i32), ApiError>,
+) {
+    match result {
+        Ok((_, original_error_count)) => {
+            audit(
+                state,
+                principal,
+                ip,
+                AuditEvent {
+                    action: AUDIT_CONNECTOR_BACKOFF_RESET,
+                    resource_type: "connector",
+                    resource_id: Some(id.to_string()),
+                    outcome: "success",
+                    metadata: json!({
+                        "connector_id": id,
+                        "original_error_count": original_error_count,
+                    }),
+                },
+            )
+            .await;
+        }
+        Err(err) => {
+            audit(
+                state,
+                principal,
+                ip,
+                AuditEvent {
+                    action: AUDIT_CONNECTOR_BACKOFF_RESET,
+                    resource_type: "connector",
+                    resource_id: Some(id.to_string()),
+                    outcome: "rejected",
+                    metadata: rejected_metadata(err, json!({"connector_id": id})),
+                },
+            )
+            .await;
+        }
     }
 }
 
@@ -624,6 +794,9 @@ const MAX_DLQ_JOBS: u32 = 100;
 #[derive(Debug, Clone, Deserialize)]
 pub struct DlqQuery {
     pub limit: Option<u32>,
+    /// 只列這個 job type。省略或空白則不分種類。
+    #[serde(rename = "type")]
+    pub job_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -661,23 +834,158 @@ pub async fn dlq(
         )
     })?;
     let limit = query.limit.unwrap_or(MAX_DLQ_JOBS).clamp(1, MAX_DLQ_JOBS);
-    let failed_jobs = jobs
-        .list_by_status(core_model::JobStatus::Failed, None, limit)
-        .await
-        .map_err(ApiError::from)?;
+    let job_type = query
+        .job_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let failed_jobs = match job_type {
+        Some(job_type) => jobs
+            .list_by_status_and_type(JobStatus::Failed, job_type, None, limit)
+            .await
+            .map_err(ApiError::from)?,
+        None => jobs
+            .list_by_status(JobStatus::Failed, None, limit)
+            .await
+            .map_err(ApiError::from)?,
+    };
     let truncated = failed_jobs.len() as u32 >= limit;
 
     Ok(Json(DlqView {
         dlq_topic: None,
-        note: "V0.1 沒有 DLQ topic：消費失敗的事件只會留在記錄檔，不會被搬到另一個 topic，\
-               也沒有落地成可查詢的紀錄。這裡列的是 `failed` 狀態的 Job，\
-               可以用 POST /api/v1/jobs/{id}/retry 重試（operator 以上）。\
-               事件層級的重送在 V0.1 只能靠 raw_evidence_id 手動觸發"
+        note: "沒有獨立 DLQ topic：消費失敗的事件只會留在記錄檔，不會被搬到另一個 topic。\
+               這裡列的是 `failed` 狀態的 Job（可用 ?type=collect 過濾）。\
+               collect 類 failed 預設保留 30 天、completed／cancelled 7 天，\
+               之後由 [retention.jobs] 清除；其他 job type 不會被排程清掉。\
+               可用 POST /api/v1/jobs/{id}/retry 重試（operator 以上），\
+               或 POST /api/v1/ops/jobs/purge 手動清除（admin）。\
+               事件層級的重送見 /api/v1/ops/failed-events"
             .into(),
         failed_job_count: failed_jobs.len(),
         failed_jobs,
         truncated,
     }))
+}
+
+// --------------------------------------------------------------- jobs purge
+
+/// `POST /ops/jobs/purge` 的 body。全部省略（`{}`）時套用 `[retention.jobs]`。
+/// 自訂範圍必須同時給 `job_type`、`statuses`、`older_than_days`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PurgeJobsBody {
+    #[serde(default)]
+    pub dry_run: bool,
+    pub job_type: Option<String>,
+    pub statuses: Option<Vec<JobStatus>>,
+    pub older_than_days: Option<u32>,
+    pub limit: Option<u32>,
+}
+
+/// `POST /api/v1/ops/jobs/purge`。admin。
+///
+/// 非終態 status 回 **422**（全域 `ConstraintViolation` 是 400，這裡自己轉，
+/// 因為「還在跑的 job 不能刪」是語意錯誤，不是 JSON 格式錯）。
+pub async fn purge_jobs(
+    State(state): State<AppState>,
+    principal: Principal,
+    ip: ClientIp,
+    Json(body): Json<PurgeJobsBody>,
+) -> Result<Json<core_jobs::PurgeReport>, ApiError> {
+    principal.role.require(Permission::Admin)?;
+    let store = store(&state)?;
+    let retention = JobRetention::new(state.retention_jobs.clone());
+    let result = purge_jobs_inner(store.as_ref(), &retention, &body).await;
+    match &result {
+        Ok(report) => {
+            if report.deleted > 0 {
+                state.metrics.inc("osint_jobs_purged_total", report.deleted);
+            }
+            audit(
+                &state,
+                &principal,
+                &ip,
+                AuditEvent {
+                    action: AUDIT_JOBS_PURGE,
+                    resource_type: "job",
+                    resource_id: None,
+                    outcome: "success",
+                    metadata: json!({
+                        "dry_run": report.dry_run,
+                        "deleted": report.deleted,
+                        "counted": report.counted,
+                        "truncated": report.truncated,
+                        "custom": is_custom_purge(&body),
+                    }),
+                },
+            )
+            .await;
+        }
+        Err(err) => {
+            audit(
+                &state,
+                &principal,
+                &ip,
+                AuditEvent {
+                    action: AUDIT_JOBS_PURGE,
+                    resource_type: "job",
+                    resource_id: None,
+                    outcome: "rejected",
+                    metadata: rejected_metadata(err, json!({ "dry_run": body.dry_run })),
+                },
+            )
+            .await;
+        }
+    }
+    result.map(Json)
+}
+
+fn is_custom_purge(body: &PurgeJobsBody) -> bool {
+    body.job_type.is_some() || body.statuses.is_some() || body.older_than_days.is_some()
+}
+
+async fn purge_jobs_inner(
+    store: &(dyn storage_core::RelationalStore + Send + Sync),
+    retention: &JobRetention,
+    body: &PurgeJobsBody,
+) -> Result<core_jobs::PurgeReport, ApiError> {
+    if is_custom_purge(body) {
+        let job_type = body.job_type.as_deref().map(str::trim).unwrap_or("");
+        let statuses = body.statuses.clone().unwrap_or_default();
+        let Some(days) = body.older_than_days else {
+            return Err(ApiError::unprocessable(
+                "自訂 purge 必須同時給 job_type、statuses、older_than_days。\
+                 要套用 [retention.jobs] 請傳空物件 {}",
+            ));
+        };
+        if job_type.is_empty() || statuses.is_empty() {
+            return Err(ApiError::unprocessable(
+                "自訂 purge 必須同時給 job_type、statuses、older_than_days。\
+                 要套用 [retention.jobs] 請傳空物件 {}",
+            ));
+        }
+        let filter = JobPurgeFilter {
+            job_type: job_type.to_string(),
+            statuses,
+            older_than: Utc::now() - ChronoDuration::days(i64::from(days)),
+            limit: body.limit.unwrap_or(retention.config().batch),
+        };
+        return retention
+            .run_custom(store, &filter, body.dry_run, days)
+            .await
+            .map_err(purge_storage_error);
+    }
+    retention
+        .run_once(store, body.dry_run)
+        .await
+        .map_err(purge_storage_error)
+}
+
+/// 終態檢查失敗是語意錯誤 → 422，不要走全域 ConstraintViolation → 400。
+fn purge_storage_error(err: StorageError) -> ApiError {
+    match err {
+        StorageError::ConstraintViolation { .. } => ApiError::unprocessable(err.to_string()),
+        other => other.into(),
+    }
 }
 
 // --------------------------------------------------------------- failed events
@@ -1150,6 +1458,7 @@ fn status_kb(status: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     const STATUS: &str = "Name:\tosint-api\nThreads:\t9\nVmSize:\t 2097152 kB\nVmHWM:\t   65536 kB\nVmRSS:\t   32768 kB\n";
     // 欄位取自真實的 /proc/self/stat，utime=123、stime=45。
@@ -1217,5 +1526,104 @@ mod tests {
         let m = parse_process_metrics(STATUS, STAT).unwrap();
         assert_eq!(m.disk_bytes_total, None);
         assert_eq!(m.disk_bytes_available, None);
+    }
+
+    fn sample_connector() -> core_model::Connector {
+        core_model::Connector {
+            id: uuid::Uuid::from_u128(1000),
+            source_id: uuid::Uuid::nil(),
+            name: "test".into(),
+            connector_type: "rss".into(),
+            version: "0.1.0".into(),
+            enabled: true,
+            configuration: json!({}),
+            credential_reference: None,
+            schedule: Some("*/15 * * * *".into()),
+            rate_limit: json!({}),
+            timeout: json!({}),
+            proxy_reference: None,
+            checkpoint: json!({}),
+            last_run: None,
+            last_success: None,
+            status: "idle".into(),
+            error_count: 0,
+        }
+    }
+
+    fn health_now(
+        connector: &core_model::Connector,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> ConnectorHealth {
+        connector_health(
+            connector,
+            now,
+            DEFAULT_STALE_AFTER_SECS,
+            &BackoffConfig::default(),
+        )
+    }
+
+    #[test]
+    fn disabled_connector_is_healthy_even_with_errors() {
+        let mut c = sample_connector();
+        c.enabled = false;
+        c.error_count = 4;
+        c.status = "error".into();
+        let h = health_now(&c, Utc::now());
+        assert!(h.healthy, "停用不算故障：{h:?}");
+        assert!(h.reason.is_none());
+        assert_eq!(h.error_count, 4);
+    }
+
+    #[test]
+    fn stuck_running_beats_error_count() {
+        let mut c = sample_connector();
+        c.status = "running".into();
+        c.error_count = 2;
+        c.last_run = Some(Utc::now() - chrono::Duration::hours(2));
+        let h = health_now(&c, Utc::now());
+        assert!(!h.healthy);
+        let reason = h.reason.expect("應有原因");
+        assert!(
+            reason.contains("running"),
+            "卡在 running 應優先於 error_count：{reason}"
+        );
+        assert!(reason.contains("重啟 osint-collector"), "{reason}");
+    }
+
+    #[test]
+    fn recent_running_is_not_stuck() {
+        let mut c = sample_connector();
+        c.status = "running".into();
+        c.last_run = Some(Utc::now() - chrono::Duration::minutes(10));
+        let h = health_now(&c, Utc::now());
+        assert!(h.healthy, "跑了 10 分鐘不算卡住：{h:?}");
+    }
+
+    #[test]
+    fn error_count_sets_backing_off_and_last_error() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 12, 3, 0).unwrap();
+        let mut c = sample_connector();
+        c.error_count = 1;
+        c.status = "error".into();
+        c.last_run = Some(chrono::Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
+        c.checkpoint = json!({"last_error": "連不上來源"});
+        let h = health_now(&c, now);
+        assert!(!h.healthy);
+        assert!(h.backing_off, "n=1 退避 5 分鐘，12:03 應仍在窗內");
+        assert_eq!(h.last_error.as_deref(), Some("連不上來源"));
+        assert!(h.next_attempt_at.is_some());
+        let reason = h.reason.expect("應有原因");
+        assert!(reason.contains("reset-backoff"), "{reason}");
+    }
+
+    #[test]
+    fn unscheduled_next_attempt_at_is_none() {
+        let mut c = sample_connector();
+        c.schedule = None;
+        c.error_count = 3;
+        c.last_run = Some(Utc::now());
+        let h = health_now(&c, Utc::now());
+        assert_eq!(h.next_attempt_at, None);
+        assert!(!h.healthy);
     }
 }

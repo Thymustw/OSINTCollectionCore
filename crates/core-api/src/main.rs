@@ -8,16 +8,16 @@ use std::time::Duration;
 use chrono::Duration as ChronoDuration;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{
-    AppState, AuthState, AutoApprovalState, BackendCheck, BrokerCheck, ErrorBody,
+    AUDIT_JOBS_PURGE, AppState, AuthState, AutoApprovalState, BackendCheck, BrokerCheck, ErrorBody,
     GraphProjectionState, ImportState, PostgresReady, QueueBinding, QueueInspector, ReadyCheck,
     ReadyProbe, SemanticSearchState, SharedGraphStore, SharedObjects, SharedStore,
     SharedTokenStore, router, warn_unimplemented_hybrid_weights,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
-use core_jobs::JobService;
+use core_jobs::{JobRetention, JobService};
 use core_observability::{MetricsRegistry, init_tracing};
-use core_security::{AuditLog, JwtService};
+use core_security::{AuditEntry, AuditLog, JwtService};
 use merge::MergeService;
 use resolver::{GraphContextResolver, ResolverService};
 use storage_core::conformance::{
@@ -87,6 +87,7 @@ async fn run() -> Result<(), String> {
     // 稽核與 token 落到 `audit_log` / `api_tokens`（migration 0006）。
     // 兩者共用 canonical store 的連線池，不另開池。
     let audit: Arc<dyn AuditLog> = Arc::new(PostgresAuditLog::new(&store));
+    let audit_for_retention = cfg.retention.jobs.enabled.then(|| audit.clone());
     let tokens: SharedTokenStore = Arc::new(PostgresApiTokenStore::new(&store));
     // 一份 Arc 給所有 handler 用（AppState.store 與 ImportState.store 是同一個）。
     let shared: SharedStore = Arc::new(store.clone());
@@ -126,6 +127,7 @@ async fn run() -> Result<(), String> {
         }
     };
     let jobs = Some(Arc::new(JobService::new(store.clone(), producer.clone())));
+    let store_for_retention = cfg.retention.jobs.enabled.then(|| store.clone());
     let merge = Some(Arc::new(MergeService::new(store.clone(), producer.clone())));
     // MockEmbeddingProvider::unsupported() 讓 semantic_similarity 誠實回空，
     // 不是假裝已接上。graph_context 不在 ResolverService 上，見下方
@@ -304,8 +306,26 @@ async fn run() -> Result<(), String> {
         stix_config: cfg.stix.clone(),
         auto_approval_max_concurrent: cfg.auto_approval.llm.max_concurrent,
         object_bucket: cfg.storage.object.bucket.clone(),
+        collector: cfg.collector.clone(),
+        retention_jobs: cfg.retention.jobs.clone(),
         rate_limiter: core_api::RateLimiter::new(cfg.http.rate_limit_per_second),
     };
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    if let (Some(store_for_retention), Some(audit_for_retention)) =
+        (store_for_retention, audit_for_retention)
+    {
+        tokio::spawn(job_retention_loop(
+            store_for_retention,
+            cfg.retention.jobs.clone(),
+            metrics.clone(),
+            audit_for_retention,
+            shutdown_rx,
+        ));
+    } else {
+        drop(shutdown_rx);
+        tracing::info!("[retention.jobs] enabled=false，不啟動背景清除");
+    }
 
     let app = router(state).fallback(fallback);
     let addr: SocketAddr = cfg
@@ -324,9 +344,75 @@ async fn run() -> Result<(), String> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    })
     .await
     .map_err(|err| format!("伺服器結束：{err}"))
+}
+
+/// 第一次先等一個 interval，避免 API 一啟動就對大表 DELETE。
+/// 錯誤只 warn，不讓背景任務把行程拉下來。有刪才寫稽核（actor=`system`）。
+async fn job_retention_loop(
+    store: PostgresCanonicalStore,
+    config: core_config::RetentionJobsConfig,
+    metrics: MetricsRegistry,
+    audit: Arc<dyn AuditLog>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let interval = Duration::from_secs(config.interval_secs);
+    tracing::info!(
+        interval_secs = config.interval_secs,
+        batch = config.batch,
+        "jobs 保留期限背景任務已啟動；第一次清除會等一個 interval"
+    );
+    tokio::select! {
+        _ = tokio::time::sleep(interval) => {}
+        _ = shutdown.changed() => return,
+    }
+    let retention = JobRetention::new(config);
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        match retention.run_once(&store, false).await {
+            Ok(report) => {
+                if report.deleted > 0 {
+                    metrics.inc("osint_jobs_purged_total", report.deleted);
+                    let entry = AuditEntry::new("system", AUDIT_JOBS_PURGE, "job", None, "success")
+                        .with_metadata(serde_json::json!({
+                            "dry_run": false,
+                            "deleted": report.deleted,
+                            "counted": report.counted,
+                            "truncated": report.truncated,
+                            "batches": report.batches,
+                            "source": "scheduler",
+                        }));
+                    if let Err(err) = audit.append(entry).await {
+                        tracing::warn!(error = %err, "jobs 保留期限稽核寫入失敗");
+                    }
+                    tracing::info!(
+                        deleted = report.deleted,
+                        truncated = report.truncated,
+                        batches = report.batches,
+                        "jobs 保留期限已清除一批"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "jobs 保留期限清除失敗；下次 interval 再試。\
+                     請確認 Postgres 可連、migration 0019 已套用"
+                );
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => return,
+        }
+    }
 }
 
 /// `GET /api/v1/ops/queues` 要查哪幾個 (service, group, topic)。
@@ -595,7 +681,9 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
             error: "not_found".into(),
             message: "沒有這個路徑。V0.1 提供 GET /health /ready /metrics、/api/v1/jobs、\
                  /api/v1/tokens（admin）、/api/v1/ops/health、/api/v1/ops/metrics、\
-                 /api/v1/ops/connectors、/api/v1/ops/queues、/api/v1/ops/dlq、/api/v1/ops/graph 與 /api/v1/ops/discovery、\
+                 /api/v1/ops/connectors、POST /api/v1/ops/connectors/{{id}}/reset-backoff、\
+                 /api/v1/ops/queues、/api/v1/ops/dlq、POST /api/v1/ops/jobs/purge、\
+                 /api/v1/ops/graph 與 /api/v1/ops/discovery、\
                  sources／connectors／collections／objects／entities／relationships／events／raw、\
                  /api/v1/graph/*、POST /api/v1/import、POST /api/v1/search、POST /api/v1/search/semantic、\
                  POST /api/v1/search/hybrid 與 GET /api/v1/objects/{id}/similar"

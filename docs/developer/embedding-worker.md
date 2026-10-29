@@ -191,7 +191,7 @@ make rebuild-embeddings-drop
 4. **不訂 `embedding.requested`／`job.dispatched`**（見上）。
 5. **`--rebuild` 不刪多餘文件**。Document overlay 不會清掉已不該存在的向量欄位；Entity 幽靈文件要靠 `--drop`。
 6. **沒有 DLQ topic**。真正的失敗不提交 offset、靠 broker 重送；永久性錯誤（payload 缺 `document_id`）目前也走同一條。
-7. **跨服務 backpressure 仍未接**。consumer lag 寫進 `osint_queue_depth`，本服務自己不降速。
+7. **本服務自己不降速**。consumer lag 寫進 `osint_queue_depth`（只有人寫、沒有人讀）。collector 的跨服務背壓看的是 normalizer lag，不讀這個 gauge。
 8. **Document 同一語言空間只有一個向量**。title 與 body 互蓋，沒有分開存。
 9. **Redis 快取是效能優化，不是正確性路徑。** 沒接上／過期／model 對不上都只是多打推論。key 不含模型名，讀取端必須核對 `EmbeddingVector.model`。
 

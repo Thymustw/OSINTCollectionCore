@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use ai_gateway::OpenAiCompatibleLlmProvider;
 use connector_sdk::EvidenceSink;
-use core_config::{HybridSearchSection, ImportSection, StixSection};
+use core_config::{
+    CollectorSection, HybridSearchSection, ImportSection, RetentionJobsConfig, StixSection,
+};
 use core_events::EventProducer;
 use core_jobs::JobService;
 use core_observability::MetricsRegistry;
@@ -220,5 +222,10 @@ pub struct AppState {
     /// `s3://{bucket}/{key}` 形式的 `storage_path` 還原成物件 key。
     /// 沒接物件儲存時是空字串（那時 `?body=true` 本來就會回 503）。
     pub object_bucket: String,
+    /// collector 退避／公平性設定。`GET /ops/connectors` 與
+    /// `POST /ops/connectors/{id}/reset-backoff` 用同一套算法算 next_attempt_at。
+    pub collector: CollectorSection,
+    /// `[retention.jobs]`。背景任務與 `POST /ops/jobs/purge` 空 body 都讀這份。
+    pub retention_jobs: RetentionJobsConfig,
     pub rate_limiter: crate::rate_limit::RateLimiter,
 }

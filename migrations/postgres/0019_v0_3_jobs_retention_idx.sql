@@ -1,0 +1,21 @@
+-- no-transaction
+--
+-- jobs 保留期限用的複合索引 (type, status, completed_at)。
+-- 查詢是 DELETE ... WHERE type=$1 AND status = ANY($2) AND completed_at < $3
+-- ORDER BY completed_at LIMIT $4，索引欄位必須跟條件一致。
+--
+-- 為什麼用 completed_at 而不是 created_at：
+-- JobService 進入 completed／failed／cancelled 時都會寫 completed_at
+-- （retrying 會清掉）。「結束後保留 N 天」應以結束時間為準——
+-- 一筆 40 天前建立、昨天才失敗的 collect job，failed 要再留 30 天給 /ops/dlq 查，
+-- 不該因為 created_at 已超過 30 天就被刪。
+-- 終態列若 completed_at 是 NULL（沒走 JobService 的資料異常）不會被 purge 選中。
+--
+-- CONCURRENTLY 避免在大表上鎖寫入。sqlx 看到第一行 `-- no-transaction`
+-- 就不包交易（CREATE INDEX CONCURRENTLY 不能在交易裡跑）。
+--
+-- 這個檔只能有這一條語句。失敗時不會回滾，可能留下 INVALID index：
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_jobs_retention;
+-- 然後重跑 `make migrate-postgres`。不要用 DROP INDEX（非 CONCURRENTLY），
+-- 那會鎖表。
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_jobs_retention ON jobs ("type", status, completed_at);

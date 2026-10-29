@@ -48,6 +48,10 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/ops/failed-events/{id}/replay",
             post(ops::replay_failed_event),
         )
+        .route(
+            "/api/v1/ops/connectors/{id}/reset-backoff",
+            post(ops::reset_connector_backoff),
+        )
         .route("/api/v1/sources", post(resources::sources::create_source))
         .route(
             "/api/v1/sources/{id}",
@@ -136,6 +140,7 @@ pub fn router(state: AppState) -> Router {
             post(tokens::issue_token).get(tokens::list_tokens),
         )
         .route("/api/v1/tokens/{id}", delete(tokens::revoke_token))
+        .route("/api/v1/ops/jobs/purge", post(ops::purge_jobs))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_mw::require_admin,

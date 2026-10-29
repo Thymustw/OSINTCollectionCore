@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use storage_core::conformance::{
-    assert_candidate_natural_key, assert_collection_member_links_atomic, assert_embedded_health,
-    assert_evidence_collections, assert_list_sources_by_entity, assert_relational_round_trip,
-    assert_transactional_contract, find_workspace_root,
+    assert_candidate_natural_key, assert_collection_member_links_atomic,
+    assert_connector_run_state_partial_update, assert_embedded_health, assert_evidence_collections,
+    assert_jobs_purge, assert_list_sources_by_entity, assert_reclaim_orphan_collect_runs,
+    assert_relational_round_trip, assert_transactional_contract, find_workspace_root,
 };
 use storage_sqlite::SqliteEmbeddedStore;
 
@@ -108,6 +109,17 @@ where
 }
 
 #[tokio::test]
+async fn sqlite_connector_run_state_partial_update_does_not_clobber_patch() {
+    with_temp_store("run-state", |store| async move {
+        assert_connector_run_state_partial_update(&store)
+            .await
+            .expect("update_connector_run_state 不得蓋掉 enabled/schedule");
+        store
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn sqlite_collection_member_links_are_atomic() {
     with_temp_store("member-links", |store| async move {
         assert_collection_member_links_atomic(&store)
@@ -124,6 +136,28 @@ async fn sqlite_candidate_natural_key_dedups_rediscovery() {
         assert_candidate_natural_key(&store)
             .await
             .expect("candidate 自然鍵：重跑不新增、被拒不復活、只附加證據");
+        store
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_jobs_purge_only_deletes_matching_terminal_rows() {
+    with_temp_store("jobs-purge", |store| async move {
+        assert_jobs_purge(&store)
+            .await
+            .expect("purge_jobs：只刪 collect+failed+夠舊，limit／非終態／count 對得上");
+        store
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_reclaim_orphan_collect_runs_marks_failed_and_idle() {
+    with_temp_store("reclaim-orphan", |store| async move {
+        assert_reclaim_orphan_collect_runs(&store)
+            .await
+            .expect("reclaim：running collect job → failed（completed_at／固定 error）、running connector → idle（error_count 不動）");
         store
     })
     .await;

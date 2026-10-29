@@ -428,6 +428,11 @@ services:
     depends_on: *osint-depends
     restart: unless-stopped
     logging: *osint-logging
+    # init 是保險：即使日後 ENTRYPOINT 改成 shell form 或生出子行程，
+    # tini 仍會把 SIGTERM 轉給 collector。exec-form 的 PID 1 自己有 handler 也夠。
+    init: true
+    # 必須 > [collector].shutdown_drain_secs（預設 20）+ 5 秒，否則 Docker 會先 SIGKILL。
+    stop_grace_period: 30s
 
   osint-normalizer:
     build:

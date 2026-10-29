@@ -2,6 +2,7 @@
 //!
 //! IP 分類沿用 `core_security::ssrf`，這裡只加 `NetworkRule` 白名單與實際連線控制。
 
+mod backoff;
 mod checkpoint;
 mod connector;
 mod dns;
@@ -14,6 +15,10 @@ mod rate_limit;
 mod retry;
 mod ssrf;
 
+pub use backoff::{
+    BackoffConfig, DEFAULT_BASE_SECS, DEFAULT_MAX_SECS, is_backing_off, next_attempt_at,
+    retry_backoff,
+};
 pub use checkpoint::{CheckpointStore, ConnectorCheckpoint, RelationalCheckpointStore};
 pub use connector::{
     CollectContext, CollectResult, ConnectorHealth, ConnectorTrait, DiscoverItem, ParsedItem,

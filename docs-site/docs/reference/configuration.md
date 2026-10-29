@@ -136,6 +136,38 @@ Redpanda（Kafka 相容）連線設定：
 
 ---
 
+### `[collector]`
+
+收集器排程與併發上限：
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `bind` | `"127.0.0.1:18081"` | 健康／指標埠。容器內覆寫成 `0.0.0.0:18081` |
+| `tick_secs` | `5` | 排程掃描間隔（秒） |
+| `global_inflight` | `4` | 同時進行中的收集上限 |
+| `per_domain_inflight` | `1` | 同一網域同時進行中的收集上限 |
+| `backoff_base_secs` | `300` | 連續失敗後的指數退避起點（秒）。`0` = 關閉退避 |
+| `backoff_max_secs` | `43200` | 退避上限（秒）。必須 ≥ `backoff_base_secs` |
+| `max_retry_per_tick` | `8` | 每一輪最多重試幾個失敗中的連接器。必須 ≥ 1 |
+| `shutdown_drain_secs` | `20` | 收到停止訊號後等待進行中收集結束的最長秒數。必須 ≥ 1 |
+
+### `[collector.backpressure]`
+
+下游積壓背壓閘門。查的是正規化服務在 `raw.collected` 上的積壓，**不是**搜尋索引服務的積壓。查詢失敗或逾時照常收集。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `true` | `false` 時完全不查訊息佇列 |
+| `throttle_lag` | `5000` | 達到此積壓時本輪併發降為 1。必須 < `pause_lag` |
+| `pause_lag` | `50000` | 達到此積壓時本輪不派新工作 |
+| `lag_check_interval_secs` | `30` | 真正去查積壓的間隔（秒）。必須 > 0 |
+| `probe_timeout_ms` | `3000` | 單次查詢逾時（毫秒）。必須 > 0 |
+
+!!! warning "門檻是推測值"
+    `throttle_lag=5000`、`pause_lag=50000` 沒有做過容量測試。調整前請先看收集器 `/metrics` 的 `osint_collector_downstream_lag` 實際分佈。
+
+---
+
 ### `[import]`
 
 `POST /api/v1/import` 的上限：
@@ -173,6 +205,23 @@ AI 輔助自動合併設定（預設完全關閉）：
 | `max_concurrent` | `24` | 最大同時進行中的 LLM 請求數（bounded semaphore） |
 
 ---
+
+### `[retention.jobs]`
+
+定期清除 `collect` 類型、已結束的 Job。其他 Job 類型（STIX 匯出、圖重建等）不會被這份規則刪掉。稽核紀錄與失敗事件也不自動清。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `true` | 是否啟用背景清除。關掉排程請設 `false` |
+| `interval_secs` | `3600` | 背景任務間隔（秒）。必須 ≥ 60。啟動後會先等一個間隔才跑第一次 |
+| `batch` | `5000` | 單次 DELETE 最多幾列 |
+| `batch_pause_ms` | `200` | 批次之間暫停（毫秒）。`0` = 不暫停 |
+| `max_batches_per_run` | `200` | 每次執行最多跑幾批（200 × 5000 = 單次最多 100 萬列） |
+| `collect_completed_days` | `7` | collect／completed 保留天數。`0` = 這條規則不刪 |
+| `collect_failed_days` | `30` | collect／failed 保留天數（`/ops/dlq` 只列 failed，所以留比較久） |
+| `collect_cancelled_days` | `7` | collect／cancelled 保留天數 |
+
+時間以 Job 的結束時間（`completed_at`）為準，不是建立時間。手動清除見 `POST /api/v1/ops/jobs/purge`（admin）。
 
 ### `[discovery_worker]`
 

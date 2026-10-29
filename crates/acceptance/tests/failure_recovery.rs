@@ -63,6 +63,7 @@ use storage_core::conformance::{
 };
 use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -264,6 +265,8 @@ fn build_api(stack: &Stack, producer: Arc<EventProducer>, search: Option<SearchS
         stix_config: core_config::StixSection::default(),
         auto_approval_max_concurrent: 2,
         object_bucket: stack.bucket.clone(),
+        collector: core_config::CollectorSection::default(),
+        retention_jobs: core_config::RetentionJobsConfig::default(),
         rate_limiter: RateLimiter::new(1_000),
     };
     TestApi {
@@ -624,7 +627,7 @@ async fn db_temporary_failure_degrades_then_recovers() {
     // 這裡斷言的是「不 panic、而且不會假裝有跑過任何 connector」。
     // ⚠️ 這是一個已知的靜默降級：外部只看回傳值的話，「PG 掛了」與
     // 「沒有到期的 connector」長得一模一樣。
-    let ticked = collector.tick(Utc::now()).await;
+    let ticked = collector.tick(Utc::now(), &CancellationToken::new()).await;
     assert!(
         ticked.is_empty(),
         "PG 掛掉時 tick 不該回報任何 connector 結果，實際 {ticked:?}"

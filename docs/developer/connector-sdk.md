@@ -17,6 +17,23 @@ crates/connector-rest-api      REST JSON API（整份 response 存 RawEvidence�
 
 Checkpoint 除了 `etag`／`last_modified`／`last_retrieved_at`，還有 `content_sha256`：Static Web 與 REST 在伺服器沒給條件標頭時，用 body hash 判斷有沒有新內容。
 
+## 失敗退避（`retry_backoff`）
+
+`crates/connector-sdk/src/backoff.rs`。collector 排程與 ops 健康視圖共用同一套算法，
+所以不放在 collector crate。
+
+| 函式 | 語意 |
+|---|---|
+| `retry_backoff(error_count, connector_id, cfg)` | `error_count ≤ 0` 或 `base = 0` → 0；否則 `min(base × 2^(n−1), max)`，再套由 `connector_id` 雜湊決定的 ±10% jitter（可重現，不用亂數）。jitter 後仍不得超過 max、不得為負 |
+| `next_attempt_at(connector, now, cfg)` | 未排程 → `None`；從未跑過 → `Some(now)`；否則 `max(cron 下一個時點, last_run + retry_backoff)`。退避只延後、不提前 |
+| `is_backing_off(connector, now, cfg)` | `error_count > 0` 且 `last_run` 存在且 `now < last_run + retry_backoff` |
+
+預設 `BackoffConfig`：base 300 秒、max 43200 秒，與 `[collector].backoff_base_secs`／
+`backoff_max_secs` 對齊（core-config 不依賴本 crate，兩邊各寫一份常數）。
+
+`connector.timeout` JSON **目前沒有接到 fetch**：實際逾時走 `SourcePolicy`
+（connect 5s／request 30s）。
+
 ## ConnectorTrait
 
 規格只列資料欄位，沒有方法簽名。實作契約：

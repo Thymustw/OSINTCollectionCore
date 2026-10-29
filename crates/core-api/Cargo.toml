@@ -59,6 +59,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# 整合測試用的 DisableConnectorsOnDrop／測試鎖（見 storage-postgres 的 test-support feature）。
+storage-postgres = { path = "../storage-postgres", features = ["test-support"] }
 # Acceptance A/E 的完整版要真的跑一次採集→正規化→去重→抽取→索引，
 # 才驗得到「真實流程產生的資料可搜尋、可回溯」（見 tests/search_api_e2e.rs）。
 collector = { path = "../collector" }

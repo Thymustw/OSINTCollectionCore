@@ -21,3 +21,12 @@ storage-core = { workspace = true }
 # 交易 handle 要在 `&self` 介面下拿到 `&mut sqlx::Transaction`，需要能跨 await 持有的鎖。
 tokio = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+# 測試輔助：DisableConnectorsOnDrop、acquire_collect_state_test_lock。
+# 只由 dev-dependencies 開啟（本 crate 與 collector、core-api），正式 binary 不含。
+test-support = []
+
+[dev-dependencies]
+# 本 crate 的整合測試（tests/*.rs）要用 test-support 的型別。
+storage-postgres = { path = ".", features = ["test-support"] }

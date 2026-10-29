@@ -84,7 +84,7 @@ curl -s http://127.0.0.1:18080/api/v1/ops/health \
 | `GET /api/v1/ops/metrics` | 這個行程的資源用量（記憶體、CPU 等） |
 | `GET /api/v1/ops/connectors` | 各 Connector 的採集狀態與最近一次執行結果 |
 | `GET /api/v1/ops/queues` | 各消費者的 Kafka 消費進度（lag） |
-| `GET /api/v1/ops/dlq` | 失敗 Job 列表（目前不設獨立 DLQ topic，失敗 Job 可用 `POST /api/v1/jobs/{id}/retry` 重試） |
+| `GET /api/v1/ops/dlq` | 失敗 Job 列表（`?type=` 依種類過濾；目前不設獨立 DLQ topic，失敗 Job 可用 `POST /api/v1/jobs/{id}/retry` 重試） |
 | `GET /api/v1/ops/failed-events` | 處理失敗的事件記錄 |
 | `GET /api/v1/ops/graph` | 圖投影（Neo4j）的 lag 與最近一次 rebuild 狀態 |
 | `GET /api/v1/ops/discovery` | Discovery 的 AI 並發上限、Candidate 各狀態數量、最近 AI Run 歷史 |
@@ -93,6 +93,13 @@ curl -s http://127.0.0.1:18080/api/v1/ops/health \
 
 ```
 POST /api/v1/ops/failed-events/{id}/replay
+```
+
+清除已結束的 Job 需要 admin。空物件 `{}` 套用設定檔 `[retention.jobs]` 的規則
+（只清 collect 類：completed／cancelled 預設 7 天、failed 30 天）。`dry_run: true` 只計數、不刪：
+
+```
+POST /api/v1/ops/jobs/purge
 ```
 
 ---
@@ -106,6 +113,21 @@ curl -s http://127.0.0.1:18080/api/v1/ops/queues \
 
 回應包含每個消費者的 `lag`（積壓未處理的訊息數）。
 `lag` 持續上升代表消費者跟不上生產速度；持平在 0 代表正常。
+
+這份 lag **只是給人看的**。收集器的自動背壓不讀這裡，而是自己查正規化服務在 `raw.collected` 上的積壓。
+
+### 收集器背壓狀態
+
+收集器自己的 `/metrics`（預設埠 18081）另輸出：
+
+| 名稱 | 意義 |
+|---|---|
+| `osint_collector_downstream_lag` | 最近一次查到的正規化積壓 |
+| `osint_collector_backpressure_state` | 0=正常、1=降速（本輪併發 1）、2=暫停派工 |
+| `osint_collector_lag_probe_failures_total` | 查詢失敗或逾時次數（失敗時照常收集） |
+| `osint_collector_backpressure_skipped_total` | 因暫停而本輪略過的連接器數 |
+
+暫停派工時 `/health` 仍是存活、`/ready` **不會**變 503——暫停不是「不就緒」。設定在 `[collector.backpressure]`。主機壓力目前不會讓收集器降速。
 
 ---
 

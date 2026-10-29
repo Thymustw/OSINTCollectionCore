@@ -109,6 +109,7 @@ adapter 必須通過 `storage_core::conformance::assert_bulk_upsert_preserves_un
 | `list_events(after, limit)` | `id DESC` | UUID v7（V0.1 沒有寫入者） |
 | `list_relationships(after, limit)` | `id DESC` | **不等於時間序**，id 是 UUID v5 |
 | `list_jobs_by_status(status, after, limit)` | `id DESC` | 過濾在 SQL 裡做 |
+| `list_jobs_by_status_and_type(status, job_type, after, limit)` | `id DESC` | 再依 `job_type` 過濾；`GET /ops/dlq?type=` |
 
 Phase 6b（`GET /api/v1/*` 的過濾參數）新增的四個，語意與上表相同，
 差別只在多一個**在 SQL 裡**求值的過濾條件：
@@ -374,6 +375,132 @@ cargo test --workspace --all-targets -- --nocapture
 
 conformance（`storage-core::conformance::assert_relational_round_trip`）對這三點都有斷言，
 新增 backend 時照樣會被驗到。
+
+## `update_connector_run_state`（collector 執行狀態，2026-10-28 步驟 1）
+
+collector 標記 running／成功／失敗、以及 `RelationalCheckpointStore::save`，
+**不能**走 `put_connector`。`put_connector` 是 17 欄 upsert：operator 在收集期間
+`PATCH /api/v1/connectors/{id}` 改 `enabled`／`schedule`／`configuration`，
+collector 稍後把記憶體裡的舊列寫回，會把 PATCH 蓋掉。
+
+API PATCH、匯入、STIX 建立 connector 仍走 `put_connector`——那些本來就是整列編輯。
+
+### 契約
+
+```text
+update_connector_run_state(id, &ConnectorRunStateUpdate) -> Result<bool>
+```
+
+只動執行狀態：`status`、`last_run`、`last_success`、`error_count`、`checkpoint`。
+每個欄位都能表達「不改」：
+
+| 欄位 | 不改 | 寫入 |
+|---|---|---|
+| `status`／`error_count` | `None` | `Some(...)` |
+| `last_run`／`last_success` | `None` | `Some(ts)`。沒有「清成 SQL NULL」的路徑；collector 從來不會清這兩個欄位 |
+| `checkpoint` | `CheckpointUpdate::Unchanged` | `Replace(object)` 整包替換；`Merge(object)` 合併頂層鍵 |
+
+回傳比照 `update_candidate_status`：改到一列 → `Ok(true)`；id 不存在 → `Ok(false)`，
+**不新建列**。`Replace`／`Merge` 的值不是 JSON 物件 → `ConstraintViolation`。
+
+生產 adapter（postgres／sqlite）必須是**單一** `UPDATE ... WHERE id`，只 SET 有給值的欄位，
+交易中走 `self.conn()`。trait 預設實作是 `get_connector` + 改欄位 + `put_connector`，
+**沒有部分更新的保證**，只給 resolver 的 MemoryStore 這類測試替身用。
+
+### checkpoint：為什麼同時提供 Replace 與 Merge
+
+operator PATCH 不會被蓋掉，靠的是「執行狀態欄位的部分 UPDATE」，不是靠 Merge。
+就算 `Replace` 整包 checkpoint，`enabled`／`schedule` 也不會動。
+
+Merge 仍然要有：`mark_failure` 只寫 `last_error`、`save` 只寫 HTTP 快取四鍵
+（etag／last_modified／last_retrieved_at／content_sha256）、成功時只寫
+`last_raw_evidence_id`。若每次都先 SELECT 再整包寫回，兩個 collector 交錯時會丟掉
+對方剛寫的頂層鍵。Merge 在單一 `UPDATE` 裡完成，不另外 SELECT。
+
+| 後端 | Merge | JSON `null` |
+|---|---|---|
+| PostgreSQL | `jsonb \|\|` | 把該鍵設成 `null` |
+| SQLite | `json_patch` | **刪掉**該鍵 |
+| 記憶體預設／`merge_json_objects` | 對齊 PostgreSQL `\|\|` | 寫入 `null` |
+
+對 `serde` 的 `Option` 欄位，鍵是 `null` 與鍵不存在都是 `None`。呼叫端不要依賴
+「鍵還在、值是 null」。
+
+### conformance
+
+`storage_core::conformance::assert_connector_run_state_partial_update`：
+
+1. 建 source + connector（`enabled=true`、既有 schedule／checkpoint／last_run）
+2. `put_connector` 把 `enabled` 改 false、換 schedule（模擬 PATCH）
+3. `update_connector_run_state` 只改 `status`／`error_count`
+4. 讀回：`enabled` 仍 false、schedule 是新值、執行狀態是新值；沒給的欄位不變
+5. `Merge { last_error }` 保留既有 `etag`
+6. 不存在的 id 回 `false`，不新建列
+
+adapter 測試：
+
+- `postgres_connector_run_state_partial_update_does_not_clobber_patch`
+- `sqlite_connector_run_state_partial_update_does_not_clobber_patch`
+
+## `purge_jobs`／`count_purgeable_jobs`（jobs 保留期限，2026-10-28 步驟 3）
+
+終態 collect job 的批次刪除。單次 `purge_jobs` 只刪一批（`<= filter.limit`），
+迴圈與批次間 sleep 由 `core_jobs::JobRetention` 負責，adapter 不做無界 DELETE。
+
+```text
+purge_jobs(&JobPurgeFilter) -> Result<u64>
+count_purgeable_jobs(&JobPurgeFilter) -> Result<u64>
+```
+
+`JobPurgeFilter`：`job_type`、`statuses`、`older_than`（對 `completed_at`）、`limit`。
+時間欄位是 `completed_at` 不是 `created_at`；`completed_at IS NULL` 的列不會被選中。
+`count_purgeable_jobs` **忽略 limit**（dry-run 要看全部）。
+
+驗證在 storage-core：`validate()`（purge）／`validate_scope()`（count）。
+非終態、空 statuses、空 job_type、limit 超出 1..=100000 → `ConstraintViolation`。
+postgres／sqlite 都先呼叫，不能只靠呼叫端自律。trait 預設先 validate 再回
+`UnsupportedCapability`（resolver MemoryStore 不必覆寫）。
+
+SQL 形狀：`DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE type=$1 AND status=ANY(...) AND completed_at IS NOT NULL AND completed_at < $n ORDER BY completed_at LIMIT $n)`。
+SQLite 用 `json_each` 模擬 `ANY`。索引 `idx_jobs_retention`（`type, status, completed_at`）
+在 migration `0019_v0_3_jobs_retention_idx.sql`。postgres 檔第一行必須是 `-- no-transaction`，
+語句是 `CREATE INDEX CONCURRENTLY IF NOT EXISTS`；失敗留下 INVALID index 時用
+`DROP INDEX CONCURRENTLY IF EXISTS idx_jobs_retention` 後重跑。
+
+conformance：`storage_core::conformance::assert_jobs_purge`。測試列的
+`completed_at` 用 2020-01-01、cutoff 2020-06-01，避免誤刪共用開發 DB 的 leftover collect job。
+
+adapter 測試：
+
+- `postgres_jobs_purge`
+- `sqlite_jobs_purge`
+
+## `reclaim_orphan_collect_runs`（collector 啟動回收，2026-10-28 步驟 4）
+
+把上次非正常結束留下的 collect 工作收回來。**不需要 migration**。
+
+```text
+reclaim_orphan_collect_runs(now) -> Result<(jobs_reclaimed, connectors_reclaimed)>
+```
+
+- 所有 `jobs.type='collect' AND status='running'` → `failed`，設 `completed_at=now`、
+  `error`＝`RECLAIM_ORPHAN_COLLECT_JOB_ERROR`（「collector 非正常結束（啟動回收）」）。
+  用 Failed 不是 Cancelled：被 SIGKILL 時不知道寫到哪一步，Failed 才能出現在 `/ops/dlq`。
+  `completed_at` 必須設，步驟 3 的保留期限靠它。
+- 所有 `connectors.status='running'` → `idle`。不碰 `error_count`、checkpoint、
+  enabled——被中斷不是來源的錯，不該觸發退避。
+- **單一副本前提**：會收回**所有** running collect job／running connector。
+  多副本會誤收別的副本正在跑的工作，屆時要改成 lease。compose 目前 collector 就是單一副本。
+- trait 預設回 `UnsupportedCapability`。postgres／sqlite 覆寫。兩次 UPDATE 不包交易（各自冪等）。
+
+conformance：`storage_core::conformance::assert_reclaim_orphan_collect_runs`。
+斷言只針對本次建立的 id；共用開發 Postgres 可能有上次 `docker stop` 留下的
+running collect job／connector，回傳計數可以 > 1。
+
+adapter 測試：
+
+- `postgres_reclaim_orphan_collect_runs_marks_failed_and_idle`
+- `sqlite_reclaim_orphan_collect_runs_marks_failed_and_idle`
 
 ## `TransactionalStore`（V0.2 Phase 0e）
 

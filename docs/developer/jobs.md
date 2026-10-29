@@ -51,6 +51,20 @@ queued ──► running ──► completed
 
 collector 每次收集會建立 `job_type=collect`（`correlation_id=connector.id`），自己把狀態轉 `running`／`completed`／`failed`，**不**走 `job.dispatched`。Job 轉態失敗只記 warn，不中止收集。`graph_rebuild` 才是第一個由 worker 消費 `job.dispatched` 執行的 job type。
 
+優雅停止（2026-10-28 步驟 4）時，spawn 前就建 job 並轉 Running；drain 逾時 abort 後外層把剩餘 job 轉 `cancelled`，並寫入 `error`（「collector 停止時中斷」）。`JobService::transition` 對 Failed **與** Cancelled 都寫 `error`、設 `completed_at`——Cancelled 是終態，沒有 `completed_at` 的話保留期限清不到。啟動回收把卡住的 running collect job 標成 **failed**（不是 cancelled），才能出現在 `/ops/dlq`。
+
+`list_by_status_and_type(status, job_type, after, limit)` 對應 `GET /api/v1/ops/dlq?type=`，過濾在 SQL 裡做。
+
+## 保留期限（`[retention.jobs]`）
+
+只清 **collect** 類終態。failed 預設 30 天（`/ops/dlq` 只列 failed）、completed／cancelled 各 7 天。其他 job type 不在設定規則裡，排程不會刪。時間欄位是 `completed_at`（結束後保留 N 天），不是 `created_at`。`completed_at IS NULL` 的終態列不會被選中。
+
+`core_jobs::JobRetention` 吃 `RetentionJobsConfig`。`run_once` 依規則分批呼叫 `RelationalStore::purge_jobs`（單次只刪一批，迴圈與 `batch_pause_ms` 在這裡）。dry-run 走 `count_purgeable_jobs`（不受 batch limit 限制）。天數 `0` 的規則不列入。達到 `max_batches_per_run` 就停，`PurgeReport.truncated = true`。
+
+osint-api 背景任務第一次延後一個 interval，之後週期跑。有刪才寫稽核 `jobs.purge`（actor=`system`、`metadata.source=scheduler`）並累加 `osint_jobs_purged_total`。錯誤只 warn。手動端點 `POST /api/v1/ops/jobs/purge`（admin）見 `docs/developer/api-skeleton.md`。
+
+非終態（queued／running／retrying）在 `JobPurgeFilter::validate` 回 `ConstraintViolation`；postgres／sqlite 都先呼叫，不能只靠呼叫端自律。
+
 ## 驗證
 
 ```bash

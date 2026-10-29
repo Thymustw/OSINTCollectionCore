@@ -19,9 +19,10 @@ use sqlx::Row;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
-    BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor, DailyUsage,
-    HealthProvider, RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth,
-    Transaction, TransactionalStore,
+    BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor,
+    ConnectorRunStateUpdate, DailyUsage, HealthProvider, JobPurgeFilter,
+    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RelationalStore, SimhashCandidate, StorageAdapter,
+    StorageError, StorageHealth, Transaction, TransactionalStore,
 };
 
 use crate::error::map_sqlx;
@@ -48,6 +49,16 @@ fn ports_json(ports: Option<&[u16]>) -> Result<Option<Value>, StorageError> {
                 message: format!("序列化 source_network_rules.ports 失敗：{err}"),
             }),
     }
+}
+
+/// `acquire_collect_state_test_lock` 用的 advisory lock key（任意固定值，只要全 repo 唯一）。
+#[cfg(feature = "test-support")]
+const COLLECT_STATE_TEST_LOCK_KEY: i64 = 0x05C0_11EC_7000_0001;
+
+/// 測試用跨行程鎖的 guard。drop 即釋放（連線關閉 → session 結束 → Postgres 釋放鎖）。
+#[cfg(feature = "test-support")]
+pub struct CollectStateTestLock {
+    _conn: sqlx::PgConnection,
 }
 
 /// 一次查詢要用的連線。
@@ -122,6 +133,34 @@ impl PostgresCanonicalStore {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// **只給測試用**：取得跨行程的 `collect` 執行狀態測試鎖（Postgres session advisory lock）。
+    ///
+    /// 為什麼需要：`reclaim_orphan_collect_runs` 依設計會收回**全表**的 running collect job
+    /// 與 running connector（正式環境單一 collector、只在啟動時跑一次）。測試共用同一個開發
+    /// Postgres，`cargo test --workspace` 又會平行跑不同 crate 的測試執行檔——storage-postgres
+    /// conformance 的 reclaim 若剛好落在 collector shutdown 測試「job 正在 running」的那幾秒，
+    /// 會把對方的 job 改成 Failed，造成偶發失敗。行程內的 Mutex 管不到別的行程，所以用
+    /// advisory lock：凡是「建立 running collect job／connector」或「呼叫 reclaim」的測試都先拿這把鎖。
+    ///
+    /// 回傳的 guard 握著一條**從連線池拆出來**的專用連線。advisory lock 綁 session；
+    /// guard drop 時連線被丟棄、session 結束，Postgres 自動釋放該 session 的所有
+    /// advisory lock——不需要在同步的 Drop 裡做 async unlock，測試 panic 時也一樣會釋放。
+    ///
+    /// 只在 `test-support` feature 下編譯，正式 binary 不含這個方法。
+    #[cfg(feature = "test-support")]
+    pub async fn acquire_collect_state_test_lock(
+        &self,
+    ) -> Result<CollectStateTestLock, StorageError> {
+        let conn = self.pool.acquire().await.map_err(map_sqlx)?;
+        let mut conn = conn.detach();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(COLLECT_STATE_TEST_LOCK_KEY)
+            .execute(&mut conn)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(CollectStateTestLock { _conn: conn })
     }
 
     async fn fetch_optional_mapped<T, F>(
@@ -696,6 +735,47 @@ impl RelationalStore for PostgresCanonicalStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::connector).collect()
+    }
+
+    async fn update_connector_run_state(
+        &self,
+        id: ConnectorId,
+        update: &ConnectorRunStateUpdate,
+    ) -> Result<bool, StorageError> {
+        update.validate()?;
+        let (mode, checkpoint) = update.checkpoint_sql_parts();
+        let result = sqlx::query(
+            r#"
+            UPDATE connectors SET
+                status = COALESCE($2, status),
+                last_run = COALESCE($3, last_run),
+                last_success = COALESCE($4, last_success),
+                error_count = COALESCE($5, error_count),
+                checkpoint = CASE $6::text
+                    WHEN 'replace' THEN $7::jsonb
+                    WHEN 'merge' THEN
+                        CASE
+                            WHEN jsonb_typeof(COALESCE(checkpoint, '{}'::jsonb)) = 'object'
+                                THEN COALESCE(checkpoint, '{}'::jsonb)
+                                     || COALESCE($7, '{}'::jsonb)
+                            ELSE COALESCE($7, '{}'::jsonb)
+                        END
+                    ELSE checkpoint
+                END
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(update.status.as_deref())
+        .bind(update.last_run)
+        .bind(update.last_success)
+        .bind(update.error_count)
+        .bind(mode)
+        .bind(checkpoint)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn put_collection(&self, collection: &Collection) -> Result<(), StorageError> {
@@ -1731,6 +1811,114 @@ impl RelationalStore for PostgresCanonicalStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::job).collect()
+    }
+
+    async fn list_jobs_by_status_and_type(
+        &self,
+        status: JobStatus,
+        job_type: &str,
+        after: Option<JobId>,
+        limit: u32,
+    ) -> Result<Vec<Job>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT * FROM jobs
+            WHERE status = $1 AND "type" = $2 AND ($3::uuid IS NULL OR id < $3)
+            ORDER BY id DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(encode_enum(&status)?)
+        .bind(job_type)
+        .bind(after)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::job).collect()
+    }
+
+    async fn purge_jobs(&self, filter: &JobPurgeFilter) -> Result<u64, StorageError> {
+        filter.validate()?;
+        let statuses = filter.encoded_statuses()?;
+        let result = sqlx::query(
+            r#"
+            DELETE FROM jobs
+            WHERE id IN (
+                SELECT id FROM jobs
+                WHERE "type" = $1
+                  AND status = ANY($2::text[])
+                  AND completed_at IS NOT NULL
+                  AND completed_at < $3
+                ORDER BY completed_at
+                LIMIT $4
+            )
+            "#,
+        )
+        .bind(&filter.job_type)
+        .bind(&statuses)
+        .bind(filter.older_than)
+        .bind(i64::from(filter.limit))
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected())
+    }
+
+    async fn count_purgeable_jobs(&self, filter: &JobPurgeFilter) -> Result<u64, StorageError> {
+        filter.validate_scope()?;
+        let statuses = filter.encoded_statuses()?;
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint FROM jobs
+            WHERE "type" = $1
+              AND status = ANY($2::text[])
+              AND completed_at IS NOT NULL
+              AND completed_at < $3
+            "#,
+        )
+        .bind(&filter.job_type)
+        .bind(&statuses)
+        .bind(filter.older_than)
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    async fn reclaim_orphan_collect_runs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(u64, u64), StorageError> {
+        let failed = encode_enum(&JobStatus::Failed)?;
+        let running = encode_enum(&JobStatus::Running)?;
+        let jobs = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = $1, completed_at = $2, error = $3
+            WHERE "type" = 'collect' AND status = $4
+            "#,
+        )
+        .bind(&failed)
+        .bind(now)
+        .bind(RECLAIM_ORPHAN_COLLECT_JOB_ERROR)
+        .bind(&running)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+
+        let connectors = sqlx::query(
+            r#"
+            UPDATE connectors
+            SET status = 'idle'
+            WHERE status = 'running'
+            "#,
+        )
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok((jobs.rows_affected(), connectors.rows_affected()))
     }
 
     async fn find_document_ids_by_external_key(

@@ -107,6 +107,8 @@ fn build_api(stack: &Stack, index: &str) -> TestApi {
         stix_config: core_config::StixSection::default(),
         auto_approval_max_concurrent: 2,
         object_bucket: String::new(),
+        collector: core_config::CollectorSection::default(),
+        retention_jobs: core_config::RetentionJobsConfig::default(),
         rate_limiter: RateLimiter::new(1_000),
     };
     TestApi {

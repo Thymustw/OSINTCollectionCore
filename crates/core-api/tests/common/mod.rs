@@ -115,6 +115,8 @@ pub fn test_app_with_backends(
             max_objects: 2,
         },
         auto_approval_max_concurrent: 2,
+        collector: core_config::CollectorSection::default(),
+        retention_jobs: core_config::RetentionJobsConfig::default(),
         rate_limiter: RateLimiter::new(100),
     };
     (router(state), audit, tokens)

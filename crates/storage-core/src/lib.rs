@@ -16,11 +16,13 @@ pub use error::StorageError;
 pub use health::{HealthProvider, StorageHealth};
 pub use traits::{
     BudgetConsumption, BulkFailure, BulkIndexResult, CandidateDiscoveryOutcome, CanonicalStore,
-    DailyUsage, EMBEDDING_CACHE_KEY_PREFIX, EmbeddedStore, EmbeddingKind, EmbeddingModelRef,
-    EmbeddingProvider, EmbeddingRequest, EmbeddingVector, GraphEdge, GraphNode, GraphPath,
-    GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, KeyValueStore, ObjectStore,
-    ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr, RebuildState, RebuildStatus,
-    RelationalStore, SearchDocument, SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery,
-    SearchStore, SimhashCandidate, SortField, StructuredSearch, Transaction, TransactionalStore,
-    VectorSearch, embedding_cache_key, embedding_content_hash,
+    CheckpointUpdate, ConnectorRunStateUpdate, DailyUsage, EMBEDDING_CACHE_KEY_PREFIX,
+    EmbeddedStore, EmbeddingKind, EmbeddingModelRef, EmbeddingProvider, EmbeddingRequest,
+    EmbeddingVector, GraphEdge, GraphNode, GraphPath, GraphPattern, GraphQuery, GraphStore,
+    GraphTraversalOptions, JobPurgeFilter, KeyValueStore, ObjectStore, ProjectionCheckpoint,
+    ProjectionLag, ProjectionStore, QueryExpr, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RebuildState,
+    RebuildStatus, RelationalStore, SearchDocument, SearchField, SearchFilter, SearchHit,
+    SearchHits, SearchQuery, SearchStore, SimhashCandidate, SortField, StructuredSearch,
+    Transaction, TransactionalStore, VectorSearch, embedding_cache_key, embedding_content_hash,
+    merge_json_objects,
 };

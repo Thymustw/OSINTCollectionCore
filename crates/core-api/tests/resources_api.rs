@@ -52,6 +52,7 @@ fn read_paths() -> Vec<String> {
         format!("/api/v1/raw/{id}"),
         "/api/v1/ops/health".into(),
         "/api/v1/ops/metrics".into(),
+        "/api/v1/ops/connectors".into(),
         "/api/v1/ops/graph".into(),
         "/api/v1/ops/discovery".into(),
         format!("/api/v1/graph/entities/{id}/neighbors"),
@@ -141,6 +142,11 @@ fn write_requests() -> Vec<(&'static str, String, Value)> {
             json!({}),
         ),
         ("POST", "/api/v1/graph/rebuild".into(), json!({})),
+        (
+            "POST",
+            format!("/api/v1/ops/connectors/{id}/reset-backoff"),
+            json!({}),
+        ),
         (
             "POST",
             "/api/v1/import/stix".into(),

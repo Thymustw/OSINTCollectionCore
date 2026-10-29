@@ -74,6 +74,20 @@ impl<S: RelationalStore> JobService<S> {
         Ok(self.store.list_jobs_by_status(status, after, limit).await?)
     }
 
+    /// 同 [`Self::list_by_status`]，再依 `job_type` 過濾。過濾在 SQL 裡做。
+    pub async fn list_by_status_and_type(
+        &self,
+        status: JobStatus,
+        job_type: &str,
+        after: Option<JobId>,
+        limit: u32,
+    ) -> Result<Vec<Job>, JobError> {
+        Ok(self
+            .store
+            .list_jobs_by_status_and_type(status, job_type, after, limit)
+            .await?)
+    }
+
     /// 重試一個失敗的 job（SPEC §31：operator 可以重試，而且要留稽核）。
     ///
     /// # 為什麼是 `failed → retrying` 而不是 `failed → queued`
@@ -124,7 +138,7 @@ impl<S: RelationalStore> JobService<S> {
             }
             JobStatus::Queued => {}
         }
-        if to == JobStatus::Failed {
+        if to == JobStatus::Failed || to == JobStatus::Cancelled {
             job.error = error;
         } else if to == JobStatus::Completed || to == JobStatus::Running {
             job.error = None;

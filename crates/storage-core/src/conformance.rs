@@ -2,6 +2,12 @@
 //!
 //! 關聯式測試用 UUID v7 當資料，不 TRUNCATE 共用表。
 //! OpenSearch / S3 測試必須先通過 [`verify_not_opencti_search`] / [`verify_not_opencti_s3`]。
+//!
+//! 共用開發 Postgres 上，測試建立的 connector 預設 `enabled=false`。只有驗證
+//! `list_enabled_connectors`／enabled 過濾／PATCH enabled 時才打開，而且 Postgres
+//! 測試必須用 `storage_postgres::DisableConnectorsOnDrop`（Drop 在 panic 時仍會
+//! 停用）。SQLite conformance 用一次性檔案，不需要 guard。守門測試：
+//! `no_stale_enabled_scheduled_test_connectors`。
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -22,8 +28,9 @@ use uuid::Uuid;
 
 use crate::error::StorageError;
 use crate::traits::{
-    CanonicalStore, EmbeddedStore, GraphEdge, GraphNode, GraphPattern, GraphQuery, GraphStore,
-    GraphTraversalOptions, KeyValueStore, ObjectStore, ProjectionCheckpoint, ProjectionStore,
+    CanonicalStore, CheckpointUpdate, ConnectorRunStateUpdate, EmbeddedStore, GraphEdge, GraphNode,
+    GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, JobPurgeFilter, KeyValueStore,
+    ObjectStore, ProjectionCheckpoint, ProjectionStore, RECLAIM_ORPHAN_COLLECT_JOB_ERROR,
     RebuildState, RebuildStatus, RelationalStore, SearchDocument, SearchQuery, SearchStore,
     StructuredSearch, TransactionalStore,
 };
@@ -148,9 +155,25 @@ fn fixture_ts() -> chrono::DateTime<Utc> {
 }
 
 /// 關聯式 CRUD + Raw Evidence 不可變。
+///
+/// 中間會暫時寫入 `enabled=true` 的 connector 以驗證 `list_enabled_connectors`。
+/// Postgres 測試請改呼叫 [`assert_relational_round_trip_with_enabled_hook`]，
+/// 把 id 交給 `DisableConnectorsOnDrop`——函式結尾的停用在 panic 時不會跑。
 pub async fn assert_relational_round_trip<S: RelationalStore>(
     store: &S,
 ) -> Result<(), StorageError> {
+    assert_relational_round_trip_with_enabled_hook(store, |_| {}).await
+}
+
+/// 同 [`assert_relational_round_trip`]，在寫入 enabled connector 之後呼叫 `on_enabled`。
+pub async fn assert_relational_round_trip_with_enabled_hook<S, F>(
+    store: &S,
+    mut on_enabled: F,
+) -> Result<(), StorageError>
+where
+    S: RelationalStore,
+    F: FnMut(Uuid),
+{
     store.health().await?;
 
     let source = Source {
@@ -266,6 +289,7 @@ pub async fn assert_relational_round_trip<S: RelationalStore>(
         error_count: 0,
     };
     store.put_connector(&connector).await?;
+    on_enabled(connector.id);
     let got = store
         .get_connector(connector.id)
         .await?
@@ -890,6 +914,825 @@ async fn assert_extraction_queries<S: RelationalStore>(
         });
     }
     Ok(())
+}
+
+/// `update_connector_run_state` 只動執行狀態，不能把 operator 的 PATCH 蓋掉。
+///
+/// 驗證：
+/// 1. 建 connector 後用 `put_connector` 把 `enabled` 改 false、`schedule` 改掉
+///    （模擬 PATCH）→ `update_connector_run_state` 只改 `status`／`error_count`
+///    → 讀回 `enabled` 仍 false、`schedule` 仍是新值、執行狀態是新值。
+/// 2. 標成「不改」的欄位（`last_run`／`last_success`／`checkpoint`）確實不變。
+/// 3. `Merge` 只疊頂層鍵（`last_error`），既有 `etag` 還在。
+/// 4. 不存在的 id 回 `false`，不新建列。
+pub async fn assert_connector_run_state_partial_update<S: RelationalStore>(
+    store: &S,
+) -> Result<(), StorageError> {
+    let source = Source {
+        id: Uuid::now_v7(),
+        name: "run-state-partial-source".into(),
+        source_type: SourceType::Rss,
+        platform: None,
+        base_url: Some("https://example.invalid/rss".into()),
+        description: None,
+        language: Some("en".into()),
+        country: None,
+        enabled: true,
+        collection_policy: json!({}),
+        created_at: fixture_ts(),
+        updated_at: fixture_ts(),
+        last_seen: None,
+    };
+    store.put_source(&source).await?;
+
+    let original_run = fixture_ts();
+    let original_success = fixture_ts();
+    let connector = Connector {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        name: "run-state-partial-connector".into(),
+        connector_type: "rss".into(),
+        version: "0.1.0".into(),
+        // 不需 list_enabled_connectors／tick。中間狀態若 panic 留下 enabled=true
+        // 且有 schedule，collector 會排程（2026-10-15～10-28 累積過這類殘留）。
+        enabled: false,
+        configuration: json!({"url": "https://example.invalid/rss"}),
+        credential_reference: None,
+        schedule: Some("*/15 * * * *".into()),
+        rate_limit: json!({"rps": 1}),
+        timeout: json!({"connect_ms": 5000}),
+        proxy_reference: None,
+        checkpoint: json!({"etag": "abc"}),
+        last_run: Some(original_run),
+        last_success: Some(original_success),
+        status: "idle".into(),
+        error_count: 0,
+    };
+    store.put_connector(&connector).await?;
+
+    // 模擬 operator PATCH：enabled / schedule 被改掉，執行狀態維持原樣。
+    let mut patched = connector.clone();
+    patched.enabled = false;
+    patched.schedule = Some("0 * * * *".into());
+    store.put_connector(&patched).await?;
+
+    let changed = store
+        .update_connector_run_state(
+            connector.id,
+            &ConnectorRunStateUpdate {
+                status: Some("error".into()),
+                error_count: Some(3),
+                ..ConnectorRunStateUpdate::default()
+            },
+        )
+        .await?;
+    if !changed {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_connector_run_state 對剛寫入的 connector 回 false".into(),
+        });
+    }
+
+    let got = store
+        .get_connector(connector.id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "部分更新後 connector 讀不到".into(),
+        })?;
+    if got.enabled {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_connector_run_state 把 enabled 蓋回 true 了。\
+                      這支方法只能 UPDATE 執行狀態欄位，不能整列 put_connector"
+                .into(),
+        });
+    }
+    if got.schedule.as_deref() != Some("0 * * * *") {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "update_connector_run_state 把 schedule 蓋掉了，實際 {:?}",
+                got.schedule
+            ),
+        });
+    }
+    if got.status != "error" || got.error_count != 3 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "status/error_count 應為 error/3，實際 {}/{}",
+                got.status, got.error_count
+            ),
+        });
+    }
+    if got.last_run != Some(original_run) || got.last_success != Some(original_success) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "未給值的 last_run/last_success 不該變，實際 last_run={:?} last_success={:?}",
+                got.last_run, got.last_success
+            ),
+        });
+    }
+    if got.checkpoint != json!({"etag": "abc"}) {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("未給值的 checkpoint 不該變，實際 {:?}", got.checkpoint),
+        });
+    }
+    if got.name != connector.name || got.configuration != connector.configuration {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "name/configuration 被執行狀態更新動到了".into(),
+        });
+    }
+
+    let merged = store
+        .update_connector_run_state(
+            connector.id,
+            &ConnectorRunStateUpdate {
+                checkpoint: CheckpointUpdate::Merge(json!({"last_error": "來源不見了"})),
+                ..ConnectorRunStateUpdate::default()
+            },
+        )
+        .await?;
+    if !merged {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "checkpoint Merge 對既有 connector 回 false".into(),
+        });
+    }
+    let got = store
+        .get_connector(connector.id)
+        .await?
+        .ok_or_else(|| StorageError::NotFound {
+            message: "Merge 之後 connector 讀不到".into(),
+        })?;
+    if got.checkpoint.get("etag") != Some(&json!("abc"))
+        || got.checkpoint.get("last_error") != Some(&json!("來源不見了"))
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!(
+                "Merge 應保留 etag 並加上 last_error，實際 {:?}",
+                got.checkpoint
+            ),
+        });
+    }
+    if got.enabled {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "checkpoint Merge 把 enabled 蓋回 true 了".into(),
+        });
+    }
+
+    let missing = store
+        .update_connector_run_state(
+            Uuid::now_v7(),
+            &ConnectorRunStateUpdate {
+                status: Some("error".into()),
+                ..ConnectorRunStateUpdate::default()
+            },
+        )
+        .await?;
+    if missing {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_connector_run_state 對不存在的 id 回 true".into(),
+        });
+    }
+    Ok(())
+}
+
+/// jobs 保留期限：只刪「指定 type + 終態 + completed_at 夠舊」的列。
+///
+/// 共用開發 DB 有別的 job，所有計數都限定在本次建立的 id 集合內。
+/// 結束時刪掉自己建立的 job。
+pub async fn assert_jobs_purge<S: RelationalStore>(store: &S) -> Result<(), StorageError> {
+    let correlation_id = Uuid::now_v7();
+    let now = Utc::now();
+    // 用遠古時間當「夠舊」，避免 purge 誤刪共用開發 DB 裡其他 collect|failed。
+    // 2026 年的 leftover 其 completed_at 不會小於 2020-06-01。
+    let old = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+    let recent = now - chrono::Duration::hours(1);
+    let cutoff = Utc.with_ymd_and_hms(2020, 6, 1, 0, 0, 0).unwrap();
+
+    fn make_job(
+        job_type: &str,
+        status: JobStatus,
+        completed_at: Option<chrono::DateTime<Utc>>,
+        created_at: chrono::DateTime<Utc>,
+        correlation_id: Uuid,
+        error: Option<&str>,
+    ) -> Job {
+        Job {
+            id: Uuid::now_v7(),
+            job_type: job_type.into(),
+            status,
+            correlation_id: Some(correlation_id),
+            created_at,
+            started_at: completed_at,
+            completed_at,
+            retry_count: 0,
+            error: error.map(str::to_string),
+            parameters: None,
+        }
+    }
+
+    let collect_failed_old_a = make_job(
+        "collect",
+        JobStatus::Failed,
+        Some(old),
+        old,
+        correlation_id,
+        Some("timeout"),
+    );
+    let collect_failed_old_b = make_job(
+        "collect",
+        JobStatus::Failed,
+        Some(old),
+        old,
+        correlation_id,
+        Some("timeout"),
+    );
+    let collect_failed_old_c = make_job(
+        "collect",
+        JobStatus::Failed,
+        Some(old),
+        old,
+        correlation_id,
+        Some("timeout"),
+    );
+    let collect_failed_recent = make_job(
+        "collect",
+        JobStatus::Failed,
+        Some(recent),
+        recent,
+        correlation_id,
+        Some("timeout"),
+    );
+    let collect_failed_null_completed = make_job(
+        "collect",
+        JobStatus::Failed,
+        None,
+        old,
+        correlation_id,
+        Some("anomaly"),
+    );
+    let collect_completed_old = make_job(
+        "collect",
+        JobStatus::Completed,
+        Some(old),
+        old,
+        correlation_id,
+        None,
+    );
+    let collect_cancelled_old = make_job(
+        "collect",
+        JobStatus::Cancelled,
+        Some(old),
+        old,
+        correlation_id,
+        None,
+    );
+    let collect_queued_old = make_job(
+        "collect",
+        JobStatus::Queued,
+        None,
+        old,
+        correlation_id,
+        None,
+    );
+    let collect_running_old = make_job(
+        "collect",
+        JobStatus::Running,
+        None,
+        old,
+        correlation_id,
+        None,
+    );
+    let collect_retrying_old = make_job(
+        "collect",
+        JobStatus::Retrying,
+        None,
+        old,
+        correlation_id,
+        None,
+    );
+    let stix_failed_old = make_job(
+        "stix_export",
+        JobStatus::Failed,
+        Some(old),
+        old,
+        correlation_id,
+        Some("export failed"),
+    );
+
+    let all: Vec<Job> = vec![
+        collect_failed_old_a.clone(),
+        collect_failed_old_b.clone(),
+        collect_failed_old_c.clone(),
+        collect_failed_recent.clone(),
+        collect_failed_null_completed.clone(),
+        collect_completed_old.clone(),
+        collect_cancelled_old.clone(),
+        collect_queued_old.clone(),
+        collect_running_old.clone(),
+        collect_retrying_old.clone(),
+        stix_failed_old.clone(),
+    ];
+    let all_ids: Vec<Uuid> = all.iter().map(|j| j.id).collect();
+
+    let cleanup = async {
+        for id in &all_ids {
+            let _ = store.delete_job(*id).await;
+        }
+    };
+
+    for job in &all {
+        if let Err(err) = store.put_job(job).await {
+            cleanup.await;
+            return Err(err);
+        }
+    }
+
+    let run = async {
+        let target_ids = [
+            collect_failed_old_a.id,
+            collect_failed_old_b.id,
+            collect_failed_old_c.id,
+        ];
+        let keep_ids = [
+            collect_failed_recent.id,
+            collect_failed_null_completed.id,
+            collect_completed_old.id,
+            collect_cancelled_old.id,
+            collect_queued_old.id,
+            collect_running_old.id,
+            collect_retrying_old.id,
+            stix_failed_old.id,
+        ];
+
+        let filter_all = JobPurgeFilter {
+            job_type: "collect".into(),
+            statuses: vec![JobStatus::Failed],
+            older_than: cutoff,
+            limit: 5000,
+        };
+        let counted = store.count_purgeable_jobs(&filter_all).await?;
+        // 共用 DB 可能有其他舊的 collect|failed；只比對「我們這批裡有幾筆符合」。
+        let mut ours_purgeable = 0u64;
+        for id in target_ids {
+            if store.get_job(id).await?.is_some() {
+                ours_purgeable += 1;
+            }
+        }
+        if counted < ours_purgeable {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "count_purgeable_jobs 回 {counted}，少於本次建立的可清列 {ours_purgeable}"
+                ),
+            });
+        }
+
+        let filter_one = JobPurgeFilter {
+            job_type: "collect".into(),
+            statuses: vec![JobStatus::Failed],
+            older_than: cutoff,
+            limit: 1,
+        };
+        let deleted_one = store.purge_jobs(&filter_one).await?;
+        if deleted_one > 1 {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!("purge_jobs(limit=1) 刪了 {deleted_one} 列，limit 沒生效"),
+            });
+        }
+
+        let mut remaining_targets = 0u64;
+        for id in target_ids {
+            if store.get_job(id).await?.is_some() {
+                remaining_targets += 1;
+            }
+        }
+        if remaining_targets != ours_purgeable.saturating_sub(deleted_one) {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "limit=1 之後剩餘可清列 {remaining_targets}，預期 {}",
+                    ours_purgeable.saturating_sub(deleted_one)
+                ),
+            });
+        }
+
+        let deleted_rest = store.purge_jobs(&filter_all).await?;
+        for id in target_ids {
+            if store.get_job(id).await?.is_some() {
+                return Err(StorageError::Unknown {
+                    backend: "conformance",
+                    message: format!("purge 後 collect|failed|舊 的 {id} 還在"),
+                });
+            }
+        }
+        if deleted_one + deleted_rest < ours_purgeable {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "兩次 purge 共刪 {}，少於本次可清列 {ours_purgeable}",
+                    deleted_one + deleted_rest
+                ),
+            });
+        }
+
+        for id in keep_ids {
+            if store.get_job(id).await?.is_none() {
+                return Err(StorageError::Unknown {
+                    backend: "conformance",
+                    message: format!(
+                        "不該被刪的 job {id} 消失了（其他 type／非終態／較新／completed_at 為空）"
+                    ),
+                });
+            }
+        }
+
+        let non_terminal = JobPurgeFilter {
+            job_type: "collect".into(),
+            statuses: vec![JobStatus::Queued],
+            older_than: cutoff,
+            limit: 10,
+        };
+        match store.purge_jobs(&non_terminal).await {
+            Err(StorageError::ConstraintViolation { message }) => {
+                if !message.contains("queued") {
+                    return Err(StorageError::Unknown {
+                        backend: "conformance",
+                        message: format!("非終態錯誤訊息應指出 queued，實際：{message}"),
+                    });
+                }
+            }
+            other => {
+                return Err(StorageError::Unknown {
+                    backend: "conformance",
+                    message: format!("purge 含 queued 應回 ConstraintViolation，實際 {other:?}"),
+                });
+            }
+        }
+
+        let empty_statuses = JobPurgeFilter {
+            job_type: "collect".into(),
+            statuses: vec![],
+            older_than: cutoff,
+            limit: 10,
+        };
+        match store.purge_jobs(&empty_statuses).await {
+            Err(StorageError::ConstraintViolation { .. }) => {}
+            other => {
+                return Err(StorageError::Unknown {
+                    backend: "conformance",
+                    message: format!("statuses 為空應回 ConstraintViolation，實際 {other:?}"),
+                });
+            }
+        }
+
+        let counted_after = store.count_purgeable_jobs(&filter_all).await?;
+        // 我們這批的舊 collect|failed 已刪光；count 可以 > 0（共用 DB 其他列），
+        // 但不能再含我們的 keep 列。上面已確認 keep 都還在。
+        let _ = counted_after;
+
+        Ok(())
+    };
+
+    let result = run.await;
+    cleanup.await;
+    result
+}
+
+/// 啟動回收：running 的 collect job → failed（設 completed_at 與固定 error）、
+/// running 的 connector → idle（不碰 error_count）。
+///
+/// 斷言只針對本次建立的 id。共用開發 Postgres 可能有上次 `docker stop` 留下的
+/// running collect job／connector，回傳計數可以 > 1。
+pub async fn assert_reclaim_orphan_collect_runs<S: RelationalStore>(
+    store: &S,
+) -> Result<(), StorageError> {
+    let now = Utc::now();
+    let source = Source {
+        id: Uuid::now_v7(),
+        name: format!("reclaim-source-{}", Uuid::now_v7().simple()),
+        source_type: SourceType::Rss,
+        platform: None,
+        base_url: Some("https://example.invalid/rss".into()),
+        description: None,
+        language: Some("en".into()),
+        country: None,
+        enabled: true,
+        collection_policy: json!({}),
+        created_at: now,
+        updated_at: now,
+        last_seen: None,
+    };
+
+    let running_connector = Connector {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        name: "reclaim-running".into(),
+        connector_type: "rss".into(),
+        version: "0.1.0".into(),
+        enabled: false,
+        configuration: json!({}),
+        credential_reference: None,
+        schedule: Some("*/15 * * * *".into()),
+        rate_limit: json!({}),
+        timeout: json!({}),
+        proxy_reference: None,
+        checkpoint: json!({"etag": "keep-me"}),
+        last_run: Some(now),
+        last_success: None,
+        status: "running".into(),
+        error_count: 2,
+    };
+    let idle_connector = Connector {
+        id: Uuid::now_v7(),
+        source_id: source.id,
+        name: "reclaim-idle".into(),
+        connector_type: "rss".into(),
+        version: "0.1.0".into(),
+        enabled: false,
+        configuration: json!({}),
+        credential_reference: None,
+        schedule: Some("*/15 * * * *".into()),
+        rate_limit: json!({}),
+        timeout: json!({}),
+        proxy_reference: None,
+        checkpoint: json!({}),
+        last_run: Some(now),
+        last_success: Some(now),
+        status: "idle".into(),
+        error_count: 0,
+    };
+
+    fn make_job(
+        job_type: &str,
+        status: JobStatus,
+        completed_at: Option<chrono::DateTime<Utc>>,
+        correlation_id: Uuid,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Job {
+        Job {
+            id: Uuid::now_v7(),
+            job_type: job_type.into(),
+            status,
+            correlation_id: Some(correlation_id),
+            created_at,
+            started_at: Some(created_at),
+            completed_at,
+            retry_count: 0,
+            error: None,
+            parameters: None,
+        }
+    }
+
+    let collect_running = make_job(
+        "collect",
+        JobStatus::Running,
+        None,
+        running_connector.id,
+        now,
+    );
+    let collect_completed = make_job(
+        "collect",
+        JobStatus::Completed,
+        Some(now),
+        idle_connector.id,
+        now,
+    );
+    let collect_failed = make_job(
+        "collect",
+        JobStatus::Failed,
+        Some(now),
+        idle_connector.id,
+        now,
+    );
+    let other_running = make_job(
+        "stix_export",
+        JobStatus::Running,
+        None,
+        idle_connector.id,
+        now,
+    );
+
+    let job_ids = [
+        collect_running.id,
+        collect_completed.id,
+        collect_failed.id,
+        other_running.id,
+    ];
+    let connector_ids = [running_connector.id, idle_connector.id];
+    let source_id = source.id;
+
+    let cleanup = async {
+        for id in &job_ids {
+            let _ = store.delete_job(*id).await;
+        }
+        for id in &connector_ids {
+            let _ = store.delete_connector(*id).await;
+        }
+        let _ = store.delete_source(source_id).await;
+    };
+
+    if let Err(err) = store.put_source(&source).await {
+        cleanup.await;
+        return Err(err);
+    }
+    for connector in [&running_connector, &idle_connector] {
+        if let Err(err) = store.put_connector(connector).await {
+            cleanup.await;
+            return Err(err);
+        }
+    }
+    for job in [
+        &collect_running,
+        &collect_completed,
+        &collect_failed,
+        &other_running,
+    ] {
+        if let Err(err) = store.put_job(job).await {
+            cleanup.await;
+            return Err(err);
+        }
+    }
+
+    let run = async {
+        let (jobs_n, connectors_n) = store.reclaim_orphan_collect_runs(now).await?;
+        if jobs_n < 1 {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "reclaim_orphan_collect_runs 回 jobs={jobs_n}，至少應收回本次建立的 1 筆 running collect job"
+                ),
+            });
+        }
+        if connectors_n < 1 {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "reclaim_orphan_collect_runs 回 connectors={connectors_n}，至少應收回本次建立的 1 個 running connector"
+                ),
+            });
+        }
+
+        let reclaimed =
+            store
+                .get_job(collect_running.id)
+                .await?
+                .ok_or_else(|| StorageError::Unknown {
+                    backend: "conformance",
+                    message: format!("回收後 collect running job {} 消失了", collect_running.id),
+                })?;
+        if reclaimed.status != JobStatus::Failed {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "回收後 collect running job 應為 failed，實際 {:?}",
+                    reclaimed.status
+                ),
+            });
+        }
+        if reclaimed.completed_at.is_none() {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: "回收後必須設 completed_at，否則步驟 3 保留期限永遠清不到這列".into(),
+            });
+        }
+        if reclaimed.error.as_deref() != Some(RECLAIM_ORPHAN_COLLECT_JOB_ERROR) {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "回收後 error 應為「{RECLAIM_ORPHAN_COLLECT_JOB_ERROR}」，實際 {:?}",
+                    reclaimed.error
+                ),
+            });
+        }
+
+        let still_completed =
+            store
+                .get_job(collect_completed.id)
+                .await?
+                .ok_or_else(|| StorageError::Unknown {
+                    backend: "conformance",
+                    message: "不該動的 completed collect job 消失了".into(),
+                })?;
+        if still_completed.status != JobStatus::Completed {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "completed collect job 不該被回收，實際 {:?}",
+                    still_completed.status
+                ),
+            });
+        }
+
+        let still_failed =
+            store
+                .get_job(collect_failed.id)
+                .await?
+                .ok_or_else(|| StorageError::Unknown {
+                    backend: "conformance",
+                    message: "不該動的 failed collect job 消失了".into(),
+                })?;
+        if still_failed.status != JobStatus::Failed {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "failed collect job 不該被回收改寫，實際 {:?}",
+                    still_failed.status
+                ),
+            });
+        }
+
+        let still_other =
+            store
+                .get_job(other_running.id)
+                .await?
+                .ok_or_else(|| StorageError::Unknown {
+                    backend: "conformance",
+                    message: "不該動的 stix_export running job 消失了".into(),
+                })?;
+        if still_other.status != JobStatus::Running {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "其他 type 的 running job 不該被回收，實際 {:?}",
+                    still_other.status
+                ),
+            });
+        }
+
+        let connector = store
+            .get_connector(running_connector.id)
+            .await?
+            .ok_or_else(|| StorageError::Unknown {
+                backend: "conformance",
+                message: "回收後 running connector 消失了".into(),
+            })?;
+        if connector.status != "idle" {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "回收後 running connector 應為 idle，實際 {}",
+                    connector.status
+                ),
+            });
+        }
+        if connector.error_count != 2 {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "回收不得改 error_count（被中斷不是來源的錯），收集前是 2，實際 {}",
+                    connector.error_count
+                ),
+            });
+        }
+        if connector.checkpoint.get("etag").and_then(|v| v.as_str()) != Some("keep-me") {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "回收不得改 checkpoint，etag 應保留，實際 {}",
+                    connector.checkpoint
+                ),
+            });
+        }
+
+        let idle = store
+            .get_connector(idle_connector.id)
+            .await?
+            .ok_or_else(|| StorageError::Unknown {
+                backend: "conformance",
+                message: "不該動的 idle connector 消失了".into(),
+            })?;
+        if idle.status != "idle" {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!("idle connector 不該被改，實際 {}", idle.status),
+            });
+        }
+        if idle.error_count != 0 {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "idle connector 的 error_count 不該被改，實際 {}",
+                    idle.error_count
+                ),
+            });
+        }
+
+        Ok(())
+    };
+
+    let result = run.await;
+    cleanup.await;
+    result
 }
 
 /// 這個 Entity 出現在哪些 Source：entity_extractions → provenance

@@ -132,6 +132,9 @@ resolver = { path = "crates/resolver" }
 merge = { path = "crates/merge" }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal"] }
+# CancellationToken 在 `sync` 模組；0.7 沒有 feature gate，關掉 default 以免
+# 把 codec／io-util 一併拉進來。collector 優雅停止用，之後其他服務也可共用。
+tokio-util = { version = "0.7.19", default-features = false }
 tower = { version = "0.5.3", features = ["limit", "util"] }
 tower-http = { version = "0.6.11", features = [
     "trace",

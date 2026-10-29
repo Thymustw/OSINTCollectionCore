@@ -282,4 +282,9 @@ connector 目前不會被執行**——collector 只排程有合法 cron 的連�
 公開的「手動觸發一次收集」API。匯入專用類型（`manual_upload`／`json_import`／
 `csv_import`／`stix_import`）走 `POST /api/v1/import`，不會被 collector 排程。
 
+連續收集失敗時，collector 會指數退避（預設第一次等 5 分鐘，上限 12 小時），
+每一輪最多只重試 8 個失敗中的連接器，避免壞掉的來源拖慢正常的。來源修好後，
+operator 可呼叫 `POST /api/v1/ops/connectors/{id}/reset-backoff` 立刻重試，
+不必等退避結束；這不會清掉上次錯誤訊息。停用連接器請 `PATCH` 設 `enabled: false`。
+
 詳細設定選項見 [API 參考](../reference/api.md)。
