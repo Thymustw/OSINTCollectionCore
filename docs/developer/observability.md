@@ -45,7 +45,7 @@ Phase 6a 起 `AuditLog` 落地到 Postgres 的 `audit_log` 表。哪些動作會
 | `GET /api/v1/ops/health` | viewer+ | **整套系統**哪一塊壞了 | 運維的人 |
 | `GET /api/v1/ops/metrics` | viewer+ | **這個行程**吃了多少記憶體／CPU | 運維的人 |
 | `GET /api/v1/ops/graph` | viewer+ | 圖投影 lag／rebuild | 運維的人 |
-| `GET /api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog、最近 AI Run | 運維的人 |
+| `GET /api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog、最近 AI Run、今天有用量的 collection | 運維的人 |
 
 `/api/v1/ops/*` 另有七條（與上表不是「健康／指標」的分工關係，所以不列在表內）：
 `GET /ops/connectors`（連接器狀態，含 `backing_off`／`next_attempt_at`／`last_error`）、
@@ -86,6 +86,28 @@ drain 期間 `/health` 維持 200（liveness）、`/ready` 回 503（readiness�
 | `osint_jobs_purged_total` | counter | 實際刪除的 job 列數（dry-run 不計）。排程與手動端點共用；`MetricsRegistry` extra counter 不支援 label，所以不分來源 |
 
 設定見 `[retention.jobs]`。
+
+### AI 閘道 metrics
+
+`osint-api` 與 `osint-stix-worker` 的 `/metrics` 另輸出（`MetricsRegistry`
+沒有 label，拒絕原因用獨立 counter 拆開）：
+
+| 名稱 | 類型 | 意義 |
+|---|---|---|
+| `osint_ai_admission_p0_available` | gauge | P0 剩餘保留名額 |
+| `osint_ai_admission_shared_available` | gauge | P1–P4 共用佇列剩餘名額 |
+| `osint_ai_admission_rejected_total` | counter | admission 被拒合計 |
+| `osint_ai_admission_rejected_p0_busy_total` | counter | P0 名額已滿 |
+| `osint_ai_admission_rejected_pressure_total` | counter | 被壓力訊號擋下 |
+| `osint_ai_quota_rejected_total` | counter | 額度拒絕（含 fail-closed） |
+| `osint_ai_http_429_total` | counter | 後端回 429 |
+| `osint_ai_http_timeout_total` | counter | 後端逾時 |
+| `osint_ai_http_5xx_total` | counter | 後端 5xx |
+| `osint_ai_inflight_requests` | gauge | 正在飛的請求數 |
+| `osint_ai_pressure_state` | gauge | 0=Normal、1=Elevated、2=High、3=Critical |
+
+壓力門檻見 `[ai_gateway.pressure]`（推測值、未做容量測試）。P0 刻意不看
+壓力訊號。額度拒絕用 `debug!` 記，後端不可用才 `warn!`。
 
 ### 為什麼 Redis／Redpanda 不放進 `/ready`
 

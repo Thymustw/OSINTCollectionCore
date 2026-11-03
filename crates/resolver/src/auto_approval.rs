@@ -231,6 +231,9 @@ where
             max_tokens: self.config.llm_max_tokens,
             enable_reasoning: self.config.enable_reasoning,
             priority: self.config.priority,
+            // AutoApproval 是系統內部的 entity resolution，不消耗任何
+            // collection 的 Discovery AI 額度。
+            account: ai_gateway::AiAccount::System,
         };
 
         let started = Instant::now();
@@ -1231,6 +1234,7 @@ mod tests {
             max_tokens: 16,
             enable_reasoning: false,
             priority: ai_gateway::Priority::P0,
+            account: ai_gateway::AiAccount::System,
         };
         let cand = candidate(Uuid::now_v7(), Uuid::now_v7(), "semantic_similarity", 0.80);
         let run = build_ai_run(

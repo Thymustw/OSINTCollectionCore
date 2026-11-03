@@ -13,6 +13,8 @@ mod admission;
 mod cost;
 mod mock;
 mod openai;
+mod pressure;
+mod quota;
 mod redact;
 mod registry;
 
@@ -22,6 +24,13 @@ pub use admission::{
 pub use cost::Pricing;
 pub use mock::{MockLlmProvider, UnsupportedLlmProvider};
 pub use openai::{OpenAiCompatibleLlmProvider, OpenAiCompatibleLlmProviderConfig};
+pub use pressure::{
+    AttemptClass, InstantSource, ManualClock, ObservedPressure, PressureThresholds, SystemClock,
+};
+pub use quota::{
+    AiAccount, AiBudgetLimits, AiQuota, CollectionAiBudget, DailyConsume, StoreAiQuota,
+    UnlimitedQuota,
+};
 pub use redact::{redact_credentials, truncate};
 pub use registry::ModelRegistry;
 
@@ -70,6 +79,10 @@ pub struct ChatCompletionRequest {
     /// 不是運維可調參數，不走 config（詳見 `crates/resolver/src/
     /// auto_approval.rs` 裡 `AutoApprovalConfig.priority` 的說明）。
     pub priority: crate::admission::Priority,
+    /// 這次呼叫記到哪個帳戶。AutoApproval 必須用 [`AiAccount::System`]，
+    /// 不消耗任何 collection 額度；Discovery 路徑才用
+    /// [`AiAccount::Collection`]。
+    pub account: crate::quota::AiAccount,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +118,9 @@ pub struct TokenUsage {
 pub enum AiGatewayError {
     /// 暫時性：逾時、503、429。呼叫端可決定要不要重試（Step 3 的預設是不重試，
     /// 見 `AutoApprovalLlmSection::max_retries` 預設 0）。
+    ///
+    /// [`Self::QuotaExceeded`]／[`Self::QuotaUnavailable`] **不是** Transient——
+    /// SPEC_V0.3 §21 E 要求超過額度後停止新增 AI request，重試沒有意義。
     #[error("LLM 暫時性錯誤：{message}")]
     Transient { message: String },
     /// 永久性：401、400、模型不存在。重試無意義。
@@ -116,4 +132,12 @@ pub enum AiGatewayError {
     /// LLM 功能未設定／未啟用。`UnsupportedLlmProvider` 一律回這個。
     #[error("LLM 功能未啟用")]
     Unsupported,
+    /// collection 的 `daily_ai_budget` 或 `max_ai_calls_per_run` 已用完。
+    /// 不是暫時性錯誤，閘道不會重試。
+    #[error("AI 額度已用完：{message}")]
+    QuotaExceeded { message: String },
+    /// 額度後端讀不到（例如 PostgreSQL 連不上）。Collection 帳戶 fail-closed：
+    /// 看不見用量時拒絕放行。不是暫時性錯誤，閘道不會重試。
+    #[error("AI 額度無法確認：{message}")]
+    QuotaUnavailable { message: String },
 }

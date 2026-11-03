@@ -135,6 +135,10 @@ async fn run() -> Result<(), String> {
         // job 計數用；admission gauge 這輪先接上同一份，避免再建一份
         // 沒人 scrape 的 registry。
         metrics: Some(metrics.clone()),
+        quota: Some(Arc::new(ai_gateway::StoreAiQuota::new(
+            resolver::RelationalAiBudget::new(store.clone()),
+        ))),
+        pressure: Some(observed_pressure(&cfg.ai_gateway.pressure)),
     });
     let auto_config = AutoApprovalConfig {
         enabled: effectively_enabled,
@@ -190,6 +194,35 @@ async fn run() -> Result<(), String> {
 
     consume_loop(&service, &jobs, &consumer, &metrics).await;
     Ok(())
+}
+
+/// 把 `[ai_gateway.pressure]` 轉成閘道的觀測門檻。
+///
+/// 門檻是推測值，未做容量測試；見 `config/default.toml` 註解。
+fn observed_pressure(
+    section: &core_config::AiGatewayPressureSection,
+) -> Arc<ai_gateway::ObservedPressure> {
+    ai_gateway::ObservedPressure::new(ai_gateway::PressureThresholds {
+        enabled: section.enabled,
+        window: Duration::from_secs(section.window_secs),
+        min_samples: section.min_samples,
+        cooldown: Duration::from_secs(section.cooldown_secs),
+        elevated_p95: Duration::from_millis(section.elevated_p95_ms),
+        high_p95: Duration::from_millis(section.high_p95_ms),
+        critical_p95: Duration::from_millis(section.critical_p95_ms),
+        elevated_429_ratio: section.elevated_429_ratio,
+        high_429_ratio: section.high_429_ratio,
+        critical_429_ratio: section.critical_429_ratio,
+        elevated_timeout_ratio: section.elevated_timeout_ratio,
+        high_timeout_ratio: section.high_timeout_ratio,
+        critical_timeout_ratio: section.critical_timeout_ratio,
+        elevated_5xx_ratio: section.elevated_5xx_ratio,
+        high_5xx_ratio: section.high_5xx_ratio,
+        critical_5xx_ratio: section.critical_5xx_ratio,
+        elevated_queue: section.elevated_queue,
+        high_queue: section.high_queue,
+        critical_queue: section.critical_queue,
+    })
 }
 
 fn connect_objects(cfg: &AppConfig) -> Result<S3ObjectStore, String> {

@@ -50,6 +50,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub auto_approval: AutoApprovalSection,
     #[serde(default)]
+    pub ai_gateway: AiGatewaySection,
+    #[serde(default)]
     pub stix: StixSection,
     /// 資料保留期限。形狀預留給其他表（failed_events／audit_log），目前只實作 jobs。
     #[serde(default)]
@@ -926,6 +928,240 @@ impl Default for AutoApprovalLlmSection {
     }
 }
 
+/// `[ai_gateway]`：AI 閘道的觀測與額度相關設定。
+///
+/// 目前只有 `[ai_gateway.pressure]`。額度上限本身在 collection budget
+/// （`daily_ai_budget`／`max_ai_calls_per_run`），不走這一段。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AiGatewaySection {
+    #[serde(default)]
+    pub pressure: AiGatewayPressureSection,
+}
+
+/// `[ai_gateway.pressure]`：[`ObservedPressure`] 的門檻。
+///
+/// **全部都是推測值，未做容量測試。** 換部署或真實流量來了之後應重測再改。
+/// `enabled = false` 時壓力訊號永遠回 Normal（仍可記錄樣本與 metric）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiGatewayPressureSection {
+    #[serde(default = "default_pressure_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_pressure_window_secs")]
+    pub window_secs: u64,
+    #[serde(default = "default_pressure_min_samples")]
+    pub min_samples: usize,
+    #[serde(default = "default_pressure_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default = "default_pressure_elevated_p95_ms")]
+    pub elevated_p95_ms: u64,
+    #[serde(default = "default_pressure_high_p95_ms")]
+    pub high_p95_ms: u64,
+    #[serde(default = "default_pressure_critical_p95_ms")]
+    pub critical_p95_ms: u64,
+    #[serde(default = "default_pressure_elevated_429_ratio")]
+    pub elevated_429_ratio: f64,
+    #[serde(default = "default_pressure_high_429_ratio")]
+    pub high_429_ratio: f64,
+    #[serde(default = "default_pressure_critical_429_ratio")]
+    pub critical_429_ratio: f64,
+    #[serde(default = "default_pressure_elevated_timeout_ratio")]
+    pub elevated_timeout_ratio: f64,
+    #[serde(default = "default_pressure_high_timeout_ratio")]
+    pub high_timeout_ratio: f64,
+    #[serde(default = "default_pressure_critical_timeout_ratio")]
+    pub critical_timeout_ratio: f64,
+    #[serde(default = "default_pressure_elevated_5xx_ratio")]
+    pub elevated_5xx_ratio: f64,
+    #[serde(default = "default_pressure_high_5xx_ratio")]
+    pub high_5xx_ratio: f64,
+    #[serde(default = "default_pressure_critical_5xx_ratio")]
+    pub critical_5xx_ratio: f64,
+    #[serde(default = "default_pressure_elevated_queue")]
+    pub elevated_queue: usize,
+    #[serde(default = "default_pressure_high_queue")]
+    pub high_queue: usize,
+    #[serde(default = "default_pressure_critical_queue")]
+    pub critical_queue: usize,
+}
+
+fn default_pressure_enabled() -> bool {
+    true
+}
+fn default_pressure_window_secs() -> u64 {
+    30
+}
+fn default_pressure_min_samples() -> usize {
+    5
+}
+fn default_pressure_cooldown_secs() -> u64 {
+    15
+}
+fn default_pressure_elevated_p95_ms() -> u64 {
+    5_000
+}
+fn default_pressure_high_p95_ms() -> u64 {
+    15_000
+}
+fn default_pressure_critical_p95_ms() -> u64 {
+    30_000
+}
+fn default_pressure_elevated_429_ratio() -> f64 {
+    0.10
+}
+fn default_pressure_high_429_ratio() -> f64 {
+    0.25
+}
+fn default_pressure_critical_429_ratio() -> f64 {
+    0.50
+}
+fn default_pressure_elevated_timeout_ratio() -> f64 {
+    0.05
+}
+fn default_pressure_high_timeout_ratio() -> f64 {
+    0.15
+}
+fn default_pressure_critical_timeout_ratio() -> f64 {
+    0.30
+}
+fn default_pressure_elevated_5xx_ratio() -> f64 {
+    0.05
+}
+fn default_pressure_high_5xx_ratio() -> f64 {
+    0.15
+}
+fn default_pressure_critical_5xx_ratio() -> f64 {
+    0.30
+}
+fn default_pressure_elevated_queue() -> usize {
+    2
+}
+fn default_pressure_high_queue() -> usize {
+    8
+}
+fn default_pressure_critical_queue() -> usize {
+    16
+}
+
+impl Default for AiGatewayPressureSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_pressure_enabled(),
+            window_secs: default_pressure_window_secs(),
+            min_samples: default_pressure_min_samples(),
+            cooldown_secs: default_pressure_cooldown_secs(),
+            elevated_p95_ms: default_pressure_elevated_p95_ms(),
+            high_p95_ms: default_pressure_high_p95_ms(),
+            critical_p95_ms: default_pressure_critical_p95_ms(),
+            elevated_429_ratio: default_pressure_elevated_429_ratio(),
+            high_429_ratio: default_pressure_high_429_ratio(),
+            critical_429_ratio: default_pressure_critical_429_ratio(),
+            elevated_timeout_ratio: default_pressure_elevated_timeout_ratio(),
+            high_timeout_ratio: default_pressure_high_timeout_ratio(),
+            critical_timeout_ratio: default_pressure_critical_timeout_ratio(),
+            elevated_5xx_ratio: default_pressure_elevated_5xx_ratio(),
+            high_5xx_ratio: default_pressure_high_5xx_ratio(),
+            critical_5xx_ratio: default_pressure_critical_5xx_ratio(),
+            elevated_queue: default_pressure_elevated_queue(),
+            high_queue: default_pressure_high_queue(),
+            critical_queue: default_pressure_critical_queue(),
+        }
+    }
+}
+
+impl AiGatewayPressureSection {
+    /// 門檻是否自洽。不自洽時 `load_from` 會拒絕整份設定。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.window_secs < 1 {
+            return Err("[ai_gateway.pressure].window_secs 必須 ≥ 1".into());
+        }
+        if self.min_samples < 1 {
+            return Err("[ai_gateway.pressure].min_samples 必須 ≥ 1".into());
+        }
+        fn ordered_ms(name: &str, elevated: u64, high: u64, critical: u64) -> Result<(), String> {
+            if elevated < high && high < critical {
+                Ok(())
+            } else {
+                Err(format!(
+                    "[ai_gateway.pressure] 的 {name} 必須 elevated < high < critical \
+                     （目前 {elevated} / {high} / {critical}）。請調整後重載設定"
+                ))
+            }
+        }
+        fn ordered_ratio(
+            name: &str,
+            elevated: f64,
+            high: f64,
+            critical: f64,
+        ) -> Result<(), String> {
+            for (label, value) in [
+                ("elevated", elevated),
+                ("high", high),
+                ("critical", critical),
+            ] {
+                if !(0.0..=1.0).contains(&value) {
+                    return Err(format!(
+                        "[ai_gateway.pressure] 的 {name} {label} 必須在 0..=1（目前 {value}）"
+                    ));
+                }
+            }
+            if elevated < high && high < critical {
+                Ok(())
+            } else {
+                Err(format!(
+                    "[ai_gateway.pressure] 的 {name} 必須 elevated < high < critical \
+                     （目前 {elevated} / {high} / {critical}）。請調整後重載設定"
+                ))
+            }
+        }
+        fn ordered_queue(
+            name: &str,
+            elevated: usize,
+            high: usize,
+            critical: usize,
+        ) -> Result<(), String> {
+            if elevated < high && high < critical {
+                Ok(())
+            } else {
+                Err(format!(
+                    "[ai_gateway.pressure] 的 {name} 必須 elevated < high < critical \
+                     （目前 {elevated} / {high} / {critical}）。請調整後重載設定"
+                ))
+            }
+        }
+        ordered_ms(
+            "p95_ms",
+            self.elevated_p95_ms,
+            self.high_p95_ms,
+            self.critical_p95_ms,
+        )?;
+        ordered_ratio(
+            "429_ratio",
+            self.elevated_429_ratio,
+            self.high_429_ratio,
+            self.critical_429_ratio,
+        )?;
+        ordered_ratio(
+            "timeout_ratio",
+            self.elevated_timeout_ratio,
+            self.high_timeout_ratio,
+            self.critical_timeout_ratio,
+        )?;
+        ordered_ratio(
+            "5xx_ratio",
+            self.elevated_5xx_ratio,
+            self.high_5xx_ratio,
+            self.critical_5xx_ratio,
+        )?;
+        ordered_queue(
+            "queue",
+            self.elevated_queue,
+            self.high_queue,
+            self.critical_queue,
+        )?;
+        Ok(())
+    }
+}
+
 /// 資料保留期限。目前只實作 `[retention.jobs]`；之後加表時在這裡加欄位，
 /// 不要另開頂層區段。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1042,6 +1278,8 @@ pub enum ConfigError {
     InvalidCollector(String),
     #[error("{0}")]
     InvalidRetention(String),
+    #[error("{0}")]
+    InvalidAiGateway(String),
 }
 
 impl AppConfig {
@@ -1087,6 +1325,11 @@ impl AppConfig {
             .jobs
             .validate()
             .map_err(ConfigError::InvalidRetention)?;
+        parsed
+            .ai_gateway
+            .pressure
+            .validate()
+            .map_err(ConfigError::InvalidAiGateway)?;
         Ok(parsed)
     }
 }
@@ -1244,6 +1487,23 @@ mod tests {
         assert_eq!(cfg.auto_approval.llm.temperature, 0.0);
         assert!(!cfg.auto_approval.llm.enable_reasoning);
         assert!(cfg.auto_approval.thresholds_are_sane());
+        assert!(cfg.ai_gateway.pressure.enabled);
+        assert_eq!(cfg.ai_gateway.pressure.window_secs, 30);
+        assert_eq!(cfg.ai_gateway.pressure.min_samples, 5);
+        assert_eq!(cfg.ai_gateway.pressure.cooldown_secs, 15);
+        assert_eq!(cfg.ai_gateway.pressure.elevated_p95_ms, 5_000);
+        assert_eq!(cfg.ai_gateway.pressure.high_p95_ms, 15_000);
+        assert_eq!(cfg.ai_gateway.pressure.critical_p95_ms, 30_000);
+        assert_eq!(cfg.ai_gateway.pressure.elevated_429_ratio, 0.10);
+        assert_eq!(cfg.ai_gateway.pressure.high_429_ratio, 0.25);
+        assert_eq!(cfg.ai_gateway.pressure.critical_429_ratio, 0.50);
+        assert_eq!(cfg.ai_gateway.pressure.elevated_queue, 2);
+        assert_eq!(cfg.ai_gateway.pressure.high_queue, 8);
+        assert_eq!(cfg.ai_gateway.pressure.critical_queue, 16);
+        cfg.ai_gateway
+            .pressure
+            .validate()
+            .expect("default.toml 的 pressure 門檻必須自洽");
         assert_eq!(cfg.stix.max_bundle_bytes, 50 * 1024 * 1024);
         assert_eq!(cfg.stix.max_objects, 10_000);
         assert!(cfg.retention.jobs.enabled);
@@ -1692,5 +1952,46 @@ mod tests {
             too_large.dedup_cache_ttl(),
             std::time::Duration::from_secs(3600)
         );
+    }
+
+    #[test]
+    fn pressure_validate_rejects_unordered_p95() {
+        let section = AiGatewayPressureSection {
+            elevated_p95_ms: 30_000,
+            high_p95_ms: 15_000,
+            ..AiGatewayPressureSection::default()
+        };
+        let err = section.validate().expect_err("p95 順序反了應失敗");
+        assert!(err.contains("p95_ms"), "{err}");
+        assert!(err.contains("elevated < high < critical"), "{err}");
+    }
+
+    #[test]
+    fn pressure_validate_rejects_ratio_out_of_range() {
+        let section = AiGatewayPressureSection {
+            critical_429_ratio: 1.5,
+            ..AiGatewayPressureSection::default()
+        };
+        let err = section.validate().expect_err("ratio > 1 應失敗");
+        assert!(err.contains("429_ratio"), "{err}");
+        assert!(err.contains("0..=1"), "{err}");
+    }
+
+    #[test]
+    fn missing_ai_gateway_section_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        let parsed: AppConfig = {
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            value.as_object_mut().unwrap().remove("ai_gateway");
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(parsed.ai_gateway, AiGatewaySection::default());
+        parsed
+            .ai_gateway
+            .pressure
+            .validate()
+            .expect("預設 pressure 必須自洽");
     }
 }

@@ -192,8 +192,8 @@ collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有�
 | `DELETE` | `/api/v1/collections/{id}/sources/{source_id}` | operator | 拿掉來源。集合或來源不存在 → 404；本來就沒掛上 → 204（冪等） |
 | `POST` | `/api/v1/collections/{id}/connectors` | operator | 把連接器掛上這個集合。同樣不回填舊資料。一個連接器最多屬於 50 個集合，超過回 422；已掛上的重送仍成功。整批全有或全無（同上） |
 | `DELETE` | `/api/v1/collections/{id}/connectors/{connector_id}` | operator | 拿掉連接器。語意同上 |
-| `GET` | `/api/v1/collections/{id}/budget` | viewer | 取得 Discovery 配額。沒設過時回保守預設，並標 `is_default: true` |
-| `PUT` | `/api/v1/collections/{id}/budget` | operator | 覆寫 Discovery 配額。之後 `is_default` 為 `false` |
+| `GET` | `/api/v1/collections/{id}/budget` | viewer | 取得 Discovery 配額。沒設過時回保守預設，並標 `is_default: true`。含 `field_status`（哪一欄已生效）與 `today_usage` |
+| `PUT` | `/api/v1/collections/{id}/budget` | operator | 覆寫 Discovery 配額。之後 `is_default` 為 `false`。稽核會記下全部六個欄位 |
 | `GET` | `/api/v1/collections/{id}/discovery` | viewer | 列出這個調查集合的候選。集合不存在 → 404（不是 200 空頁） |
 
 ### 種子（Seed）
@@ -275,7 +275,7 @@ collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有�
 | `GET` | `/api/v1/ops/failed-events` | viewer | 處理失敗的事件記錄 |
 | `POST` | `/api/v1/ops/failed-events/{id}/replay` | operator | 重送指定的失敗事件 |
 | `GET` | `/api/v1/ops/graph` | viewer | 圖投影 lag 與最近 rebuild 狀態 |
-| `GET` | `/api/v1/ops/discovery` | viewer | Discovery AI 並發設定與 Candidate 各狀態統計 |
+| `GET` | `/api/v1/ops/discovery` | viewer | Discovery AI 並發設定、Candidate 各狀態統計、今天有用量的 collection |
 
 ---
 

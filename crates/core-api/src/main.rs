@@ -140,6 +140,7 @@ async fn run() -> Result<(), String> {
         store.clone(),
         producer.clone(),
         &cfg.auto_approval,
+        &cfg.ai_gateway.pressure,
         metrics.clone(),
     )));
 
@@ -458,6 +459,7 @@ fn assemble_auto_approval(
     store: PostgresCanonicalStore,
     producer: Option<Arc<EventProducer>>,
     section: &core_config::AutoApprovalSection,
+    pressure: &core_config::AiGatewayPressureSection,
     metrics: MetricsRegistry,
 ) -> AutoApprovalState {
     let effectively_enabled = section.enabled && section.thresholds_are_sane();
@@ -493,6 +495,13 @@ fn assemble_auto_approval(
             // 沿用既有 max_concurrent，避免既有配置的並發效果縮水。
             shared_capacity: section.llm.max_concurrent,
             metrics: Some(metrics),
+            // AutoApproval 帳戶是 System，不會打到這個後端；注入是為了
+            // 組裝契約完整——未來若有 Collection 帳戶從 core-api 出去，
+            // 不會靜默變成無額度。
+            quota: Some(std::sync::Arc::new(ai_gateway::StoreAiQuota::new(
+                resolver::RelationalAiBudget::new(store.clone()),
+            ))),
+            pressure: Some(observed_pressure(pressure)),
         },
     );
     let evaluator_config = resolver::AutoApprovalConfig {
@@ -516,6 +525,35 @@ fn assemble_auto_approval(
         )),
         max_auto_merges_per_resolve: section.max_auto_merges_per_resolve,
     }
+}
+
+/// 把 `[ai_gateway.pressure]` 轉成閘道的觀測門檻。
+///
+/// 門檻是推測值，未做容量測試；見 `config/default.toml` 註解。
+fn observed_pressure(
+    section: &core_config::AiGatewayPressureSection,
+) -> Arc<ai_gateway::ObservedPressure> {
+    ai_gateway::ObservedPressure::new(ai_gateway::PressureThresholds {
+        enabled: section.enabled,
+        window: Duration::from_secs(section.window_secs),
+        min_samples: section.min_samples,
+        cooldown: Duration::from_secs(section.cooldown_secs),
+        elevated_p95: Duration::from_millis(section.elevated_p95_ms),
+        high_p95: Duration::from_millis(section.high_p95_ms),
+        critical_p95: Duration::from_millis(section.critical_p95_ms),
+        elevated_429_ratio: section.elevated_429_ratio,
+        high_429_ratio: section.high_429_ratio,
+        critical_429_ratio: section.critical_429_ratio,
+        elevated_timeout_ratio: section.elevated_timeout_ratio,
+        high_timeout_ratio: section.high_timeout_ratio,
+        critical_timeout_ratio: section.critical_timeout_ratio,
+        elevated_5xx_ratio: section.elevated_5xx_ratio,
+        high_5xx_ratio: section.high_5xx_ratio,
+        critical_5xx_ratio: section.critical_5xx_ratio,
+        elevated_queue: section.elevated_queue,
+        high_queue: section.high_queue,
+        critical_queue: section.critical_queue,
+    })
 }
 
 /// 啟動時連 Postgres，有上限的退避重試；全部失敗就回錯誤讓行程結束。

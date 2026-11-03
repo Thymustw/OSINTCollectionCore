@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use core_model::{
     AiRun, Candidate, CandidateEvidence, Collection, CollectionBudget, Connector, Document,
     DuplicateGroup, Embedding, Entity, EntityAlias, EntityExtraction, EntityIdentifier, Event,
@@ -9,7 +9,7 @@ use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use storage_core::codec::{decode_enum, decode_json, decode_string_vec};
-use storage_core::{SimhashCandidate, StorageError};
+use storage_core::{CollectionDailyUsage, SimhashCandidate, StorageError};
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
@@ -507,6 +507,22 @@ pub fn collection_budget(row: &SqliteRow) -> Result<CollectionBudget, StorageErr
         daily_ai_budget: get_i64(row, "daily_ai_budget")?,
         created_at: ts(row, "created_at")?,
         updated_at: ts(row, "updated_at")?,
+    })
+}
+
+fn date_from(row: &SqliteRow, col: &str) -> Result<NaiveDate, StorageError> {
+    let raw = get_str(row, col)?;
+    NaiveDate::parse_from_str(&raw, "%Y-%m-%d").map_err(|err| StorageError::CorruptionSuspected {
+        message: format!("欄位 `{col}` 不是 YYYY-MM-DD 日期：{err}"),
+    })
+}
+
+pub fn collection_daily_usage(row: &SqliteRow) -> Result<CollectionDailyUsage, StorageError> {
+    Ok(CollectionDailyUsage {
+        collection_id: uuid_from(row, "collection_id")?,
+        date: date_from(row, "usage_date")?,
+        requests_used: get_i64(row, "requests_used")?,
+        ai_calls_used: get_i64(row, "ai_calls_used")?,
     })
 }
 

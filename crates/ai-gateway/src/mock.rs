@@ -107,6 +107,7 @@ mod tests {
             max_tokens: 128,
             enable_reasoning: false,
             priority: crate::Priority::P0,
+            account: crate::AiAccount::System,
         }
     }
 

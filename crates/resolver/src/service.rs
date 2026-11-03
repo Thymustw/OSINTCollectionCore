@@ -1137,6 +1137,13 @@ mod tests {
         ) -> Result<storage_core::DailyUsage, StorageError> {
             Self::unsupported("get_daily_usage")
         }
+        async fn list_daily_usage(
+            &self,
+            _: chrono::NaiveDate,
+            _: u32,
+        ) -> Result<Vec<storage_core::CollectionDailyUsage>, StorageError> {
+            Self::unsupported("list_daily_usage")
+        }
         async fn put_merge_history(&self, _: &MergeHistory) -> Result<(), StorageError> {
             Self::unsupported("put_merge_history")
         }

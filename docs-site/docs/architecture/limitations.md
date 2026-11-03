@@ -80,17 +80,17 @@
 
 ## AI 相關的限制
 
-### Discovery 預算有三個欄位設定了但尚未生效
+### Discovery 預算有一個欄位設定了但尚未生效
 
-**現況：** Discovery Budget 裡的 `max_requests_per_run`、`max_ai_calls_per_run`、`daily_ai_budget` 這三個欄位可以設定、會存進資料庫、API 也會回傳，但目前沒有任何執行流程會讀取它們。真正會被檢查的只有 `max_candidates_per_run`、`daily_request_budget`、`max_depth`。
+**現況：** `max_requests_per_run` 可以設定、會存進資料庫、API 也會回傳，但目前沒有任何 Discovery 方法會對外部發出 HTTP，所以這欄還沒接上。這**不是無限制**。`daily_ai_budget` 與 `max_ai_calls_per_run` 已在 AI 閘道對 Collection 帳戶生效；目前生產上的自動核准走系統帳戶，不消耗 Collection 額度，所以實際用量會是 0，直到有 Discovery 方法以 Collection 帳戶呼叫 AI。真正會被 Discovery 執行流程檢查的還有 `max_candidates_per_run`、`daily_request_budget`、`max_depth`。
 
-**影響：** 把這三個欄位設成很小的值，也不會限制任何東西。要控制 Discovery 的規模，請用 `max_candidates_per_run` 與 `daily_request_budget`。
+**影響：** 把 `max_requests_per_run` 設成很小的值，也不會限制任何東西。把 AI 日額度設得很小，目前也不會擋住自動核准。要控制 Discovery 的規模，請用 `max_candidates_per_run` 與 `daily_request_budget`。查 `GET /api/v1/collections/{id}/budget` 的 `field_status` 可以看出哪一欄已生效。
 
-### 資源壓力感知永遠回報「正常」
+### 資源壓力感知看的是推論請求本身，不是主機負載
 
-**現況：** AI Gateway 的 Admission Controller 有「資源壓力升高時降級低優先權請求」的邏輯，但目前唯一的壓力訊號來源永遠回報「正常」，還沒有接上真實的 GPU／記憶體監控。
+**現況：** AI Gateway 會依近期延遲、HTTP 429／逾時／錯誤比例、以及排隊人數升高時降級低優先權請求。門檻尚未做容量測試；流量太少時維持「正常」。互動請求（P0）刻意不看這個訊號。主機 CPU／記憶體壓力還沒接上。
 
-**影響：** 自動降級機制（高壓力擋 P2+ 請求）在目前部署下永遠不會觸發。要手動控制 AI 並發量，需要調整設定檔裡的 `auto_approval.llm.max_concurrent`。
+**影響：** 自動降級只在推論後端開始變慢或大量回錯誤時才會觸發。主機本身很忙但推論還很快時，這個機制不會動作。要手動控制 AI 並發量，調整設定檔裡的 `auto_approval.llm.max_concurrent`。
 
 ---
 

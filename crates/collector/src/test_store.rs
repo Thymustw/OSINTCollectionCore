@@ -747,6 +747,13 @@ impl RelationalStore for MemoryConnectorStore {
     ) -> Result<storage_core::DailyUsage, StorageError> {
         Self::unused()
     }
+    async fn list_daily_usage(
+        &self,
+        _: chrono::NaiveDate,
+        _: u32,
+    ) -> Result<Vec<storage_core::CollectionDailyUsage>, StorageError> {
+        Self::unused()
+    }
     async fn put_merge_history(&self, _: &MergeHistory) -> Result<(), StorageError> {
         Self::unused()
     }

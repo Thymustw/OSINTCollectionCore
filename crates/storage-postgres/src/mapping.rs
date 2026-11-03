@@ -8,7 +8,7 @@ use serde_json::Value;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use storage_core::codec::decode_enum;
-use storage_core::{SimhashCandidate, StorageError};
+use storage_core::{CollectionDailyUsage, SimhashCandidate, StorageError};
 
 use crate::error::map_sqlx;
 
@@ -440,6 +440,15 @@ pub fn collection_budget(row: &PgRow) -> Result<CollectionBudget, StorageError> 
         daily_ai_budget: get(row, "daily_ai_budget")?,
         created_at: get(row, "created_at")?,
         updated_at: get(row, "updated_at")?,
+    })
+}
+
+pub fn collection_daily_usage(row: &PgRow) -> Result<CollectionDailyUsage, StorageError> {
+    Ok(CollectionDailyUsage {
+        collection_id: get(row, "collection_id")?,
+        date: get(row, "usage_date")?,
+        requests_used: get(row, "requests_used")?,
+        ai_calls_used: get(row, "ai_calls_used")?,
     })
 }
 

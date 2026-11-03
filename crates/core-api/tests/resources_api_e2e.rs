@@ -120,6 +120,8 @@ fn assemble_test_auto_approval(
             p0_reserved_capacity: 2,
             shared_capacity: section.llm.max_concurrent,
             metrics: None,
+            quota: None,
+            pressure: None,
         },
     );
     core_api::AutoApprovalState {
@@ -362,6 +364,53 @@ fn new_connector(source_id: Uuid, enabled: bool) -> Connector {
         last_success: None,
         status: "idle".into(),
         error_count: 0,
+    }
+}
+
+/// `GET/PUT /collections/{id}/budget` 必須同時回欄位生效狀態與今日用量。
+fn assert_budget_visibility(body: &Value, expect_zero_usage: bool) {
+    let fields = body["field_status"]
+        .as_array()
+        .unwrap_or_else(|| panic!("field_status 必須是陣列：{body}"));
+    assert_eq!(fields.len(), 6, "六個 budget 欄位都要有狀態：{body}");
+    let mut seen = std::collections::HashSet::new();
+    for item in fields {
+        let name = item["field"].as_str().expect("field");
+        let in_effect = item["in_effect"].as_bool().expect("in_effect");
+        let reason = item["reason"].as_str().unwrap_or("");
+        seen.insert(name.to_string());
+        match name {
+            "max_requests_per_run" => {
+                assert!(!in_effect, "max_requests_per_run 這輪還沒接上：{body}");
+                assert!(
+                    reason.contains("尚未接上"),
+                    "未接上的欄位要講原因，避免被當成無限制：{body}"
+                );
+            }
+            "max_candidates_per_run"
+            | "max_ai_calls_per_run"
+            | "max_depth"
+            | "daily_request_budget"
+            | "daily_ai_budget" => {
+                assert!(in_effect, "{name} 應標 in_effect：{body}");
+            }
+            other => panic!("不認識的 budget 欄位 {other}：{body}"),
+        }
+    }
+    for expected in [
+        "max_candidates_per_run",
+        "max_requests_per_run",
+        "max_ai_calls_per_run",
+        "max_depth",
+        "daily_request_budget",
+        "daily_ai_budget",
+    ] {
+        assert!(seen.contains(expected), "缺 {expected}：{body}");
+    }
+    assert!(body["today_usage"]["date"].as_str().is_some(), "{body}");
+    if expect_zero_usage {
+        assert_eq!(body["today_usage"]["requests_used"], json!(0), "{body}");
+        assert_eq!(body["today_usage"]["ai_calls_used"], json!(0), "{body}");
     }
 }
 
@@ -1089,6 +1138,7 @@ async fn collection_link_unlink_and_budget() {
     );
     assert_eq!(budget["max_candidates_per_run"], 200);
     assert_eq!(budget["max_depth"], 3);
+    assert_budget_visibility(&budget, /*expect_zero_usage*/ true);
 
     let (status, written, _) = send(
         &api.app,
@@ -1115,14 +1165,25 @@ async fn collection_link_unlink_and_budget() {
     assert_eq!(written["max_depth"], 4);
     assert_eq!(written["daily_request_budget"], 111);
     assert_eq!(written["daily_ai_budget"], 55);
-    assert!(
-        api.audit.entries().iter().any(|e| {
+    assert_budget_visibility(&written, true);
+    let audit_entry = api
+        .audit
+        .entries()
+        .iter()
+        .find(|e| {
             e.action == core_api::AUDIT_COLLECTION_BUDGET_UPDATE
                 && e.resource_id == Some(id.to_string())
                 && e.outcome == "success"
-        }),
-        "改 budget 要留稽核"
-    );
+        })
+        .cloned();
+    assert!(audit_entry.is_some(), "改 budget 要留稽核");
+    let metadata = &audit_entry.unwrap().metadata;
+    assert_eq!(metadata["max_candidates_per_run"], json!(11));
+    assert_eq!(metadata["max_requests_per_run"], json!(22));
+    assert_eq!(metadata["max_ai_calls_per_run"], json!(33));
+    assert_eq!(metadata["max_depth"], json!(4));
+    assert_eq!(metadata["daily_request_budget"], json!(111));
+    assert_eq!(metadata["daily_ai_budget"], json!(55));
 
     // created_at 以 round-trip 後的值為準：Postgres timestamptz 是微秒精度，
     // PUT 回應裡的 in-memory `Utc::now()` 可能還帶奈秒。
@@ -1164,6 +1225,7 @@ async fn collection_link_unlink_and_budget() {
     assert_eq!(status, StatusCode::OK, "{reread}");
     assert_eq!(reread["is_default"], false);
     assert_eq!(reread["max_candidates_per_run"], 12);
+    assert_budget_visibility(&reread, true);
 
     let missing = Uuid::now_v7();
     let (status, body, _) = send(

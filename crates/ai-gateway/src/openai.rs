@@ -14,15 +14,19 @@
 //! 多段 `content` 陣列或其他變體，會被當成 [`AiGatewayError::InvalidResponse`]。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::admission::AdmissionError;
+use crate::pressure::AttemptClass;
+use crate::quota::{AiQuota, FailClosedIfCollection};
 use crate::redact::{redact_credentials, truncate};
 use crate::{
     AdmissionController, AiGatewayError, ChatCompletionRequest, ChatCompletionResponse, ChatRole,
-    LlmProvider, Priority, StaticPressure, TokenUsage,
+    LlmProvider, ObservedPressure, PressureSource, Priority, StaticPressure, TokenUsage,
 };
 
 /// 組裝 [`OpenAiCompatibleLlmProvider`] 用的建構參數。
@@ -32,7 +36,9 @@ use crate::{
 ///
 /// `model`／`temperature`／`max_tokens` 走 [`ChatCompletionRequest`]，這裡只留
 /// client 連線、並發控制、重試、限流需要的欄位。
-#[derive(Debug, Clone)]
+///
+/// 不含 `Debug`：`quota` 是 `dyn AiQuota`，沒有 Debug。
+#[derive(Clone)]
 pub struct OpenAiCompatibleLlmProviderConfig {
     /// `false` 時不建 HTTP client，所有呼叫回 [`AiGatewayError::Unsupported`]。
     pub enabled: bool,
@@ -46,8 +52,8 @@ pub struct OpenAiCompatibleLlmProviderConfig {
     pub max_concurrent: usize,
     /// 除了第一次嘗試外，[`AiGatewayError::Transient`] 最多重試幾次。
     /// `0`＝不重試（V0.3 Phase 1 Step A 之前的既有行為）。
-    /// `Permanent`／`InvalidResponse`／`Unsupported` 一律不重試——重試對
-    /// 這三類錯誤沒有意義，白白多等一個逾時。
+    /// `Permanent`／`InvalidResponse`／`Unsupported`／`QuotaExceeded`／
+    /// `QuotaUnavailable` 一律不重試——重試對這幾類錯誤沒有意義。
     pub max_retries: usize,
     /// 全域請求速率上限（次/秒），跟 `max_concurrent` 是兩個獨立機制：
     /// `max_concurrent` 限制「同時有幾個請求在飛」，這個限制「多快能發出
@@ -61,6 +67,11 @@ pub struct OpenAiCompatibleLlmProviderConfig {
     /// metrics registry，用來曝露 admission 狀態。`None` 時不記錄
     /// metrics（比照「這個能力沒接上」的既有慣例，不 panic、不用假的 registry）。
     pub metrics: Option<core_observability::MetricsRegistry>,
+    /// Collection 帳戶的額度後端。`None` 時 System 放行、Collection fail-closed
+    /// （避免組裝端漏接時 Collection 靜默變成無額度）。
+    pub quota: Option<Arc<dyn AiQuota>>,
+    /// 觀測到的壓力訊號。`None` 時 admission 當壓力永遠 Normal。
+    pub pressure: Option<Arc<ObservedPressure>>,
 }
 
 /// OpenAI 相容 chat completion 的生產實作。
@@ -80,8 +91,41 @@ struct Inner {
     semaphore: Arc<tokio::sync::Semaphore>,
     max_retries: usize,
     rate_limiter: Option<RateLimiter>,
-    admission: AdmissionController<StaticPressure>,
+    admission: AdmissionController<Arc<dyn PressureSource>>,
+    quota: Arc<dyn AiQuota>,
+    pressure: Option<Arc<ObservedPressure>>,
+    admission_waiters: Arc<AtomicUsize>,
+    inflight: Arc<AtomicU64>,
     metrics: Option<core_observability::MetricsRegistry>,
+}
+
+/// `admit()` 期間把排隊人數寫進 [`ObservedPressure`]。drop 時減 1。
+struct WaiterGuard<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        let prev = self.inner.admission_waiters.fetch_sub(1, Ordering::Relaxed);
+        let remaining = prev.saturating_sub(1);
+        if let Some(pressure) = &self.inner.pressure {
+            pressure.set_queue_depth(remaining);
+        }
+    }
+}
+
+/// HTTP 進行中的 in-flight 計數。drop 時減 1 並更新 gauge。
+struct InflightGuard<'a> {
+    inner: &'a Inner,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let prev = self.inner.inflight.fetch_sub(1, Ordering::Relaxed);
+        if let Some(metrics) = &self.inner.metrics {
+            metrics.set_gauge("osint_ai_inflight_requests", prev.saturating_sub(1));
+        }
+    }
 }
 
 /// 簡單的固定間隔限流器：`next_allowed` 記錄下一個請求最早能出發的時間，
@@ -131,6 +175,14 @@ impl OpenAiCompatibleLlmProvider {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let permits = config.max_concurrent.max(1);
+        let pressure_source: Arc<dyn PressureSource> = match &config.pressure {
+            Some(observed) => Arc::clone(observed) as Arc<dyn PressureSource>,
+            None => Arc::new(StaticPressure),
+        };
+        let quota: Arc<dyn AiQuota> = match &config.quota {
+            Some(quota) => Arc::clone(quota),
+            None => Arc::new(FailClosedIfCollection),
+        };
         Self {
             inner: Some(Inner {
                 client,
@@ -141,8 +193,12 @@ impl OpenAiCompatibleLlmProvider {
                 admission: AdmissionController::new(
                     config.p0_reserved_capacity,
                     config.shared_capacity,
-                    StaticPressure,
+                    pressure_source,
                 ),
+                quota,
+                pressure: config.pressure.clone(),
+                admission_waiters: Arc::new(AtomicUsize::new(0)),
+                inflight: Arc::new(AtomicU64::new(0)),
                 metrics: config.metrics.clone(),
             }),
         }
@@ -158,42 +214,70 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
             return Err(AiGatewayError::Unsupported);
         };
 
+        // 先 admission 再扣額度：壓力下被 admission 擋掉的呼叫沒有真的打到模型，
+        // 不該耗掉 collection 的每日額度——否則壓力高時背景工作反覆被擋，
+        // 會把當天額度白白燒光。額度扣不到時 return，`_admit_guard` drop 即歸還名額。
+        // QuotaExceeded／QuotaUnavailable 不是 Transient，後面的重試迴圈不會重試它們。
         let _admit_guard = match request.priority {
             Priority::P0 => inner.admission.try_admit_p0().map_err(|err| {
-                tracing::warn!(error = %err, "P0 admission 被拒");
-                if let Some(metrics) = &inner.metrics {
-                    metrics.inc("osint_ai_admission_rejected_total", 1);
-                }
+                inner.record_admission_rejection(&err, request.priority);
                 AiGatewayError::Transient {
                     message: format!("AI admission 被拒：{err}"),
                 }
             })?,
-            p => inner.admission.admit(p).await.map_err(|err| {
-                tracing::warn!(error = %err, priority = ?p, "AI admission 被拒");
-                if let Some(metrics) = &inner.metrics {
-                    metrics.inc("osint_ai_admission_rejected_total", 1);
+            p => {
+                let n = inner.admission_waiters.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(pressure) = &inner.pressure {
+                    pressure.set_queue_depth(n);
                 }
-                AiGatewayError::Transient {
-                    message: format!("AI admission 被拒：{err}"),
-                }
-            })?,
+                let _waiter = WaiterGuard { inner };
+                inner.admission.admit(p).await.map_err(|err| {
+                    inner.record_admission_rejection(&err, p);
+                    AiGatewayError::Transient {
+                        message: format!("AI admission 被拒：{err}"),
+                    }
+                })?
+            }
         };
 
-        if let Some(metrics) = &inner.metrics {
-            metrics.set_gauge(
-                "osint_ai_admission_p0_available",
-                inner.admission.p0_available() as u64,
-            );
-            metrics.set_gauge(
-                "osint_ai_admission_shared_available",
-                inner.admission.shared_available() as u64,
-            );
+        if let Err(err) = inner.quota.try_consume(&request.account).await {
+            match &err {
+                AiGatewayError::QuotaExceeded { .. } => {
+                    tracing::debug!(
+                        error = %err,
+                        account = ?request.account,
+                        "AI 額度已用完，拒絕本次呼叫"
+                    );
+                }
+                AiGatewayError::QuotaUnavailable { .. } => {
+                    tracing::warn!(
+                        error = %err,
+                        account = ?request.account,
+                        "AI 額度後端不可用，fail-closed 拒絕本次呼叫"
+                    );
+                }
+                other => {
+                    tracing::warn!(error = %other, "AI 額度檢查回了非預期錯誤");
+                }
+            }
+            if let Some(metrics) = &inner.metrics {
+                metrics.inc("osint_ai_quota_rejected_total", 1);
+            }
+            return Err(err);
         }
+
+        inner.publish_admission_gauges();
+        let inflight = inner.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(metrics) = &inner.metrics {
+            metrics.set_gauge("osint_ai_inflight_requests", inflight);
+        }
+        let _inflight = InflightGuard { inner };
 
         tracing::debug!(
             model = %request.model,
             message_count = request.messages.len(),
             priority = ?request.priority,
+            account = ?request.account,
             "LLM 呼叫開始"
         );
 
@@ -240,9 +324,76 @@ impl LlmProvider for OpenAiCompatibleLlmProvider {
 }
 
 impl Inner {
+    fn record_admission_rejection(&self, err: &AdmissionError, priority: Priority) {
+        tracing::warn!(error = %err, priority = ?priority, "AI admission 被拒");
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        metrics.inc("osint_ai_admission_rejected_total", 1);
+        match err {
+            AdmissionError::P0Busy => {
+                metrics.inc("osint_ai_admission_rejected_p0_busy_total", 1);
+            }
+            AdmissionError::RejectedByPressure(_) => {
+                metrics.inc("osint_ai_admission_rejected_pressure_total", 1);
+            }
+        }
+    }
+
+    fn publish_admission_gauges(&self) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        metrics.set_gauge(
+            "osint_ai_admission_p0_available",
+            self.admission.p0_available() as u64,
+        );
+        metrics.set_gauge(
+            "osint_ai_admission_shared_available",
+            self.admission.shared_available() as u64,
+        );
+        if let Some(pressure) = &self.pressure {
+            metrics.set_gauge("osint_ai_pressure_state", pressure.current().as_gauge());
+        }
+    }
+
+    fn observe(&self, class: AttemptClass, latency: Duration) {
+        if let Some(pressure) = &self.pressure {
+            pressure.record(class, latency);
+        }
+        if let Some(metrics) = &self.metrics {
+            match class {
+                AttemptClass::RateLimited => metrics.inc("osint_ai_http_429_total", 1),
+                AttemptClass::Timeout => metrics.inc("osint_ai_http_timeout_total", 1),
+                AttemptClass::ServerError => metrics.inc("osint_ai_http_5xx_total", 1),
+                AttemptClass::Success | AttemptClass::Other => {}
+            }
+            if let Some(pressure) = &self.pressure {
+                metrics.set_gauge("osint_ai_pressure_state", pressure.current().as_gauge());
+            }
+        }
+    }
+
     /// 單次嘗試：取 semaphore permit、等限流輪到、發 HTTP 請求、解析回應。
     /// 不含重試邏輯——重試迴圈在 [`LlmProvider::chat_completion`]。
     async fn send_once(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, AiGatewayError> {
+        let started = Instant::now();
+        match self.dispatch(request).await {
+            Ok(response) => {
+                self.observe(AttemptClass::Success, started.elapsed());
+                Ok(response)
+            }
+            Err(err) => {
+                self.observe(attempt_class_from_error(&err), started.elapsed());
+                Err(err)
+            }
+        }
+    }
+
+    async fn dispatch(
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, AiGatewayError> {
@@ -316,6 +467,33 @@ fn role_as_str(role: ChatRole) -> &'static str {
 
 fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+fn attempt_class_from_error(err: &AiGatewayError) -> AttemptClass {
+    let message = match err {
+        AiGatewayError::Transient { message } | AiGatewayError::Permanent { message } => {
+            message.as_str()
+        }
+        _ => return AttemptClass::Other,
+    };
+    if message.contains("逾時") {
+        return AttemptClass::Timeout;
+    }
+    if let Some(status) = http_status_from_message(message) {
+        if status == 429 {
+            return AttemptClass::RateLimited;
+        }
+        if (500..600).contains(&status) {
+            return AttemptClass::ServerError;
+        }
+    }
+    AttemptClass::Other
+}
+
+fn http_status_from_message(message: &str) -> Option<u16> {
+    let rest = message.split("HTTP ").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 fn classify_reqwest(err: reqwest::Error) -> AiGatewayError {
@@ -435,6 +613,7 @@ mod tests {
             max_tokens: 128,
             enable_reasoning: false,
             priority: crate::Priority::P0,
+            account: crate::AiAccount::System,
         }
     }
 
@@ -453,6 +632,8 @@ mod tests {
             p0_reserved_capacity: 2,
             shared_capacity: max_concurrent.max(1),
             metrics: None,
+            quota: None,
+            pressure: None,
         }
     }
 
@@ -711,6 +892,8 @@ mod tests {
             p0_reserved_capacity: 2,
             shared_capacity: 2,
             metrics: None,
+            quota: None,
+            pressure: None,
         });
         let err = provider
             .chat_completion(&sample_request())
@@ -982,6 +1165,277 @@ mod tests {
         assert_eq!(
             chat_completions_url("http://ai-inference:8000/v1"),
             "http://ai-inference:8000/v1/chat/completions"
+        );
+    }
+
+    struct MemoryBudget {
+        remaining: std::sync::atomic::AtomicI64,
+        consume_calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::CollectionAiBudget for MemoryBudget {
+        async fn load_limits(
+            &self,
+            _collection_id: uuid::Uuid,
+        ) -> Result<Option<crate::AiBudgetLimits>, AiGatewayError> {
+            Ok(Some(crate::AiBudgetLimits {
+                daily_ai_budget: 1,
+                max_ai_calls_per_run: 50,
+            }))
+        }
+
+        async fn try_consume_daily(
+            &self,
+            _collection_id: uuid::Uuid,
+            _date: chrono::NaiveDate,
+            by: i64,
+            _budget: i64,
+        ) -> Result<crate::DailyConsume, AiGatewayError> {
+            self.consume_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let prev = self
+                .remaining
+                .fetch_sub(by, std::sync::atomic::Ordering::SeqCst);
+            if prev >= by {
+                Ok(crate::DailyConsume {
+                    allowed: true,
+                    used_after: 1,
+                })
+            } else {
+                self.remaining
+                    .fetch_add(by, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::DailyConsume {
+                    allowed: false,
+                    used_after: 1,
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collection_quota_exceeded_sends_no_http() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(success_body()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let backend = MemoryBudget {
+            remaining: std::sync::atomic::AtomicI64::new(0),
+            consume_calls: std::sync::atomic::AtomicU64::new(0),
+        };
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 1);
+        config.quota = Some(Arc::new(crate::StoreAiQuota::new(backend)));
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let mut request = sample_request();
+        request.account = crate::AiAccount::Collection {
+            collection_id: uuid::Uuid::now_v7(),
+            run_id: None,
+        };
+        let err = provider
+            .chat_completion(&request)
+            .await
+            .expect_err("額度 0 必須被拒");
+        assert!(
+            matches!(err, AiGatewayError::QuotaExceeded { .. }),
+            "期望 QuotaExceeded，實際 {err:?}"
+        );
+        assert!(
+            !matches!(err, AiGatewayError::Transient { .. }),
+            "QuotaExceeded 不得是 Transient"
+        );
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 0, "額度拒絕後不該發出 HTTP");
+    }
+
+    #[tokio::test]
+    async fn quota_exceeded_is_not_retried_even_with_max_retries() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(success_body()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let backend = MemoryBudget {
+            remaining: std::sync::atomic::AtomicI64::new(0),
+            consume_calls: std::sync::atomic::AtomicU64::new(0),
+        };
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 1);
+        config.max_retries = 3;
+        config.quota = Some(Arc::new(crate::StoreAiQuota::new(backend)));
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let mut request = sample_request();
+        request.account = crate::AiAccount::Collection {
+            collection_id: uuid::Uuid::now_v7(),
+            run_id: None,
+        };
+        let _ = provider
+            .chat_completion(&request)
+            .await
+            .expect_err("應被拒");
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            received.len(),
+            0,
+            "QuotaExceeded 即使 max_retries=3 也不該打 HTTP"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_account_does_not_consume_collection_quota() {
+        let server = MockServer::start().await;
+        mount_json(&server, 200, &success_body()).await;
+
+        // remaining=0：若誤走 Collection 路徑會被拒。System 必須跳過後端、打到 HTTP。
+        let backend = MemoryBudget {
+            remaining: std::sync::atomic::AtomicI64::new(0),
+            consume_calls: std::sync::atomic::AtomicU64::new(0),
+        };
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 1);
+        config.quota = Some(Arc::new(crate::StoreAiQuota::new(backend)));
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        provider
+            .chat_completion(&sample_request())
+            .await
+            .expect("System 帳戶即使 collection 額度為 0 也必須放行");
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1, "System 必須真的打到 HTTP");
+    }
+
+    fn high_pressure() -> Arc<crate::ObservedPressure> {
+        let mut t = crate::PressureThresholds::speculative_defaults();
+        t.min_samples = 5;
+        t.elevated_429_ratio = 0.20;
+        t.high_429_ratio = 0.50;
+        t.critical_429_ratio = 0.80;
+        t.elevated_p95 = Duration::from_secs(3600);
+        t.high_p95 = Duration::from_secs(3600);
+        t.critical_p95 = Duration::from_secs(3600);
+        t.elevated_timeout_ratio = 1.1;
+        t.high_timeout_ratio = 1.1;
+        t.critical_timeout_ratio = 1.1;
+        t.elevated_5xx_ratio = 1.1;
+        t.high_5xx_ratio = 1.1;
+        t.critical_5xx_ratio = 1.1;
+        t.elevated_queue = 100;
+        t.high_queue = 100;
+        t.critical_queue = 100;
+        let p = crate::ObservedPressure::new(t);
+        for _ in 0..2 {
+            p.record(crate::AttemptClass::Success, Duration::from_millis(10));
+        }
+        for _ in 0..3 {
+            p.record(crate::AttemptClass::RateLimited, Duration::from_millis(10));
+        }
+        assert_eq!(p.current(), crate::ResourcePressure::High);
+        p
+    }
+
+    #[tokio::test]
+    async fn high_pressure_rejects_p3_without_http_but_p0_still_http() {
+        let server = MockServer::start().await;
+        mount_json(&server, 200, &success_body()).await;
+        let pressure = high_pressure();
+
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 4);
+        config.pressure = Some(Arc::clone(&pressure));
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let mut p3 = sample_request();
+        p3.priority = crate::Priority::P3;
+        let err = provider
+            .chat_completion(&p3)
+            .await
+            .expect_err("High 必須擋 P3");
+        assert!(
+            matches!(err, AiGatewayError::Transient { ref message } if message.contains("資源壓力")),
+            "P3 被壓力擋下應是 Transient，實際 {err:?}"
+        );
+
+        let mut p0 = sample_request();
+        p0.priority = crate::Priority::P0;
+        provider
+            .chat_completion(&p0)
+            .await
+            .expect("P0 刻意不看壓力，High 時仍應放行並打 HTTP");
+
+        let received = server.received_requests().await.unwrap_or_default();
+        assert_eq!(received.len(), 1, "只有 P0 該打到 HTTP，P3 不該發請求");
+    }
+
+    /// 壓力下被 admission 擋掉的呼叫沒有打到模型，不能耗掉 collection 每日額度。
+    /// 若順序寫反（先扣額度再 admission），壓力高時背景工作反覆被擋會把當天額度燒光。
+    #[tokio::test]
+    async fn pressure_rejection_does_not_consume_collection_quota() {
+        let server = MockServer::start().await;
+        mount_json(&server, 200, &success_body()).await;
+
+        let backend = Arc::new(MemoryBudget {
+            remaining: std::sync::atomic::AtomicI64::new(1),
+            consume_calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        struct Shared(Arc<MemoryBudget>);
+        impl crate::CollectionAiBudget for Shared {
+            async fn load_limits(
+                &self,
+                id: uuid::Uuid,
+            ) -> Result<Option<crate::AiBudgetLimits>, AiGatewayError> {
+                self.0.load_limits(id).await
+            }
+            async fn try_consume_daily(
+                &self,
+                id: uuid::Uuid,
+                date: chrono::NaiveDate,
+                by: i64,
+                budget: i64,
+            ) -> Result<crate::DailyConsume, AiGatewayError> {
+                self.0.try_consume_daily(id, date, by, budget).await
+            }
+        }
+
+        let mut config = enabled_config(format!("{}/v1", server.uri()), Duration::from_secs(5), 4);
+        config.pressure = Some(high_pressure());
+        config.quota = Some(Arc::new(crate::StoreAiQuota::new(Shared(Arc::clone(
+            &backend,
+        )))));
+        let provider = OpenAiCompatibleLlmProvider::new(&config);
+
+        let mut p3 = sample_request();
+        p3.priority = crate::Priority::P3;
+        p3.account = crate::AiAccount::Collection {
+            collection_id: uuid::Uuid::now_v7(),
+            run_id: None,
+        };
+        for _ in 0..3 {
+            let err = provider
+                .chat_completion(&p3)
+                .await
+                .expect_err("High 必須擋 P3");
+            assert!(
+                matches!(err, AiGatewayError::Transient { .. }),
+                "應是壓力拒絕（Transient），不是額度拒絕，實際 {err:?}"
+            );
+        }
+        assert_eq!(
+            backend
+                .consume_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "壓力拒絕發生在扣額度之前，額度後端一次都不該被呼叫"
+        );
+        assert_eq!(
+            backend.remaining.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "被壓力擋掉的 3 次不得消耗每日額度"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            0
         );
     }
 }

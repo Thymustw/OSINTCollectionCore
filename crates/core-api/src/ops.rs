@@ -20,7 +20,9 @@
 //! * `POST /ops/failed-events/{id}/replay`：把一則失敗事件的原始 envelope 重發回它
 //!   原本的 topic 並標記為已重放（ADR-008 的手動復原路徑）。operator 以上。
 //! * `GET /ops/discovery`：SPEC_V0.3 §27 的讀側子集——AI 並發上限設定值、
-//!   Candidate backlog 近似計數、最近 AI Run 歷史。沒接 Postgres 回 503。
+//!   Candidate backlog 近似計數、最近 AI Run 歷史、今天有用量的 collection。
+//!   沒接 Postgres 回 503。Admission Controller／ObservedPressure 在閘道內，
+//!   這個端點還沒把佇列快照掛上來。
 //!
 //! # 為什麼與 `/ready`、`/metrics` 分開
 //!
@@ -1226,6 +1228,9 @@ const BACKLOG_COUNT_LIMIT: u32 = 100;
 /// AI Run history 只回最近幾筆，這是總覽視圖不是完整清單
 /// （完整清單走既有的 `GET /ai/runs`，支援 cursor 分頁）。
 const RECENT_AI_RUN_LIMIT: u32 = 20;
+/// 今天有用量的 collection 清單上限。對齊 storage `clamp_limit` 的 1..=100，
+/// 選 50 是因為這個視圖是總覽不是完整對帳。
+const COLLECTION_USAGE_LIMIT: u32 = 50;
 
 /// `GET /ops/discovery` 的回應。SPEC_V0.3 §27 AI/Discovery Operations
 /// 的讀側子集——只回現有資料能組出來的部分，見下方各欄位的排除說明。
@@ -1240,7 +1245,20 @@ pub struct DiscoveryOpsView {
     /// 最近 N 筆 AI Run（依 id 遞減）。跟 `GET /ai/runs` 是同一份資料，
     /// 這裡只是聚合進同一個 Ops 視圖方便一次看完。
     pub ai_run_recent: Vec<core_model::AiRun>,
+    /// 今天有用量的 collection（`requests_used > 0` 或 `ai_calls_used > 0`）。
+    /// 有上限 [`COLLECTION_USAGE_LIMIT`]；撞上限時
+    /// [`Self::collection_daily_usage_truncated`] 為 true。
+    pub collection_daily_usage: Vec<CollectionDailyUsageView>,
+    pub collection_daily_usage_truncated: bool,
     pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CollectionDailyUsageView {
+    pub collection_id: uuid::Uuid,
+    pub date: chrono::NaiveDate,
+    pub requests_used: i64,
+    pub ai_calls_used: i64,
 }
 
 /// 依 [`core_model::CandidateStatus`] 各分一組的近似計數。
@@ -1274,15 +1292,10 @@ async fn count_candidates_by_status(
 
 /// `GET /api/v1/ops/discovery`。viewer 以上。
 ///
-/// SPEC_V0.3 §27 AI/Discovery Operations 的讀側子集。**明確排除**（延後到
-/// V0.3 Phase 5，屆時才有真實 AI runtime 可以驗證這些欄位有沒有意義）：
-/// P0-P4 佇列深度（程式碼裡不存在這個抽象）、即時 active
-/// requests/TPS/TTFT/P95（沒有真實推論流量可量測，也沒有任何地方在收集
-/// 這些指標）、Admission Controller state（不存在這個元件）、
-/// pause/resume P4／drain AI queue（沒有東西可以 pause/resume/drain）、
-/// OOM/retry/deferred counts（`max_retries` 目前只有 config 沒有累計
-/// metric）。這個端點回應裡的 `note` 欄位重述這件事，避免呼叫端誤以為
-/// 缺的欄位代表系統沒有問題。
+/// SPEC_V0.3 §27 AI/Discovery Operations 的讀側子集。Admission Controller
+/// 與 [`ai_gateway::ObservedPressure`] 已在閘道落地；這個端點**仍然沒有**
+/// 佇列快照、pause／drain 操作。P0 刻意不看壓力訊號（互動路徑不被背景
+/// 負載連帶拒絕）。`note` 重述這件事，避免呼叫端把缺欄位當成系統沒問題。
 pub async fn discovery(
     State(state): State<AppState>,
     principal: Principal,
@@ -1306,6 +1319,22 @@ pub async fn discovery(
         .await
         .map_err(storage_error)?;
 
+    let today = chrono::Utc::now().date_naive();
+    let usage_rows = store
+        .list_daily_usage(today, COLLECTION_USAGE_LIMIT)
+        .await
+        .map_err(storage_error)?;
+    let collection_daily_usage_truncated = usage_rows.len() as u32 >= COLLECTION_USAGE_LIMIT;
+    let collection_daily_usage = usage_rows
+        .into_iter()
+        .map(|row| CollectionDailyUsageView {
+            collection_id: row.collection_id,
+            date: row.date,
+            requests_used: row.requests_used,
+            ai_calls_used: row.ai_calls_used,
+        })
+        .collect();
+
     Ok(Json(DiscoveryOpsView {
         ai_max_concurrent_requests: state.auto_approval_max_concurrent,
         candidate_backlog: CandidateBacklogSummary {
@@ -1321,11 +1350,13 @@ pub async fn discovery(
                 || sat_expired,
         },
         ai_run_recent,
-        note: "P0-P4 佇列、即時 active requests/TPS/TTFT/P95、Admission \
-               Controller state、pause/resume/drain 操作延後到 V0.3 Phase 5\
-              （本地 AI Runtime 部署後才有真實資料可驗證這些欄位的設計）。\
-               本端點目前只回：AI 呼叫並發上限設定值、Candidate backlog \
-               各狀態近似計數、最近 AI Run 歷史。"
+        collection_daily_usage,
+        collection_daily_usage_truncated,
+        note: "Admission Controller 與 ObservedPressure 已在 AI 閘道落地\
+               （P0 刻意不看壓力訊號）。本端點仍無 P0–P4 佇列快照、\
+               pause/resume/drain 操作、即時 TPS/TTFT。\
+               本端點目前回：AI 呼叫並發上限設定值、Candidate backlog \
+               各狀態近似計數、最近 AI Run 歷史、今天有用量的 collection。"
             .into(),
     }))
 }

@@ -11,7 +11,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -459,6 +459,67 @@ pub struct CollectionBudgetView {
     #[serde(flatten)]
     pub budget: CollectionBudget,
     pub is_default: bool,
+    /// 六個欄位各自是否已接上生產路徑。沒接上的不是「無限制」，
+    /// 是「這輪還沒有呼叫端會讀它」。
+    pub field_status: Vec<BudgetFieldStatus>,
+    pub today_usage: TodayUsageView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BudgetFieldStatus {
+    pub field: &'static str,
+    pub in_effect: bool,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TodayUsageView {
+    pub date: NaiveDate,
+    pub requests_used: i64,
+    pub ai_calls_used: i64,
+}
+
+fn budget_field_status() -> Vec<BudgetFieldStatus> {
+    vec![
+        BudgetFieldStatus {
+            field: "max_candidates_per_run",
+            in_effect: true,
+            reason: "discovery-worker 在每次 run 套用",
+        },
+        BudgetFieldStatus {
+            field: "max_requests_per_run",
+            in_effect: false,
+            reason: "目前沒有任何 Discovery method 對外部發出 HTTP，這欄尚未接上；不是無限制",
+        },
+        BudgetFieldStatus {
+            field: "max_ai_calls_per_run",
+            in_effect: true,
+            reason: "AI 閘道對 Collection 帳戶在單次 run 內套用。目前生產呼叫端 AutoApproval 用 System 帳戶，所以實際消耗是 0，直到 Discovery 以 Collection+run_id 呼叫閘道",
+        },
+        BudgetFieldStatus {
+            field: "max_depth",
+            in_effect: true,
+            reason: "discovery-worker 在每次 run 套用",
+        },
+        BudgetFieldStatus {
+            field: "daily_request_budget",
+            in_effect: true,
+            reason: "discovery-worker 透過 try_consume_daily_request_budget 原子扣額",
+        },
+        BudgetFieldStatus {
+            field: "daily_ai_budget",
+            in_effect: true,
+            reason: "AI 閘道對 Collection 帳戶透過 try_consume_daily_ai_budget 原子扣額。目前生產呼叫端 AutoApproval 用 System 帳戶，所以實際消耗是 0，直到 Discovery 以 Collection 帳戶呼叫閘道",
+        },
+    ]
+}
+
+fn today_usage_view(usage: storage_core::DailyUsage, date: NaiveDate) -> TodayUsageView {
+    TodayUsageView {
+        date,
+        requests_used: usage.requests_used,
+        ai_calls_used: usage.ai_calls_used,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -870,6 +931,12 @@ pub async fn get_budget(
     principal.role.require(Permission::Read)?;
     load(&state, id).await?;
     let store = store(&state)?;
+    let today = Utc::now().date_naive();
+    let usage = store
+        .get_daily_usage(id, today)
+        .await
+        .map_err(storage_error)?;
+    let today_usage = today_usage_view(usage, today);
     match store
         .get_collection_budget(id)
         .await
@@ -878,10 +945,14 @@ pub async fn get_budget(
         Some(budget) => Ok(Json(CollectionBudgetView {
             budget,
             is_default: false,
+            field_status: budget_field_status(),
+            today_usage,
         })),
         None => Ok(Json(CollectionBudgetView {
             budget: CollectionBudget::conservative_default(id, Utc::now()),
             is_default: true,
+            field_status: budget_field_status(),
+            today_usage,
         })),
     }
 }
@@ -908,7 +979,11 @@ pub async fn put_budget(
                     outcome: "success",
                     metadata: json!({
                         "max_candidates_per_run": view.budget.max_candidates_per_run,
+                        "max_requests_per_run": view.budget.max_requests_per_run,
+                        "max_ai_calls_per_run": view.budget.max_ai_calls_per_run,
+                        "max_depth": view.budget.max_depth,
                         "daily_request_budget": view.budget.daily_request_budget,
+                        "daily_ai_budget": view.budget.daily_ai_budget,
                     }),
                 },
             )
@@ -974,9 +1049,16 @@ async fn put_budget_inner(
         .put_collection_budget(&budget)
         .await
         .map_err(storage_error)?;
+    let today = Utc::now().date_naive();
+    let usage = store
+        .get_daily_usage(collection_id, today)
+        .await
+        .map_err(storage_error)?;
     Ok(CollectionBudgetView {
         budget,
         is_default: false,
+        field_status: budget_field_status(),
+        today_usage: today_usage_view(usage, today),
     })
 }
 

@@ -54,6 +54,7 @@
 //!     crate::ResolverService::resolve_semantic_similarity
 //! [`GraphContextResolver`]: crate::GraphContextResolver
 
+mod ai_quota;
 mod auto_approval;
 mod conflict;
 mod error;
@@ -64,6 +65,7 @@ mod persist;
 mod semantic;
 mod service;
 
+pub use ai_quota::RelationalAiBudget;
 pub use auto_approval::{
     AutoApprovalConfig, AutoApprovalEvaluator, AutoApprovalOutcome,
     group_candidates_for_auto_approval,

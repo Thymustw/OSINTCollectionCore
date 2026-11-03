@@ -40,6 +40,8 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/collections` | viewer | 200 | cursor 分頁 |
 | GET | `/api/v1/collections/{id}` | viewer | 200 | 含三份關聯 id 清單 |
 | POST | `/api/v1/collections` | operator | 201 | 可一併 link source／connector |
+| GET | `/api/v1/collections/{id}/budget` | viewer | 200 | 含 `field_status`（六欄是否生效）與 `today_usage`。沒設過回保守預設 + `is_default=true` |
+| PUT | `/api/v1/collections/{id}/budget` | operator | 200 | 覆寫六欄；稽核 metadata 記全部六欄 |
 | GET | `/api/v1/objects` | viewer | 200 | `?object_type=`、`?include_duplicates=` |
 | GET | `/api/v1/objects/{id}` | viewer | 200 | 含 provenance 鏈、去重、entity |
 | GET | `/api/v1/objects/{id}/similar` | viewer | 200／404／409／503 | 相似文件。duplicate 409；沒向量 200 空清單 |
@@ -74,7 +76,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
 | GET | `/api/v1/ops/failed-events` | viewer | 200／503 | 永久失敗事件清單（ADR-008）。`?topic=`、`?unreplayed_only=`、`?cursor=`、`?limit=`。沒接 Postgres 回 503 |
 | POST | `/api/v1/ops/failed-events/{id}/replay` | operator | 200／404／500／503 | 把失敗事件的原始 envelope 重發回原 topic 並標記已重放。envelope 壞掉回 500，broker 不可用回 503 |
-| GET | `/api/v1/ops/discovery` | viewer | 200／503 | AI/Discovery 讀側子集。沒接 Postgres 回 503 |
+| GET | `/api/v1/ops/discovery` | viewer | 200／503 | AI/Discovery 讀側子集（含今天有用量的 collection）。沒接 Postgres 回 503 |
 | POST | `/api/v1/import` | operator | 201 | multipart |
 | POST | `/api/v1/import/stix` | operator | 202 | STIX 2.1 bundle 匯入，回 `stix_import` Job；不發 `raw.collected` |
 | POST | `/api/v1/export/stix` | operator | 202 | 回 `stix_export` Job；`filter` 可省略 |
@@ -561,7 +563,7 @@ curl -s "http://127.0.0.1:18080/api/v1/entities/$ENTITY_ID/timeline?limit=20" \
 | `/api/v1/ops/dlq` | viewer+ | 有哪些失敗的 Job（V0.1 沒有 DLQ topic） |
 | `/api/v1/ops/failed-events` | viewer+ | 有哪些**事件**永久失敗（ADR-008，跟上面的 Job 層級是兩回事） |
 | `/api/v1/ops/graph` | viewer+ | 圖投影 lag 與 rebuild 狀態 |
-| `/api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog 近似計數、最近 AI Run |
+| `/api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog 近似計數、最近 AI Run、今天有用量的 collection |
 
 Redis／Redpanda 刻意**不放進 `/ready`**：API 自己不需要它們，
 把它們塞進 `/ready` 會讓「Redis 掛了」變成「API 不接受流量」，
@@ -858,14 +860,19 @@ SPEC_V0.3 §27 的讀側子集。viewer 以上。沒接 Postgres 回 503。
     "saturated": false
   },
   "ai_run_recent": [{"id": "0199...", "task_type": "candidate_scoring", "…": "…"}],
-  "note": "P0-P4 佇列、即時 active requests/TPS/TTFT/P95、Admission Controller state…"
+  "collection_daily_usage": [
+    {"collection_id": "0199...", "date": "2026-11-04", "requests_used": 2, "ai_calls_used": 3}
+  ],
+  "collection_daily_usage_truncated": false,
+  "note": "Admission Controller 與 ObservedPressure 已在 AI 閘道落地（P0 刻意不看壓力訊號）…"
 }
 ```
 
-- `ai_max_concurrent_requests` 是 `auto_approval.llm.max_concurrent` 的**靜態設定值**，不是即時 in-flight 請求數。系統目前沒有任何地方在計數「現在有幾個 AI 呼叫正在進行」。
+- `ai_max_concurrent_requests` 是 `auto_approval.llm.max_concurrent` 的**靜態設定值**，不是即時 in-flight 請求數。
 - `candidate_backlog` 是近似值：對每個 `CandidateStatus` 各撈一次（上限 100，對齊 storage 的 `clamp_limit`）取 `.len()`。某個 status 超過上限時 `saturated: true`，代表「至少有這麼多」而不是「剛好這麼多」。沒有 COUNT 查詢可用。
 - `ai_run_recent` 與 `GET /ai/runs` 是同一份資料，這裡只回最近 20 筆；完整清單請走那個 endpoint。
-- `note` 重述尚未掛上這個 endpoint 的項目：P0–P4 佇列深度、即時 TPS/TTFT/P95、Admission Controller state、pause/resume/drain。Admission Controller **本體**已在 `ai-gateway`（V0.3 Phase 5）落地，但這個讀側 endpoint 還沒把它曝露出來。缺的欄位不代表系統沒有問題。
+- `collection_daily_usage` 只含今天有用量的 collection（上限 50）。撞上限時 `collection_daily_usage_truncated: true`。
+- `note` 重述：Admission Controller／`ObservedPressure` 已在閘道落地（P0 刻意不看壓力），這個端點仍無 P0–P4 佇列快照、pause／resume／drain、即時 TPS／TTFT。缺的欄位不代表系統沒有問題。
 
 ## API token 管理（`/api/v1/tokens`，admin-only）
 

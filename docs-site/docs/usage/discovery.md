@@ -139,15 +139,16 @@ entity_extractions
 | `max_candidates_per_run` | 單次 run 最多產生幾筆候選，超過的截斷 | 200 | 生效 |
 | `max_depth` | Discovery 展開的最大深度 | 3 | 生效 |
 | `daily_request_budget` | 這個 Collection 每日最多幾次 Discovery 擴張（跨多次 run 累計，每次擴張消耗 1） | 5,000 | 生效 |
-| `max_requests_per_run` | 單次 run 最多發出幾次外部請求 | 500 | **尚未生效** |
-| `max_ai_calls_per_run` | 單次 run 最多呼叫幾次 AI | 50 | **尚未生效** |
-| `daily_ai_budget` | 每日最多幾次 AI 呼叫 | 500 | **尚未生效** |
+| `max_requests_per_run` | 單次 run 最多發出幾次外部請求 | 500 | **尚未生效**（沒有 Discovery 方法會對外部發出 HTTP；不是無限制） |
+| `max_ai_calls_per_run` | 單次 run 最多呼叫幾次 AI | 50 | 閘道已對 Collection 帳戶生效；目前生產呼叫端不走 Collection 帳戶，實際消耗 0 |
+| `daily_ai_budget` | 每日最多幾次 AI 呼叫 | 500 | 閘道已對 Collection 帳戶生效；目前生產呼叫端不走 Collection 帳戶，實際消耗 0 |
 
 沒有明確設定時，系統退回上面的保守預設值——沒有設定不代表沒有限制。
+`GET /api/v1/collections/{id}/budget` 會回 `field_status`（哪一欄已生效）與 `today_usage`（今天用了多少）。
 
-!!! warning "三個欄位目前沒有作用"
-    `max_requests_per_run`、`max_ai_calls_per_run`、`daily_ai_budget` 可以設定、會被儲存與回傳，
-    但目前沒有任何執行流程讀取它們。設成很小的值也不會限制任何東西。
+!!! warning "`max_requests_per_run` 目前沒有作用"
+    這個欄位可以設定、會被儲存與回傳，但目前沒有任何執行流程讀取它。設成很小的值也不會限制任何東西。
+    AI 日額度已接到閘道，但自動核准走系統帳戶、不消耗 Collection 額度。
     見[目前的限制](../architecture/limitations.md)。
 
 當日 `daily_request_budget` 已用完，或 `depth + 1 > max_depth` 時，Discovery 會直接拒絕而不是部分執行。

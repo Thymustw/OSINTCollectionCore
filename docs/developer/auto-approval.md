@@ -131,9 +131,13 @@ LLM 預期回傳以下格式的 JSON：
 | `p0_reserved_capacity` | 硬編 `2` | P0 同時進行上限。沒有壓測數據，2 是保守起點 |
 | `shared_capacity` | `auto_approval.llm.max_concurrent` | P1–P4 共用名額，沿用既有並發上限以免縮水 |
 
-資源壓力訊號這輪只有 `StaticPressure`（永遠 `Normal`），沒有真實 GPU 監控。
-被拒時 LLM 呼叫回 `AiGatewayError::Transient`，評估器收斂成 `Pending`，
-不會擋住 ingestion。
+資源壓力訊號生產組裝注入 `ObservedPressure`（近期延遲 P95、429／逾時／5xx
+比例、admission 排隊人數）。門檻在 `[ai_gateway.pressure]`，**推測值、未做
+容量測試**。P0 刻意不看壓力。`StaticPressure` 仍給測試用。AutoApproval 帳戶
+固定 `AiAccount::System`，不扣 collection 的 `daily_ai_budget`。
+被拒時 LLM 呼叫回 `AiGatewayError::Transient`（admission／HTTP）或
+`QuotaExceeded`／`QuotaUnavailable`（額度；AutoApproval 走 System 所以不會
+碰到），評估器收斂成 `Pending`，不會擋住 ingestion。
 
 ### 門檻自洽檢查
 
@@ -280,16 +284,25 @@ ORDER BY created_at DESC;
 
 ### Metrics
 
-Admission Controller 已寫入 `MetricsRegistry`（`/metrics` Prometheus text）：
+Admission Controller 已寫入 `MetricsRegistry`（`/metrics` Prometheus text）。
+`MetricsRegistry` **沒有 label**，拒絕原因用獨立 counter 拆開，不是在同一個
+metric 上加 label：
 
 - `osint_ai_admission_p0_available`（gauge）——P0 剩餘保留名額
 - `osint_ai_admission_shared_available`（gauge）——P1–P4 共用佇列剩餘名額
-- `osint_ai_admission_rejected_total`（counter）——admission 被拒次數
+- `osint_ai_admission_rejected_total`（counter）——admission 被拒次數（合計）
+- `osint_ai_admission_rejected_p0_busy_total`（counter）——P0 名額已滿
+- `osint_ai_admission_rejected_pressure_total`（counter）——被壓力訊號擋下
+- `osint_ai_quota_rejected_total`（counter）——額度拒絕（含 fail-closed）
+- `osint_ai_http_429_total`／`osint_ai_http_timeout_total`／
+  `osint_ai_http_5xx_total`（counter）——後端 HTTP 分類
+- `osint_ai_inflight_requests`（gauge）——正在飛的請求數
+- `osint_ai_pressure_state`（gauge，0–3）——Normal／Elevated／High／Critical
 
-這些值在每次 `chat_completion` 通過（或拒絕）admission 時更新（gauge 走
+這些值在每次 `chat_completion` 通過（或拒絕）admission／額度時更新（gauge 走
 `MetricsRegistry::set_gauge`，跟 `inc()` 的 counter 分開存放，Prometheus
 輸出是 `# TYPE … gauge`）。`metrics: None` 時不記錄（測試 fixture 與未接
-registry 的組裝點）。
+registry 的組裝點）。額度拒絕用 `debug!` 記（避免刷版），後端不可用才 `warn!`。
 
 ADR-012 記錄、尚未實作的 metric：
 

@@ -20,7 +20,7 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
     BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor,
-    ConnectorRunStateUpdate, DailyUsage, HealthProvider, JobPurgeFilter,
+    CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage, HealthProvider, JobPurgeFilter,
     RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RelationalStore, SimhashCandidate, StorageAdapter,
     StorageError, StorageHealth, Transaction, TransactionalStore,
 };
@@ -3333,5 +3333,28 @@ impl RelationalStore for PostgresCanonicalStore {
                 ai_calls_used: 0,
             },
         })
+    }
+
+    async fn list_daily_usage(
+        &self,
+        date: NaiveDate,
+        limit: u32,
+    ) -> Result<Vec<CollectionDailyUsage>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT collection_id, usage_date, requests_used, ai_calls_used
+            FROM discovery_daily_usage
+            WHERE usage_date = $1
+              AND (requests_used > 0 OR ai_calls_used > 0)
+            ORDER BY ai_calls_used DESC, requests_used DESC, collection_id
+            LIMIT $2
+            "#,
+        )
+        .bind(date)
+        .bind(clamp_limit(limit))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::collection_daily_usage).collect()
     }
 }

@@ -57,6 +57,8 @@ dependencies = [
 name = "ai-gateway"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
  "core-observability",
  "reqwest",
  "serde",
@@ -64,6 +66,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 
@@ -778,6 +781,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "stix-adapter",
  "storage-core",
  "storage-neo4j",

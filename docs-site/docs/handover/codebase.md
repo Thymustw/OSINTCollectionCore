@@ -119,7 +119,7 @@
 | `merge` | 執行一次實體合併與復原：在一筆交易裡改寫所有參照、記錄合併歷史。**不產生候選**（那是 `resolver` 的事） | `core-api`、`resolver` |
 | `import-format` | JSON／CSV 匯入的欄位對映與有界解析。API 收檔時先解析一次、`normalizer` 產生 Document 時再解析一次，兩邊共用同一份實作 | `core-api`、`normalizer` |
 | `stix-adapter` | STIX 2.1 型別、bundle 驗證、與內部物件的雙向映射。純函式，不碰儲存 | `core-api`、`stix-worker` |
-| `ai-gateway` | 生成式 AI 呼叫的抽象層：OpenAI 相容端點的實作、測試用 mock、重試、限流、成本計算、敏感資訊遮蔽、依優先權的併發控管（Admission Controller） | `core-api`、`resolver`、`stix-worker` |
+| `ai-gateway` | 生成式 AI 呼叫的抽象層：OpenAI 相容端點的實作、測試用 mock、重試、限流、成本計算、敏感資訊遮蔽、依優先權的併發控管（Admission Controller）、觀測壓力訊號、Collection AI 額度 | `core-api`、`resolver`、`stix-worker` |
 
 !!! note "有些服務 crate 也被當函式庫用"
     `indexer`（搜尋查詢語法與索引 schema）、`entity-worker`（衍生 ID 的產生規則）、

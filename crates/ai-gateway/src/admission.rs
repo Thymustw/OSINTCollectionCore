@@ -29,14 +29,43 @@ pub enum ResourcePressure {
     Critical,
 }
 
-/// 讀取目前資源壓力的介面。這輪唯一實作是 [`StaticPressure`]（永遠回
-/// Normal）——沒有 GPU 監控來源，不假裝有。未來要接真實 GPU/RAM 監控時
-/// 實作這個 trait 即可，不用改 [`AdmissionController`] 本身的邏輯。
+impl ResourcePressure {
+    /// 壓力等級，數字越大越緊。給遲滯比較與 Prometheus gauge 用。
+    #[must_use]
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Elevated => 1,
+            Self::High => 2,
+            Self::Critical => 3,
+        }
+    }
+
+    /// `osint_ai_pressure_state` gauge：0=Normal … 3=Critical。
+    #[must_use]
+    pub const fn as_gauge(self) -> u64 {
+        self.severity() as u64
+    }
+}
+
+/// 讀取目前資源壓力的介面。
+///
+/// 生產路徑用 [`crate::ObservedPressure`]（滑動時間窗的延遲／429／逾時／5xx／
+/// 排隊深度）。[`StaticPressure`] 留給測試與「尚未注入觀測」的組裝點，
+/// 永遠回 Normal。這不是 GPU／主機 RAM 監控——那些訊號這台機器上沒有
+/// 可驗證的來源，不假裝有。
 pub trait PressureSource: Send + Sync {
     fn current(&self) -> ResourcePressure;
 }
 
-/// 這輪唯一的 [`PressureSource`] 實作：永遠回報 Normal。
+impl<T: PressureSource + ?Sized> PressureSource for Arc<T> {
+    fn current(&self) -> ResourcePressure {
+        (**self).current()
+    }
+}
+
+/// 永遠回報 Normal 的 [`PressureSource`]。測試與未注入 [`crate::ObservedPressure`]
+/// 時使用。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StaticPressure;
 
@@ -102,6 +131,11 @@ impl<P: PressureSource> AdmissionController<P> {
     }
 
     /// P0：立刻嘗試拿保留名額，拿不到直接回錯誤，不等待。
+    ///
+    /// **刻意不看 [`PressureSource`]。** P0 是使用者在等的互動請求
+    /// （目前唯一生產呼叫端是 AutoApproval 的 HTTP resolve），壓力再高
+    /// 也不該讓互動路徑被背景負載連帶拒絕。P1–P4 才走 [`Self::admit`]
+    /// 的降級表。這是契約，不是漏接。
     pub fn try_admit_p0(&self) -> Result<AdmitGuard, AdmissionError> {
         self.reserved_p0
             .clone()

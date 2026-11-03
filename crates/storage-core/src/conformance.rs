@@ -4063,6 +4063,10 @@ async fn assert_v0_3_discovery_queries<S: RelationalStore>(
 /// 6. 單次 `by` 就超過 `budget`（全新一天，目前用量是 0）必須直接拒絕——
 ///    這是兩段式 SQL 要防的那個邊界情況（見派工說明的「關鍵設計」一節），
 ///    不能因為是全新一天就無條件放行第一筆。
+/// 7. `list_daily_usage` 只回有用量的列，且 `ai_calls_used DESC` 排在前面。
+///    日期綁 collection id：這支 API 是整天跨 collection 的清單，固定日期
+///    會被共用 Postgres 上前幾輪 conformance 殘留列塞滿 `limit`，把本輪
+///    新建的 collection 擠掉（2022-06-15 實測過）。
 async fn assert_v0_3_budget_queries<S: RelationalStore>(
     store: &S,
     collection: &Collection,
@@ -4162,7 +4166,10 @@ async fn assert_v0_3_budget_queries<S: RelationalStore>(
     }
 
     // --- daily_request_budget 與 daily_ai_budget 是獨立計數器 -------------------
-    let ai_date = NaiveDate::from_ymd_opt(2022, 6, 15).expect("合法日期");
+    // 日期從 1970-01-01 起算、綁 collection id，範圍停在 1997 之前，
+    // 避開本函式其他固定日期（2019-01-01／2020-01-01／2021-01-01／2023-03-03）。
+    let ai_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("合法日期")
+        + chrono::Duration::days((collection.id.as_u128() % 10_000) as i64);
     let ai_result = store
         .try_consume_daily_ai_budget(collection.id, ai_date, 3, 10)
         .await?;
@@ -4205,6 +4212,49 @@ async fn assert_v0_3_budget_queries<S: RelationalStore>(
                 "被拒絕且是全新一天，used_after 應該是 0，實際 {}",
                 overflow_result.used_after
             ),
+        });
+    }
+
+    // --- list_daily_usage：只回有用量的列，用量高的排前面 -------------------
+    let other = conformance_collection(format!("list-usage-{}", collection.id));
+    store.put_collection(&other).await?;
+    let other_ai = store
+        .try_consume_daily_ai_budget(other.id, ai_date, 7, 10)
+        .await?;
+    if !other_ai.allowed || other_ai.used_after != 7 {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("排序對照 collection 消耗 7 次應該成功，實際 {other_ai:?}"),
+        });
+    }
+    let listed = store.list_daily_usage(ai_date, 10).await?;
+    let pos_self = listed
+        .iter()
+        .position(|row| row.collection_id == collection.id && row.ai_calls_used == 3);
+    let pos_other = listed
+        .iter()
+        .position(|row| row.collection_id == other.id && row.ai_calls_used == 7);
+    match (pos_self, pos_other) {
+        (Some(self_idx), Some(other_idx)) if other_idx < self_idx => {}
+        _ => {
+            return Err(StorageError::Unknown {
+                backend: "conformance",
+                message: format!(
+                    "list_daily_usage({ai_date}) 應含 ai_calls_used=7 的對照 collection，\
+                     且排在本 collection（ai_calls_used=3）前面，實際 {listed:?}"
+                ),
+            });
+        }
+    }
+    let empty_day = NaiveDate::from_ymd_opt(2019, 1, 1).expect("合法日期");
+    let empty_list = store.list_daily_usage(empty_day, 10).await?;
+    if empty_list
+        .iter()
+        .any(|row| row.collection_id == collection.id)
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: format!("沒用量的一天不該列出本 collection，實際 {empty_list:?}"),
         });
     }
 

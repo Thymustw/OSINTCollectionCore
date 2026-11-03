@@ -1245,6 +1245,15 @@ pub trait RelationalStore: HealthProvider {
         collection_id: CollectionId,
         date: NaiveDate,
     ) -> Result<DailyUsage, StorageError>;
+    /// 列出某天**有用量**的 collection（`requests_used > 0 OR ai_calls_used > 0`）。
+    /// 給 `GET /ops/discovery` 用，避免對每個 collection 做 N+1。
+    /// `limit` 由 adapter 夾在 1..=100。
+    /// 排序：`ai_calls_used DESC, requests_used DESC, collection_id`。
+    async fn list_daily_usage(
+        &self,
+        date: NaiveDate,
+        limit: u32,
+    ) -> Result<Vec<CollectionDailyUsage>, StorageError>;
 }
 
 /// [`RelationalStore::record_candidate_discovery`] 的結果。
@@ -1272,6 +1281,15 @@ pub struct BudgetConsumption {
 /// [`RelationalStore::get_daily_usage`] 的結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DailyUsage {
+    pub requests_used: i64,
+    pub ai_calls_used: i64,
+}
+
+/// [`RelationalStore::list_daily_usage`] 的一列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionDailyUsage {
+    pub collection_id: CollectionId,
+    pub date: NaiveDate,
     pub requests_used: i64,
     pub ai_calls_used: i64,
 }

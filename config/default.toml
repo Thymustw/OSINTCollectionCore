@@ -263,6 +263,32 @@ temperature = 0.0
 # entity resolution 是結構化輸入上的二元判斷，預設關閉推理以省 token。
 enable_reasoning = false
 
+# AI 閘道壓力訊號（ObservedPressure）。看的是櫃台自己感受到的忙碌程度
+# （近期延遲、429／逾時／5xx 比例、admission 排隊人數），不是 GPU／主機 RAM。
+# 以下數字全部是推測值，未做容量測試；換部署或真實流量來了之後應重測。
+# enabled = false 時永遠回 Normal（仍可記錄樣本與 metric）。
+# P0 刻意不看這個訊號（互動路徑不被背景負載連帶拒絕）。
+[ai_gateway.pressure]
+enabled = true
+window_secs = 30
+min_samples = 5
+cooldown_secs = 15
+elevated_p95_ms = 5000
+high_p95_ms = 15000
+critical_p95_ms = 30000
+elevated_429_ratio = 0.10
+high_429_ratio = 0.25
+critical_429_ratio = 0.50
+elevated_timeout_ratio = 0.05
+high_timeout_ratio = 0.15
+critical_timeout_ratio = 0.30
+elevated_5xx_ratio = 0.05
+high_5xx_ratio = 0.15
+critical_5xx_ratio = 0.30
+elevated_queue = 2
+high_queue = 8
+critical_queue = 16
+
 # jobs 保留期限。只清 collect 類終態；其他 job type（stix_export／graph_rebuild…）
 # 不在這份規則裡，不會被排程刪。failed_events／audit_log 也不做——
 # 前者清掉就丟失可重放 envelope（ADR-008），後者是 append-only

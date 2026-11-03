@@ -87,7 +87,7 @@ curl -s http://127.0.0.1:18080/api/v1/ops/health \
 | `GET /api/v1/ops/dlq` | 失敗 Job 列表（`?type=` 依種類過濾；目前不設獨立 DLQ topic，失敗 Job 可用 `POST /api/v1/jobs/{id}/retry` 重試） |
 | `GET /api/v1/ops/failed-events` | 處理失敗的事件記錄 |
 | `GET /api/v1/ops/graph` | 圖投影（Neo4j）的 lag 與最近一次 rebuild 狀態 |
-| `GET /api/v1/ops/discovery` | Discovery 的 AI 並發上限、Candidate 各狀態數量、最近 AI Run 歷史 |
+| `GET /api/v1/ops/discovery` | Discovery 的 AI 並發上限、Candidate 各狀態數量、最近 AI Run 歷史、今天有用量的 collection |
 
 重送失敗事件需要 operator 以上：
 

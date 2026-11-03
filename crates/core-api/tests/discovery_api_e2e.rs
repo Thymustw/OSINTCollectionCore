@@ -738,9 +738,81 @@ async fn ops_discovery_returns_backlog_and_recent_ai_runs() {
     );
     let note = resp["note"].as_str().unwrap();
     assert!(
-        note.contains("Phase 5"),
-        "note 要講清楚延後項目，避免呼叫端把缺欄位當成系統沒問題：{resp}"
+        note.contains("ObservedPressure"),
+        "note 要講清楚 Admission／壓力訊號已落地、這個端點仍無佇列快照：{resp}"
     );
+    assert!(note.contains("P0"), "note 要講 P0 刻意不看壓力訊號：{resp}");
+    assert!(
+        resp["collection_daily_usage"].is_array(),
+        "今天有用量的 collection 清單必須存在：{resp}"
+    );
+    assert!(
+        resp["collection_daily_usage_truncated"].is_boolean(),
+        "截斷旗標必須存在：{resp}"
+    );
+}
+
+/// `GET /ops/discovery` 列出今天有用量的 collection。測完刪自己寫的列，
+/// 避免污染共用開發 DB（今天的用量會出現在後續呼叫裡）。
+#[tokio::test]
+async fn ops_discovery_lists_today_usage_then_cleans_up() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let now = Utc::now();
+    let collection = Collection {
+        id: Uuid::now_v7(),
+        workspace_id: None,
+        name: "ds-e2e-daily-usage".into(),
+        description: None,
+        status: "active".into(),
+        priority: 3,
+        created_at: now,
+        updated_at: now,
+    };
+    stack
+        .pg
+        .put_collection(&collection)
+        .await
+        .expect("seed collection");
+    let today = now.date_naive();
+    let ai = stack
+        .pg
+        .try_consume_daily_ai_budget(collection.id, today, 3, 500)
+        .await
+        .expect("consume ai");
+    assert!(ai.allowed, "{ai:?}");
+    let req = stack
+        .pg
+        .try_consume_daily_request_budget(collection.id, today, 2, 5_000)
+        .await
+        .expect("consume requests");
+    assert!(req.allowed, "{req:?}");
+
+    let (status, resp) = send(&api.app, get("/api/v1/ops/discovery", &api.viewer)).await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let rows = resp["collection_daily_usage"]
+        .as_array()
+        .unwrap_or_else(|| panic!("collection_daily_usage 必須是陣列：{resp}"));
+    let collection_id = collection.id.to_string();
+    let found = rows
+        .iter()
+        .find(|row| row["collection_id"].as_str() == Some(collection_id.as_str()));
+    assert!(
+        found.is_some(),
+        "剛消耗的 collection {collection_id} 應出現在今日用量：{resp}"
+    );
+    let found = found.unwrap();
+    assert_eq!(found["ai_calls_used"], json!(3), "{resp}");
+    assert_eq!(found["requests_used"], json!(2), "{resp}");
+    let today_text = today.to_string();
+    assert_eq!(found["date"].as_str(), Some(today_text.as_str()), "{resp}");
+
+    sqlx::query("DELETE FROM discovery_daily_usage WHERE collection_id = $1 AND usage_date = $2")
+        .bind(collection.id)
+        .bind(today)
+        .execute(stack.pg.pool())
+        .await
+        .expect("cleanup today's usage row");
 }
 
 /// viewer 讀 `/ops/discovery` 是 Read 權限，不是 403。
