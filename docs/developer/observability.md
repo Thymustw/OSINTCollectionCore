@@ -45,7 +45,7 @@ Phase 6a 起 `AuditLog` 落地到 Postgres 的 `audit_log` 表。哪些動作會
 | `GET /api/v1/ops/health` | viewer+ | **整套系統**哪一塊壞了 | 運維的人 |
 | `GET /api/v1/ops/metrics` | viewer+ | **這個行程**吃了多少記憶體／CPU | 運維的人 |
 | `GET /api/v1/ops/graph` | viewer+ | 圖投影 lag／rebuild | 運維的人 |
-| `GET /api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog、最近 AI Run、今天有用量的 collection | 運維的人 |
+| `GET /api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog、最近 AI Run、今天有用量的 collection、`event_outbox_pending` | 運維的人 |
 
 `/api/v1/ops/*` 另有七條（與上表不是「健康／指標」的分工關係，所以不列在表內）：
 `GET /ops/connectors`（連接器狀態，含 `backing_off`／`next_attempt_at`／`last_error`）、
@@ -86,6 +86,21 @@ drain 期間 `/health` 維持 200（liveness）、`/ready` 回 503（readiness�
 | `osint_jobs_purged_total` | counter | 實際刪除的 job 列數（dry-run 不計）。排程與手動端點共用；`MetricsRegistry` extra counter 不支援 label，所以不分來源 |
 
 設定見 `[retention.jobs]`。
+
+### event outbox metrics
+
+`osint-api` 的 `/metrics` 另輸出（郵差每輪更新）：
+
+| 名稱 | 類型 | 意義 |
+|---|---|---|
+| `osint_event_outbox_pending` | gauge | 待送列數（含尚未到期的退避列）。broker 掛掉或郵差沒跑時會往上爬 |
+| `osint_event_outbox_published_total` | counter | 成功送到 Redpanda 的次數 |
+| `osint_event_outbox_publish_failures_total` | counter | 本輪發送失敗（列留在表裡、依退避重試） |
+| `osint_event_outbox_oldest_pending_age_secs` | gauge | 最舊待送列的年齡（秒）。沒有待送列時為 0 |
+
+`GET /api/v1/ops/discovery` 的 `event_outbox_pending` 與 gauge 同源（當下 `count_pending_outbox()`）。
+設定見 `[event_outbox]`。broker 連不上時郵差不啟動，gauge 不會更新，請看 API 啟動 log
+「Redpanda 未連上；event_outbox 列仍會寫入，但不啟動郵差」。
 
 ### AI 閘道 metrics
 

@@ -27,7 +27,7 @@ use stix_adapter::{
     StixBundle, StixExportFilter, StixId, StixObject, entity_to_stix_object,
     relationship_to_stix_object,
 };
-use storage_core::{EmbeddingProvider, ObjectStore, StorageError, TransactionalStore};
+use storage_core::{CanonicalWriteStore, EmbeddingProvider, ObjectStore, StorageError};
 use uuid::Uuid;
 
 use crate::error::ImportError;
@@ -48,7 +48,7 @@ pub(super) struct ExportReport {
 
 impl<S, E, L, O> crate::service::StixWorker<S, E, L, O>
 where
-    S: TransactionalStore + Clone,
+    S: CanonicalWriteStore + Clone,
     E: EmbeddingProvider,
     L: LlmProvider,
     O: ObjectStore + Clone,

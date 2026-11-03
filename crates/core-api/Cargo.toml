@@ -59,8 +59,11 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+storage-sqlite = { path = "../storage-sqlite" }
 # 整合測試用的 DisableConnectorsOnDrop／測試鎖（見 storage-postgres 的 test-support feature）。
 storage-postgres = { path = "../storage-postgres", features = ["test-support"] }
+# e2e 用 EventOutboxTestSupport（依 correlation_id 找自己的列，不掃共用表）。
+storage-core = { workspace = true, features = ["test-support"] }
 # `GET /ops/discovery` 用量測試測完要刪自己寫進 `discovery_daily_usage` 的列。
 sqlx = { workspace = true, features = ["postgres"] }
 # Acceptance A/E 的完整版要真的跑一次採集→正規化→去重→抽取→索引，

@@ -9,18 +9,22 @@ pub mod conformance;
 pub mod error;
 pub mod health;
 pub mod mock;
+pub mod outbox;
 pub mod traits;
 
 pub use capability::{CapabilityDescriptor, StorageAdapter};
 pub use error::StorageError;
 pub use health::{HealthProvider, StorageHealth};
+#[cfg(feature = "test-support")]
+pub use outbox::EventOutboxTestSupport;
+pub use outbox::{EventOutboxStore, OUTBOX_CLAIM_LIMIT_MAX, OutboxEvent, clamp_outbox_limit};
 pub use traits::{
     BudgetConsumption, BulkFailure, BulkIndexResult, CandidateDiscoveryOutcome, CanonicalStore,
-    CheckpointUpdate, CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage,
-    EMBEDDING_CACHE_KEY_PREFIX, EmbeddedStore, EmbeddingKind, EmbeddingModelRef, EmbeddingProvider,
-    EmbeddingRequest, EmbeddingVector, GraphEdge, GraphNode, GraphPath, GraphPattern, GraphQuery,
-    GraphStore, GraphTraversalOptions, JobPurgeFilter, KeyValueStore, ObjectStore,
-    ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
+    CanonicalWriteStore, CheckpointUpdate, CollectionDailyUsage, ConnectorRunStateUpdate,
+    DailyUsage, EMBEDDING_CACHE_KEY_PREFIX, EmbeddedStore, EmbeddingKind, EmbeddingModelRef,
+    EmbeddingProvider, EmbeddingRequest, EmbeddingVector, GraphEdge, GraphNode, GraphPath,
+    GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, JobPurgeFilter, KeyValueStore,
+    ObjectStore, ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
     RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RebuildState, RebuildStatus, RelationalStore, SearchDocument,
     SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery, SearchStore, SimhashCandidate,
     SortField, StructuredSearch, Transaction, TransactionalStore, VectorSearch,

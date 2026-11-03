@@ -9,7 +9,7 @@ use serde_json::Value;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use storage_core::codec::{decode_enum, decode_json, decode_string_vec};
-use storage_core::{CollectionDailyUsage, SimhashCandidate, StorageError};
+use storage_core::{CollectionDailyUsage, OutboxEvent, SimhashCandidate, StorageError};
 use uuid::Uuid;
 
 use crate::error::map_sqlx;
@@ -567,6 +567,22 @@ pub fn failed_event(row: &SqliteRow) -> Result<FailedEvent, StorageError> {
         first_seen: ts(row, "first_seen")?,
         last_seen: ts(row, "last_seen")?,
         replayed_at: opt_ts(row, "replayed_at")?,
+    })
+}
+
+pub fn outbox_event(row: &SqliteRow) -> Result<OutboxEvent, StorageError> {
+    Ok(OutboxEvent {
+        id: uuid_from(row, "id")?,
+        topic: get_str(row, "topic")?,
+        partition_key: get_str(row, "partition_key")?,
+        correlation_id: opt_uuid(row, "correlation_id")?,
+        payload: json(row, "payload")?,
+        source_service: get_str(row, "source_service")?,
+        created_at: ts(row, "created_at")?,
+        attempts: i32_from(row, "attempts")?,
+        last_error: get_opt_str(row, "last_error")?,
+        next_attempt_at: ts(row, "next_attempt_at")?,
+        published_at: opt_ts(row, "published_at")?,
     })
 }
 

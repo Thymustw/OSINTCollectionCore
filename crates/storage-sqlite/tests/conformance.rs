@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use storage_core::conformance::{
     assert_candidate_natural_key, assert_collection_member_links_atomic,
-    assert_connector_run_state_partial_update, assert_embedded_health, assert_evidence_collections,
-    assert_jobs_purge, assert_list_sources_by_entity, assert_reclaim_orphan_collect_runs,
+    assert_connector_run_state_partial_update, assert_embedded_health,
+    assert_event_outbox_contract, assert_evidence_collections, assert_jobs_purge,
+    assert_list_sources_by_entity, assert_reclaim_orphan_collect_runs,
     assert_relational_round_trip, assert_transactional_contract, find_workspace_root,
 };
 use storage_sqlite::SqliteEmbeddedStore;
@@ -31,6 +32,9 @@ async fn sqlite_embedded_conformance() {
     assert_transactional_contract(&store, "sqlite")
         .await
         .expect("transactional contract");
+    assert_event_outbox_contract(&store, "sqlite")
+        .await
+        .expect("event outbox contract");
     drop(store);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));

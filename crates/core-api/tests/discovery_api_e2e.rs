@@ -9,21 +9,23 @@
 //! `put_ai_run` 塞進去（跟 `POST /api/v1/seeds` 只建立 Seed 的設計一致）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
-use core_api::{AppState, AuthState, RateLimiter, ready_always, router};
+use core_api::{AppState, AuthState, RateLimiter, envelope_from_outbox, ready_always, router};
 use core_config::ImportSection;
+use core_events::{EventConsumer, EventProducer};
 use core_jobs::JobService;
 use core_model::{AiRun, Candidate, CandidateEvidence, CandidateStatus, CandidateType, Collection};
 use core_observability::MetricsRegistry;
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use storage_core::RelationalStore;
 use storage_core::conformance::{load_workspace_dotenv, required_env, verify_not_opencti_s3};
+use storage_core::{EventOutboxStore, EventOutboxTestSupport, RelationalStore};
 use storage_postgres::PostgresCanonicalStore;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -32,6 +34,7 @@ const MAX_BODY_BYTES: u64 = 4_096;
 
 struct Stack {
     pg: PostgresCanonicalStore,
+    dsn: String,
 }
 
 async fn connect_stack() -> Stack {
@@ -47,7 +50,7 @@ async fn connect_stack() -> Stack {
         .await
         .expect("postgres");
     pg.migrate().await.expect("migrate");
-    Stack { pg }
+    Stack { pg, dsn }
 }
 
 struct TestApi {
@@ -246,6 +249,8 @@ async fn create_seed_returns_201_with_full_seed() {
         "origin": "manual",
     });
     let (status, resp) = send(&api.app, post_json("/api/v1/seeds", &api.operator, &body)).await;
+    let seed_id = resp["id"].as_str().and_then(|s| Uuid::parse_str(s).ok());
+    let _cleanup = seed_id.map(|id| E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).seed(id));
     assert_eq!(status, StatusCode::CREATED, "{resp}");
     assert!(resp["id"].as_str().is_some(), "{resp}");
     assert_eq!(resp["seed_type"], json!("keyword"), "{resp}");
@@ -273,6 +278,7 @@ async fn create_seed_with_duplicate_id_is_409() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
     let id = Uuid::now_v7();
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).seed(id);
     let body = json!({
         "id": id.to_string(),
         "seed_type": "domain",
@@ -307,8 +313,10 @@ async fn list_seeds_filters_by_status() {
         "value": "https://example.invalid/news",
         "origin": "connector",
     });
-    let (status, _) = send(&api.app, post_json("/api/v1/seeds", &api.operator, &body)).await;
-    assert_eq!(status, StatusCode::CREATED);
+    let (status, resp) = send(&api.app, post_json("/api/v1/seeds", &api.operator, &body)).await;
+    let seed_id = resp["id"].as_str().and_then(|s| Uuid::parse_str(s).ok());
+    let _cleanup = seed_id.map(|id| E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).seed(id));
+    assert_eq!(status, StatusCode::CREATED, "{resp}");
 
     let (pending, pending_body) =
         send(&api.app, get("/api/v1/seeds?status=pending", &api.viewer)).await;
@@ -344,6 +352,7 @@ async fn approve_candidate_updates_status_and_audits() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
     let candidate = put_candidate_fixture(&stack, None).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(candidate.id);
 
     let (status, resp) = send(
         &api.app,
@@ -379,6 +388,132 @@ async fn approve_candidate_updates_status_and_audits() {
 }
 
 #[tokio::test]
+async fn approve_candidate_twice_does_not_reemit_outbox() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let candidate = put_candidate_fixture(&stack, None).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(candidate.id);
+
+    let (first_status, first) = send(
+        &api.app,
+        post(
+            &format!("/api/v1/candidates/{}/approve", candidate.id),
+            &api.operator,
+        ),
+    )
+    .await;
+    assert_eq!(first_status, StatusCode::OK, "{first}");
+    assert_eq!(first["status"], json!("approved"), "{first}");
+    let after_first =
+        count_outbox_for_payload(&stack, "candidate.approved", "candidate_id", candidate.id).await;
+    assert_eq!(after_first, 1, "第一次核准應寫一列 candidate.approved");
+
+    let (second_status, second) = send(
+        &api.app,
+        post(
+            &format!("/api/v1/candidates/{}/approve", candidate.id),
+            &api.operator,
+        ),
+    )
+    .await;
+    assert_eq!(second_status, StatusCode::OK, "{second}");
+    assert_eq!(second["status"], json!("approved"), "{second}");
+    let after_second =
+        count_outbox_for_payload(&stack, "candidate.approved", "candidate_id", candidate.id).await;
+    assert_eq!(after_second, 1, "重複核准不可再寫 candidate.approved");
+}
+
+/// 真實 Redpanda：建立 seed、核准 candidate，郵差送出後從正式 topic 消費。
+/// 測完刪自己的 outbox 列；正式 V0.3 topic 留下。
+#[tokio::test]
+async fn outbox_relay_publishes_seed_created_and_candidate_approved() {
+    let stack = connect_stack().await;
+    let api = build_api(&stack);
+    let brokers = required_env("REDPANDA_BROKERS")
+        .or_else(|_| required_env("OSINT__BROKER__BROKERS"))
+        .unwrap_or_else(|_| "127.0.0.1:9092".into());
+    assert!(
+        brokers.contains("127.0.0.1") || brokers.contains("localhost"),
+        "e2e 只連本機 Redpanda，實際 brokers={brokers}"
+    );
+
+    let seed_value = format!("outbox-e2e-{}", Uuid::now_v7().simple());
+    let (seed_status, seed_resp) = send(
+        &api.app,
+        post_json(
+            "/api/v1/seeds",
+            &api.operator,
+            &json!({
+                "seed_type": "keyword",
+                "value": seed_value,
+                "origin": "manual",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(seed_status, StatusCode::CREATED, "{seed_resp}");
+    let seed_id = Uuid::parse_str(seed_resp["id"].as_str().expect("seed id")).expect("uuid");
+    let mut cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).seed(seed_id);
+
+    let candidate = put_candidate_fixture(&stack, None).await;
+    cleanup.track_candidate(candidate.id);
+    let _cleanup = cleanup;
+    let (approve_status, approve_resp) = send(
+        &api.app,
+        post(
+            &format!("/api/v1/candidates/{}/approve", candidate.id),
+            &api.operator,
+        ),
+    )
+    .await;
+    assert_eq!(approve_status, StatusCode::OK, "{approve_resp}");
+
+    let group = format!("osint-outbox-e2e-{}", Uuid::now_v7());
+    let consumer =
+        EventConsumer::connect(&brokers, &group, &["seed.created", "candidate.approved"])
+            .expect("建立 consumer。請確認 osint-core-redpanda-1 在跑（埠 9092）");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let producer = EventProducer::connect(&brokers, "core-api-outbox-e2e")
+        .expect("建立 producer。請確認 Redpanda healthy");
+    relay_own_outbox_rows(&stack, &producer, &[seed_id, candidate.id]).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let seed_id_text = seed_id.to_string();
+    let candidate_id_text = candidate.id.to_string();
+    let mut saw_seed = false;
+    let mut saw_approved = false;
+    while tokio::time::Instant::now() < deadline && !(saw_seed && saw_approved) {
+        if let Ok(envelope) = consumer.next_envelope(Duration::from_secs(2)).await {
+            if envelope.event_type == "seed.created"
+                && envelope.payload.get("seed_id").and_then(Value::as_str)
+                    == Some(seed_id_text.as_str())
+            {
+                saw_seed = true;
+            }
+            if envelope.event_type == "candidate.approved"
+                && envelope.payload.get("candidate_id").and_then(Value::as_str)
+                    == Some(candidate_id_text.as_str())
+            {
+                saw_approved = true;
+            }
+        }
+    }
+    assert!(
+        saw_seed,
+        "30 秒內沒收到 seed.created（seed_id={seed_id}）。請確認 Redpanda 與 event_outbox 列"
+    );
+    assert!(
+        saw_approved,
+        "30 秒內沒收到 candidate.approved（candidate_id={}）。請確認 Redpanda 與 event_outbox 列",
+        candidate.id
+    );
+
+    drop(consumer);
+}
+
+/// 打不存在的 id：沒有 candidate 列、handler 在 enqueue 前就 404，不寫 outbox。
+#[tokio::test]
 async fn approve_missing_candidate_is_404() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
@@ -405,6 +540,7 @@ async fn reject_candidate_audits_reject_action() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
     let candidate = put_candidate_fixture(&stack, None).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(candidate.id);
     let (status, resp) = send(
         &api.app,
         post(
@@ -434,6 +570,7 @@ async fn approve_url_candidate_with_non_absolute_value_is_400() {
     // （`javascript:` 這類 opaque URL 是第二道 scheme 白名單擋的，見下面
     // `approve_url_candidate_with_non_http_scheme_is_400`。）
     let candidate = put_url_candidate_fixture(&stack, "path-without-scheme".into()).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(candidate.id);
 
     let (status, resp) = send(
         &api.app,
@@ -464,6 +601,7 @@ async fn approve_url_candidate_with_valid_absolute_url_succeeds() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
     let candidate = put_url_candidate_fixture(&stack, "https://example.com/path".into()).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(candidate.id);
 
     let (status, resp) = send(
         &api.app,
@@ -483,6 +621,7 @@ async fn approve_url_candidate_with_valid_absolute_url_succeeds() {
 async fn approve_url_candidate_with_non_http_scheme_is_400() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
+    let mut cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone());
     for value in [
         "javascript:alert(1)",
         "data:text/html,x",
@@ -490,6 +629,7 @@ async fn approve_url_candidate_with_non_http_scheme_is_400() {
         "ftp://x",
     ] {
         let candidate = put_url_candidate_fixture(&stack, value.into()).await;
+        cleanup.track_candidate(candidate.id);
         let (status, resp) = send(
             &api.app,
             post(
@@ -516,6 +656,7 @@ async fn approve_url_candidate_with_non_http_scheme_is_400() {
             "被拒後不可改狀態（`{value}`）：{get_resp}"
         );
     }
+    drop(cleanup);
 }
 
 #[tokio::test]
@@ -524,6 +665,7 @@ async fn reject_url_candidate_ignores_url_validation() {
     let api = build_api(&stack);
     // 跟前一筆 approve 測試相同的不合法 URL：reject 必須照樣成功，不被擋住。
     let candidate = put_url_candidate_fixture(&stack, "path-without-scheme".into()).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(candidate.id);
 
     let (status, resp) = send(
         &api.app,
@@ -542,6 +684,7 @@ async fn get_candidate_detail_includes_evidence() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
     let candidate = put_candidate_fixture(&stack, None).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(candidate.id);
     let evidence = put_evidence_fixture(&stack, candidate.id).await;
 
     let (status, resp) = send(
@@ -589,6 +732,9 @@ async fn collection_discovery_lists_only_that_collection() {
     let collection_id = collection.id;
     let in_collection = put_candidate_fixture(&stack, Some(collection_id)).await;
     let orphan = put_candidate_fixture(&stack, None).await;
+    let _cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone())
+        .candidate(in_collection.id)
+        .candidate(orphan.id);
 
     let (status, resp) = send(
         &api.app,
@@ -612,6 +758,7 @@ async fn collection_discovery_lists_only_that_collection() {
     assert!(!ids.iter().any(|id| *id == orphan.id.to_string()), "{resp}");
 }
 
+/// 打不存在的 collection：沒有 candidate／outbox 列可刪。
 #[tokio::test]
 async fn collection_discovery_missing_collection_is_404() {
     let stack = connect_stack().await;
@@ -636,6 +783,7 @@ async fn collection_discovery_missing_collection_is_404() {
 
 // ---------------------------------------------------------------- ai runs
 
+/// 直接 `put_ai_run`，不經 8 個 send point，不寫 outbox。ai_runs 列不在本次清理範圍。
 #[tokio::test]
 async fn list_and_get_ai_runs() {
     let stack = connect_stack().await;
@@ -685,6 +833,7 @@ async fn ops_discovery_returns_backlog_and_recent_ai_runs() {
     let stack = connect_stack().await;
     let api = build_api(&stack);
     let pending = put_candidate_fixture(&stack, None).await;
+    let mut cleanup = E2eDiscoveryRowsOnDrop::from_dsn(stack.dsn.clone()).candidate(pending.id);
     let (approve_status, _) = send(
         &api.app,
         post(
@@ -695,6 +844,7 @@ async fn ops_discovery_returns_backlog_and_recent_ai_runs() {
     .await;
     assert_eq!(approve_status, StatusCode::OK);
     let still_pending = put_candidate_fixture(&stack, None).await;
+    cleanup.track_candidate(still_pending.id);
     let run = put_ai_run_fixture(&stack, "candidate_scoring").await;
 
     let (status, resp) = send(&api.app, get("/api/v1/ops/discovery", &api.viewer)).await;
@@ -750,6 +900,15 @@ async fn ops_discovery_returns_backlog_and_recent_ai_runs() {
         resp["collection_daily_usage_truncated"].is_boolean(),
         "截斷旗標必須存在：{resp}"
     );
+    assert!(
+        resp["event_outbox_pending"].as_u64().is_some(),
+        "event_outbox 待送列數必須存在：{resp}"
+    );
+    assert!(
+        note.contains("event_outbox"),
+        "note 要提到 event_outbox 待送列數：{resp}"
+    );
+    drop(cleanup);
 }
 
 /// `GET /ops/discovery` 列出今天有用量的 collection。測完刪自己寫的列，
@@ -816,6 +975,7 @@ async fn ops_discovery_lists_today_usage_then_cleans_up() {
 }
 
 /// viewer 讀 `/ops/discovery` 是 Read 權限，不是 403。
+/// 只讀 ops，不建立 seed／candidate／outbox。
 #[tokio::test]
 async fn viewer_may_read_ops_discovery() {
     let stack = connect_stack().await;
@@ -827,6 +987,7 @@ async fn viewer_may_read_ops_discovery() {
 
 // ---------------------------------------------------------------- rbac
 
+/// viewer 403：沒寫 seed 列，也不寫 outbox。
 #[tokio::test]
 async fn viewer_cannot_create_seed() {
     let stack = connect_stack().await;
@@ -850,6 +1011,7 @@ async fn viewer_cannot_create_seed() {
 
 // ---------------------------------------------------------------- discovery run
 
+/// 只建立 queued Job；`discovery.completed` 是 worker 寫終態時才進 outbox。
 #[tokio::test]
 async fn run_discovery_creates_and_dispatches_job() {
     let stack = connect_stack().await;
@@ -879,6 +1041,7 @@ async fn run_discovery_creates_and_dispatches_job() {
     assert_eq!(resp["parameters"]["depth"], json!(0), "{resp}");
 }
 
+/// 只建立 queued Job；不寫 `discovery.completed` outbox。
 #[tokio::test]
 async fn run_discovery_writes_success_audit() {
     let stack = connect_stack().await;
@@ -906,6 +1069,7 @@ async fn run_discovery_writes_success_audit() {
     );
 }
 
+/// 只建立 queued Job；不寫 `discovery.completed` outbox。
 #[tokio::test]
 async fn discover_from_entity_creates_job_with_path_entity_id() {
     let stack = connect_stack().await;
@@ -941,6 +1105,7 @@ async fn discover_from_entity_creates_job_with_path_entity_id() {
     assert_eq!(resp["parameters"]["depth"], json!(0), "{resp}");
 }
 
+/// viewer 403：沒建立 Job，也不寫 outbox。
 #[tokio::test]
 async fn viewer_cannot_run_discovery() {
     let stack = connect_stack().await;
@@ -974,4 +1139,182 @@ fn post(uri: &str, token: &str) -> Request<Body> {
         .header("Authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap()
+}
+
+async fn count_outbox_for_payload(stack: &Stack, topic: &str, payload_key: &str, id: Uuid) -> i64 {
+    let id_text = id.to_string();
+    let (count,): (i64,) = match payload_key {
+        "candidate_id" => sqlx::query_as(
+            "SELECT count(*) FROM event_outbox WHERE topic = $1 AND payload->>'candidate_id' = $2",
+        )
+        .bind(topic)
+        .bind(&id_text)
+        .fetch_one(stack.pg.pool())
+        .await
+        .expect("count event_outbox"),
+        "seed_id" => sqlx::query_as(
+            "SELECT count(*) FROM event_outbox WHERE topic = $1 AND payload->>'seed_id' = $2",
+        )
+        .bind(topic)
+        .bind(&id_text)
+        .fetch_one(stack.pg.pool())
+        .await
+        .expect("count event_outbox"),
+        other => panic!("count_outbox_for_payload 不認得 payload_key `{other}`"),
+    };
+    count
+}
+
+/// 只 claim／發送這幾個 correlation_id 的列，不掃共用表。
+async fn relay_own_outbox_rows(stack: &Stack, producer: &EventProducer, correlation_ids: &[Uuid]) {
+    let now = Utc::now();
+    let lease = now + chrono::Duration::seconds(30);
+    for correlation_id in correlation_ids {
+        let rows = stack
+            .pg
+            .list_outbox_by_correlation_id(*correlation_id)
+            .await
+            .expect("list own outbox");
+        for row in rows {
+            if row.published_at.is_some() {
+                continue;
+            }
+            let claimed = stack
+                .pg
+                .claim_outbox_by_id(row.id, now, lease)
+                .await
+                .expect("claim own outbox");
+            let Some(claimed) = claimed else {
+                continue;
+            };
+            let envelope = envelope_from_outbox(&claimed);
+            producer
+                .publish_to_topic(&claimed.topic, Some(&claimed.partition_key), &envelope)
+                .await
+                .expect("publish own outbox");
+            stack
+                .pg
+                .mark_outbox_published(claimed.id, Utc::now())
+                .await
+                .expect("mark own outbox published");
+        }
+    }
+}
+
+/// e2e 結束（含 panic）時刪自己的 outbox／seed／candidate／candidate_evidence。
+///
+/// `seed_ids`／`candidate_ids` 可只填一邊。刪 candidate 前先刪
+/// `candidate_evidence`（FK 沒有 ON DELETE CASCADE）。
+#[must_use = "不綁成變數會立刻 drop，測試列還沒寫就被刪"]
+struct E2eDiscoveryRowsOnDrop {
+    dsn: String,
+    seed_ids: Vec<Uuid>,
+    candidate_ids: Vec<Uuid>,
+}
+
+impl E2eDiscoveryRowsOnDrop {
+    fn from_dsn(dsn: impl Into<String>) -> Self {
+        Self {
+            dsn: dsn.into(),
+            seed_ids: Vec::new(),
+            candidate_ids: Vec::new(),
+        }
+    }
+
+    fn seed(mut self, id: Uuid) -> Self {
+        self.seed_ids.push(id);
+        self
+    }
+
+    fn candidate(mut self, id: Uuid) -> Self {
+        self.candidate_ids.push(id);
+        self
+    }
+
+    fn track_candidate(&mut self, id: Uuid) {
+        self.candidate_ids.push(id);
+    }
+}
+
+impl Drop for E2eDiscoveryRowsOnDrop {
+    fn drop(&mut self) {
+        let dsn = self.dsn.clone();
+        let seed_ids = std::mem::take(&mut self.seed_ids);
+        let candidate_ids = std::mem::take(&mut self.candidate_ids);
+        if seed_ids.is_empty() && candidate_ids.is_empty() {
+            return;
+        }
+        let joined = std::thread::spawn(move || {
+            delete_e2e_discovery_rows_blocking(&dsn, &seed_ids, &candidate_ids)
+        })
+        .join();
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                eprintln!(
+                    "E2eDiscoveryRowsOnDrop: 刪測試列失敗：{message}。\
+                     請手動刪這次測試的 seed／candidate 與其 outbox 列，\
+                     否則會污染共用開發 DB"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "E2eDiscoveryRowsOnDrop: 刪測試列的執行緒 panic。\
+                     請檢查開發 Postgres 是否留下 ds-e2e-seed candidate 或測試 seed"
+                );
+            }
+        }
+    }
+}
+
+fn delete_e2e_discovery_rows_blocking(
+    dsn: &str,
+    seed_ids: &[Uuid],
+    candidate_ids: &[Uuid],
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("建立 tokio runtime 失敗：{err}"))?;
+    runtime.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(dsn)
+            .await
+            .map_err(|err| format!("連 Postgres 失敗：{err}"))?;
+        for id in seed_ids {
+            let seed_text = id.to_string();
+            sqlx::query("DELETE FROM event_outbox WHERE payload->>'seed_id' = $1")
+                .bind(&seed_text)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE event_outbox seed `{id}` 失敗：{err}"))?;
+            sqlx::query("DELETE FROM seeds WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE seeds `{id}` 失敗：{err}"))?;
+        }
+        for id in candidate_ids {
+            let candidate_text = id.to_string();
+            sqlx::query("DELETE FROM event_outbox WHERE payload->>'candidate_id' = $1")
+                .bind(&candidate_text)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE event_outbox candidate `{id}` 失敗：{err}"))?;
+            sqlx::query("DELETE FROM candidate_evidence WHERE candidate_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE candidate_evidence `{id}` 失敗：{err}"))?;
+            sqlx::query("DELETE FROM candidates WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE candidates `{id}` 失敗：{err}"))?;
+        }
+        pool.close().await;
+        Ok(())
+    })
 }

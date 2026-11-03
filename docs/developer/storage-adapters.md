@@ -47,6 +47,8 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `CanonicalStore` | `storage-postgres` | PostgreSQL 17（Core 真實來源） |
 | `EmbeddedStore` | `storage-sqlite` | SQLite（本機／App／投影，不是高併發 canonical） |
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
+| `EventOutboxStore` | postgres + sqlite | V0.3 transactional outbox（migration `0020`）。見下方「`EventOutboxStore`」 |
+| `CanonicalWriteStore` | postgres + sqlite | `TransactionalStore + EventOutboxStore` 的 blanket。給「業務寫入與事件列同一交易」的呼叫端 |
 | `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`）；Phase 3 Step 1 再加 `0010`（`embeddings` metadata，`put_embedding` **不是** upsert）與 `0011`（`duplicate_groups.model`）；ADR-012 Step 0 再加 `0012`（`merge_history.auto_approval_audit`）。見 `schema-v0.2.md` |
 | `SearchStore` | `storage-opensearch`；mock：`storage_core::mock::MockSearchStore` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`bulk_upsert_fields`／`query`／`search`／`delete`／`update_fields`／`vector_search`） |
 | `ProjectionStore` | `storage-opensearch`、`storage-neo4j` | 投影進度／lag／重建狀態（V0.2 Phase 0f）。見下方「`ProjectionStore`」 |
@@ -556,6 +558,52 @@ merge 橫跨 `entities`／`entity_aliases`／`entity_identifiers`／`relationshi
   不要在收到錯誤後還想在同一條交易上補寫。
 - 交易 handle 借用連線池的一條連線。同時開的交易數不能超過 `pool_max`，
   否則後續 `begin()` 會在 acquire 逾時。
+
+## `EventOutboxStore`（V0.3 transactional outbox，migration `0020`）
+
+獨立 capability，**不**塞進 `RelationalStore`。`Transaction::outbox()` 回
+`&dyn EventOutboxStore`，與 `store()` 是**同一條連線**，所以 `put_seed` 與
+`enqueue_outbox` 要嘛一起成功、要嘛一起回滾。
+
+```rust
+let tx = store.begin().await?;
+tx.store().put_seed(&seed).await?;
+tx.outbox().enqueue_outbox(&event).await?;
+tx.commit().await?;
+```
+
+`CanonicalWriteStore = TransactionalStore + EventOutboxStore`（blanket impl）。
+core-api 的 `SharedStore` 是 `Arc<dyn CanonicalWriteStore>`，handler 才能 `begin()`。
+
+方法：
+
+| 方法 | 行為 |
+|---|---|
+| `enqueue_outbox` | 插入一列。可在既有交易內呼叫 |
+| `claim_pending_outbox(limit, now, lease_until)` | 把到期未送列的 `attempts+1`、`next_attempt_at=lease`。Postgres：`FOR UPDATE SKIP LOCKED`。SQLite：單一寫入者，沒有 SKIP LOCKED。`limit` 夾在 1..=500 |
+| `mark_outbox_published` | 設 `published_at` |
+| `mark_outbox_failed` | 寫 `last_error`（截到 2000 字）與下次 `next_attempt_at` |
+| `count_pending_outbox` | `published_at IS NULL` 的列數（含尚未到期的退避列） |
+| `oldest_pending_outbox_age_secs` | 最舊待送列的年齡 |
+| `purge_published_outbox(cutoff, limit)` | 刪 `published_at < cutoff` 的已送列 |
+
+claim 之後 envelope `id` = 列 `id`，重試同一列必須送出同一個 id。租約到期後可能再送（at-least-once），下游用 envelope id 去重。
+
+conformance：`storage_core::conformance::assert_event_outbox_contract`（`test-support` feature）。
+**不**用 `claim_pending_outbox(500)` 掃共用開發表——改走 `EventOutboxTestSupport::claim_outbox_by_id`。
+結尾刪自己的 outbox 列與 commit 的 entity；Postgres 另掛 `CleanupOutboxConformanceOnDrop`（panic 也刪）。
+共用開發 Postgres **不**對 `count_pending_outbox` 做精確值斷言；SQLite 用全新檔可以。
+平行 claim 測試：兩個連線同時 `claim_outbox_by_id` 同一列，恰好一人拿到。
+併發核准：`update_candidate_status` 條件 UPDATE，兩個連線同時核准只能寫一列 outbox。
+
+adapter 測試：
+
+- `postgres_outbox_parallel_claim_does_not_double_send`
+- `postgres_concurrent_candidate_approve_writes_single_outbox_row`
+- sqlite／postgres conformance 都呼叫 `assert_event_outbox_contract`
+
+郵差本體在 `crates/core-api/src/outbox.rs`，設定 `[event_outbox]`，見
+`docs/developer/events.md` 的 V0.3 一節。
 
 ## `ProjectionStore`（V0.2 Phase 0f）
 

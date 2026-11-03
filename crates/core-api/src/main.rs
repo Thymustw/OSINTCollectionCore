@@ -11,7 +11,7 @@ use core_api::{
     AUDIT_JOBS_PURGE, AppState, AuthState, AutoApprovalState, BackendCheck, BrokerCheck, ErrorBody,
     GraphProjectionState, ImportState, PostgresReady, QueueBinding, QueueInspector, ReadyCheck,
     ReadyProbe, SemanticSearchState, SharedGraphStore, SharedObjects, SharedStore,
-    SharedTokenStore, router, warn_unimplemented_hybrid_weights,
+    SharedTokenStore, event_outbox_loop, router, warn_unimplemented_hybrid_weights,
 };
 use core_config::AppConfig;
 use core_events::EventProducer;
@@ -166,7 +166,7 @@ async fn run() -> Result<(), String> {
                         as Arc<dyn storage_core::ProjectionStore + Send + Sync>,
                     projection: cfg.graph_worker.projection.clone(),
                 }));
-                let resolver = Arc::new(GraphContextResolver::new(store, neo4j));
+                let resolver = Arc::new(GraphContextResolver::new(store.clone(), neo4j));
                 (Some(resolver), Some(graph), graph_projection)
             }
             Err(err) => {
@@ -313,6 +313,9 @@ async fn run() -> Result<(), String> {
     };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let retention_shutdown = shutdown_rx.clone();
+    let outbox_shutdown = shutdown_rx.clone();
+    drop(shutdown_rx);
     if let (Some(store_for_retention), Some(audit_for_retention)) =
         (store_for_retention, audit_for_retention)
     {
@@ -321,11 +324,41 @@ async fn run() -> Result<(), String> {
             cfg.retention.jobs.clone(),
             metrics.clone(),
             audit_for_retention,
-            shutdown_rx,
+            retention_shutdown,
         ));
     } else {
-        drop(shutdown_rx);
+        drop(retention_shutdown);
         tracing::info!("[retention.jobs] enabled=false，不啟動背景清除");
+    }
+
+    if cfg.event_outbox.enabled {
+        match producer.clone() {
+            Some(producer) => {
+                let outbox_store = store.clone();
+                let outbox_metrics = metrics.clone();
+                let outbox_cfg = cfg.event_outbox.clone();
+                tokio::spawn(async move {
+                    event_outbox_loop(
+                        outbox_store,
+                        producer,
+                        outbox_cfg,
+                        outbox_metrics,
+                        outbox_shutdown,
+                    )
+                    .await;
+                });
+            }
+            None => {
+                drop(outbox_shutdown);
+                tracing::warn!(
+                    "Redpanda 未連上；event_outbox 列仍會寫入，但不啟動郵差。\
+                     事件會一直待送。請確認 [broker].brokers 與容器 osint-core-redpanda-1 在跑後重啟 osint-api"
+                );
+            }
+        }
+    } else {
+        drop(outbox_shutdown);
+        tracing::info!("[event_outbox] enabled=false，不啟動郵差（業務路徑仍會寫 outbox 列）");
     }
 
     let app = router(state).fallback(fallback);

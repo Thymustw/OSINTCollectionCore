@@ -21,6 +21,7 @@ mod import;
 mod jobs;
 mod middleware;
 mod ops;
+mod outbox;
 mod pagination;
 mod rate_limit;
 mod ready;
@@ -42,6 +43,10 @@ pub use ops::{
     BrokerCheck, CandidateBacklogSummary, ConnectorHealth, ConnectorsView, DiscoveryOpsView,
     DlqView, GraphCheck, GraphProjectionView, OpsHealth, ProcessMetrics, QueueBinding, QueueEntry,
     QueueInspector, QueueSummary,
+};
+pub use outbox::{
+    METRIC_OUTBOX_OLDEST_AGE, METRIC_OUTBOX_PENDING, METRIC_OUTBOX_PUBLISH_FAILURES,
+    METRIC_OUTBOX_PUBLISHED, OutboxPublisher, envelope_from_outbox, event_outbox_loop, relay_once,
 };
 pub use pagination::{CursorPage, Pagination};
 pub use rate_limit::RateLimiter;

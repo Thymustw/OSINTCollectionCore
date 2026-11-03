@@ -275,7 +275,7 @@ collector 排程。沒有 `schedule` 的連接器目前不會被執行（沒有�
 | `GET` | `/api/v1/ops/failed-events` | viewer | 處理失敗的事件記錄 |
 | `POST` | `/api/v1/ops/failed-events/{id}/replay` | operator | 重送指定的失敗事件 |
 | `GET` | `/api/v1/ops/graph` | viewer | 圖投影 lag 與最近 rebuild 狀態 |
-| `GET` | `/api/v1/ops/discovery` | viewer | Discovery AI 並發設定、Candidate 各狀態統計、今天有用量的 collection |
+| `GET` | `/api/v1/ops/discovery` | viewer | Discovery AI 並發設定、Candidate 各狀態統計、今天有用量的 collection、`event_outbox_pending`（待送事件列數） |
 
 ---
 

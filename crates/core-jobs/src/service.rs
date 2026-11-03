@@ -112,13 +112,13 @@ impl<S: RelationalStore> JobService<S> {
         self.dispatch(id).await
     }
 
-    pub async fn transition(
-        &self,
-        id: JobId,
+    /// 只改記憶體裡的 [`Job`]，不寫 store。給需要「put_job + 其他寫入同一個交易」
+    /// 的呼叫端（例如 discovery-worker 把 `discovery.completed` 寫進 outbox）。
+    pub fn apply_transition(
+        job: &mut Job,
         to: JobStatus,
         error: Option<String>,
-    ) -> Result<Job, JobError> {
-        let mut job = self.get(id).await?;
+    ) -> Result<(), JobError> {
         if !can_transition(job.status, to) {
             return Err(JobError::from_status(job.status, to));
         }
@@ -144,6 +144,17 @@ impl<S: RelationalStore> JobService<S> {
             job.error = None;
         }
         job.status = to;
+        Ok(())
+    }
+
+    pub async fn transition(
+        &self,
+        id: JobId,
+        to: JobStatus,
+        error: Option<String>,
+    ) -> Result<Job, JobError> {
+        let mut job = self.get(id).await?;
+        Self::apply_transition(&mut job, to, error)?;
         self.store.put_job(&job).await?;
         Ok(job)
     }

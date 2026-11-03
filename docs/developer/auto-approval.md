@@ -56,6 +56,16 @@
 任何步驟失敗（包含 merge 本身失敗）都收斂成 `AutoApprovalOutcome::Pending`，不往上拋錯誤。
 這是刻意設計：`CLAUDE.md §5`「AI failure must not block base ingestion」。
 
+LLM 路徑會寫 transactional outbox（`source_service = resolver`）：
+
+- 打模型**之前**獨立寫 `ai.requested`（與 completed 不能同一交易：中間有遠端 HTTP）。
+- 寫 `AiRun` 的同一交易寫 `ai.completed` 或 `ai.failed`。
+- 高信心路徑不打模型，不發 AI 事件。
+- HTTP 成功但 JSON 解不出 `same_entity` 仍發 `ai.completed`（`parsed_same_entity: null`），不改走 failed。
+- `ai.requested` 先獨立 commit。若後續 `put_ai_run` 交易失敗，會留下沒有 `ai.completed`／`ai.failed` 的孤兒 `ai.requested`（`ai_run_id` 對得上，但沒有對應的 AiRun 列）。
+
+契約見 `docs/developer/events.md`。
+
 ### 候選分組邏輯
 
 `maybe_evaluate_auto_approval` 呼叫 `group_candidates_for_auto_approval`：

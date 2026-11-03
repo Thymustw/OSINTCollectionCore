@@ -223,6 +223,23 @@ AI 輔助自動合併設定（預設完全關閉）：
 
 時間以 Job 的結束時間（`completed_at`）為準，不是建立時間。手動清除見 `POST /api/v1/ops/jobs/purge`（admin）。
 
+### `[event_outbox]`
+
+V0.3 發現引擎事件的 transactional outbox 郵差。業務寫入與事件列同一個資料庫交易；
+`osint-api` 背景任務再送到 Redpanda。broker 暫時掛掉時列留在表裡，不會丟。
+
+| 鍵 | 預設值 | 說明 |
+|---|---|---|
+| `enabled` | `true` | 是否啟動郵差。關掉只停發送，業務路徑**仍會寫列** |
+| `poll_interval_ms` | `500` | 輪詢間隔（毫秒）。必須 ≥ 100 |
+| `batch_size` | `50` | 每次最多處理幾列。必須 1..=500 |
+| `backoff_base_ms` | `1000` | 第一次失敗後的退避基數（毫秒） |
+| `backoff_max_ms` | `60000` | 退避上限（毫秒）。必須 ≥ `backoff_base_ms`。公式 `min(base * 2^(attempts-1), max)` |
+| `lease_ms` | `30000` | claim 後的租約（毫秒）。必須 ≥ 1000 |
+| `published_retention_hours` | `24` | 已送列保留幾小時後 purge。`0` = 不刪。必須 ≤ 168（7 天） |
+
+連不上 Redpanda 時仍寫列、不啟動郵差。待送列數見 `GET /api/v1/ops/discovery` 的 `event_outbox_pending`。
+
 ### `[discovery_worker]`
 
 | 鍵 | 預設值 | 說明 |

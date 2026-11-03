@@ -14,7 +14,7 @@ use core_security::{ApiTokenStore, AuditLog, JwtService};
 use merge::MergeService;
 use resolver::{AutoApprovalEvaluator, GraphContextResolver, ResolverService};
 use storage_core::mock::MockEmbeddingProvider;
-use storage_core::{ObjectStore, RelationalStore};
+use storage_core::{CanonicalWriteStore, ObjectStore};
 use storage_opensearch::OpenSearchStore;
 use storage_postgres::PostgresCanonicalStore;
 
@@ -55,20 +55,21 @@ pub type SharedSemanticSearchState = Arc<SemanticSearchState>;
 
 /// 泛用的 canonical store handle。
 ///
-/// # 為什麼是 `dyn RelationalStore` 而不是 `PostgresCanonicalStore`
+/// # 為什麼是 `dyn CanonicalWriteStore` 而不是 `PostgresCanonicalStore`
 ///
-/// Phase 6b 要加的 REST handler（objects／sources／collections／relationships…）
-/// 需要的全部是 `RelationalStore` 上的方法。用具體型別會讓每一個 handler 都
-/// 硬編在 PostgreSQL 上，違反 CLAUDE.md §13
-/// 「Domain Service → storage-core capability interface → concrete adapter」；
-/// 換言之，之後要讓某個 App 走 SQLite projection 就得改二十幾個 handler 的簽名。
+/// Handler 需要 `RelationalStore` 的 CRUD，以及 V0.3 起的
+/// `begin()` + `enqueue_outbox()`（同一條交易）。用具體型別會讓每一個
+/// handler 都硬編在 PostgreSQL 上，違反 CLAUDE.md §13。
+///
+/// `CanonicalWriteStore` = `TransactionalStore` + `EventOutboxStore`，
+/// 不是把 outbox 方法塞進 `RelationalStore`。
 ///
 /// 代價是拿不到 `pool()`（那是 PG 專屬的）。需要 pool 的兩個地方
 /// （`PostgresAuditLog`、`PostgresApiTokenStore`）在 `main.rs` 連線時就從具體型別
 /// 建好再放進 `AppState`，不經過這個 handle。
 ///
-/// ⚠️ `+ Send + Sync` 不能省。`RelationalStore` 沒有把它們寫成 supertrait，
-/// 所以 `Arc<dyn RelationalStore>` 預設**不是** `Send + Sync`，
+/// ⚠️ `+ Send + Sync` 不能省。這些 capability trait 沒有把它們寫成 supertrait，
+/// 所以 `Arc<dyn CanonicalWriteStore>` 預設**不是** `Send + Sync`，
 /// `AppState` 會因此無法當 axum 的 state——而編譯器報的是
 /// 「`FromFn<…>: Service<…>` 不滿足」這種完全指不到真因的訊息。
 /// Graph API 讀取端。理由同 [`SharedStore`]：handler 綁 [`storage_core::GraphStore`]
@@ -88,7 +89,7 @@ pub struct GraphProjectionState {
 
 pub type SharedGraphProjection = Arc<GraphProjectionState>;
 
-pub type SharedStore = Arc<dyn RelationalStore + Send + Sync>;
+pub type SharedStore = Arc<dyn CanonicalWriteStore + Send + Sync>;
 
 /// 物件儲存（Raw Evidence blob）handle。理由同 [`SharedStore`]：
 /// handler 只需要 `ObjectStore` 的四個方法，不需要知道後面是哪一套 S3 相容後端。

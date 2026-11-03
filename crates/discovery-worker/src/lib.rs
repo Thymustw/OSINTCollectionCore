@@ -7,7 +7,8 @@ mod health;
 
 pub use error::DiscoveryWorkerError;
 pub use graph_expansion::{
-    DISCOVERY_METHOD_GRAPH_EXPANSION, DISCOVERY_METHOD_SOURCE_EXPANSION, run_graph_expansion,
+    DISCOVERY_METHOD_GRAPH_EXPANSION, DISCOVERY_METHOD_SOURCE_EXPANSION,
+    persist_discovery_completed, run_graph_expansion,
 };
 pub use health::serve as serve_health;
 

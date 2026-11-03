@@ -56,6 +56,10 @@ pub struct AppConfig {
     /// 資料保留期限。形狀預留給其他表（failed_events／audit_log），目前只實作 jobs。
     #[serde(default)]
     pub retention: RetentionSection,
+    /// V0.3 transactional outbox 郵差。`#[serde(default)]` 讓舊設定檔不加這一段
+    /// 也能載入，採用下方預設。
+    #[serde(default)]
+    pub event_outbox: EventOutboxSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1162,6 +1166,115 @@ impl AiGatewayPressureSection {
     }
 }
 
+/// `[event_outbox]`：transactional outbox 郵差。業務寫入與事件列同一個交易；
+/// 郵差另外 claim／publish／標記。broker 掛掉時列留在表裡，不會丟。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventOutboxSection {
+    #[serde(default = "default_event_outbox_enabled")]
+    pub enabled: bool,
+    /// 輪詢間隔（毫秒）。必須 ≥ 100。預設 500：接近即時，又不至於每毫秒打 DB。
+    #[serde(default = "default_event_outbox_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    /// 每次 claim 最多幾列。必須 1..=500。
+    #[serde(default = "default_event_outbox_batch_size")]
+    pub batch_size: u32,
+    /// 第一次失敗後的退避基數（毫秒）。必須 ≥ 1。
+    #[serde(default = "default_event_outbox_backoff_base_ms")]
+    pub backoff_base_ms: u64,
+    /// 退避上限（毫秒）。必須 ≥ `backoff_base_ms`。
+    #[serde(default = "default_event_outbox_backoff_max_ms")]
+    pub backoff_max_ms: u64,
+    /// claim 後的租約（毫秒）。必須 ≥ 1000。Kafka send timeout 是 10s，預設 30s。
+    #[serde(default = "default_event_outbox_lease_ms")]
+    pub lease_ms: u64,
+    /// 已送列保留幾小時後由郵差 purge。`0` = 不刪。必須 ≤ 168（7 天）。
+    #[serde(default = "default_event_outbox_published_retention_hours")]
+    pub published_retention_hours: u32,
+}
+
+fn default_event_outbox_enabled() -> bool {
+    true
+}
+fn default_event_outbox_poll_interval_ms() -> u64 {
+    500
+}
+fn default_event_outbox_batch_size() -> u32 {
+    50
+}
+fn default_event_outbox_backoff_base_ms() -> u64 {
+    1_000
+}
+fn default_event_outbox_backoff_max_ms() -> u64 {
+    60_000
+}
+fn default_event_outbox_lease_ms() -> u64 {
+    30_000
+}
+fn default_event_outbox_published_retention_hours() -> u32 {
+    24
+}
+
+impl Default for EventOutboxSection {
+    fn default() -> Self {
+        Self {
+            enabled: default_event_outbox_enabled(),
+            poll_interval_ms: default_event_outbox_poll_interval_ms(),
+            batch_size: default_event_outbox_batch_size(),
+            backoff_base_ms: default_event_outbox_backoff_base_ms(),
+            backoff_max_ms: default_event_outbox_backoff_max_ms(),
+            lease_ms: default_event_outbox_lease_ms(),
+            published_retention_hours: default_event_outbox_published_retention_hours(),
+        }
+    }
+}
+
+impl EventOutboxSection {
+    /// 檢查間隔／批次／退避是否自洽。失敗訊息會說明怎麼改。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.poll_interval_ms < 100 {
+            return Err(format!(
+                "[event_outbox].poll_interval_ms 必須 ≥ 100（目前是 {}）。\
+                 郵差不該比 100ms 更勤地掃表；要關掉請設 enabled = false",
+                self.poll_interval_ms
+            ));
+        }
+        if !(1..=500).contains(&self.batch_size) {
+            return Err(format!(
+                "[event_outbox].batch_size 必須在 1..=500（目前是 {}）。\
+                 單次 claim 至少一列、最多 500（與 storage 層硬上限相同）",
+                self.batch_size
+            ));
+        }
+        if self.backoff_base_ms < 1 {
+            return Err(format!(
+                "[event_outbox].backoff_base_ms 必須 ≥ 1（目前是 {}）",
+                self.backoff_base_ms
+            ));
+        }
+        if self.backoff_max_ms < self.backoff_base_ms {
+            return Err(format!(
+                "[event_outbox].backoff_max_ms 必須 ≥ backoff_base_ms（目前是 {} < {}）",
+                self.backoff_max_ms, self.backoff_base_ms
+            ));
+        }
+        if self.lease_ms < 1_000 {
+            return Err(format!(
+                "[event_outbox].lease_ms 必須 ≥ 1000（目前是 {}）。\
+                 租約要比 Kafka send timeout（10s）短也沒意義，太短會讓兩個郵差搶同一列",
+                self.lease_ms
+            ));
+        }
+        if self.published_retention_hours > 168 {
+            return Err(format!(
+                "[event_outbox].published_retention_hours 必須 ≤ 168（7 天；目前是 {}）。\
+                 outbox 不是稽核日誌；要留更久請改 audit_log。0 = 不刪",
+                self.published_retention_hours
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// 資料保留期限。目前只實作 `[retention.jobs]`；之後加表時在這裡加欄位，
 /// 不要另開頂層區段。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1280,6 +1393,8 @@ pub enum ConfigError {
     InvalidRetention(String),
     #[error("{0}")]
     InvalidAiGateway(String),
+    #[error("{0}")]
+    InvalidEventOutbox(String),
 }
 
 impl AppConfig {
@@ -1330,6 +1445,10 @@ impl AppConfig {
             .pressure
             .validate()
             .map_err(ConfigError::InvalidAiGateway)?;
+        parsed
+            .event_outbox
+            .validate()
+            .map_err(ConfigError::InvalidEventOutbox)?;
         Ok(parsed)
     }
 }
@@ -1514,6 +1633,16 @@ mod tests {
         assert_eq!(cfg.retention.jobs.collect_completed_days, 7);
         assert_eq!(cfg.retention.jobs.collect_failed_days, 30);
         assert_eq!(cfg.retention.jobs.collect_cancelled_days, 7);
+        assert!(cfg.event_outbox.enabled);
+        assert_eq!(cfg.event_outbox.poll_interval_ms, 500);
+        assert_eq!(cfg.event_outbox.batch_size, 50);
+        assert_eq!(cfg.event_outbox.backoff_base_ms, 1_000);
+        assert_eq!(cfg.event_outbox.backoff_max_ms, 60_000);
+        assert_eq!(cfg.event_outbox.lease_ms, 30_000);
+        assert_eq!(cfg.event_outbox.published_retention_hours, 24);
+        cfg.event_outbox
+            .validate()
+            .expect("default.toml 的 event_outbox 必須自洽");
     }
 
     #[test]
@@ -1749,6 +1878,69 @@ mod tests {
         assert_eq!(parsed.retention, RetentionSection::default());
         assert!(parsed.retention.jobs.enabled);
         assert_eq!(parsed.retention.jobs.collect_failed_days, 30);
+    }
+
+    #[test]
+    fn event_outbox_validate_rejects_short_poll() {
+        let cfg = EventOutboxSection {
+            poll_interval_ms: 99,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("poll_interval_ms < 100 應失敗");
+        assert!(err.contains("poll_interval_ms"), "{err}");
+    }
+
+    #[test]
+    fn event_outbox_validate_rejects_zero_batch() {
+        let cfg = EventOutboxSection {
+            batch_size: 0,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("batch_size = 0 應失敗");
+        assert!(err.contains("batch_size"), "{err}");
+    }
+
+    #[test]
+    fn event_outbox_validate_rejects_backoff_inverted() {
+        let cfg = EventOutboxSection {
+            backoff_base_ms: 10_000,
+            backoff_max_ms: 1_000,
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("backoff_max < base 應失敗");
+        assert!(err.contains("backoff_max_ms"), "{err}");
+    }
+
+    #[test]
+    fn load_from_rejects_invalid_event_outbox() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let path = std::env::temp_dir().join("osint-core-config-bad-outbox.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "[event_outbox]\npoll_interval_ms = 1").unwrap();
+        drop(f);
+        let err = AppConfig::load_from(Some(&workspace_default()), Some(&path)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("poll_interval_ms"),
+            "載入失敗要指出哪個鍵：{msg}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn missing_event_outbox_section_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        let parsed: AppConfig = {
+            let mut value = serde_json::to_value(&cfg).unwrap();
+            value.as_object_mut().unwrap().remove("event_outbox");
+            serde_json::from_value(value).unwrap()
+        };
+        assert_eq!(parsed.event_outbox, EventOutboxSection::default());
+        assert!(parsed.event_outbox.enabled);
+        assert_eq!(parsed.event_outbox.batch_size, 50);
     }
 
     #[test]

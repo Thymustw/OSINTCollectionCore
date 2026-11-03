@@ -789,6 +789,7 @@ dependencies = [
  "storage-postgres",
  "storage-redis",
  "storage-s3",
+ "storage-sqlite",
  "thiserror 2.0.20",
  "tokio",
  "tower",
@@ -2482,9 +2483,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.29"
+version = "1.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
 dependencies = [
  "cc",
  "libc",
@@ -3554,6 +3555,7 @@ dependencies = [
  "core-model",
  "hex",
  "merge",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "storage-core",
@@ -4499,6 +4501,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "storage-core",
+ "storage-sqlite",
  "tokio",
  "uuid",
 ]

@@ -18,11 +18,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use core_events::{CandidateLifecycle, EventTopic, SeedCreated};
 use core_model::{
     AiRun, Candidate, CandidateEvidence, CandidateStatus, CandidateType, Job, Seed, SeedOrigin,
     SeedType, url_norm,
 };
 use core_security::{Permission, Principal};
+use storage_core::OutboxEvent;
 
 use crate::error::ApiError;
 use crate::extractors::ClientIp;
@@ -159,7 +161,23 @@ async fn create_seed_inner(state: &AppState, body: CreateSeedBody) -> Result<See
         depth: body.depth,
         created_at: Utc::now(),
     };
-    store.put_seed(&seed).await.map_err(storage_error)?;
+    let payload = SeedCreated::from_seed(&seed);
+    let event = OutboxEvent::pending(
+        EventTopic::SeedCreated.as_str(),
+        payload.partition_key(),
+        Some(seed.id),
+        core_events::to_payload_value(&payload).map_err(|err| {
+            ApiError::internal(format!("序列化 seed.created payload 失敗：{err}"))
+        })?,
+        "core-api",
+    );
+    let tx = store.begin().await.map_err(storage_error)?;
+    tx.store().put_seed(&seed).await.map_err(storage_error)?;
+    tx.outbox()
+        .enqueue_outbox(&event)
+        .await
+        .map_err(storage_error)?;
+    tx.commit().await.map_err(storage_error)?;
     Ok(seed)
 }
 
@@ -317,9 +335,9 @@ pub async fn get_candidate(
 
 /// 核准／拒絕共用：更新狀態後重新讀回最新的 Candidate。
 ///
-/// `update_candidate_status` 回 `false` 代表 `id` 不存在，轉成 404。
-/// 更新成功後緊接著的 `get_candidate` 理論上不可能讀不到（沒有刪除 API）；
-/// 讀不到代表出現了沒設計到的併發狀況，用 500 讓它明確可見，不要吞掉。
+/// `update_candidate_status` 是條件 UPDATE（`status IS DISTINCT FROM` 目標值）。
+/// 回 `false` 時：id 不存在 → 404；已經是目標狀態（含另一條連線剛改完）→
+/// 讀回最新列、不寫 outbox。兩個連線同時核准因此只會發一次事件。
 ///
 /// `validate_url` 只在 approve 路徑開 `true`：核准一筆 `candidate_type == Url`
 /// 的 candidate 之前做兩道檢查（§26「unsafe model-generated URL/action」的關卡），
@@ -372,20 +390,74 @@ async fn set_candidate_status(
             )));
         }
     }
-    let updated = store
+    let topic = match status {
+        CandidateStatus::Approved => EventTopic::CandidateApproved,
+        CandidateStatus::Rejected => EventTopic::CandidateRejected,
+        other => {
+            return Err(ApiError::internal(format!(
+                "set_candidate_status 不該收到 {other:?}"
+            )));
+        }
+    };
+    let tx = store.begin().await.map_err(storage_error)?;
+    let current = tx
+        .store()
+        .get_candidate(id)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "找不到 Candidate `{id}`。請用 GET /api/v1/candidates 確認 id"
+            ))
+        })?;
+    if current.status == status {
+        tx.commit().await.map_err(storage_error)?;
+        return Ok(current);
+    }
+    let changed = tx
+        .store()
         .update_candidate_status(id, status, Utc::now())
         .await
         .map_err(storage_error)?;
-    if !updated {
-        return Err(ApiError::not_found(format!(
-            "找不到 Candidate `{id}`。請用 GET /api/v1/candidates 確認 id"
-        )));
+    if !changed {
+        let latest = tx
+            .store()
+            .get_candidate(id)
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "找不到 Candidate `{id}`。請用 GET /api/v1/candidates 確認 id"
+                ))
+            })?;
+        tx.commit().await.map_err(storage_error)?;
+        return Ok(latest);
     }
-    store.get_candidate(id).await.map_err(storage_error)?.ok_or_else(|| {
-        ApiError::internal(
-            "update_candidate_status 回 true 但緊接著讀不到這筆 candidate，這是不該發生的併發狀態",
-        )
-    })
+    let candidate = tx
+        .store()
+        .get_candidate(id)
+        .await
+        .map_err(storage_error)?
+        .ok_or_else(|| {
+            ApiError::internal(
+                "update_candidate_status 回 true 但緊接著讀不到這筆 candidate，這是不該發生的併發狀態",
+            )
+        })?;
+    let payload = CandidateLifecycle::from_candidate(&candidate);
+    let event = OutboxEvent::pending(
+        topic.as_str(),
+        payload.partition_key(),
+        Some(candidate.id),
+        core_events::to_payload_value(&payload)
+            .map_err(|err| ApiError::internal(format!("序列化 candidate payload 失敗：{err}")))?,
+        "core-api",
+    );
+    tx.outbox()
+        .enqueue_outbox(&event)
+        .await
+        .map_err(storage_error)?;
+    tx.commit().await.map_err(storage_error)?;
+    Ok(candidate)
 }
 
 /// 核准 Url candidate 時允許的 scheme：只有 `http`／`https`

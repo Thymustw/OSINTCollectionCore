@@ -1250,6 +1250,9 @@ pub struct DiscoveryOpsView {
     /// [`Self::collection_daily_usage_truncated`] 為 true。
     pub collection_daily_usage: Vec<CollectionDailyUsageView>,
     pub collection_daily_usage_truncated: bool,
+    /// `event_outbox` 待送列數（含尚未到期的退避列）。郵差跟不上或
+    /// broker 掛掉時這個數字會往上爬。
+    pub event_outbox_pending: u64,
     pub note: String,
 }
 
@@ -1335,6 +1338,8 @@ pub async fn discovery(
         })
         .collect();
 
+    let event_outbox_pending = store.count_pending_outbox().await.map_err(storage_error)?;
+
     Ok(Json(DiscoveryOpsView {
         ai_max_concurrent_requests: state.auto_approval_max_concurrent,
         candidate_backlog: CandidateBacklogSummary {
@@ -1352,11 +1357,13 @@ pub async fn discovery(
         ai_run_recent,
         collection_daily_usage,
         collection_daily_usage_truncated,
+        event_outbox_pending,
         note: "Admission Controller 與 ObservedPressure 已在 AI 閘道落地\
                （P0 刻意不看壓力訊號）。本端點仍無 P0–P4 佇列快照、\
                pause/resume/drain 操作、即時 TPS/TTFT。\
                本端點目前回：AI 呼叫並發上限設定值、Candidate backlog \
-               各狀態近似計數、最近 AI Run 歷史、今天有用量的 collection。"
+               各狀態近似計數、最近 AI Run 歷史、今天有用量的 collection、\
+               event_outbox 待送列數。"
             .into(),
     }))
 }

@@ -14,4 +14,4 @@ pub use security::{PostgresApiTokenStore, PostgresAuditLog};
 pub use store::CollectStateTestLock;
 pub use store::{PostgresCanonicalStore, PostgresTransaction};
 #[cfg(feature = "test-support")]
-pub use test_guard::DisableConnectorsOnDrop;
+pub use test_guard::{CleanupOutboxConformanceOnDrop, DisableConnectorsOnDrop};

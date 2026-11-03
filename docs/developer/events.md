@@ -130,6 +130,78 @@ Partition key：job 派工使用 `job_id`（TECH_STACK 預設表沒有 job；這
 
 `embedding.requested`／`embedding.completed` 同樣**沒有生產者與消費者**：embedding-worker 直接訂 `entity.extracted`，重新產生走 `osint-embedding-worker --rebuild`。topic 名稱保留在 `EventTopic`。
 
+### V0.3 新增（`SPEC_V0.3.md` §18）——transactional outbox
+
+SPEC 列了十個 topic。實際 **produce** 的是八個；另外兩個只保留名稱：
+
+```text
+seed.created
+candidate.created
+candidate.approved
+candidate.rejected
+discovery.completed
+ai.requested
+ai.completed
+ai.failed
+```
+
+**不發** `seed.updated`：沒有更新 seed 的 API。
+**不發** `discovery.requested`：派工已經由 `job.dispatched` 覆蓋；兩邊都發會讓未來的消費者跑兩次。
+
+這八個走 **transactional outbox**，不是 handler 裡直接 `produce`：
+
+1. 業務寫入與 `event_outbox` 列同一個 DB 交易（`tx.store()` + `tx.outbox()`）。
+2. `osint-api` 背景郵差 claim → 送到 Redpanda → 標記已送／失敗退避。
+3. broker 掛掉時列留在表裡，API 不會卡住 10 秒 Kafka timeout。
+
+新 topic 第一次 produce 時由 broker **自動建立、1 個 partition**（dev-container 預設）。正式 V0.3 topic 可以留著；測試用的 `osint.conformance.*` 測完一定要刪（見下方「本機驗證」）。
+
+| topic | 發送點 | `source_service` | 何時不發 |
+|---|---|---|---|
+| `seed.created` | `POST /api/v1/seeds` | `core-api` | — |
+| `candidate.created` | discovery-worker `run_graph_expansion` | `discovery-worker` | `record_candidate_discovery` 沿用既有候選（`created == false`），含被拒絕後再發現 |
+| `candidate.approved`／`rejected` | `POST /api/v1/candidates/{id}/approve`／`reject` | `core-api` | 狀態已經是目標值（重複核准／拒絕） |
+| `discovery.completed` | discovery-worker job 終態（成功與失敗都走這個 topic，用 payload `status` 區分） | `discovery-worker` | Running 轉換不發 |
+| `ai.requested` | resolver 打 LLM **之前**（獨立短寫，與 completed 不能同一交易：中間有遠端 HTTP） | `resolver` | 高信心路徑不打 LLM。`ai.requested` 先獨立 commit；若後續 `put_ai_run` 交易失敗，會留下沒有 `ai.completed`／`ai.failed` 的孤兒 `ai.requested` |
+| `ai.completed` | resolver 寫 `AiRun` 的同一交易 | `resolver` | HTTP 成功但 JSON 解不出 `same_entity` 仍發 completed（`parsed_same_entity: null`），不改走 failed |
+| `ai.failed` | 同上，LLM 呼叫失敗 | `resolver` | `error_kind`：`admission`／`http`／`parse`／`quota_exceeded`／`quota_unavailable`／`unsupported`（沒有 `other`） |
+
+Partition key：有 `collection_id` 用它（同一調查進同一 partition），否則用 seed／candidate／job／ai_run id。見 `TECH_STACK.md` §6。
+
+Typed payload 在 `crates/core-events/src/payloads.rs`。envelope `id` 等於 outbox 列 `id`——重試同一列必須送出同一個 envelope id（at-least-once：crash 在 produce 與 mark published 之間會重送）。
+
+欄位摘要（snake_case JSON）：
+
+| topic | payload |
+|---|---|
+| `seed.created` | `seed_id`、`collection_id`、`seed_type`、`value`、`entity_id`、`origin`、`status`、`priority`、`confidence`、`depth`、`created_at` |
+| `candidate.created`／`approved`／`rejected` | 共用 `CandidateLifecycle`：`candidate_id`、`collection_id`、`candidate_type`、`value`、`normalized_value`、`status`、`discovery_method`、`discovered_by`、`confidence`、`score`、`depth`、`created_at`、`reviewed_at` |
+| `discovery.completed` | `job_id`、`status`（`completed`／`failed`）、`collection_id`、`entity_id`、`error`、`completed_at`。`collection_id`／`entity_id` 從 job `parameters` 讀 |
+| `ai.requested` | `ai_run_id`、`task_type`、`model`、`collection_id`、`resolution_candidate_id`、`requested_at` |
+| `ai.completed` | `ai_run_id`、`task_type`、`model`、`tokens`、`duration_ms`、`confidence`、`parsed_same_entity`（解不出為 `null`）、`collection_id` |
+| `ai.failed` | `ai_run_id`、`task_type`、`model`、`error_kind`、`error_message`、`duration_ms`、`collection_id` |
+
+resolver 的 AI 事件目前 `collection_id` 是 `null`（自動核准路徑沒有 collection 脈絡）。
+
+郵差設定 `[event_outbox]`（`config/default.toml`）：`enabled=true`、`poll_interval_ms=500`、`batch_size=50`、退避 `min(base * 2^(attempts-1), max)`（base 1000ms、max 60s）、租約 30s、已送列保留 24 小時後 purge（`0` = 不刪）。producer 連不上時仍寫 outbox、不啟動郵差（log 一次）；列會一直待送，請確認 `[broker].brokers` 與 `osint-core-redpanda-1` 後重啟 osint-api。`enabled=false` 時業務路徑仍寫列，只是沒有郵差。
+
+Postgres claim 用 `FOR UPDATE SKIP LOCKED`：租約內兩個郵差不會拿到同一列。租約到期後同一列可能被再送一次（at-least-once），envelope `id` 仍是同一列的 id，下游用 id 去重。SQLite 沒有 SKIP LOCKED，前提是單一寫入者。
+
+關閉 osint-api 時郵差會等當輪 batch 跑完再離開（不會在 produce 中途丟列）。單則 produce 逾時 10s，所以最久約 `batch_size × 10s`。
+
+指標（`osint-api` `/metrics`）：
+
+| 名稱 | 類型 |
+|---|---|
+| `osint_event_outbox_pending` | gauge，含尚未到期的退避列 |
+| `osint_event_outbox_published_total` | counter |
+| `osint_event_outbox_publish_failures_total` | counter |
+| `osint_event_outbox_oldest_pending_age_secs` | gauge |
+
+`GET /api/v1/ops/discovery` 的 `event_outbox_pending` 是同一份待送列數。
+
+表結構：migration `0020_v0_3_event_outbox.sql`（postgres + sqlite）。capability 是獨立的 `EventOutboxStore`，**沒有**塞進 `RelationalStore`。見 `docs/developer/storage-adapters.md`。
+
 ## Broker health check
 
 `EventProducer::cluster_metadata(timeout) -> Result<(broker 數, topic 數), EventError>`

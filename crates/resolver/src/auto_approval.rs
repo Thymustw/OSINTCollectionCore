@@ -17,12 +17,15 @@ use ai_gateway::{
     LlmProvider, Pricing, redact_credentials,
 };
 use chrono::Utc;
-use core_events::EventProducer;
+use core_events::{
+    AiCompleted, AiFailed, AiRequested, EventProducer, EventTopic, to_payload_value,
+};
 use core_model::{AiRun, Entity, EntityId, MergeHistoryId, ResolutionCandidate, ResolutionStatus};
 use merge::MergeService;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use storage_core::TransactionalStore;
+use storage_core::{CanonicalWriteStore, OutboxEvent};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -73,7 +76,7 @@ pub enum AutoApprovalOutcome {
 /// 評估一對 Entity 是否該自動核准並 merge。
 pub struct AutoApprovalEvaluator<S, L>
 where
-    S: TransactionalStore + Clone,
+    S: CanonicalWriteStore + Clone,
     L: LlmProvider,
 {
     store: S,
@@ -104,7 +107,7 @@ const AI_PROVIDER: &str = "local";
 
 impl<S, L> AutoApprovalEvaluator<S, L>
 where
-    S: TransactionalStore + Clone,
+    S: CanonicalWriteStore + Clone,
     L: LlmProvider,
 {
     #[must_use]
@@ -236,6 +239,10 @@ where
             account: ai_gateway::AiAccount::System,
         };
 
+        let ai_run_id = Uuid::now_v7();
+        self.enqueue_ai_requested(ai_run_id, &request, best.id)
+            .await;
+
         let started = Instant::now();
         let call_result = self.llm.chat_completion(&request).await;
         let latency_ms = started.elapsed().as_millis() as i64;
@@ -245,7 +252,9 @@ where
         //    紀錄，其餘（判 false／解析失敗／呼叫失敗／未啟用）完全查不到
         //    AI 到底看過什麼、判斷結果是什麼。寫入失敗只記 error，不影響
         //    本次判斷（可觀測性本身的失敗不該擋住主流程，同 CLAUDE.md §5）。
+        //    ai.requested 與 completed／failed 不能同一交易：中間有遠端 HTTP。
         self.persist_ai_run(
+            ai_run_id,
             &request,
             &call_result,
             &redacted_user_prompt,
@@ -321,9 +330,42 @@ where
         }
     }
 
-    /// 把這次 LLM 呼叫的完整脈絡寫成一筆 [`AiRun`]。見第 9 步的呼叫點註解。
+    /// `ai.requested` 在打 LLM 之前獨立寫入。失敗只記 log，不擋住呼叫。
+    async fn enqueue_ai_requested(
+        &self,
+        ai_run_id: Uuid,
+        request: &ChatCompletionRequest,
+        resolution_candidate_id: Uuid,
+    ) {
+        let payload = AiRequested {
+            ai_run_id,
+            task_type: AI_TASK_TYPE.to_string(),
+            model: request.model.clone(),
+            collection_id: None,
+            resolution_candidate_id: Some(resolution_candidate_id),
+            requested_at: Utc::now(),
+        };
+        if let Err(err) = enqueue_resolver_outbox(
+            &self.store,
+            EventTopic::AiRequested,
+            payload.partition_key(),
+            Some(ai_run_id),
+            &payload,
+        )
+        .await
+        {
+            error!(
+                error = %err,
+                %ai_run_id,
+                "寫入 ai.requested outbox 失敗（不影響本次自動核准判斷）"
+            );
+        }
+    }
+
+    /// 把這次 LLM 呼叫的完整脈絡寫成一筆 [`AiRun`]，並在同一個交易寫 completed／failed。
     async fn persist_ai_run(
         &self,
+        ai_run_id: Uuid,
         request: &ChatCompletionRequest,
         result: &Result<ChatCompletionResponse, AiGatewayError>,
         redacted_user_prompt: &str,
@@ -331,6 +373,7 @@ where
         latency_ms: i64,
     ) {
         let run = build_ai_run(
+            ai_run_id,
             &self.config.llm_model_version,
             request,
             result,
@@ -338,12 +381,70 @@ where
             best,
             latency_ms,
         );
-        if let Err(err) = self.store.put_ai_run(&run).await {
-            error!(
-                error = %err,
-                ai_run_id = %run.id,
-                "寫入 AiRun 失敗（不影響本次自動核准判斷，只損失這筆可觀測性紀錄）"
-            );
+        let event = match result {
+            Ok(response) => {
+                let payload = AiCompleted {
+                    ai_run_id,
+                    task_type: AI_TASK_TYPE.to_string(),
+                    model: response.model.clone(),
+                    tokens: run.tokens,
+                    duration_ms: latency_ms,
+                    confidence: run.confidence,
+                    parsed_same_entity: parse_llm_verdict(&response.content),
+                    collection_id: None,
+                };
+                match pending_resolver_event(
+                    EventTopic::AiCompleted,
+                    payload.partition_key(),
+                    Some(ai_run_id),
+                    &payload,
+                ) {
+                    Ok(event) => event,
+                    Err(err) => {
+                        error!(error = %err, %ai_run_id, "序列化 ai.completed payload 失敗");
+                        if let Err(err) = self.store.put_ai_run(&run).await {
+                            error!(error = %err, %ai_run_id, "寫入 AiRun 失敗（不影響本次自動核准判斷，只損失這筆可觀測性紀錄）");
+                        }
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                let payload = AiFailed {
+                    ai_run_id,
+                    task_type: AI_TASK_TYPE.to_string(),
+                    model: request.model.clone(),
+                    error_kind: ai_error_kind(err).to_string(),
+                    error_message: ai_gateway::redact_credentials(&err.to_string()),
+                    duration_ms: latency_ms,
+                    collection_id: None,
+                };
+                match pending_resolver_event(
+                    EventTopic::AiFailed,
+                    payload.partition_key(),
+                    Some(ai_run_id),
+                    &payload,
+                ) {
+                    Ok(event) => event,
+                    Err(ser_err) => {
+                        error!(error = %ser_err, %ai_run_id, "序列化 ai.failed payload 失敗");
+                        if let Err(err) = self.store.put_ai_run(&run).await {
+                            error!(error = %err, %ai_run_id, "寫入 AiRun 失敗（不影響本次自動核准判斷，只損失這筆可觀測性紀錄）");
+                        }
+                        return;
+                    }
+                }
+            }
+        };
+        match persist_ai_run_with_outbox(&self.store, &run, &event).await {
+            Ok(()) => {}
+            Err(err) => {
+                error!(
+                    error = %err,
+                    ai_run_id = %run.id,
+                    "寫入 AiRun／outbox 失敗（不影響本次自動核准判斷，只損失這筆可觀測性紀錄）"
+                );
+            }
         }
     }
 
@@ -634,7 +735,65 @@ fn sha256_hex(input: &str) -> String {
 
 /// 組一筆 [`AiRun`]，涵蓋 LLM 呼叫的成功／失敗全部結果。純函式（不碰
 /// store），方便單元測試不需要真的接資料庫。
+fn ai_error_kind(err: &AiGatewayError) -> &'static str {
+    match err {
+        AiGatewayError::QuotaExceeded { .. } => "quota_exceeded",
+        AiGatewayError::QuotaUnavailable { .. } => "quota_unavailable",
+        AiGatewayError::Unsupported => "unsupported",
+        AiGatewayError::InvalidResponse { .. } => "parse",
+        AiGatewayError::Transient { message } if message.starts_with("AI admission 被拒") => {
+            "admission"
+        }
+        AiGatewayError::Transient { .. } | AiGatewayError::Permanent { .. } => "http",
+    }
+}
+
+fn pending_resolver_event(
+    topic: EventTopic,
+    partition_key: String,
+    correlation_id: Option<Uuid>,
+    payload: &impl Serialize,
+) -> Result<OutboxEvent, serde_json::Error> {
+    Ok(OutboxEvent::pending(
+        topic.as_str(),
+        partition_key,
+        correlation_id,
+        to_payload_value(payload)?,
+        "resolver",
+    ))
+}
+
+async fn enqueue_resolver_outbox<S: storage_core::EventOutboxStore>(
+    store: &S,
+    topic: EventTopic,
+    partition_key: String,
+    correlation_id: Option<Uuid>,
+    payload: &impl Serialize,
+) -> Result<(), storage_core::StorageError> {
+    let event =
+        pending_resolver_event(topic, partition_key, correlation_id, payload).map_err(|err| {
+            storage_core::StorageError::Unknown {
+                backend: "resolver",
+                message: format!("序列化 outbox payload 失敗：{err}"),
+            }
+        })?;
+    store.enqueue_outbox(&event).await
+}
+
+async fn persist_ai_run_with_outbox<S: CanonicalWriteStore>(
+    store: &S,
+    run: &AiRun,
+    event: &OutboxEvent,
+) -> Result<(), storage_core::StorageError> {
+    let tx = store.begin().await?;
+    tx.store().put_ai_run(run).await?;
+    tx.outbox().enqueue_outbox(event).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 fn build_ai_run(
+    ai_run_id: Uuid,
     model_version: &str,
     request: &ChatCompletionRequest,
     result: &Result<ChatCompletionResponse, AiGatewayError>,
@@ -689,7 +848,7 @@ fn build_ai_run(
     };
 
     AiRun {
-        id: Uuid::now_v7(),
+        id: ai_run_id,
         task_type: AI_TASK_TYPE.to_string(),
         provider: AI_PROVIDER.to_string(),
         model,
@@ -753,8 +912,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use core_model::{Entity, EntityType, ResolutionCandidate};
     use serde_json::json;
-    use storage_core::RelationalStore;
     use storage_core::conformance::find_workspace_root;
+    use storage_core::{EventOutboxStore, RelationalStore};
     use storage_sqlite::SqliteEmbeddedStore;
     use uuid::Uuid;
 
@@ -1000,6 +1159,11 @@ mod tests {
 
         let got_merged = h.store.get_entity(merged.id).await.unwrap().unwrap();
         assert_eq!(got_merged.merged_into, Some(survivor.id));
+        assert_eq!(
+            h.store.count_pending_outbox().await.unwrap(),
+            0,
+            "高信心路徑不打 LLM，不該寫 ai.requested／completed／failed"
+        );
     }
 
     #[tokio::test]
@@ -1164,6 +1328,11 @@ mod tests {
         assert_eq!(run.prompt_version, PROMPT_VERSION);
         assert_eq!(run.model_version, "test-fixture");
         assert_eq!(run.output["parsed_same_entity"], true);
+        assert_eq!(
+            h.store.count_pending_outbox().await.unwrap(),
+            2,
+            "LLM 成功應寫 ai.requested + ai.completed 兩列"
+        );
     }
 
     #[tokio::test]
@@ -1191,6 +1360,11 @@ mod tests {
         // 拿到明確的 false 判斷，仍然代表模型給了可用答案 → confidence 1.0。
         assert_eq!(run.confidence, 1.0);
         assert_eq!(run.output["parsed_same_entity"], false);
+        assert_eq!(
+            h.store.count_pending_outbox().await.unwrap(),
+            2,
+            "LLM 判 false 仍應寫 ai.requested + ai.completed 兩列"
+        );
     }
 
     #[tokio::test]
@@ -1219,6 +1393,11 @@ mod tests {
         let run = &runs[0];
         assert_eq!(run.confidence, 0.0);
         assert_eq!(run.tokens, 0);
+        assert_eq!(
+            h.store.count_pending_outbox().await.unwrap(),
+            2,
+            "LLM 呼叫失敗應寫 ai.requested + ai.failed 兩列"
+        );
     }
 
     #[tokio::test]
@@ -1238,6 +1417,7 @@ mod tests {
         };
         let cand = candidate(Uuid::now_v7(), Uuid::now_v7(), "semantic_similarity", 0.80);
         let run = build_ai_run(
+            Uuid::now_v7(),
             "test-fixture",
             &request,
             &Ok(ChatCompletionResponse {

@@ -16,11 +16,12 @@
 //! 證據不重複附加。既有候選已被拒絕（`rejected`）時**不復活、不新增**，只附加證據。
 
 use chrono::Utc;
+use core_events::{CandidateLifecycle, DiscoveryCompleted, EventTopic, to_payload_value};
 use core_model::{
     Candidate, CandidateEvidence, CandidateId, CandidateStatus, CandidateType, CollectionBudget,
-    CollectionId, Entity, EntityId,
+    CollectionId, Entity, EntityId, Job,
 };
-use storage_core::{GraphStore, GraphTraversalOptions, RelationalStore};
+use storage_core::{CanonicalWriteStore, GraphStore, GraphTraversalOptions, OutboxEvent};
 use uuid::Uuid;
 
 pub const DISCOVERY_METHOD_GRAPH_EXPANSION: &str = "graph_expansion";
@@ -142,7 +143,7 @@ pub async fn graph_expansion<G: GraphStore>(
 /// `depth` 選填、預設 `0`。**`collection_id` 是必要參數**——Discovery
 /// Budget 是 per-collection 的，沒有 collection 就無法判斷配額，不像
 /// 其他地方的 `Option<CollectionId>` 那樣可以留白。
-pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
+pub async fn run_graph_expansion<S: CanonicalWriteStore, G: GraphStore>(
     store: &S,
     graph: &G,
     parameters: Option<&serde_json::Value>,
@@ -228,10 +229,7 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
             );
             break;
         }
-        let outcome = store
-            .record_candidate_discovery(candidate, evidence)
-            .await
-            .map_err(|e| e.to_string())?;
+        let outcome = write_candidate_with_outbox(store, candidate, evidence).await?;
         if outcome.created {
             created += 1;
         }
@@ -302,10 +300,7 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
                 weight: SOURCE_EXPANSION_SCORE,
                 created_at: now,
             };
-            let outcome = store
-                .record_candidate_discovery(&candidate, &evidence)
-                .await
-                .map_err(|e| e.to_string())?;
+            let outcome = write_candidate_with_outbox(store, &candidate, &evidence).await?;
             if outcome.created {
                 created += 1;
             }
@@ -321,12 +316,82 @@ pub async fn run_graph_expansion<S: RelationalStore, G: GraphStore>(
     ))
 }
 
+/// 在同一交易寫候選與 `candidate.created`。只有 `outcome.created` 才入隊，
+/// 重跑沿用既有候選時不重發。
+async fn write_candidate_with_outbox<S: CanonicalWriteStore>(
+    store: &S,
+    candidate: &Candidate,
+    evidence: &CandidateEvidence,
+) -> Result<storage_core::CandidateDiscoveryOutcome, String> {
+    let tx = store.begin().await.map_err(|e| e.to_string())?;
+    let outcome = match tx
+        .store()
+        .record_candidate_discovery(candidate, evidence)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.to_string());
+        }
+    };
+    if outcome.created {
+        let mut payload = CandidateLifecycle::from_candidate(candidate);
+        payload.candidate_id = outcome.candidate_id;
+        let value = match to_payload_value(&payload) {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(format!("序列化 candidate.created payload 失敗：{err}"));
+            }
+        };
+        let event = OutboxEvent::pending(
+            EventTopic::CandidateCreated.as_str(),
+            payload.partition_key(),
+            Some(outcome.candidate_id),
+            value,
+            "discovery-worker",
+        );
+        if let Err(err) = tx.outbox().enqueue_outbox(&event).await {
+            let _ = tx.rollback().await;
+            return Err(err.to_string());
+        }
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(outcome)
+}
+
+/// 在同一交易寫 job 終態與 `discovery.completed`。成功／失敗都走這個 topic。
+pub async fn persist_discovery_completed<S: CanonicalWriteStore>(
+    store: &S,
+    job: &Job,
+) -> Result<(), storage_core::StorageError> {
+    let payload = DiscoveryCompleted::from_job(job);
+    let value = to_payload_value(&payload).map_err(|err| storage_core::StorageError::Unknown {
+        backend: "discovery-worker",
+        message: format!("序列化 discovery.completed payload 失敗：{err}"),
+    })?;
+    let event = OutboxEvent::pending(
+        EventTopic::DiscoveryCompleted.as_str(),
+        payload.partition_key(),
+        Some(job.id),
+        value,
+        "discovery-worker",
+    );
+    let tx = store.begin().await?;
+    tx.store().put_job(job).await?;
+    tx.outbox().enqueue_outbox(&event).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
     use chrono::{TimeZone, Utc};
+    use core_model::JobStatus;
     use core_model::{
         Collection, Connector, Document, DocumentType, EntityExtraction, EntityType, Provenance,
         RawEvidence, Source, SourceType,
@@ -334,7 +399,7 @@ mod tests {
     use serde_json::json;
     use storage_core::conformance::find_workspace_root;
     use storage_core::mock::MockGraphStore;
-    use storage_core::{GraphEdge, GraphNode};
+    use storage_core::{EventOutboxStore, GraphEdge, GraphNode, RelationalStore};
     use storage_sqlite::SqliteEmbeddedStore;
 
     fn ts() -> chrono::DateTime<Utc> {
@@ -647,6 +712,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after_first.len(), 2, "{after_first:?}");
+        let pending_after_first = h.store.count_pending_outbox().await.unwrap();
+        assert_eq!(
+            pending_after_first, 2,
+            "第一次新建兩筆候選，應寫兩列 candidate.created"
+        );
 
         let second = run_graph_expansion(&h.store, &graph, Some(&params))
             .await
@@ -674,6 +744,40 @@ mod tests {
                 candidate.value
             );
         }
+        assert_eq!(
+            h.store.count_pending_outbox().await.unwrap(),
+            pending_after_first,
+            "重跑沿用既有候選，不可再寫 candidate.created"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_discovery_completed_writes_job_and_outbox() {
+        let h = open_harness().await;
+        let now = ts();
+        let collection_id = Uuid::now_v7();
+        let entity_id = Uuid::now_v7();
+        let job = Job {
+            id: Uuid::now_v7(),
+            job_type: crate::JOB_TYPE_DISCOVERY_RUN.to_string(),
+            status: JobStatus::Completed,
+            correlation_id: None,
+            created_at: now,
+            started_at: Some(now),
+            completed_at: Some(now),
+            retry_count: 0,
+            error: None,
+            parameters: Some(json!({
+                "collection_id": collection_id.to_string(),
+                "entity_id": entity_id.to_string(),
+            })),
+        };
+        persist_discovery_completed(&h.store, &job)
+            .await
+            .expect("persist");
+        let stored = h.store.get_job(job.id).await.unwrap().expect("job 應存在");
+        assert_eq!(stored.status, JobStatus::Completed);
+        assert_eq!(h.store.count_pending_outbox().await.unwrap(), 1);
     }
 
     /// 被拒絕的候選再次被發現：不復活、不新增，只附加新證據。

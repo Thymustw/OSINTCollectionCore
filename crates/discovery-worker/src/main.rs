@@ -12,7 +12,9 @@ use core_events::{EventConsumer, EventEnvelope, EventTopic};
 use core_jobs::JobService;
 use core_model::JobStatus;
 use core_observability::{MetricsRegistry, init_tracing};
-use discovery_worker::{JOB_TYPE_DISCOVERY_RUN, run_graph_expansion, serve_health};
+use discovery_worker::{
+    JOB_TYPE_DISCOVERY_RUN, persist_discovery_completed, run_graph_expansion, serve_health,
+};
 use storage_core::conformance::load_workspace_dotenv;
 use storage_neo4j::Neo4jStore;
 use storage_postgres::PostgresCanonicalStore;
@@ -211,22 +213,42 @@ async fn handle_discovery_run(
     match run_graph_expansion(store, graph, job.parameters.as_ref()).await {
         Ok(summary) => {
             tracing::info!(%job_id, %summary, "discovery_run job 完成");
-            if let Err(err) = jobs
-                .transition(job_id, JobStatus::Completed, Some(summary))
-                .await
-            {
-                tracing::error!(error = %err, %job_id, "discovery_run job 標記 Completed 失敗");
-            }
+            persist_discovery_terminal(jobs, store, job_id, JobStatus::Completed, Some(summary))
+                .await;
         }
         Err(message) => {
             tracing::warn!(%job_id, %message, "discovery_run job 執行失敗");
-            if let Err(err) = jobs
-                .transition(job_id, JobStatus::Failed, Some(message))
-                .await
-            {
-                tracing::error!(error = %err, %job_id, "標記 discovery_run job Failed 也失敗");
-            }
+            persist_discovery_terminal(jobs, store, job_id, JobStatus::Failed, Some(message)).await;
         }
+    }
+}
+
+/// 把 job 終態與 `discovery.completed` 寫進同一個交易。失敗只記 log：
+/// job 會停在 Running，列不會進 outbox，請查狀態後重跑或手動改。
+async fn persist_discovery_terminal(
+    jobs: &JobService<PostgresCanonicalStore>,
+    store: &PostgresCanonicalStore,
+    job_id: Uuid,
+    to: JobStatus,
+    error: Option<String>,
+) {
+    let mut job = match jobs.get(job_id).await {
+        Ok(job) => job,
+        Err(err) => {
+            tracing::error!(error = %err, %job_id, "discovery_run 終態讀不到 job");
+            return;
+        }
+    };
+    if let Err(err) = JobService::<PostgresCanonicalStore>::apply_transition(&mut job, to, error) {
+        tracing::error!(error = %err, %job_id, "discovery_run job 狀態轉換失敗");
+        return;
+    }
+    if let Err(err) = persist_discovery_completed(store, &job).await {
+        tracing::error!(
+            error = %err,
+            %job_id,
+            "寫入 discovery.completed／job 終態失敗。job 仍是 Running，outbox 沒有這筆。請查狀態後重跑"
+        );
     }
 }
 

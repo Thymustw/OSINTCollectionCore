@@ -27,12 +27,14 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::error::StorageError;
+#[cfg(feature = "test-support")]
+use crate::outbox::{EventOutboxTestSupport, OutboxEvent};
 use crate::traits::{
-    CanonicalStore, CheckpointUpdate, ConnectorRunStateUpdate, EmbeddedStore, GraphEdge, GraphNode,
-    GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, JobPurgeFilter, KeyValueStore,
-    ObjectStore, ProjectionCheckpoint, ProjectionStore, RECLAIM_ORPHAN_COLLECT_JOB_ERROR,
-    RebuildState, RebuildStatus, RelationalStore, SearchDocument, SearchQuery, SearchStore,
-    StructuredSearch, TransactionalStore,
+    CanonicalStore, CanonicalWriteStore, CheckpointUpdate, ConnectorRunStateUpdate, EmbeddedStore,
+    GraphEdge, GraphNode, GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions,
+    JobPurgeFilter, KeyValueStore, ObjectStore, ProjectionCheckpoint, ProjectionStore,
+    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RebuildState, RebuildStatus, RelationalStore, SearchDocument,
+    SearchQuery, SearchStore, StructuredSearch, TransactionalStore,
 };
 
 /// 從 workspace 根目錄載入 `.env`（若存在）。已設定的環境變數不被覆蓋。
@@ -3947,6 +3949,15 @@ async fn assert_v0_3_discovery_queries<S: RelationalStore>(
         });
     }
     if store
+        .update_candidate_status(candidate.id, CandidateStatus::Approved, fixture_ts())
+        .await?
+    {
+        return Err(StorageError::Unknown {
+            backend: "conformance",
+            message: "update_candidate_status 對已經是目標狀態的列應回 false（條件 UPDATE，避免重複發 outbox）".into(),
+        });
+    }
+    if store
         .update_candidate_status(Uuid::now_v7(), CandidateStatus::Rejected, fixture_ts())
         .await?
     {
@@ -4684,6 +4695,313 @@ pub async fn assert_transactional_contract<S: TransactionalStore>(
     }
 
     Ok(())
+}
+
+/// 記錄這輪 conformance 寫進共用 DB 的 id，給 Drop guard 與函式結尾清理用。
+#[cfg(feature = "test-support")]
+#[derive(Clone, Default)]
+pub struct OutboxContractTracker {
+    pub outbox_ids: std::sync::Arc<std::sync::Mutex<Vec<Uuid>>>,
+    pub entity_ids: std::sync::Arc<std::sync::Mutex<Vec<Uuid>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl OutboxContractTracker {
+    pub fn track_outbox(&self, id: Uuid) {
+        self.outbox_ids
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(id);
+    }
+
+    pub fn track_entity(&self, id: Uuid) {
+        self.entity_ids
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(id);
+    }
+}
+
+/// `EventOutboxStore` 契約：enqueue／claim／失敗退避／已送／purge，以及與業務寫入
+/// 同一個交易的原子性（rollback 兩邊都沒有、commit 兩邊都有、commit 前交易外看不到）。
+///
+/// 開發 Postgres 是共用的，不對 `count_pending_outbox` 做精確值斷言（其他測試可能
+/// 同時有待送列）。SQLite conformance 用一次性檔，可以驗精確計數。
+///
+/// 不呼叫 `claim_pending_outbox` 掃共用表。結尾會刪自己建立的 outbox 列與
+/// commit 的 entity；失敗路徑也刪。Postgres 測試請再掛
+/// `CleanupOutboxConformanceOnDrop`，panic 時才清得掉。
+#[cfg(feature = "test-support")]
+pub async fn assert_event_outbox_contract<S>(
+    store: &S,
+    backend: &'static str,
+) -> Result<(), StorageError>
+where
+    S: CanonicalWriteStore + EventOutboxTestSupport,
+{
+    let tracker = OutboxContractTracker::default();
+    assert_event_outbox_contract_tracked(store, backend, &tracker).await
+}
+
+/// 同 [`assert_event_outbox_contract`]，但把 id 寫進呼叫端的 tracker，方便
+/// Postgres Drop guard 在 panic 時刪列。
+#[cfg(feature = "test-support")]
+pub async fn assert_event_outbox_contract_tracked<S>(
+    store: &S,
+    backend: &'static str,
+    tracker: &OutboxContractTracker,
+) -> Result<(), StorageError>
+where
+    S: CanonicalWriteStore + EventOutboxTestSupport,
+{
+    let result = assert_event_outbox_contract_inner(store, backend, tracker).await;
+    cleanup_outbox_contract(store, tracker).await;
+    result
+}
+
+#[cfg(feature = "test-support")]
+async fn cleanup_outbox_contract<S>(store: &S, tracker: &OutboxContractTracker)
+where
+    S: EventOutboxTestSupport + crate::traits::RelationalStore,
+{
+    let outbox_ids = tracker
+        .outbox_ids
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    let entity_ids = tracker
+        .entity_ids
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone();
+    for id in outbox_ids {
+        let _ = store.delete_outbox(id).await;
+    }
+    for id in entity_ids {
+        let _ = store.delete_entity(id).await;
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn assert_event_outbox_contract_inner<S>(
+    store: &S,
+    backend: &'static str,
+    tracker: &OutboxContractTracker,
+) -> Result<(), StorageError>
+where
+    S: CanonicalWriteStore + EventOutboxTestSupport,
+{
+    let fail = |message: String| StorageError::Unknown {
+        backend: "conformance",
+        message,
+    };
+    let isolated = backend == "sqlite";
+    let run = Uuid::now_v7();
+    let topic = format!("osint.conformance.outbox.{run}");
+    let now = Utc::now();
+    let lease = now + chrono::Duration::seconds(5);
+
+    // --- 1. enqueue 後 claim 拿得到，attempts 至少 +1 --------------------------
+    let pending = outbox_fixture(
+        topic.clone(),
+        run.to_string(),
+        Some(run),
+        json!({"kind": "claim"}),
+    );
+    let pending_id = pending.id;
+    store.enqueue_outbox(&pending).await?;
+    tracker.track_outbox(pending_id);
+    if isolated {
+        let count = store.count_pending_outbox().await?;
+        if count != 1 {
+            return Err(fail(format!(
+                "{backend}：enqueue 一筆後 pending 應為 1，實際 {count}"
+            )));
+        }
+    }
+    let claimed = store
+        .claim_outbox_by_id(pending_id, now, lease)
+        .await?
+        .ok_or_else(|| {
+            fail(format!(
+                "{backend}：enqueue 後 claim_outbox_by_id 拿不到 `{pending_id}`"
+            ))
+        })?;
+    if claimed.attempts < 1 {
+        return Err(fail(format!(
+            "{backend}：claim 之後 attempts 應 ≥ 1，實際 {}",
+            claimed.attempts
+        )));
+    }
+    if claimed.topic != topic {
+        return Err(fail(format!(
+            "{backend}：claim 到的 topic 不符：{}",
+            claimed.topic
+        )));
+    }
+    // 租約內再 claim 不該再拿到同一列（next_attempt_at 已被推到 lease）。
+    if store
+        .claim_outbox_by_id(pending_id, now, lease)
+        .await?
+        .is_some()
+    {
+        return Err(fail(format!(
+            "{backend}：剛 claim 過的列在租約結束前又被 claim 到"
+        )));
+    }
+
+    // --- 2. 失敗標記：attempts 不再加（claim 時已加），next_attempt_at 改成未來 --
+    let backoff_at = now + chrono::Duration::seconds(60);
+    store
+        .mark_outbox_failed(pending_id, "conformance 模擬 broker 失敗", backoff_at)
+        .await?;
+    if store
+        .claim_outbox_by_id(pending_id, now, lease)
+        .await?
+        .is_some()
+    {
+        return Err(fail(format!(
+            "{backend}：mark_outbox_failed 之後、尚未到期的列又被 claim 到"
+        )));
+    }
+    let due_now = now + chrono::Duration::seconds(61);
+    let retried = store
+        .claim_outbox_by_id(pending_id, due_now, due_now + chrono::Duration::seconds(5))
+        .await?
+        .ok_or_else(|| {
+            fail(format!(
+                "{backend}：退避到期後 claim_outbox_by_id 拿不到 `{pending_id}`"
+            ))
+        })?;
+    if retried.attempts < 2 {
+        return Err(fail(format!(
+            "{backend}：第二次 claim 之後 attempts 應 ≥ 2，實際 {}",
+            retried.attempts
+        )));
+    }
+
+    // --- 3. 標記已送後不再待送；purge 只在隔離的 SQLite 上跑（避免掃共用表） --
+    let published_at = Utc::now();
+    store
+        .mark_outbox_published(pending_id, published_at)
+        .await?;
+    if store
+        .claim_outbox_by_id(pending_id, due_now + chrono::Duration::seconds(120), lease)
+        .await?
+        .is_some()
+    {
+        return Err(fail(format!(
+            "{backend}：mark_outbox_published 之後還能 claim 到同一列"
+        )));
+    }
+    if isolated {
+        let purged = store
+            .purge_published_outbox(published_at + chrono::Duration::seconds(1), 50)
+            .await?;
+        if purged != 1 {
+            return Err(fail(format!("{backend}：purge 應刪 1 列，實際 {purged}")));
+        }
+    }
+
+    // --- 4. 同一交易：rollback 後業務列與 outbox 列都不在 --------------------
+    let rolled_entity = tx_entity("outbox-rollback");
+    let rolled_event = outbox_fixture(
+        format!("osint.conformance.outbox.rollback.{run}"),
+        rolled_entity.id.to_string(),
+        Some(rolled_entity.id),
+        json!({"kind": "rollback"}),
+    );
+    let rolled_event_id = rolled_event.id;
+    let tx = store.begin().await?;
+    {
+        tx.store().put_entity(&rolled_entity).await?;
+        tx.outbox().enqueue_outbox(&rolled_event).await?;
+        if store.get_entity(rolled_entity.id).await?.is_some() {
+            return Err(fail(format!(
+                "{backend}：交易尚未 commit，交易外卻讀得到 entity。\
+                 outbox 與業務寫入沒有真的進同一條交易"
+            )));
+        }
+    }
+    tx.rollback().await?;
+    if store.get_entity(rolled_entity.id).await?.is_some() {
+        return Err(fail(format!("{backend}：rollback 之後 entity 還在")));
+    }
+    if store.get_outbox(rolled_event_id).await?.is_some() {
+        return Err(fail(format!(
+            "{backend}：rollback 之後 outbox 列還在。\
+             業務回滾時事件不該留下"
+        )));
+    }
+
+    // --- 5. 同一交易：commit 後兩邊都看得到 ----------------------------------
+    let committed_entity = tx_entity("outbox-commit");
+    let committed_event = outbox_fixture(
+        format!("osint.conformance.outbox.commit.{run}"),
+        committed_entity.id.to_string(),
+        Some(committed_entity.id),
+        json!({"kind": "commit"}),
+    );
+    let committed_event_id = committed_event.id;
+    let tx = store.begin().await?;
+    {
+        tx.store().put_entity(&committed_entity).await?;
+        tx.outbox().enqueue_outbox(&committed_event).await?;
+        if store.get_entity(committed_entity.id).await?.is_some() {
+            return Err(fail(format!("{backend}：commit 前交易外讀得到 entity")));
+        }
+    }
+    tx.commit().await?;
+    tracker.track_entity(committed_entity.id);
+    tracker.track_outbox(committed_event_id);
+    if store.get_entity(committed_entity.id).await?.is_none() {
+        return Err(fail(format!("{backend}：commit 之後讀不到 entity")));
+    }
+    let committed_claimed = store
+        .claim_outbox_by_id(
+            committed_event_id,
+            Utc::now() + chrono::Duration::seconds(5),
+            Utc::now() + chrono::Duration::seconds(10),
+        )
+        .await?
+        .ok_or_else(|| {
+            fail(format!(
+                "{backend}：commit 後 claim_outbox_by_id 拿不到 `{committed_event_id}`"
+            ))
+        })?;
+    if committed_claimed
+        .payload
+        .get("kind")
+        .and_then(Value::as_str)
+        != Some("commit")
+    {
+        return Err(fail(format!(
+            "{backend}：commit 後 claim 到的 payload 不是這筆"
+        )));
+    }
+    store
+        .mark_outbox_published(committed_event_id, Utc::now())
+        .await?;
+
+    Ok(())
+}
+
+/// 組一筆 conformance 用的 outbox 列。`next_attempt_at` 設成 epoch，讓
+/// 呼叫端先抓 `now` 再 enqueue 時，`claim_outbox_by_id` 的
+/// `next_attempt_at <= now` 仍看得到這列。
+#[cfg(feature = "test-support")]
+fn outbox_fixture(
+    topic: impl Into<String>,
+    partition_key: impl Into<String>,
+    correlation_id: Option<Uuid>,
+    payload: Value,
+) -> OutboxEvent {
+    let mut event =
+        OutboxEvent::pending(topic, partition_key, correlation_id, payload, "conformance");
+    let epoch = chrono::DateTime::<Utc>::UNIX_EPOCH;
+    event.created_at = epoch;
+    event.next_attempt_at = epoch;
+    event
 }
 
 /// 交易 conformance 用的 Entity fixture。`normalized_name` 帶 run-specific UUID，

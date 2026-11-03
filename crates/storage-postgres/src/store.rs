@@ -20,9 +20,10 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
     BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor,
-    CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage, HealthProvider, JobPurgeFilter,
-    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RelationalStore, SimhashCandidate, StorageAdapter,
-    StorageError, StorageHealth, Transaction, TransactionalStore,
+    CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage, EventOutboxStore, HealthProvider,
+    JobPurgeFilter, OutboxEvent, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RelationalStore,
+    SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
+    clamp_outbox_limit,
 };
 
 use crate::error::map_sqlx;
@@ -393,7 +394,7 @@ impl StorageAdapter for PostgresCanonicalStore {
         CapabilityDescriptor::new(
             "postgres",
             env!("CARGO_PKG_VERSION"),
-            &["canonical", "relational", "transactional"],
+            &["canonical", "relational", "transactional", "event_outbox"],
         )
         .with_feature("json", Value::Bool(true))
         .with_feature("high_concurrent_write", Value::Bool(true))
@@ -469,6 +470,10 @@ impl PostgresTransaction {
 #[async_trait]
 impl Transaction for PostgresTransaction {
     fn store(&self) -> &dyn RelationalStore {
+        &self.store
+    }
+
+    fn outbox(&self) -> &dyn EventOutboxStore {
         &self.store
     }
 
@@ -2961,14 +2966,19 @@ impl RelationalStore for PostgresCanonicalStore {
         status: CandidateStatus,
         reviewed_at: DateTime<Utc>,
     ) -> Result<bool, StorageError> {
-        let result =
-            sqlx::query("UPDATE candidates SET status = $2, reviewed_at = $3 WHERE id = $1")
-                .bind(id)
-                .bind(encode_enum(&status)?)
-                .bind(reviewed_at)
-                .execute(self.conn().await?.as_mut())
-                .await
-                .map_err(map_sqlx)?;
+        let result = sqlx::query(
+            r#"
+            UPDATE candidates
+            SET status = $2, reviewed_at = $3
+            WHERE id = $1 AND status IS DISTINCT FROM $2
+            "#,
+        )
+        .bind(id)
+        .bind(encode_enum(&status)?)
+        .bind(reviewed_at)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -3356,5 +3366,228 @@ impl RelationalStore for PostgresCanonicalStore {
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(mapping::collection_daily_usage).collect()
+    }
+}
+
+/// last_error 上限。broker 錯誤訊息可能很長，寫進列之前截斷。
+fn truncate_outbox_error(error: &str) -> &str {
+    const MAX_CHARS: usize = 2_000;
+    match error.char_indices().nth(MAX_CHARS) {
+        None => error,
+        Some((idx, _)) => &error[..idx],
+    }
+}
+
+#[async_trait]
+impl EventOutboxStore for PostgresCanonicalStore {
+    async fn enqueue_outbox(&self, event: &OutboxEvent) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            INSERT INTO event_outbox (
+                id, topic, partition_key, correlation_id, payload, source_service,
+                created_at, attempts, last_error, next_attempt_at, published_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(event.id)
+        .bind(&event.topic)
+        .bind(&event.partition_key)
+        .bind(event.correlation_id)
+        .bind(&event.payload)
+        .bind(&event.source_service)
+        .bind(event.created_at)
+        .bind(event.attempts)
+        .bind(&event.last_error)
+        .bind(event.next_attempt_at)
+        .bind(event.published_at)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn claim_pending_outbox(
+        &self,
+        limit: u32,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> Result<Vec<OutboxEvent>, StorageError> {
+        let limit = i64::from(clamp_outbox_limit(limit));
+        let rows = sqlx::query(
+            r#"
+            UPDATE event_outbox AS e
+            SET attempts = e.attempts + 1,
+                next_attempt_at = $1
+            FROM (
+                SELECT id
+                FROM event_outbox
+                WHERE published_at IS NULL
+                  AND next_attempt_at <= $2
+                ORDER BY created_at ASC
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            ) AS picked
+            WHERE e.id = picked.id
+            RETURNING e.id, e.topic, e.partition_key, e.correlation_id, e.payload,
+                      e.source_service, e.created_at, e.attempts, e.last_error,
+                      e.next_attempt_at, e.published_at
+            "#,
+        )
+        .bind(lease_until)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::outbox_event).collect()
+    }
+
+    async fn mark_outbox_published(
+        &self,
+        id: uuid::Uuid,
+        published_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            UPDATE event_outbox
+            SET published_at = $1
+            WHERE id = $2 AND published_at IS NULL
+            "#,
+        )
+        .bind(published_at)
+        .bind(id)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn mark_outbox_failed(
+        &self,
+        id: uuid::Uuid,
+        error: &str,
+        next_attempt_at: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            UPDATE event_outbox
+            SET last_error = $1,
+                next_attempt_at = $2
+            WHERE id = $3 AND published_at IS NULL
+            "#,
+        )
+        .bind(truncate_outbox_error(error))
+        .bind(next_attempt_at)
+        .bind(id)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    async fn count_pending_outbox(&self) -> Result<u64, StorageError> {
+        let count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*)::bigint FROM event_outbox WHERE published_at IS NULL"#,
+        )
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    async fn oldest_pending_outbox_age_secs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<i64>, StorageError> {
+        let oldest: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r#"SELECT MIN(created_at) FROM event_outbox WHERE published_at IS NULL"#,
+        )
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(oldest.map(|ts| (now - ts).num_seconds().max(0)))
+    }
+
+    async fn purge_published_outbox(
+        &self,
+        older_than: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, StorageError> {
+        let limit = i64::from(clamp_outbox_limit(limit));
+        let result = sqlx::query(
+            r#"
+            DELETE FROM event_outbox
+            WHERE id IN (
+                SELECT id FROM event_outbox
+                WHERE published_at IS NOT NULL AND published_at < $1
+                ORDER BY published_at ASC
+                LIMIT $2
+            )
+            "#,
+        )
+        .bind(older_than)
+        .bind(limit)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl storage_core::EventOutboxTestSupport for PostgresCanonicalStore {
+    async fn get_outbox(&self, id: uuid::Uuid) -> Result<Option<OutboxEvent>, StorageError> {
+        self.fetch_optional_mapped(
+            "SELECT * FROM event_outbox WHERE id = $1",
+            id,
+            mapping::outbox_event,
+        )
+        .await
+    }
+
+    async fn claim_outbox_by_id(
+        &self,
+        id: uuid::Uuid,
+        now: DateTime<Utc>,
+        lease_until: DateTime<Utc>,
+    ) -> Result<Option<OutboxEvent>, StorageError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE event_outbox
+            SET attempts = attempts + 1,
+                next_attempt_at = $1
+            WHERE id = $2
+              AND published_at IS NULL
+              AND next_attempt_at <= $3
+            RETURNING id, topic, partition_key, correlation_id, payload,
+                      source_service, created_at, attempts, last_error,
+                      next_attempt_at, published_at
+            "#,
+        )
+        .bind(lease_until)
+        .bind(id)
+        .bind(now)
+        .fetch_optional(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        row.map(|r| mapping::outbox_event(&r)).transpose()
+    }
+
+    async fn delete_outbox(&self, id: uuid::Uuid) -> Result<bool, StorageError> {
+        self.delete_id("DELETE FROM event_outbox WHERE id = $1", id)
+            .await
+    }
+
+    async fn list_outbox_by_correlation_id(
+        &self,
+        correlation_id: uuid::Uuid,
+    ) -> Result<Vec<OutboxEvent>, StorageError> {
+        let rows = sqlx::query("SELECT * FROM event_outbox WHERE correlation_id = $1")
+            .bind(correlation_id)
+            .fetch_all(self.conn().await?.as_mut())
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter().map(mapping::outbox_event).collect()
     }
 }

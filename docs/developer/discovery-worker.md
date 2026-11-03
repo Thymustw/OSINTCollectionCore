@@ -80,7 +80,21 @@ entity_extractions.entity_id
   「新增 N 筆、沿用既有 M 筆」。
 
 測試：`rerunning_same_entity_does_not_duplicate_candidates`、
-`rediscovered_rejected_candidate_stays_rejected_and_gains_evidence`。
+`rediscovered_rejected_candidate_stays_rejected_and_gains_evidence`、
+`persist_discovery_completed_writes_job_and_outbox`。
+
+## 事件（transactional outbox）
+
+`source_service` 一律 `discovery-worker`。寫入與事件列同一個資料庫交易，
+由 `osint-api` 背景郵差送到 Redpanda。
+
+- `candidate.created`：只有 `record_candidate_discovery` 回 `created == true`
+  才入隊。重跑沿用既有候選、被拒絕後再發現，都不發。
+- `discovery.completed`：job 終態（成功與失敗都走這個 topic，用 payload
+  `status` 區分）與 `put_job` 同一交易。Running 轉換不發。寫入失敗時 job
+  停在 Running、outbox 沒有這筆，請查狀態後重跑。
+
+契約見 `docs/developer/events.md`。
 
 ## 已知限制
 

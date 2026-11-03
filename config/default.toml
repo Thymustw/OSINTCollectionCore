@@ -311,3 +311,19 @@ max_batches_per_run = 200
 collect_completed_days = 7
 collect_failed_days = 30
 collect_cancelled_days = 7
+
+# V0.3 transactional outbox 郵差。業務寫入與事件列同一個交易；
+# 郵差另外 claim／送到 Redpanda／標記。broker 掛掉時列留在表裡。
+# producer 連不上時仍會寫 outbox，但不啟動郵差（啟動時 log 一次）。
+#
+# poll 500ms：接近即時。jobs 保留期限是小時級清理，間隔完全不同。
+# 退避 min(base * 2^(attempts-1), max)，第一次失敗等 1s。
+# 已送列留 24 小時夠查「這則有沒有出去」，不是稽核日誌。
+[event_outbox]
+enabled = true
+poll_interval_ms = 500
+batch_size = 50
+backoff_base_ms = 1000
+backoff_max_ms = 60000
+lease_ms = 30000
+published_retention_hours = 24

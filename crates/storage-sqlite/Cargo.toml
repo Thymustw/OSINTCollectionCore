@@ -17,3 +17,11 @@ storage-core = { workspace = true }
 # 交易 handle 要在 `&self` 介面下拿到 `&mut sqlx::Transaction`，需要能跨 await 持有的鎖。
 tokio = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+# 測試專用：EventOutboxTestSupport。正式 binary 不開。
+test-support = ["storage-core/test-support"]
+
+[dev-dependencies]
+# 整合測試要開 test-support，才能呼叫 assert_event_outbox_contract。
+storage-sqlite = { path = ".", features = ["test-support"] }

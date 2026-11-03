@@ -319,6 +319,10 @@ jobs:
           ignore-unfixed: true
           format: table
           exit-code: "0"
+      # 例外清單只套在 neo4j（外部 image、我們無法重建），不影響本 repo
+      # 自建 image 的 gate。每一條都要在 docs/security/VULNERABILITY_TRIAGE.md
+      # 有對應條目，且帶 exp: 到期日——過期 trivy 自動恢復擋下。
+      - uses: actions/checkout@v7
       - name: CRITICAL gate (blocking)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -327,6 +331,7 @@ jobs:
           scanners: vuln
           severity: CRITICAL
           ignore-unfixed: true
+          trivyignores: .github/trivyignore-neo4j
           format: table
           exit-code: "1"
 

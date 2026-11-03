@@ -2,9 +2,14 @@
 //!
 //! V0.2 的九個 topic（`SPEC_V0.2.md` §20）、V0.3 的十個 topic
 //! （`SPEC_V0.3.md` §18）也定義在這裡，與 V0.1 沒有任何名稱重疊。
-//! **這一批只有定義，沒有生產者也沒有消費者**——同 V0.1 的
-//! `search.index.requested`；V0.3 這十個要等 Phase 1（AI Gateway）與
-//! Phase 3（Discovery Engine）的 worker/handler 實際發布/訂閱才會有人用。
+//!
+//! V0.3 實際會 **produce** 的八個：`seed.created`、`candidate.created`／
+//! `approved`／`rejected`、`discovery.completed`、`ai.requested`／`completed`／
+//! `failed`。走 transactional outbox，郵差在 `osint-api` 背景任務。
+//!
+//! **不發** `seed.updated`：沒有更新 seed 的 API，發了沒有對應的寫入點。
+//! **不發** `discovery.requested`：`job.dispatched` 已經覆蓋 Discovery 派工；
+//! 兩邊都發會讓未來的消費者跑兩次。
 
 use serde::{Deserialize, Serialize};
 
@@ -62,8 +67,10 @@ pub enum EventTopic {
     // ===== V0.3（SPEC_V0.3 §18）=====
     #[serde(rename = "seed.created")]
     SeedCreated,
+    /// 定義保留、**不生產**。沒有更新 seed 的 API。
     #[serde(rename = "seed.updated")]
     SeedUpdated,
+    /// 定義保留、**不生產**。派工已由 `job.dispatched` 覆蓋。
     #[serde(rename = "discovery.requested")]
     DiscoveryRequested,
     #[serde(rename = "discovery.completed")]

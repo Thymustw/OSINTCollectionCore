@@ -34,7 +34,7 @@ use stix_adapter::{
     StixBundle, StixId, StixObject, stix_object_to_entity, stix_relationship_to_core,
 };
 use storage_core::{
-    EmbeddingProvider, ObjectStore, RelationalStore, StorageError, TransactionalStore,
+    CanonicalWriteStore, EmbeddingProvider, ObjectStore, RelationalStore, StorageError,
 };
 use uuid::Uuid;
 
@@ -107,7 +107,7 @@ pub struct StixWorkerOptions {
 /// 生產用 stix-worker。泛型是為了測試能注入 mock embedder／LLM 與真實 S3。
 pub struct StixWorker<S, E, L, O>
 where
-    S: TransactionalStore + Clone,
+    S: CanonicalWriteStore + Clone,
     E: EmbeddingProvider,
     L: LlmProvider,
     O: ObjectStore + Clone,
@@ -125,7 +125,7 @@ where
 
 impl<S, E, L, O> StixWorker<S, E, L, O>
 where
-    S: TransactionalStore + Clone,
+    S: CanonicalWriteStore + Clone,
     E: EmbeddingProvider,
     L: LlmProvider,
     O: ObjectStore + Clone,

@@ -6,7 +6,7 @@
 //!
 //! SQLite conformance 用一次性檔案，不需要這個 guard。
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
@@ -97,6 +97,129 @@ impl Drop for DisableConnectorsOnDrop {
             }
         }
     }
+}
+
+/// 測試結束（含 panic）時刪自己建立的 outbox／entity／candidate 列。
+///
+/// 共用開發 Postgres 上，conformance 若在斷言 panic 前沒清，會留下
+/// `osint.conformance.outbox.*` 與 `conformance-tx-outbox-commit-*`。
+/// Drop 開新 OS thread + runtime，不重用測試的 pool（理由同
+/// [`DisableConnectorsOnDrop`]）。
+#[must_use = "不綁成變數的話會立刻 drop，列還來不及測就被刪"]
+pub struct CleanupOutboxConformanceOnDrop {
+    dsn: String,
+    outbox_ids: Arc<Mutex<Vec<Uuid>>>,
+    entity_ids: Arc<Mutex<Vec<Uuid>>>,
+    candidate_ids: Arc<Mutex<Vec<Uuid>>>,
+}
+
+impl CleanupOutboxConformanceOnDrop {
+    pub fn new(
+        dsn: impl Into<String>,
+        outbox_ids: Arc<Mutex<Vec<Uuid>>>,
+        entity_ids: Arc<Mutex<Vec<Uuid>>>,
+    ) -> Self {
+        Self {
+            dsn: dsn.into(),
+            outbox_ids,
+            entity_ids,
+            candidate_ids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn track_candidate(&self, id: Uuid) {
+        self.candidate_ids
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(id);
+    }
+
+    pub fn track_outbox(&self, id: Uuid) {
+        self.outbox_ids
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(id);
+    }
+}
+
+impl Drop for CleanupOutboxConformanceOnDrop {
+    fn drop(&mut self) {
+        let take = |lock: &Mutex<Vec<Uuid>>| match lock.lock() {
+            Ok(mut ids) => std::mem::take(&mut *ids),
+            Err(err) => std::mem::take(&mut *err.into_inner()),
+        };
+        let outbox = take(&self.outbox_ids);
+        let entities = take(&self.entity_ids);
+        let candidates = take(&self.candidate_ids);
+        if outbox.is_empty() && entities.is_empty() && candidates.is_empty() {
+            return;
+        }
+        let dsn = self.dsn.clone();
+        let joined = std::thread::spawn(move || {
+            delete_conformance_rows_blocking(&dsn, &outbox, &entities, &candidates)
+        })
+        .join();
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                eprintln!(
+                    "CleanupOutboxConformanceOnDrop: 刪測試列失敗：{message}。\
+                     請手動刪 event_outbox／entities／candidates 裡這次測試的 id，\
+                     否則會污染共用開發 DB"
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "CleanupOutboxConformanceOnDrop: 刪測試列的執行緒 panic。\
+                     請檢查開發 Postgres 是否留下 osint.conformance.outbox.* 或 \
+                     conformance-tx-outbox-commit-*"
+                );
+            }
+        }
+    }
+}
+
+fn delete_conformance_rows_blocking(
+    dsn: &str,
+    outbox: &[Uuid],
+    entities: &[Uuid],
+    candidates: &[Uuid],
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("建立 tokio runtime 失敗：{err}"))?;
+    runtime.block_on(async {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(dsn)
+            .await
+            .map_err(|err| format!("連 Postgres 失敗：{err}"))?;
+        for id in outbox {
+            sqlx::query("DELETE FROM event_outbox WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE event_outbox `{id}` 失敗：{err}"))?;
+        }
+        for id in entities {
+            sqlx::query("DELETE FROM entities WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE entities `{id}` 失敗：{err}"))?;
+        }
+        for id in candidates {
+            sqlx::query("DELETE FROM candidates WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .map_err(|err| format!("DELETE candidates `{id}` 失敗：{err}"))?;
+        }
+        pool.close().await;
+        Ok(())
+    })
 }
 
 fn disable_connectors_blocking(dsn: &str, ids: &[Uuid]) -> Result<(), String> {

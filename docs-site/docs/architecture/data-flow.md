@@ -126,22 +126,27 @@ Redpanda 上共有 29 個主題（topic）。以下按功能分類，並標明�
 
 ### 發現引擎階段（V0.3）
 
+這八個主題走 **transactional outbox**：業務寫入與 `event_outbox` 列同一個資料庫交易，
+`osint-api` 背景郵差再送到 Redpanda。broker 暫時掛掉時列留在表裡，不會丟。
+
 | 主題 | 生產者 | 消費者 |
 |---|---|---|
-| `seed.created` | — | — |
-| `seed.updated` | — | — |
-| `discovery.requested` | — | — |
-| `discovery.completed` | — | — |
-| `candidate.created` | — | — |
-| `candidate.approved` | — | — |
-| `candidate.rejected` | — | — |
-| `ai.requested` | — | — |
-| `ai.completed` | — | — |
-| `ai.failed` | — | — |
+| `seed.created` | osint-api（建立種子） | — |
+| `candidate.created` | osint-discovery-worker（新候選；沿用既有候選不發） | — |
+| `candidate.approved` | osint-api（核准候選；重複核准不發） | — |
+| `candidate.rejected` | osint-api（拒絕候選；重複拒絕不發） | — |
+| `discovery.completed` | osint-discovery-worker（成功與失敗都走這個主題，用 payload `status` 區分） | — |
+| `ai.requested` | resolver（打語言模型之前；高信心路徑不打模型、不發。若後續寫入 AI Run 失敗，可能留下沒有 completed／failed 的 requested） | — |
+| `ai.completed` | resolver（寫入 AI Run 的同一交易） | — |
+| `ai.failed` | resolver（語言模型呼叫失敗） | — |
 
-!!! note "V0.3 主題目前只有定義"
-    V0.3 的 10 個主題目前沒有生產者與消費者。Discovery Worker 目前是透過 API 直接呼叫，
-    不透過事件觸發。
+**不發** `seed.updated`：沒有更新種子的 API。
+**不發** `discovery.requested`：派工已經由 `job.dispatched` 覆蓋。
+
+目前還沒有服務訂閱這八個主題。V0.4 的自動收集與回饋循環會接上來。
+
+郵差設定見 `[event_outbox]`。`GET /api/v1/ops/discovery` 的 `event_outbox_pending`
+是待送列數。
 
 ---
 

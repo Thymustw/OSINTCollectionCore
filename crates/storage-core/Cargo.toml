@@ -20,3 +20,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+# 測試專用：EventOutboxTestSupport（依 id claim／刪列）。正式 binary 不開。
+test-support = []

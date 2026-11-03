@@ -184,11 +184,11 @@
 
 ## 事件
 
-### 發現引擎的事件只有定義，沒有發送
+### 發現引擎的事件已發送，但還沒有消費者
 
-**現況：** 種子建立、候選建立／核准／拒絕、Discovery 開始／完成、AI 呼叫開始／完成／失敗這 10 種事件（`seed.created`、`candidate.approved` 等）已經定義了名稱與格式，但目前沒有任何程式會發送它們。
+**現況：** 八種事件（`seed.created`、`candidate.created`／`approved`／`rejected`、`discovery.completed`、`ai.requested`／`completed`／`failed`）已由 API 與 worker 寫進 transactional outbox，再由 `osint-api` 背景郵差送到 Redpanda。`seed.updated` 與 `discovery.requested` **刻意不發**（沒有更新種子的 API；派工已由 `job.dispatched` 覆蓋）。目前還沒有服務訂閱這八個主題。
 
-**影響：** 如果你寫了一個程式訂閱這些事件，它不會收到任何東西。要知道候選或 Discovery 的變化，目前只能定期查 API（例如 `GET /api/v1/candidates`）。
+**影響：** 訂閱這八個主題可以收到事件；自動收集、回饋循環仍要等後續版本接上消費者。`seed.updated`／`discovery.requested` 永遠不會出現，不要訂它們。
 
 ---
 

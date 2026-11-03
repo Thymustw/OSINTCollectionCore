@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::error::StorageError;
 use crate::health::HealthProvider;
+use crate::outbox::EventOutboxStore;
 
 /// `connectors.checkpoint` 的部分更新方式。
 ///
@@ -1130,6 +1131,11 @@ pub trait RelationalStore: HealthProvider {
     ) -> Result<Vec<Candidate>, StorageError>;
     /// 更新一筆 Candidate 的審核狀態與 `reviewed_at`
     /// （`POST /candidates/{id}/approve|reject` 之後會用到）。
+    ///
+    /// 回傳 `true` 代表真的改到一列。`false` 代表 `id` 不存在，**或** 目前
+    /// 狀態已經是目標值（`UPDATE … WHERE status IS DISTINCT FROM $2`，
+    /// `reviewed_at` 也不動）。呼叫端用這個回傳值決定要不要寫 outbox，
+    /// 兩個連線同時核准才不會發兩次。
     async fn update_candidate_status(
         &self,
         id: CandidateId,
@@ -1366,6 +1372,10 @@ pub trait Transaction: Send {
     /// **commit 之前交易外看不到**。
     fn store(&self) -> &dyn RelationalStore;
 
+    /// 交易內的 outbox 寫入。與 [`Self::store`] 是**同一條連線**，所以
+    /// `put_seed` 與 `enqueue_outbox` 要嘛一起成功、要嘛一起回滾。
+    fn outbox(&self) -> &dyn EventOutboxStore;
+
     /// 提交。`self: Box<Self>` 是為了保留 object safety
     /// （by-value `self` 的方法不能出現在 trait object 上）。
     async fn commit(self: Box<Self>) -> Result<(), StorageError>;
@@ -1374,6 +1384,14 @@ pub trait Transaction: Send {
     /// 看得出意圖，以及讓回滾本身的失敗可以被回報。
     async fn rollback(self: Box<Self>) -> Result<(), StorageError>;
 }
+
+/// 能開交易且能寫 transactional outbox 的關聯式 store。
+///
+/// 生產路徑是 `PostgresCanonicalStore`；測試可用 `SqliteEmbeddedStore`。
+/// 獨立 supertrait 組合，而不是把 outbox 方法塞進 [`RelationalStore`]。
+pub trait CanonicalWriteStore: TransactionalStore + EventOutboxStore {}
+
+impl<T> CanonicalWriteStore for T where T: TransactionalStore + EventOutboxStore {}
 
 /// 要寫進 SearchStore 的一筆文件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -8,7 +8,7 @@ use serde_json::Value;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use storage_core::codec::decode_enum;
-use storage_core::{CollectionDailyUsage, SimhashCandidate, StorageError};
+use storage_core::{CollectionDailyUsage, OutboxEvent, SimhashCandidate, StorageError};
 
 use crate::error::map_sqlx;
 
@@ -513,5 +513,21 @@ pub fn failed_event(row: &PgRow) -> Result<FailedEvent, StorageError> {
         first_seen: get(row, "first_seen")?,
         last_seen: get(row, "last_seen")?,
         replayed_at: get(row, "replayed_at")?,
+    })
+}
+
+pub fn outbox_event(row: &PgRow) -> Result<OutboxEvent, StorageError> {
+    Ok(OutboxEvent {
+        id: get(row, "id")?,
+        topic: get(row, "topic")?,
+        partition_key: get(row, "partition_key")?,
+        correlation_id: get(row, "correlation_id")?,
+        payload: get(row, "payload")?,
+        source_service: get(row, "source_service")?,
+        created_at: get(row, "created_at")?,
+        attempts: get(row, "attempts")?,
+        last_error: get(row, "last_error")?,
+        next_attempt_at: get(row, "next_attempt_at")?,
+        published_at: get(row, "published_at")?,
     })
 }

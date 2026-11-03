@@ -1,0 +1,7 @@
+# 只給 CI 的 sbom-neo4j job 用（neo4j 官方 image，本 repo 無法重建）。
+# 每一條都必須在 docs/security/VULNERABILITY_TRIAGE.md 有對應條目。
+# exp: 到期後 trivy 會自動恢復擋下，逼人重新檢查，不會變成永久例外。
+
+# linux-libc-dev 6.12.113-1（kernel 標頭檔，不是 kernel 本身；容器用主機 kernel）。
+# neo4j 5.26.32 image 最後更新 2026-10-29，尚未帶 6.12.115-2。
+CVE-2026-99083 exp:2026-11-11
