@@ -200,7 +200,7 @@ AI 輔助自動合併設定（預設完全關閉）：
 |---|---|---|
 | `enabled` | `false` | 是否啟用 LLM 輔助評分 |
 | `base_url` | `"http://ai-inference:8000/v1"` | OpenAI 相容 API 端點 |
-| `model` | `"qwen-primary"` | 模型別名（由推論服務解析） |
+| `model` | 部署時設定（例：`"your-model-alias"`） | 模型別名（由推論服務解析）；請改成你的推論服務實際提供的別名 |
 | `timeout_secs` | `30` | 單次 LLM 呼叫逾時秒數 |
 | `max_concurrent` | `24` | 最大同時進行中的 LLM 請求數（bounded semaphore） |
 
