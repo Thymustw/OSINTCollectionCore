@@ -78,8 +78,8 @@ OpenSearch 剛重新啟動、而且裡面已經有大量資料時特別容易出
 docker inspect osint-core-opensearch-1 --format '{{range .Config.Env}}{{println .}}{{end}}' | grep JAVA_OPTS
 ```
 
-應該看到 `-Xms1536m -Xmx1536m`（兩個模型並存需要的 heap）。如果是 `-Xmx1g` 或更小，兩個模型
-並存時推論會一直被擋。
+應該看到 `-Xms3g -Xmx3g`（段落向量索引需要的 heap；同時也支撐兩個 embedding 模型並存）。
+如果是 `-Xmx1g` 或更小，兩個模型並存時推論會一直被擋。
 
 ---
 

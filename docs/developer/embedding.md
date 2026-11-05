@@ -514,7 +514,7 @@ CLAUDE.md §15 的磁碟紀律：這 ~968 MB 是**常駐**的，`make disk` 會�
 ## 7. 怎麼跑
 
 ```bash
-make compose-up                          # 需要已套用 3 GB / 1536m heap 的 dev override
+make compose-up                          # 需要已套用 8 GB / 3g heap 的 dev override（phase 5 後）
 bash scripts/opensearch-ml-setup.sh      # 英文 MiniLM，冪等
 bash scripts/opensearch-ml-setup-e5.sh   # 多語 e5-small int8，冪等
 ```
@@ -718,6 +718,7 @@ conformance：`cargo test -p storage-opensearch --test embedding_conformance`。
 - CI 是否跑 **ml-commons embedding** 整合測試（要付 600 MB + 135 MB 下載，§3）。
   k-NN 查詢本身**不**在這條未決裡：`opensearch-knn` 是官方映像內建 plugin，
   `storage-opensearch` 的 `vector_search` 整合測試沒有 `#[ignore]`。
-- 3 GB 容器在兩個模型下已用到 85 %。**再加第三個模型（例如 reranker）
-  必須先重估**，而且 native memory 沒有斷路器保護（§4.1），估錯的後果是
+- ADR-016 phase 5 後容器升至 8 GB，兩模型並存時實測 3.6 GiB（45 %），
+  headroom 比 3 GB 時（85 %）寬裕許多。**再加第三個模型（例如 reranker）
+  仍須先重估**，native memory 沒有斷路器保護（§4.1），估錯的後果是
   整個 OpenSearch 被 OOM-kill，不是溫和地拒絕部署。

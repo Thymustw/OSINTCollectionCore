@@ -181,7 +181,7 @@ make rebuild-embeddings-drop
 
 容器內不要設 `OSINT_STRICT_PORT_ISOLATION`、不要 `env_file: .env`。密鑰只走 SecretRef。
 
-本行程 256m／0.25 CPU（compose.dev）；推論記憶體在 OpenSearch JVM（3g／1536m heap）。
+本行程 256m／0.25 CPU（compose.dev）；推論記憶體在 OpenSearch JVM（8g 容器／3g heap，ADR-016 phase 5 升配）。
 
 ## 已知限制
 

@@ -27,16 +27,16 @@
 
 | 類別 | 加總 |
 |---|---|
-| 基礎設施（6 個服務） | PostgreSQL 1 GB + OpenSearch 3 GB + Redpanda 512 MB + Redis 256 MB + SeaweedFS 512 MB + Neo4j 1 GB = **約 6.25 GB** |
+| 基礎設施（6 個服務） | PostgreSQL 1 GB + OpenSearch 8 GB + Redpanda 512 MB + Redis 256 MB + SeaweedFS 512 MB + Neo4j 1 GB = **約 11.25 GB** |
 | 應用服務（10 個服務） | osint-api 512 MB + osint-indexer 384 MB + 其餘 8 個各 256 MB = **約 2.9 GB** |
-| **合計** | **約 9.1 GB** |
+| **合計** | **約 14.15 GB** |
 
 !!! note "OpenSearch 的記憶體不能縮減"
-    OpenSearch 設為 3 GB（JVM heap 1536 MB）是語意搜尋模型的最低需求，不是餘裕。
-    兩個 embedding 模型（英文 MiniLM + 多語 e5-small）並存時，低於這個值模型無法部署，
+    OpenSearch 設為 8 GB（JVM heap 3 GB）是段落向量檢索需要的配置，不是餘裕。
+    兩個 embedding 模型（英文 MiniLM + 多語 e5-small）並存時，低於 2 GB 模型無法部署，
     而且容器**不會崩潰、健康檢查仍然全綠**——症狀只有 `embedding-worker` 一直重啟。
 
-建議主機至少 **16 GB RAM**（給 OS 與其他行程留餘裕）。
+建議主機至少 **24 GB RAM**（給 OS 與其他行程留餘裕）。
 
 ### CPU
 
