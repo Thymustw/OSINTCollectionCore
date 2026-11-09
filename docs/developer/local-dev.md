@@ -18,8 +18,8 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up 
 | neo4j | neo4j:5.26.32-community | 7474, 7687 | 同左 |
 
 `docker-compose.dev.yml` 的記憶體上限：postgres 1GB、**opensearch 8GB（heap 3g）**、
-redpanda 512MB、redis 256MB、seaweedfs 512MB（延用自 MinIO，未重新量測）、**neo4j 1GB（heap 512m + pagecache 256m）**，
-合計 11.25GB / 5.5 CPU。明細見內部架構文件 RESOURCE_BUDGET.md §5.1（未隨原始碼公開）。
+redpanda 512MB、redis 256MB、seaweedfs 512MB（延用自 MinIO，未重新量測）、**neo4j 2GB（heap 1g + pagecache 512m，2026-11-09 由 1GB 調高）**，
+合計 12.25GB / 5.5 CPU。明細見內部架構文件 RESOURCE_BUDGET.md §5.1（未隨原始碼公開）。
 
 ⚠️ OpenSearch 在 V0.2 Phase 0a 從 1GB／heap 512m 升到 2GB／heap 1g，
 Phase 0a-2 再升到 3GB／heap 1536m（中英雙 embedding 模型並存），

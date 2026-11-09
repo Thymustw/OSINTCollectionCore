@@ -8,8 +8,8 @@
 # Neo4j 7474/7687 同樣空閒（2026-09-12 實測），維持原埠。
 #
 # 基礎建設的記憶體合計（ADR-016 Phase 5 後）：
-#   postgres 1g + opensearch 8g + redpanda 512m + redis 256m + seaweedfs 512m + neo4j 1g
-#   = 11.25 GB / 5.5 CPU
+#   postgres 1g + opensearch 8g + redpanda 512m + redis 256m + seaweedfs 512m + neo4j 2g
+#   = 12.25 GB / 5.5 CPU
 # opensearch 從 1g 升到 2g 再升到 3g 再升到 8g 的理由見下方該服務的註解
 #（0a：單一 embedding 模型；0a-2：中英雙模型並存）。
 # 明細與宿主預算見 docs/architecture/RESOURCE_BUDGET.md。
@@ -89,13 +89,17 @@ services:
   #
   # 值與 base compose 相同是刻意重複：base 那份是給 CI 的保險
   # （Neo4j 沒設定會依可見 RAM 自動推算 heap），這份是本機的天花板。
+  #
+  # 2026-11-09 升到 2g（owner 核准）：評估語料擴充後圖上 8,771 實體／12,921 關係，
+  # 容器 967 MiB / 1 GiB（94%）。heap 1g、pagecache 512m，其餘留給 native／OS。
+  # 已不等於 base compose 的 CI 值（512m／256m），CI 資料量小，不需要跟著改。
   neo4j:
-    mem_limit: 1g
+    mem_limit: 2g
     cpus: "0.50"
     environment:
-      NEO4J_server_memory_heap_initial__size: 512m
-      NEO4J_server_memory_heap_max__size: 512m
-      NEO4J_server_memory_pagecache_size: 256m
+      NEO4J_server_memory_heap_initial__size: 1g
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_server_memory_pagecache_size: 512m
 
   # --- 應用服務（profiles: app，只有 `make compose-up-full` 會起）---
   #
