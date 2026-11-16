@@ -37,7 +37,7 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 storage-core = { workspace = true }
 storage-opensearch = { path = "../storage-opensearch" }
-storage-postgres = { path = "../storage-postgres" }
+storage-postgres = { path = "../storage-postgres", features = ["test-support"] }
 storage-s3 = { path = "../storage-s3" }
 stix-adapter = { workspace = true }
 stix-worker = { path = "../stix-worker" }

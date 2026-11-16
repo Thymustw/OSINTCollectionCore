@@ -23,7 +23,7 @@ use normalizer::{NormalizeOutcome, Normalizer};
 use serde_json::json;
 use storage_core::conformance::{load_workspace_dotenv, required_env, verify_not_opencti_s3};
 use storage_core::{ObjectStore, RelationalStore};
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use storage_s3::S3ObjectStore;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -122,25 +122,26 @@ fn ts() -> chrono::DateTime<Utc> {
     Utc::now()
 }
 
-async fn stack() -> (PostgresCanonicalStore, S3ObjectStore) {
+struct Stack {
+    pg: PostgresCanonicalStore,
+    s3: S3ObjectStore,
+    /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
+    _db: TestDatabase,
+}
+
+async fn stack() -> Stack {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "e2e 只連本機 Postgres"
-    );
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    let db = TestDatabase::create().await;
+    let pg = db.store().clone();
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
     let access = required_env("S3_ACCESS_KEY").expect("S3_ACCESS_KEY");
     let secret = required_env("S3_SECRET_KEY").expect("S3_SECRET_KEY");
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
-    (pg, s3)
+    Stack { pg, s3, _db: db }
 }
 
 fn seed_source_connector(
@@ -208,7 +209,8 @@ fn seed_source_connector(
 
 #[tokio::test]
 async fn static_web_to_raw_evidence_round_trip() {
-    let (pg, s3) = stack().await;
+    // `_db` 必須活到測試結束，drop 時才刪一次性 DB。
+    let Stack { pg, s3, _db } = stack().await;
     let run = Uuid::now_v7();
     let site_name = format!("Web Org {run}");
     let html = html_with_site_name(&site_name);
@@ -366,7 +368,8 @@ async fn static_web_to_raw_evidence_round_trip() {
 
 #[tokio::test]
 async fn static_web_unchanged_on_etag_304() {
-    let (pg, s3) = stack().await;
+    // `_db` 必須活到測試結束，drop 時才刪一次性 DB。
+    let Stack { pg, s3, _db } = stack().await;
     let page_url = serve_html_with_etag().await;
     let now = ts();
     let (source, rule, connector, collection) = seed_source_connector(&page_url, now);

@@ -128,11 +128,15 @@ fn classify_v6(ip: Ipv6Addr) -> IpClass {
         return IpClass::SoftDeny;
     }
     // IPv4-compatible deprecated
-    if segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0
+    if segs[0] == 0
+        && segs[1] == 0
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0
+        && let Some(v4) = ip.to_ipv4()
     {
-        if let Some(v4) = ip.to_ipv4() {
-            return classify_v4(v4);
-        }
+        return classify_v4(v4);
     }
     IpClass::Public
 }

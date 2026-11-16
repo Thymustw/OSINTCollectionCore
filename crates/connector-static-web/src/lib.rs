@@ -310,10 +310,10 @@ fn collect_visible(
     skip: Option<&Selector>,
     parts: &mut Vec<String>,
 ) {
-    if let Some(skip) = skip {
-        if skip.matches(element) {
-            return;
-        }
+    if let Some(skip) = skip
+        && skip.matches(element)
+    {
+        return;
     }
     for child in element.children() {
         match child.value() {

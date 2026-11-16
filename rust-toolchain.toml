@@ -1,4 +1,6 @@
 [toolchain]
-channel = "stable"
+# 2026-11-16 從浮動的 "stable" 改成釘版：workspace rust-version 是 1.100.0，浮動 stable 在還沒升級的機器
+# （當時本機 1.98.1）會低於 MSRV。升版時這裡、Cargo.toml rust-version、docker/Dockerfile RUST_IMAGE 一起改。
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
 profile = "default"

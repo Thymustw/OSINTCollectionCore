@@ -215,10 +215,10 @@ impl GraphStore for MockGraphStore {
                         if !closer_end_within_budget(edge, start, &dist, query.options.max_hops) {
                             continue;
                         }
-                        if let Some(types) = &query.options.entity_types {
-                            if !other_end_type_matches(&inner, edge, start, types) {
-                                continue;
-                            }
+                        if let Some(types) = &query.options.entity_types
+                            && !other_end_type_matches(&inner, edge, start, types)
+                        {
+                            continue;
                         }
                         if let Some(path) = path_for_edge(&inner, start, edge) {
                             paths.push(path);
@@ -318,15 +318,15 @@ fn check_hops(max_hops: u32) -> Result<(), StorageError> {
 }
 
 fn edge_matches(edge: &GraphEdge, options: &GraphTraversalOptions) -> bool {
-    if let Some(types) = &options.relationship_types {
-        if !types.iter().any(|t| t == &edge.relationship_type) {
-            return false;
-        }
+    if let Some(types) = &options.relationship_types
+        && !types.iter().any(|t| t == &edge.relationship_type)
+    {
+        return false;
     }
-    if let Some(min) = options.min_confidence {
-        if edge.confidence < min {
-            return false;
-        }
+    if let Some(min) = options.min_confidence
+        && edge.confidence < min
+    {
+        return false;
     }
     if let Some((from, to)) = options.time_range {
         // 觀測區間與查詢區間重疊。用 last_seen 落在區間內會漏掉長壽命的邊。
@@ -960,6 +960,25 @@ fn match_expr(source: &Value, expr: &QueryExpr) -> bool {
     }
 }
 
+/// 與 OpenSearch adapter 相同的語意：逐葉子「原文或正規化文字任一命中」。
+/// 形狀不同時視為不命中（adapter 會回 Configuration 錯誤）。
+fn match_paired(source: &Value, expr: &QueryExpr, normalized: &QueryExpr) -> bool {
+    let haystack = source.to_string();
+    match (expr, normalized) {
+        (QueryExpr::Term(a), QueryExpr::Term(b)) | (QueryExpr::Phrase(a), QueryExpr::Phrase(b)) => {
+            haystack.contains(a) || haystack.contains(b)
+        }
+        (QueryExpr::And(xs), QueryExpr::And(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| match_paired(source, x, y))
+        }
+        (QueryExpr::Or(xs), QueryExpr::Or(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys).any(|(x, y)| match_paired(source, x, y))
+        }
+        (QueryExpr::Not(x), QueryExpr::Not(y)) => !match_paired(source, x, y),
+        _ => false,
+    }
+}
+
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     if a.is_empty() || a.len() != b.len() {
         return 0.0;
@@ -1092,7 +1111,10 @@ impl SearchStore for MockSearchStore {
                 query
                     .expression
                     .as_ref()
-                    .is_none_or(|expr| match_expr(source, expr))
+                    .is_none_or(|expr| match &query.normalized {
+                        Some(n) => match_paired(source, expr, &n.expression),
+                        None => match_expr(source, expr),
+                    })
             })
             .map(|((_, id), source)| SearchHit {
                 id: id.clone(),
@@ -1123,15 +1145,15 @@ impl SearchStore for MockSearchStore {
     ) -> Result<(), StorageError> {
         let mut inner = self.lock()?;
         let key = (index.to_string(), id.to_string());
-        if let Some(remaining) = inner.not_found_remaining.get_mut(&key) {
-            if *remaining > 0 {
-                *remaining -= 1;
-                return Err(StorageError::NotFound {
-                    message: format!(
-                        "mock 延遲 NotFound：index `{index}` id `{id}` 還要再等 indexer 寫入"
-                    ),
-                });
-            }
+        if let Some(remaining) = inner.not_found_remaining.get_mut(&key)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            return Err(StorageError::NotFound {
+                message: format!(
+                    "mock 延遲 NotFound：index `{index}` id `{id}` 還要再等 indexer 寫入"
+                ),
+            });
         }
         let Some(existing) = inner.docs.get_mut(&key) else {
             return Err(StorageError::NotFound {

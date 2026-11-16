@@ -27,7 +27,7 @@ use storage_core::{
     ProjectionStore, RebuildState, RelationalStore, SearchDocument, SearchHits, SearchStore,
 };
 use storage_opensearch::OpenSearchStore;
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -37,22 +37,19 @@ use uuid::Uuid;
 struct Stack {
     pg: PostgresCanonicalStore,
     os: OpenSearchStore,
+    /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉，所以
+    /// 以前留在開發 DB、被 `--rebuild` 投影進正式 index 的 `indexer-e2e-*` 不會再出現。
+    _db: TestDatabase,
 }
 
 async fn connect_stack() -> Stack {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "e2e 只連本機 Postgres"
-    );
     let url = required_env("OPENSEARCH_URL").expect("OPENSEARCH_URL");
     verify_not_opencti_search(&url).expect("OPENSEARCH_URL 埠隔離");
 
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    let db = TestDatabase::create().await;
+    let pg = db.store().clone();
 
     // refresh_on_write：每次寫入後強制 refresh，讓斷言不必 sleep 等 1 秒的
     // refresh_interval。正式環境不會開（見 OpenSearchStore 的欄位說明）。
@@ -63,7 +60,7 @@ async fn connect_stack() -> Stack {
     // 這一步不是形式：本機 9200 是 OpenCTI 的 Elasticsearch。
     assert_opensearch_identity(&info).expect("必須是 OpenSearch 不是 Elasticsearch");
 
-    Stack { pg, os }
+    Stack { pg, os, _db: db }
 }
 
 /// 這個測試專屬的 index 名稱。
@@ -602,6 +599,99 @@ async fn chinese_query_matches_chinese_content() {
     assert!(
         !hit.highlights.is_empty(),
         "中文命中沒有 snippet，代表 highlight 的 require_field_match 設錯了"
+    );
+
+    cleanup(&stack, &index).await;
+}
+
+#[tokio::test]
+async fn simplified_and_traditional_queries_find_either_script() {
+    let stack = connect_stack().await;
+    let index = test_index();
+    let service = indexer_for(&stack, &index);
+    service.ensure_index().await.expect("ensure index");
+
+    let source = seed_source(&stack.pg).await;
+    let connector = seed_connector(&stack.pg, &source).await;
+    let traditional = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        DocSpec::new("外交部：秦剛任外長", "秦剛以外長身分出席。").language("zh"),
+    )
+    .await;
+    let simplified = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        DocSpec::new("外交部：秦刚任外长", "秦刚以外长身分出席。").language("zh"),
+    )
+    .await;
+    for document in [&traditional, &simplified] {
+        index_document(&stack, &service, document).await;
+    }
+
+    for query in ["秦剛", "秦刚"] {
+        let hits = run_search(&stack, &index, request_for(&source, query)).await;
+        let got = ids(&hits);
+        assert!(
+            got.contains(&traditional.id.to_string()),
+            "查「{query}」找不到繁體文件：{got:?}"
+        );
+        assert!(
+            got.contains(&simplified.id.to_string()),
+            "查「{query}」找不到簡體文件：{got:?}"
+        );
+    }
+
+    let hits = run_search(&stack, &index, request_for(&source, "秦剛")).await;
+    let trad = hits
+        .hits
+        .iter()
+        .find(|hit| hit.id == traditional.id.to_string())
+        .expect("繁體文件應在結果裡");
+    let fragments: Vec<&str> = trad
+        .highlights
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        fragments.iter().any(|frag| frag.contains("<em>秦剛</em>")),
+        "繁體文件的 snippet 應整詞標出秦剛，實際：{fragments:?}"
+    );
+
+    cleanup(&stack, &index).await;
+}
+
+/// 迴歸（2026-11-16 v0 評估 zh-n-27）：繁體單字＋另一個詞。第一版把查詢整棵轉簡打全部欄位，
+/// 「罚」在原文欄位（standard 一字一 token）對不上「罰」、在 `body_s`（cjk bigram）又對不上
+/// 「罚锾」，`CRA 罰` 回 0 筆。原文樹打原文欄位才找得回來。
+#[tokio::test]
+async fn traditional_single_character_with_another_term_still_matches() {
+    let stack = connect_stack().await;
+    let index = test_index();
+    let service = indexer_for(&stack, &index);
+    service.ensure_index().await.expect("ensure index");
+
+    let source = seed_source(&stack.pg).await;
+    let connector = seed_connector(&stack.pg, &source).await;
+    let doc = seed_document(
+        &stack.pg,
+        &source,
+        &connector,
+        DocSpec::new("歐盟 CRA 進入強制合規階段", "違規廠商最高將面臨高額罰鍰。").language("zh"),
+    )
+    .await;
+    index_document(&stack, &service, &doc).await;
+
+    // 只驗繁體查詢。簡體單字「罚」查繁體文件本來就查不到（單字在 cjk analyzer 是 unigram，
+    // `body_s` 存的是 bigram「罚锾」）——那是單字跨字形的既有限制（KNOWN_GAPS §23），不是這次的迴歸。
+    let hits = run_search(&stack, &index, request_for(&source, "CRA 罰")).await;
+    assert!(
+        ids(&hits).contains(&doc.id.to_string()),
+        "查「CRA 罰」找不到繁體文件：{:?}",
+        ids(&hits)
     );
 
     cleanup(&stack, &index).await;

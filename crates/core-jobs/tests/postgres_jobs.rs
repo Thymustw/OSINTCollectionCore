@@ -2,21 +2,21 @@
 
 use core_jobs::JobService;
 use core_model::JobStatus;
-use storage_core::conformance::{load_workspace_dotenv, required_env};
-use storage_postgres::PostgresCanonicalStore;
+use storage_core::conformance::load_workspace_dotenv;
+use storage_postgres::TestDatabase;
+
+/// 一次性 DB（KNOWN_GAPS §26）。回傳的 `_db` 必須活到測試結束，drop 時才刪 DB。
+async fn fresh_store() -> (storage_postgres::PostgresCanonicalStore, TestDatabase) {
+    load_workspace_dotenv();
+    // TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    let db = TestDatabase::create().await;
+    let store = db.store().clone();
+    (store, db)
+}
 
 #[tokio::test]
 async fn create_transition_list() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "只連本機 Postgres"
-    );
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres。請確認 osint-core-postgres-1 在跑");
-    store.migrate().await.expect("migrate");
+    let (store, _db) = fresh_store().await;
     let jobs = JobService::new(store, None);
 
     let created = jobs
@@ -63,12 +63,7 @@ async fn create_transition_list() {
 
 #[tokio::test]
 async fn cancelled_persists_error_and_completed_at() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
+    let (store, _db) = fresh_store().await;
     let jobs = JobService::new(store.clone(), None);
 
     let created = jobs.create("collect", None, None).await.expect("create");
@@ -99,12 +94,7 @@ async fn cancelled_persists_error_and_completed_at() {
 
 #[tokio::test]
 async fn merge_parameters_preserves_existing_fields() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
+    let (store, _db) = fresh_store().await;
     let jobs = JobService::new(store, None);
 
     let created = jobs
@@ -135,12 +125,7 @@ async fn merge_parameters_preserves_existing_fields() {
 
 #[tokio::test]
 async fn merge_parameters_starts_from_empty_when_none() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
+    let (store, _db) = fresh_store().await;
     let jobs = JobService::new(store, None);
 
     let created = jobs
@@ -158,12 +143,7 @@ async fn merge_parameters_starts_from_empty_when_none() {
 
 #[tokio::test]
 async fn merge_parameters_unknown_id_is_not_found() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
+    let (store, _db) = fresh_store().await;
     let jobs = JobService::new(store, None);
 
     let err = jobs

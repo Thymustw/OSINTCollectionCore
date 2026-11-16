@@ -37,11 +37,12 @@
 #   curl -s https://hub.docker.com/v2/repositories/library/rust/tags/<tag> | jq -r .digest
 #   curl -s "https://hub.docker.com/v2/repositories/library/debian/tags/?name=bookworm-slim" | jq -r '.results[0].digest'
 #
-# builder 用 `rust:1.98.1-bookworm`（**不是 -slim**）：它以 buildpack-deps 為底，
+# builder 用 `rust:1.100.0-bookworm`（**不是 -slim**）：它以 buildpack-deps 為底，
 # 已經帶 gcc/make/zlib1g-dev/git。rdkafka 走 mklove `./configure`（見 Cargo.toml
 # 對 rdkafka 的註解，刻意不用 cmake-build），需要的就是這組工具鏈；換成 -slim
 # 會在 rdkafka-sys 的 build script 掛掉。
-ARG RUST_IMAGE=rust:1.98.1-bookworm@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa
+# digest 2026-11-16 由 Docker Hub API 與 `docker buildx imagetools inspect` 兩處核對一致。
+ARG RUST_IMAGE=rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea
 ARG RUNTIME_IMAGE=debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 # ===========================================================================
@@ -55,8 +56,8 @@ WORKDIR /src
 # （cargo clippy -D warnings）把關。在 image build 裡再設一次，只會讓
 # 「容器建不起來」與「程式碼有 warning」兩種完全不同的故障共用同一個錯誤畫面。
 #
-# rust-toolchain.toml 寫的是 `channel = "stable"`，base image 內建的 1.98.1
-# 就是 stable，rustup 不會另外下載 toolchain。
+# rust-toolchain.toml 釘 `channel = "1.100.0"`，與 base image 內建版本相同，rustup 不會另外下載 toolchain。
+# 兩者不一致時 build 會在容器裡多下載一份 toolchain——升版要一起改。
 ENV CARGO_TERM_COLOR=never \
     CARGO_INCREMENTAL=0
 

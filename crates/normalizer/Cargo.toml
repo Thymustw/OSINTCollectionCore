@@ -25,7 +25,7 @@ import-format = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 storage-core = { workspace = true }
-storage-postgres = { path = "../storage-postgres" }
+storage-postgres = { path = "../storage-postgres", features = ["test-support"] }
 storage-s3 = { path = "../storage-s3" }
 thiserror = { workspace = true }
 tokio = { workspace = true }

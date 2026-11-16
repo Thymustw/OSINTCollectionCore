@@ -11,6 +11,7 @@
 //! 所以：
 //!
 //! * [`schema`]：index 名稱、欄位名常數、mapping、analyzer 取捨、搜尋欄位權重。
+//! * [`script`]：簡體／繁體正規化（OpenCC `t2s`）。索引與查詢必須共用這一個轉換器。
 //! * [`query`]：使用者語法（keyword／phrase／boolean）→ 後端中立的語法樹。
 //! * [`search`]：使用者請求（八種搜尋）→ [`storage_core::StructuredSearch`]。
 //! * [`projection`]：Document + Entity → index 的 `_source`。
@@ -38,6 +39,7 @@ pub mod batch;
 pub mod projection;
 pub mod query;
 pub mod schema;
+pub mod script;
 pub mod search;
 pub mod service;
 

@@ -305,6 +305,9 @@ impl Indexer {
 
         let entities = self.load_entities(document_id).await?;
         let provenance = self.load_provenance(&document).await?;
+        // 單筆轉換最壞約 30 ms（三個欄位各 256 KB、約 40 ms/MB）。即時路徑每次
+        // 只處理一筆，而且前後都是 PostgreSQL 往返；不為這一筆佔一個 blocking thread。
+        // 重建的整頁在 [`Self::rebuild_pages`] 裡走 `spawn_blocking`。
         Ok(PrepareOutcome::Ready(Box::new(
             projection::build_search_document(
                 &self.index,
@@ -704,7 +707,7 @@ impl Indexer {
             }
             cursor = page.last().map(|doc| doc.id);
 
-            let mut batch = Vec::with_capacity(page.len());
+            let mut pending = Vec::with_capacity(page.len());
             let mut ids = Vec::with_capacity(page.len());
             for document in page {
                 if document.duplicate_of.is_some() {
@@ -715,15 +718,42 @@ impl Indexer {
                 let entities = self.load_entities(document.id).await?;
                 let provenance = self.load_provenance(&document).await?;
                 ids.push(document.id);
-                batch.push(projection::build_search_document(
-                    &self.index,
-                    &document,
-                    provenance,
-                    &entities,
-                    Utc::now(),
-                    self.bounds.max_field_bytes,
-                ));
+                pending.push((document, provenance, entities));
             }
+
+            // 簡繁轉換實測約 40 ms/MB。一頁最多 100 筆、每筆三個欄位各最多 256 KB，
+            // 最壞約數秒的 CPU。放在 Tokio worker 上會卡住同一個 runtime 的
+            // health／flush。單筆 `prepare()`（即時消費）最壞約 30 ms，批次之間
+            // 還夾著 PostgreSQL 往返，不另開 blocking thread。
+            let batch = if pending.is_empty() {
+                Vec::new()
+            } else {
+                let index = self.index.clone();
+                let max_field_bytes = self.bounds.max_field_bytes;
+                tokio::task::spawn_blocking(move || {
+                    pending
+                        .into_iter()
+                        .map(|(document, provenance, entities)| {
+                            projection::build_search_document(
+                                &index,
+                                &document,
+                                provenance,
+                                &entities,
+                                Utc::now(),
+                                max_field_bytes,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .map_err(|err| IndexerError::Configuration {
+                    message: format!(
+                        "重建這一批文件時，簡繁轉換的背景執行緒異常結束：{err}。\
+                         這不是單筆文件的內容問題；請確認 indexer 啟動時轉換表有載入成功\
+                         （log 不該有「簡繁轉換表載入失敗」）後再跑一次 --rebuild"
+                    ),
+                })?
+            };
 
             if !batch.is_empty() {
                 let marks = Self::source_marks(&batch);

@@ -10,28 +10,24 @@ use core_security::{
     verify_secret,
 };
 use serde_json::json;
-use storage_core::conformance::{load_workspace_dotenv, required_env};
-use storage_postgres::{PostgresApiTokenStore, PostgresAuditLog, PostgresCanonicalStore};
+use storage_core::conformance::load_workspace_dotenv;
+use storage_postgres::{
+    PostgresApiTokenStore, PostgresAuditLog, PostgresCanonicalStore, TestDatabase,
+};
 use uuid::Uuid;
 
-async fn connect() -> PostgresCanonicalStore {
+/// 一次性 DB（KNOWN_GAPS §26）。回傳的 `_db` 必須活到測試結束，drop 時才刪 DB。
+/// TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+async fn connect() -> (PostgresCanonicalStore, TestDatabase) {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "只連本機 Postgres，實際 DSN host 不像本機：{}",
-        storage_core::StorageError::sanitize(&dsn)
-    );
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
-    store
+    let db = TestDatabase::create().await;
+    let store = db.store().clone();
+    (store, db)
 }
 
 #[tokio::test]
 async fn audit_round_trip_and_queries() {
-    let store = connect().await;
+    let (store, _db) = connect().await;
     let log = PostgresAuditLog::new(&store);
 
     // resource_id 帶 run-specific UUID：這顆 Postgres 是共用的，
@@ -111,7 +107,7 @@ async fn audit_round_trip_and_queries() {
 /// adapter 要把它折成 `{}`，而不是讓寫入失敗。
 #[tokio::test]
 async fn audit_null_metadata_becomes_empty_object() {
-    let store = connect().await;
+    let (store, _db) = connect().await;
     let log = PostgresAuditLog::new(&store);
     let resource_id = Uuid::now_v7().to_string();
     log.append(AuditEntry::new(
@@ -138,7 +134,7 @@ async fn audit_null_metadata_becomes_empty_object() {
 
 #[tokio::test]
 async fn token_store_round_trip() {
-    let store = connect().await;
+    let (store, _db) = connect().await;
     let tokens = PostgresApiTokenStore::new(&store);
 
     let expires_at = Utc::now() + Duration::days(7);

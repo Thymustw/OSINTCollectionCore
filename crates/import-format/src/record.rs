@@ -108,10 +108,11 @@ pub fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
         }
     }
     // Unix epoch 秒。只接受 10 位數字，避免把 ID 當成時間。
-    if value.len() == 10 && value.bytes().all(|b| b.is_ascii_digit()) {
-        if let Ok(secs) = value.parse::<i64>() {
-            return DateTime::from_timestamp(secs, 0);
-        }
+    if value.len() == 10
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(secs) = value.parse::<i64>()
+    {
+        return DateTime::from_timestamp(secs, 0);
     }
     None
 }

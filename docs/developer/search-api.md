@@ -119,9 +119,14 @@ hit.raw_evidence_id
 
 ### `snippet` 的退回機制
 
-優先用 highlight（`title` → `summary` → `body`），沒有 highlight 時退回
-摘要開頭 200 字元。**退回是必要的**：只用過濾條件（沒有全文查詢）時 OpenSearch
+優先用 highlight。每個欄位先看 `.cjk` 再看母欄位（`title.cjk` → `title` →
+`summary.cjk` → `summary` → `body.cjk` → `body`）：cjk bigram 才能把「秦剛」框成一整詞，
+standard 欄位常常只框單字。沒有 highlight 時退回摘要開頭 200 字元。
+**退回是必要的**：只用過濾條件（沒有全文查詢）時 OpenSearch
 不會產生任何 highlight，若不退回，那些結果的 snippet 會全部是 null，看起來像資料有問題。
+
+highlight 查詢是「使用者原文 OR 轉簡後的同一棵樹」（`highlight_expression`），
+不是只拿轉簡後的主查詢去標。只拿轉簡查詢時，繁體文件的標題只會被標成單字。
 
 ### `entities` 上限 20
 
@@ -142,6 +147,11 @@ hit.raw_evidence_id
 
 `AND`／`OR`／`NOT` 必須**全大寫**才算運算子。小寫的 `and` 是普通的詞——
 否則使用者查 `crowdstrike and falcon` 會得到一個他沒打算下的布林運算。
+
+簡體與繁體在 `title`／`summary`／`body` 互通：每個 Term／Phrase 是「原文打原文欄位、
+轉簡打 `*_s`（簡體副本，見 `docs/developer/indexer.md`）」取高分（`StructuredSearch.normalized`）。
+`NOT` 底下的詞一樣配對，但不會被 highlight。作者欄與 entity 名稱**不**轉。
+**單字**跨字形查不到（`罚` 找不到只寫「罰鍰」的文件），多字詞沒有這個問題。
 
 ### 為什麼自己 parse
 

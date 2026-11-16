@@ -198,10 +198,10 @@ async fn read_body(
     mut response: reqwest::Response,
     limit: u64,
 ) -> Result<Vec<u8>, ConnectorError> {
-    if let Some(len) = response.content_length() {
-        if len > limit {
-            return Err(ConnectorError::ResponseTooLarge { limit });
-        }
+    if let Some(len) = response.content_length()
+        && len > limit
+    {
+        return Err(ConnectorError::ResponseTooLarge { limit });
     }
     let mut body = Vec::new();
     while let Some(chunk) = response

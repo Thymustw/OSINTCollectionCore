@@ -82,26 +82,35 @@ async fn run() -> Result<(), String> {
         metrics.clone(),
         bounds,
     );
-    service = match assemble_semantic_detector(&cfg).await {
-        Ok(detector) => {
-            tracing::warn!(
-                threshold = cfg.embedding.similarity_threshold,
-                cache_ttl_secs = cfg.embedding.dedup_cache_ttl().as_secs(),
-                "Stage 5 語意去重已啟用。\
+    service = if !cfg.deduplicator.semantic_enabled {
+        // 明確關閉與「基礎設施連不上」是兩件事，log 要分得出來：前者是設定，後者是故障。
+        tracing::info!(
+            "Stage 5 語意去重依設定關閉（[deduplicator].semantic_enabled = false，預設）。\
+             Stage 1-4 照常；理由見 docs/KNOWN_GAPS.md §22"
+        );
+        service.with_semantic_detector(Arc::new(UnsupportedSemanticDetector))
+    } else {
+        match assemble_semantic_detector(&cfg).await {
+            Ok(detector) => {
+                tracing::warn!(
+                    threshold = cfg.embedding.similarity_threshold,
+                    cache_ttl_secs = cfg.embedding.dedup_cache_ttl().as_secs(),
+                    "Stage 5 語意去重已啟用。\
                  [embedding].similarity_threshold 目前是 Phase 0 推論出來的暫定值，\
                  沒有用真實 OSINT 語料驗證過；e5 對不相關文字的 baseline cosine \
                  就有 ~0.83，存在誤判風險。誤判的 group 可依 DuplicateGroup.model \
                  過濾後人工審查／回滾"
-            );
-            service.with_semantic_detector(detector)
-        }
-        Err(reason) => {
-            tracing::warn!(
-                %reason,
-                "Stage 5 這次停用，退回 UnsupportedSemanticDetector。\
-                 Stage 1-4 不受影響；修好連線後重啟 osint-deduplicator 即會接上"
-            );
-            service.with_semantic_detector(Arc::new(UnsupportedSemanticDetector))
+                );
+                service.with_semantic_detector(detector)
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    %reason,
+                    "Stage 5 這次停用，退回 UnsupportedSemanticDetector。\
+                     Stage 1-4 不受影響；修好連線後重啟 osint-deduplicator 即會接上"
+                );
+                service.with_semantic_detector(Arc::new(UnsupportedSemanticDetector))
+            }
         }
     };
 

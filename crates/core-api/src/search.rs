@@ -161,14 +161,18 @@ fn date(source: &Value, field: &str) -> Option<DateTime<Utc>> {
 /// 退回機制是必要的：只用過濾條件（沒有全文查詢）時 OpenSearch 不會產生任何
 /// highlight，若不退回，那些結果的 snippet 會全部是 null，看起來像資料有問題。
 fn snippet(hit: &SearchHit) -> Option<String> {
+    // `.cjk` 先於母欄位：standard analyzer 常把「秦剛」標成兩個單字，
+    // cjk bigram 才會框成一整個詞。沒有 `.cjk` 片段時仍用母欄位。
     for field in [schema::F_TITLE, schema::F_SUMMARY, schema::F_BODY] {
-        if let Some(fragment) = hit
-            .highlights
-            .get(field)
-            .and_then(|frags| frags.first())
-            .filter(|f| !f.trim().is_empty())
-        {
-            return Some(fragment.clone());
+        for name in [format!("{field}.cjk"), field.to_string()] {
+            if let Some(fragment) = hit
+                .highlights
+                .get(&name)
+                .and_then(|frags| frags.first())
+                .filter(|f| !f.trim().is_empty())
+            {
+                return Some(fragment.clone());
+            }
         }
     }
     for field in [schema::F_SUMMARY, schema::F_BODY] {
@@ -249,6 +253,18 @@ mod tests {
         );
         assert!(body.source_id.is_some());
         assert!(body.connector_id.is_some());
+    }
+
+    #[test]
+    fn snippet_prefers_cjk_full_word_over_single_character_title() {
+        let body = to_body(&hit(
+            json!({"title": "秦剛外長"}),
+            &[
+                ("title", "<em>秦</em><em>剛</em>"),
+                ("title.cjk", "<em>秦剛</em>"),
+            ],
+        ));
+        assert_eq!(body.snippet.as_deref(), Some("<em>秦剛</em>"));
     }
 
     #[test]

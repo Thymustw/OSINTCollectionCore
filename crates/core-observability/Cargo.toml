@@ -8,7 +8,6 @@ publish.workspace = true
 description = "JSON tracing、簡易 metrics registry、/health /ready 型別"
 
 [dependencies]
-chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

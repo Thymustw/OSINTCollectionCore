@@ -22,8 +22,8 @@ use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use storage_core::RelationalStore;
-use storage_core::conformance::{load_workspace_dotenv, required_env};
-use storage_postgres::PostgresCanonicalStore;
+use storage_core::conformance::load_workspace_dotenv;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -70,19 +70,15 @@ struct PgApi {
     viewer: String,
     audit: MemoryAuditLog,
     store: PostgresCanonicalStore,
+    /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
+    _db: TestDatabase,
 }
 
 async fn pg_api() -> PgApi {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "只連本機 Postgres"
-    );
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres。跑此測試前請停 osint-core 應用容器");
-    store.migrate().await.expect("migrate");
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    let db = TestDatabase::create().await;
+    let store = db.store().clone();
 
     let jwt = JwtService::new(&[b't'; 32], "osint-core", chrono::Duration::hours(1)).expect("jwt");
     let admin = jwt.issue("purge-admin", Role::Admin).expect("issue");
@@ -128,6 +124,7 @@ async fn pg_api() -> PgApi {
         viewer,
         audit,
         store,
+        _db: db,
     }
 }
 

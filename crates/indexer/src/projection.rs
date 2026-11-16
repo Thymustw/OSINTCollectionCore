@@ -13,6 +13,7 @@ use storage_core::SearchDocument;
 use uuid::Uuid;
 
 use crate::schema;
+use crate::script;
 
 /// 寫進 index 的 entity 摘要。刻意不放 `description`／`attributes`：
 /// 那些會讓每份文件的 `_source` 膨脹好幾倍，而搜尋用不到。
@@ -74,24 +75,45 @@ pub fn build_body(
     );
     map.insert("schema_version".into(), json!(document.schema_version));
 
-    insert_text(
+    let title = insert_text(
         &mut map,
         schema::F_TITLE,
         document.title.as_deref(),
         max_field_bytes,
     );
-    insert_text(
+    let summary = insert_text(
         &mut map,
         schema::F_SUMMARY,
         document.summary.as_deref(),
         max_field_bytes,
     );
-    insert_text(
+    let body = insert_text(
         &mut map,
         schema::F_BODY,
         document.body.as_deref(),
         max_field_bytes,
     );
+    // 簡體副本吃的是**已經截過**的原文。先轉再截：轉換可能讓字串變長
+    // （一字對多字），不截第二次就會超過欄位上限。
+    insert_simplified(
+        &mut map,
+        schema::F_TITLE_S,
+        title.as_deref(),
+        max_field_bytes,
+    );
+    insert_simplified(
+        &mut map,
+        schema::F_SUMMARY_S,
+        summary.as_deref(),
+        max_field_bytes,
+    );
+    insert_simplified(&mut map, schema::F_BODY_S, body.as_deref(), max_field_bytes);
+    map.insert(
+        schema::F_TEXT_NORM_VERSION.into(),
+        json!(script::TEXT_NORM_VERSION),
+    );
+    // author 不轉。人名的簡繁對齊沒有做（KNOWN_GAPS §25），這裡轉了
+    // 查詢端卻沒轉，只會讓「作者」篩選對不到自己寫進去的字。
     insert_text(&mut map, "author", document.author.as_deref(), 1024);
 
     map.insert(schema::F_LANGUAGE.into(), json!(document.language));
@@ -177,8 +199,29 @@ pub fn effective_date(document: &Document) -> DateTime<Utc> {
     document.published_at.unwrap_or(document.observed_at)
 }
 
-fn insert_text(map: &mut Map<String, Value>, key: &str, value: Option<&str>, max_bytes: usize) {
+fn insert_text(
+    map: &mut Map<String, Value>,
+    key: &str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Option<String> {
     let value = value.map(|text| truncate_on_char_boundary(text, max_bytes).to_string());
+    map.insert(key.to_string(), json!(value.clone()));
+    value
+}
+
+/// 原文缺值就寫 null，不要寫空字串——空字串和 null 在 `exists` 查詢裡不一樣，
+/// 會讓「還沒重建」的計數把新文件也算進去。
+fn insert_simplified(
+    map: &mut Map<String, Value>,
+    key: &str,
+    original: Option<&str>,
+    max_bytes: usize,
+) {
+    let value = original.map(|text| {
+        let converted = script::to_simplified(text);
+        truncate_on_char_boundary(&converted, max_bytes).to_string()
+    });
     map.insert(key.to_string(), json!(value));
 }
 
@@ -376,7 +419,90 @@ mod tests {
     }
 
     #[test]
+    fn simplified_copies_follow_the_truncated_original() {
+        let mut doc = document();
+        doc.title = Some("秦剛外長".into());
+        doc.summary = Some("華春瑩說明".into());
+        // 「外長」轉成「外长」後 byte 數不變（各 3 byte）。把上限設在一個字元邊界上，
+        // 確認副本吃的是截過的原文，而不是先轉完整篇再另外截出不同的切點。
+        let max_bytes = "外".len() * 3;
+        doc.body = Some("外長".repeat(20));
+        let body = build_body(&doc, Provenance::default(), &[], Utc::now(), max_bytes);
+        for (original_key, simplified_key) in [
+            (schema::F_TITLE, schema::F_TITLE_S),
+            (schema::F_SUMMARY, schema::F_SUMMARY_S),
+            (schema::F_BODY, schema::F_BODY_S),
+        ] {
+            let original = body.get(original_key).and_then(Value::as_str).unwrap();
+            let simplified = body
+                .get(simplified_key)
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{simplified_key} 不是字串"));
+            let converted = script::to_simplified(original);
+            let expected = if converted.len() <= max_bytes {
+                converted
+            } else {
+                let mut end = max_bytes;
+                while end > 0 && !converted.is_char_boundary(end) {
+                    end -= 1;
+                }
+                converted[..end].to_string()
+            };
+            assert_eq!(simplified, expected, "{simplified_key}");
+            assert!(simplified.len() <= max_bytes);
+        }
+        assert_eq!(
+            body.get(schema::F_TEXT_NORM_VERSION)
+                .and_then(Value::as_str),
+            Some(script::TEXT_NORM_VERSION)
+        );
+
+        let uncut = build_body(
+            &doc,
+            Provenance::default(),
+            &[],
+            Utc::now(),
+            DEFAULT_MAX_FIELD_BYTES,
+        );
+        assert_eq!(
+            uncut.get(schema::F_TITLE_S).and_then(Value::as_str),
+            Some("秦刚外长")
+        );
+    }
+
+    #[test]
+    fn missing_text_becomes_null_on_the_simplified_copy_too() {
+        let mut doc = document();
+        doc.title = None;
+        doc.summary = None;
+        doc.body = None;
+        let body = build_body(&doc, Provenance::default(), &[], Utc::now(), 64);
+        for key in [
+            schema::F_TITLE,
+            schema::F_TITLE_S,
+            schema::F_SUMMARY,
+            schema::F_SUMMARY_S,
+            schema::F_BODY,
+            schema::F_BODY_S,
+        ] {
+            assert!(
+                body.get(key).is_some_and(Value::is_null),
+                "{key} 缺值時應是 null，不是省略欄位也不是空字串"
+            );
+        }
+    }
+
+    #[test]
+    fn every_key_produced_by_build_body_exists_in_index_mappings() {
+        assert_body_keys_are_declared();
+    }
+
+    #[test]
     fn body_keys_are_all_declared_in_the_mapping() {
+        assert_body_keys_are_declared();
+    }
+
+    fn assert_body_keys_are_declared() {
         // mapping 是 dynamic:strict。多一個沒宣告的欄位會讓**整批** bulk 被拒，
         // 而且只在對真 OpenSearch 跑時才看得到。這個測試把它擋在單元層級。
         let body = build_body(

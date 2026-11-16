@@ -108,6 +108,11 @@ simhash_scan_limit = 500
 # Hamming 距離門檻（64 bit 中最多差幾個 bit 才算近似重複）。
 # 3 是 SimHash 論文與多數實務的慣用值；理由見 crates/deduplicator/src/simhash.rs。
 simhash_max_distance = 3
+# Stage 5（語意去重）總開關，預設關閉（2026-11-16 owner 裁決）。
+# 打開前先讀 docs/KNOWN_GAPS.md §22：e5 的 cosine 擠在 0.7～1.0，TWCERT 100 篇不同文章
+# 兩兩有 92% ≥ 0.90（[embedding].similarity_threshold），開了會把不同文章判成重複、從搜尋消失。
+# 關閉時 Stage 1–4 照常；provenance 的 semantic_detector 記 "unsupported"。
+semantic_enabled = false
 
 [entity_worker]
 bind = "127.0.0.1:18084"

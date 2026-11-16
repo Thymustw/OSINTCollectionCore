@@ -1604,6 +1604,32 @@ pub struct StructuredSearch {
     pub sort: Vec<SortField>,
     /// 要產生命中片段的欄位。空的代表不做 highlight。
     pub highlight_fields: Vec<String>,
+    /// 只給 highlight 用的查詢樹。`None` 時 highlight 沿用 [`Self::expression`]。
+    ///
+    /// 關鍵字搜尋的轉簡樹在 [`Self::normalized`]（打 `*_s`），但片段要框的是文件上的
+    /// 原文，而且要兩種字形都框。這個樹通常是「原文查詢 OR 轉簡查詢」。`#[serde(default)]` 讓舊的
+    /// 序列化請求（沒有這個欄位）仍是 `None`，而不是反序列化失敗。
+    #[serde(default)]
+    pub highlight_expression: Option<QueryExpr>,
+    /// 字形正規化後的查詢（關鍵字搜尋的簡繁互通，ADR-017）。`None` 時只用 [`Self::expression`]。
+    ///
+    /// 有值時 adapter **逐葉子配對**：每個 Term／Phrase 變成「原文打 [`Self::fields`]」與
+    /// 「正規化文字打 [`NormalizedSearch::fields`]」取高分（OpenSearch 是 `dis_max`）。
+    /// 不能把正規化文字拿去打原文欄位：standard analyzer 一字一 token，繁體文件的「罰」
+    /// 用「罚」查不到，整個 And 就落空（2026-11-16 v0 評估 3 題因此 0 筆）。
+    #[serde(default)]
+    pub normalized: Option<NormalizedSearch>,
+}
+
+/// [`StructuredSearch::normalized`] 的內容。
+///
+/// `expression` 必須與 [`StructuredSearch::expression`] **形狀相同**（只有葉子文字不同）；
+/// 不同時 adapter 回 [`StorageError::Configuration`]，不會默默只用其中一棵。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedSearch {
+    pub expression: QueryExpr,
+    /// 存正規化副本的欄位（例如 `title_s`）。
+    pub fields: Vec<SearchField>,
 }
 
 /// 搜尋投影的**寫入與查詢**。
@@ -1715,14 +1741,13 @@ impl ProjectionCheckpoint {
         self.objects_written = self.objects_written.saturating_add(written);
         self.updated_at = now;
         // 刻意不用 let-chain：workspace 的 rust-version 是 1.85，let-chain 要 1.88。
-        if let Some(source_at) = source_at {
-            if self
+        if let Some(source_at) = source_at
+            && self
                 .last_source_at
                 .is_none_or(|current| source_at > current)
-            {
-                self.last_source_at = Some(source_at);
-                self.last_object_id = object_id;
-            }
+        {
+            self.last_source_at = Some(source_at);
+            self.last_object_id = object_id;
         }
     }
 }

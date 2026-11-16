@@ -131,11 +131,13 @@ log 失控都會吃掉這台與 VM 共用的根磁碟（CLAUDE.md §15）。
    `test-support` feature 後面，正式 binary 不含。新 crate 的測試要用時，在
    `[dev-dependencies]` 加
    `storage-postgres = { path = "../storage-postgres", features = ["test-support"] }`
-   （目前開啟的有 storage-postgres 自己、collector、core-api）。
+   （2026-11-17 起所有連 Postgres 的測試 crate 都開了，因為 `TestDatabase` 也在這個 feature 後面）。
 3. **守門測試** `no_stale_enabled_scheduled_test_connectors`
    （`crates/storage-postgres/tests/no_stale_enabled_test_connectors.rs`）：
    開發 DB 裡不該有「enabled、有排程、名稱像測試、UUID v7 已超過 5 分鐘」的
    connector。失敗訊息會列出名稱，並說明用前綴 grep 哪支測試沒收尾。
+   同檔的 `no_test_sources_in_dev_database`（2026-11-17）更嚴：開發 DB 不可有**任何**測試命名的
+   source（不論 enabled），有就代表某支測試沒改用 `TestDatabase`。
 
 ### 本機跑 vs 容器內跑：設定完全不一樣
 
@@ -333,7 +335,25 @@ SQLite 不是 Core canonical store（詳見內部架構文件 STORAGE_ARCHITECTU
 cargo test --workspace --all-targets -- --nocapture
 ```
 
-Postgres 測試會插入 UUID v7 列，不會 TRUNCATE。OpenSearch 用一次性 index 名；S3 用 `conformance/<uuid>/` prefix。
+Postgres 測試**不寫開發 DB**（2026-11-17 起，KNOWN_GAPS §26）：每個測試用
+`storage_postgres::TestDatabase::create()` 拿一個一次性 database（`osint_test_<uuidv7>`，從
+`osint_test_tpl_<migration 雜湊>` 模板複製），drop 時刪掉。OpenSearch 用一次性 index 名；S3 用 `conformance/<uuid>/` prefix。
+
+```rust
+let db = TestDatabase::create().await;   // 綁進 Stack 或 `let _db`，活到測試結束
+let pg = db.store().clone();             // 需要 DSN 的 guard 用 db.dsn()
+```
+
+- ⚠️ 解構 Stack 時別用 `..` 丟掉 `_db`：`let Stack { pg, .. } = …` 會讓 DB 立刻被刪，
+  後續查詢確定性失敗 `database "osint_test_…" does not exist`（2026-11-17 connector e2e 實際踩過）。
+- `DATABASE_URL` 只用來取得伺服器位址與帳號，主機必須是本機；`OSINT_TEST_KEEP_DB=1` 保留 DB 方便除錯。
+- 行程被砍時 Drop 不會跑；下一次 `create()` 清掃逾時 30 分鐘且無連線的 `osint_test_*`。手動檢查：
+  `docker exec osint-core-postgres-1 psql -U osint -d postgres -c "SELECT datname FROM pg_database WHERE datname LIKE 'osint_test_%'"`
+  （模板 `osint_test_tpl_*` 留著是正常的，migration 改了會自動建新的；舊模板可手動 `DROP DATABASE`）。
+- 新 crate 要用：`[dev-dependencies]` 加 `storage-postgres = { path = "../storage-postgres", features = ["test-support"] }`。
+- 唯二刻意連開發 DB 的測試：`no_stale_enabled_test_connectors.rs`（守門）與 `acceptance/tests/failure_recovery.rs`（`#[ignore]`）。
+- Redpanda 沒有隔離：測試事件仍會被執行中的服務吃到，normalizer 在開發 DB 找不到那筆 raw_evidence 而寫進
+  `failed_events`（跑一輪全部測試實測 +44 列）；測試的 `osint-e2e-*` consumer group 也不會刪。兩者都是已知缺口。
 
 ### ⚠️ 跑測試前先停掉應用服務容器
 

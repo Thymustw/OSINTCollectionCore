@@ -49,6 +49,9 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
+    // 查詢端與 indexer 共用同一套簡繁轉換。載入失敗就不要起來：
+    // 起來了卻用未轉換的查詢字串，繁體問句會靜默漏掉簡體文件。
+    indexer::script::init()?;
     let cfg = AppConfig::load().map_err(|err| err.to_string())?;
     let jwt_secret = cfg
         .auth

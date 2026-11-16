@@ -18,6 +18,7 @@ ignore = [
     "RUSTSEC-2024-0436", # paste unmaintained，經 neo4rs 帶入，見 VULNERABILITY_TRIAGE.md
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained，經 neo4rs 帶入，見 VULNERABILITY_TRIAGE.md
     "RUSTSEC-2026-0387", # crypto-bigint 0.5 時序，經 jsonwebtoken→p256 帶入（只用 HS256），見 VULNERABILITY_TRIAGE.md
+    "RUSTSEC-2026-0459", # libsqlite3-sys 0.37 bundled SQLite，經 sqlx-sqlite（<0.38 上限）帶入，只在 dev-dependencies，見 VULNERABILITY_TRIAGE.md
 ]
 
 [licenses]

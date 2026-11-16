@@ -212,10 +212,10 @@ fn parse_date(raw: &str, end: bool) -> Result<DateTime<Utc>, CliError> {
         } else {
             date.and_hms_opt(0, 0, 0)
         };
-        if let Some(naive) = time {
-            if let Some(dt) = Utc.from_local_datetime(&naive).single() {
-                return Ok(dt);
-            }
+        if let Some(naive) = time
+            && let Some(dt) = Utc.from_local_datetime(&naive).single()
+        {
+            return Ok(dt);
         }
     }
     Err(CliError::InvalidArgument {
@@ -257,9 +257,18 @@ fn text(source: &Value, field: &str) -> Option<String> {
 }
 
 fn snippet(hit: &SearchHit) -> Option<String> {
+    // 與 core-api 的 snippet 相同：`.cjk` 先於母欄位。standard analyzer 常把「秦剛」標成兩個單字，
+    // cjk bigram 才會框成一整個詞。沒有 `.cjk` 片段時仍用母欄位。
     for field in [schema::F_TITLE, schema::F_SUMMARY, schema::F_BODY] {
-        if let Some(fragment) = hit.highlights.get(field).and_then(|frags| frags.first()) {
-            return Some(fragment.clone());
+        for name in [format!("{field}.cjk"), field.to_string()] {
+            if let Some(fragment) = hit
+                .highlights
+                .get(&name)
+                .and_then(|frags| frags.first())
+                .filter(|f| !f.trim().is_empty())
+            {
+                return Some(fragment.clone());
+            }
         }
     }
     text(&hit.source, schema::F_SUMMARY).or_else(|| text(&hit.source, schema::F_BODY))

@@ -357,7 +357,18 @@ consumer_group = "osint-deduplicator"
 candidate_limit = 20
 simhash_scan_limit = 500
 simhash_max_distance = 3
+semantic_enabled = false   # Stage 5 總開關，預設關閉
 ```
+
+**`semantic_enabled`（2026-11-16 新增，預設 `false`）**：Stage 5 的總開關。關閉時直接掛
+`UnsupportedSemanticDetector`（provenance 的 `semantic_detector` 記 `"unsupported"`），
+啟動 log 是 INFO「Stage 5 語意去重依設定關閉」，跟「基礎設施連不上而停用」的 WARN 分得開。
+預設關閉的理由是實測：e5 的 cosine 擠在 0.7～1.0，TWCERT 100 篇不同文章兩兩有 92% ≥ 0.90，
+打開會把不同文章判成重複（`docs/KNOWN_GAPS.md` §22）。舊設定檔沒有這個欄位時取 `false`。
+覆寫：`OSINT__DEDUPLICATOR__SEMANTIC_ENABLED=true`。
+
+**之前的行為（已改掉）**：沒有開關，Stage 5 只要啟動那一刻 OpenSearch／ml-commons／Redis
+都連得上就啟用——同一份設定，啟動順序不同行為就不同。
 
 Stage 5 另外讀 `[embedding].similarity_threshold`（預設 0.90）與
 `[embedding].dedup_cache_ttl_secs`（預設 900），OpenSearch／Redis 連線沿用

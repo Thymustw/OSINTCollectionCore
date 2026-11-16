@@ -132,16 +132,16 @@ impl SqliteEmbeddedStore {
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
         assert_sqlite_path_safe(path)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|err| StorageError::Unavailable {
-                    backend: "sqlite",
-                    message: format!(
-                        "無法建立 SQLite 目錄 `{}`：{err}。請確認路徑可寫",
-                        parent.display()
-                    ),
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|err| StorageError::Unavailable {
+                backend: "sqlite",
+                message: format!(
+                    "無法建立 SQLite 目錄 `{}`：{err}。請確認路徑可寫",
+                    parent.display()
+                ),
+            })?;
         }
 
         let options = SqliteConnectOptions::new()

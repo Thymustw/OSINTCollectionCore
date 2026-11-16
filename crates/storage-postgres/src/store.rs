@@ -29,6 +29,10 @@ use storage_core::{
 use crate::error::map_sqlx;
 use crate::mapping;
 
+/// `migrations/postgres`。[`PostgresCanonicalStore::migrate`] 與測試模板（`test_db.rs`）共用同一份，
+/// 模板名稱由它的 version／checksum 算出——兩邊各自 `migrate!` 會在改 migration 時漏掉一邊。
+pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/postgres");
+
 /// list cursor 分頁的每頁上限。呼叫端傳 0 或超大值都夾回 1..=100，避免無界查詢。
 fn clamp_limit(limit: u32) -> i64 {
     i64::from(limit.clamp(1, 100))
@@ -123,7 +127,7 @@ impl PostgresCanonicalStore {
 
     /// 跑 `migrations/postgres`。已套用過的版本會被 sqlx 跳過。
     pub async fn migrate(&self) -> Result<(), StorageError> {
-        sqlx::migrate!("../../migrations/postgres")
+        MIGRATOR
             .run(&self.pool)
             .await
             .map_err(|err| StorageError::MigrationRequired {

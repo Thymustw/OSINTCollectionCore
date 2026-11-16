@@ -25,28 +25,23 @@ use storage_core::{
     RelationalStore, SearchDocument, SearchStore, VectorSearch, embedding_content_hash,
 };
 use storage_opensearch::OpenSearchStore;
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use uuid::Uuid;
 
 struct Stack {
     pg: PostgresCanonicalStore,
     os: OpenSearchStore,
+    /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
+    _db: TestDatabase,
 }
 
 async fn connect_stack() -> Stack {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "e2e 只連本機 Postgres"
-    );
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    let db = TestDatabase::create().await;
+    let pg = db.store().clone();
     let url = required_env("OPENSEARCH_URL").expect("OPENSEARCH_URL");
     verify_not_opencti_search(&url).expect("OPENSEARCH_URL 埠隔離");
-
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
 
     let os = OpenSearchStore::connect(&url)
         .expect("opensearch client")
@@ -54,7 +49,7 @@ async fn connect_stack() -> Stack {
     let info = os.cluster_info().await.expect("GET /");
     assert_opensearch_identity(&info).expect("必須是 OpenSearch 不是 Elasticsearch");
 
-    Stack { pg, os }
+    Stack { pg, os, _db: db }
 }
 
 fn entities_index() -> String {

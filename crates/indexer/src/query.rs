@@ -211,10 +211,10 @@ impl Parser {
         if depth > MAX_DEPTH {
             return Err(QueryParseError::TooDeep);
         }
-        if let Some(name) = self.peek().and_then(Token::operator_name) {
-            if name != "NOT" {
-                return Err(QueryParseError::LeadingOperator { operator: name });
-            }
+        if let Some(name) = self.peek().and_then(Token::operator_name)
+            && name != "NOT"
+        {
+            return Err(QueryParseError::LeadingOperator { operator: name });
         }
         let mut parts = vec![self.parse_and(depth)?];
         while matches!(self.peek(), Some(Token::Or)) {

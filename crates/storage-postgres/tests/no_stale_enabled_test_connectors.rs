@@ -50,6 +50,22 @@ const LIST_STALE_SQL: &str = r#"
           )
 "#;
 
+/// 2026-11-17 起整合／e2e 測試一律用 `TestDatabase`（KNOWN_GAPS §26），開發 DB 不該再出現任何
+/// 測試命名的 source。樣式與 `eval/cleanup.py --source-name-regex` 用的 regex 相同，另加通用的 `-e2e-`。
+/// 排除本檔自己的 probe（`e2e-gatekeeper-source-*`、`e2e-guard-source-*`）：它們建了就刪，
+/// 但 probe 的 id 故意是 10 分鐘前，平行執行時會被誤抓。
+const LIST_TEST_SOURCES_SQL: &str = r#"
+        SELECT id, name
+        FROM sources
+        WHERE (
+            name ~ '^(dedup|indexer|dedup-semantic|search|stix|entity|acceptance|acceptance-g|bp-rss|shutdown-rss|failrec-import|ds)-e2e-'
+            OR name ~ '^e2e-'
+            OR name ~ '-e2e-'
+            OR name ~ '^(acceptance|bp-rss|shutdown-rss|failrec-import|stix-e2e|conformance|run-state-partial|reclaim|ev-col)-'
+          )
+          AND name !~ '^e2e-(gatekeeper|guard)-source-'
+"#;
+
 #[derive(Debug)]
 struct StaleConnector {
     id: Uuid,
@@ -155,6 +171,40 @@ async fn no_stale_enabled_scheduled_test_connectors() {
     assert!(
         message.contains("DisableConnectorsOnDrop"),
         "失敗訊息要指出下一步用 guard。實際：{message}"
+    );
+}
+
+/// 開發 DB 不可有測試命名的 source（不論 enabled）。有就代表某支測試沒改用 `TestDatabase`、
+/// 直接寫了開發 DB；殘留會被 `osint-indexer --rebuild` 投影進正式 index（KNOWN_GAPS §26）。
+#[tokio::test]
+async fn no_test_sources_in_dev_database() {
+    let (_dsn, store) = connect().await;
+    let rows = sqlx::query(LIST_TEST_SOURCES_SQL)
+        .fetch_all(store.pool())
+        .await
+        .expect("查測試命名的 source");
+    let now = Utc::now();
+    let stale: Vec<String> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let id: Uuid = row.get("id");
+            let name: String = row.get("name");
+            is_stale(id, now).then(|| format!("  - {name} (id={id})"))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "開發 Postgres 有 {} 個測試命名的 source（UUID v7 時間戳已超過 {} 分鐘）：\n{}\n\
+         整合／e2e 測試必須用 storage_postgres::TestDatabase，不可寫開發 DB。\
+         用名稱前綴在 crates/**/tests 搜尋是哪一支；清殘留：eval/cleanup.py --source-name-regex（先 dry-run）。",
+        stale.len(),
+        STALE_AFTER.num_minutes(),
+        stale
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 

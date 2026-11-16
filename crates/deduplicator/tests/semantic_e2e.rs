@@ -29,7 +29,7 @@ use storage_core::{
     SearchDocument, SearchStore, embedding_cache_key, embedding_content_hash,
 };
 use storage_opensearch::{MINILM_MODEL_NAME, MlCommonsEmbeddingProvider, OpenSearchStore};
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use storage_redis::RedisKeyValueStore;
 use uuid::Uuid;
 
@@ -38,23 +38,18 @@ struct Stack {
     os: OpenSearchStore,
     embeddings: MlCommonsEmbeddingProvider,
     redis: RedisKeyValueStore,
+    /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
+    _db: TestDatabase,
 }
 
 async fn connect_stack() -> Stack {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "e2e 只連本機 Postgres"
-    );
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    let db = TestDatabase::create().await;
+    let pg = db.store().clone();
     let url = required_env("OPENSEARCH_URL").expect("OPENSEARCH_URL");
     verify_not_opencti_search(&url).expect("OPENSEARCH_URL 埠隔離");
     let redis_url = required_env("REDIS_URL").expect("REDIS_URL");
-
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
 
     let os = OpenSearchStore::connect(&url)
         .expect("opensearch client")
@@ -73,6 +68,7 @@ async fn connect_stack() -> Stack {
         os,
         embeddings,
         redis,
+        _db: db,
     }
 }
 

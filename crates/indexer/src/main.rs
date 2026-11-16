@@ -107,6 +107,9 @@ async fn run() -> Result<(), String> {
         }
         ParsedArgs::Run(args) => args,
     };
+    // 轉換表壞掉就不要連資料庫、也不要開始寫 index。退回「不轉換」會讓
+    // 繁體查詢靜默漏掉簡體文件，而且重建出來的 text_norm_version 還是新的。
+    indexer::script::init()?;
     let cfg = AppConfig::load().map_err(|err| err.to_string())?;
 
     let dsn = cfg

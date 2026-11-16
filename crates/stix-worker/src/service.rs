@@ -652,10 +652,10 @@ async fn upsert_entity(
         .await?;
 
     let mut attributes = serde_json::Map::new();
-    if let Some(existing) = &existing {
-        if let Some(map) = existing.attributes.as_object() {
-            attributes.extend(map.clone());
-        }
+    if let Some(existing) = &existing
+        && let Some(map) = existing.attributes.as_object()
+    {
+        attributes.extend(map.clone());
     }
     if let Some(map) = mapped.attributes.as_object() {
         for (key, value) in map {

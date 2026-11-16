@@ -4,25 +4,26 @@ use storage_core::conformance::{
     assert_connector_run_state_partial_update, assert_event_outbox_contract_tracked,
     assert_evidence_collections, assert_jobs_purge, assert_list_sources_by_entity,
     assert_reclaim_orphan_collect_runs, assert_relational_round_trip_with_enabled_hook,
-    assert_transactional_contract, load_workspace_dotenv, required_env,
+    assert_transactional_contract, load_workspace_dotenv,
 };
 use storage_postgres::{
-    CleanupOutboxConformanceOnDrop, DisableConnectorsOnDrop, PostgresCanonicalStore,
+    CleanupOutboxConformanceOnDrop, DisableConnectorsOnDrop, PostgresCanonicalStore, TestDatabase,
 };
+
+/// 一次性 DB（KNOWN_GAPS §26）。回傳的 `_db` 必須活到測試結束，drop 時才刪 DB；
+/// DSN 給 DisableConnectorsOnDrop／CleanupOutboxConformanceOnDrop 用。
+/// TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+async fn connect() -> (PostgresCanonicalStore, String, TestDatabase) {
+    load_workspace_dotenv();
+    let db = TestDatabase::create().await;
+    let store = db.store().clone();
+    let dsn = db.dsn().to_string();
+    (store, dsn, db)
+}
 
 #[tokio::test]
 async fn postgres_canonical_conformance() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "conformance 只連本機 Postgres，實際 DSN host 不像本機：{}",
-        storage_core::StorageError::sanitize(&dsn)
-    );
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
+    let (store, dsn, _db) = connect().await;
     assert_canonical_health(&store)
         .await
         .expect("canonical health");
@@ -48,12 +49,7 @@ async fn postgres_canonical_conformance() {
 
 #[tokio::test]
 async fn postgres_list_sources_by_entity_dedup_and_empty() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
+    let (store, _dsn, _db) = connect().await;
     assert_list_sources_by_entity(&store)
         .await
         .expect("list_sources_by_entity：多 source 去重 + 無關聯回空");
@@ -61,34 +57,15 @@ async fn postgres_list_sources_by_entity_dedup_and_empty() {
 
 #[tokio::test]
 async fn postgres_evidence_collections_many_to_many() {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
+    let (store, _dsn, _db) = connect().await;
     assert_evidence_collections(&store)
         .await
         .expect("evidence ↔ collections 多對多寫入／反查／unlink／刪文件清關聯");
 }
 
-async fn connect() -> PostgresCanonicalStore {
-    load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "conformance 只連本機 Postgres"
-    );
-    let store = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("連 Postgres");
-    store.migrate().await.expect("migrate");
-    store
-}
-
 #[tokio::test]
 async fn postgres_collection_member_links_are_atomic() {
-    let store = connect().await;
+    let (store, _dsn, _db) = connect().await;
     assert_collection_member_links_atomic(&store)
         .await
         .expect("集合批次關聯：一筆無效整批不寫入");
@@ -96,7 +73,7 @@ async fn postgres_collection_member_links_are_atomic() {
 
 #[tokio::test]
 async fn postgres_connector_run_state_partial_update_does_not_clobber_patch() {
-    let store = connect().await;
+    let (store, _dsn, _db) = connect().await;
     assert_connector_run_state_partial_update(&store)
         .await
         .expect("update_connector_run_state 不得蓋掉 enabled/schedule");
@@ -104,7 +81,7 @@ async fn postgres_connector_run_state_partial_update_does_not_clobber_patch() {
 
 #[tokio::test]
 async fn postgres_candidate_natural_key_dedups_rediscovery() {
-    let store = connect().await;
+    let (store, _dsn, _db) = connect().await;
     assert_candidate_natural_key(&store)
         .await
         .expect("candidate 自然鍵：重跑不新增、被拒不復活、只附加證據");
@@ -112,7 +89,7 @@ async fn postgres_candidate_natural_key_dedups_rediscovery() {
 
 #[tokio::test]
 async fn postgres_jobs_purge_only_deletes_matching_terminal_rows() {
-    let store = connect().await;
+    let (store, _dsn, _db) = connect().await;
     assert_jobs_purge(&store)
         .await
         .expect("purge_jobs：只刪 collect+failed+夠舊，limit／非終態／count 對得上");
@@ -120,7 +97,7 @@ async fn postgres_jobs_purge_only_deletes_matching_terminal_rows() {
 
 #[tokio::test]
 async fn postgres_reclaim_orphan_collect_runs_marks_failed_and_idle() {
-    let store = connect().await;
+    let (store, _dsn, _db) = connect().await;
     // reclaim 收回全表 running collect job；與 collector shutdown 測試跨行程互斥。
     let _collect_lock = store
         .acquire_collect_state_test_lock()
@@ -133,7 +110,7 @@ async fn postgres_reclaim_orphan_collect_runs_marks_failed_and_idle() {
 
 #[tokio::test]
 async fn postgres_candidate_discovery_concurrent_writers_do_not_duplicate_evidence() {
-    let store = connect().await;
+    let (store, _dsn, _db) = connect().await;
     assert_candidate_discovery_concurrent(&store, 20)
         .await
         .expect("兩個寫入者同時記錄同一份候選證據：只能留下一列證據");
@@ -147,8 +124,7 @@ async fn postgres_outbox_parallel_claim_does_not_double_send() {
     use storage_core::{EventOutboxStore, EventOutboxTestSupport, OutboxEvent};
     use uuid::Uuid;
 
-    let store = connect().await;
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
+    let (store, dsn, _db) = connect().await;
     let run = Uuid::now_v7();
     let mut event = OutboxEvent::pending(
         format!("osint.conformance.outbox.parallel.{run}"),
@@ -200,8 +176,7 @@ async fn postgres_concurrent_candidate_approve_writes_single_outbox_row() {
     use storage_core::{EventOutboxTestSupport, OutboxEvent, RelationalStore, TransactionalStore};
     use uuid::Uuid;
 
-    let store = connect().await;
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
+    let (store, dsn, _db) = connect().await;
     let now = Utc::now();
     let candidate = Candidate {
         id: Uuid::now_v7(),

@@ -24,7 +24,7 @@ regex = { workspace = true }
 resolver = { workspace = true }
 serde_json = { workspace = true }
 storage-core = { workspace = true }
-storage-postgres = { path = "../storage-postgres" }
+storage-postgres = { path = "../storage-postgres", features = ["test-support"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -35,7 +35,7 @@ use storage_core::{
     SearchStore,
 };
 use storage_opensearch::{MlCommonsEmbeddingProvider, OpenSearchStore};
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -332,15 +332,10 @@ async fn run_hybrid_case(stack: &Stack, index: &str) -> Result<(), String> {
 #[ignore = "需要本機 ml-commons 已部署兩個模型與 Postgres；CI 沒有這個環境，見檔頭說明"]
 async fn similar_excludes_self_and_returns_nearest_neighbour() {
     let stack = connect_stack().await;
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "e2e 只連本機 Postgres"
-    );
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    // 必須活到測試結束，drop 時才刪 DB（KNOWN_GAPS §26）。
+    let _db = TestDatabase::create().await;
+    let pg = _db.store().clone();
 
     let index = format!("osint-documents-sim-e2e-{}", Uuid::now_v7().simple());
     stack

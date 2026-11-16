@@ -24,7 +24,7 @@ pub use traits::{
     DailyUsage, EMBEDDING_CACHE_KEY_PREFIX, EmbeddedStore, EmbeddingKind, EmbeddingModelRef,
     EmbeddingProvider, EmbeddingRequest, EmbeddingVector, GraphEdge, GraphNode, GraphPath,
     GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, JobPurgeFilter, KeyValueStore,
-    ObjectStore, ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
+    NormalizedSearch, ObjectStore, ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
     RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RebuildState, RebuildStatus, RelationalStore, SearchDocument,
     SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery, SearchStore, SimhashCandidate,
     SortField, StructuredSearch, Transaction, TransactionalStore, VectorSearch,

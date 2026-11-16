@@ -425,6 +425,14 @@ pub struct DeduplicatorSection {
     /// Stage 4 的 Hamming 距離門檻（0..=64）。門檻選擇的理由見
     /// `crates/deduplicator/src/simhash.rs`。
     pub simhash_max_distance: u32,
+    /// Stage 5（語意去重）總開關，**預設關閉**（2026-11-16 owner 裁決）。
+    ///
+    /// 關閉的理由是實測，不是保守：e5 的 cosine 擠在 0.7～1.0（模型卡 FAQ 明講只保證排序），
+    /// TWCERT 100 篇不同文章兩兩 4,950 對有 92% ≥ 0.90，打開就會把不同文章判成重複
+    /// （docs/KNOWN_GAPS.md §22）。找到在真實 OSINT 語料上分得開的模型／判準之前不要打開。
+    /// 舊設定檔沒有這個欄位時取 `false`。
+    #[serde(default)]
+    pub semantic_enabled: bool,
 }
 
 impl Default for DeduplicatorSection {
@@ -435,6 +443,7 @@ impl Default for DeduplicatorSection {
             candidate_limit: 20,
             simhash_scan_limit: 500,
             simhash_max_distance: 3,
+            semantic_enabled: false,
         }
     }
 }
@@ -1496,6 +1505,9 @@ mod tests {
             std::env::remove_var("OSINT__STORAGE__GRAPH__USERNAME");
             std::env::remove_var("OSINT__STORAGE__GRAPH__PASSWORD_SECRET_REF");
             std::env::remove_var("OSINT__STORAGE__GRAPH__POOL_MAX");
+            // 2026-11-16 同一類漏清：semantic_enabled 的覆寫測試設了這個，沒清會滲進
+            // load_default_toml（並行測試）而斷言失敗，再把 ENV_LOCK 毒化拖垮另外 11 個測試。
+            std::env::remove_var("OSINT__DEDUPLICATOR__SEMANTIC_ENABLED");
         }
     }
 
@@ -1581,6 +1593,8 @@ mod tests {
         assert_eq!(cfg.embedding.concurrent_inferences, 4);
         assert_eq!(cfg.embedding.similarity_threshold, 0.90);
         assert_eq!(cfg.embedding.dedup_cache_ttl_secs, 900);
+        // Stage 5 預設關閉（KNOWN_GAPS §22）：default.toml 與程式預設兩邊都要是 false。
+        assert!(!cfg.deduplicator.semantic_enabled);
         assert_eq!(cfg.search_hybrid.bm25_weight, 1.0);
         assert_eq!(cfg.search_hybrid.vector_weight, 1.0);
         assert_eq!(cfg.search_hybrid.entity_match_weight, 0.0);
@@ -1656,6 +1670,25 @@ mod tests {
         let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
         assert_eq!(cfg.app.environment, "test-override");
         assert_eq!(cfg.storage.canonical.pool_max, 3);
+        clear_osint_overrides();
+    }
+
+    #[test]
+    fn deduplicator_semantic_enabled_missing_defaults_false_and_env_can_enable() {
+        // 舊設定檔沒有 semantic_enabled → 關閉（不可因為缺欄位就整份 [deduplicator] 解析失敗）。
+        let section: DeduplicatorSection = serde_json::from_str(
+            r#"{"bind":"127.0.0.1:18083","consumer_group":"g","candidate_limit":20,"simhash_scan_limit":500,"simhash_max_distance":3}"#,
+        )
+        .unwrap();
+        assert!(!section.semantic_enabled);
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_osint_overrides();
+        unsafe {
+            std::env::set_var("OSINT__DEDUPLICATOR__SEMANTIC_ENABLED", "true");
+        }
+        let cfg = AppConfig::load_from(Some(&workspace_default()), None).unwrap();
+        assert!(cfg.deduplicator.semantic_enabled);
         clear_osint_overrides();
     }
 

@@ -23,7 +23,7 @@ use normalizer::{NormalizeOutcome, Normalizer};
 use serde_json::json;
 use storage_core::RelationalStore;
 use storage_core::conformance::{load_workspace_dotenv, required_env, verify_not_opencti_s3};
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use storage_s3::S3ObjectStore;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -93,15 +93,12 @@ struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
     brokers: String,
+    /// 一次性 PostgreSQL DB（KNOWN_GAPS §26）。以前開發 DB 裡 90 個 `dedup-e2e-*` source 都是這支留的。
+    _db: TestDatabase,
 }
 
 async fn connect_stack() -> Stack {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "e2e 只連本機 Postgres"
-    );
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
@@ -115,13 +112,16 @@ async fn connect_stack() -> Stack {
         "e2e 只連本機 Redpanda，實際 brokers={brokers}"
     );
 
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
+    let db = TestDatabase::create().await;
+    let pg = db.store().clone();
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
-    Stack { pg, s3, brokers }
+    Stack {
+        pg,
+        s3,
+        brokers,
+        _db: db,
+    }
 }
 
 fn dedup(stack: &Stack, producer: Option<Arc<EventProducer>>) -> Deduplicator {

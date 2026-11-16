@@ -216,14 +216,14 @@ impl BackpressureGate {
         let interval = Duration::from_secs(self.inner.config.lag_check_interval_secs.max(1));
         {
             let cache = self.lock_cache();
-            if let Some(at) = cache.checked_at {
-                if now.saturating_duration_since(at) < interval {
-                    self.publish_gauges(cache.state, cache.lag);
-                    return BackpressureDecision {
-                        state: cache.state,
-                        lag: cache.lag,
-                    };
-                }
+            if let Some(at) = cache.checked_at
+                && now.saturating_duration_since(at) < interval
+            {
+                self.publish_gauges(cache.state, cache.lag);
+                return BackpressureDecision {
+                    state: cache.state,
+                    lag: cache.lag,
+                };
             }
         }
 

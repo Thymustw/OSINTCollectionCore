@@ -21,7 +21,7 @@ url = { workspace = true }
 axum = { workspace = true }
 core-security = { workspace = true }
 storage-core = { workspace = true }
-storage-postgres = { path = "../storage-postgres" }
+storage-postgres = { path = "../storage-postgres", features = ["test-support"] }
 storage-s3 = { path = "../storage-s3" }
 tokio = { workspace = true }
 uuid = { workspace = true }

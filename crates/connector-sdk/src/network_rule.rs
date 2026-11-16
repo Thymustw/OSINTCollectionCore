@@ -116,10 +116,10 @@ fn rule_matches(rule: &NetworkRule, host: &str, ip: IpAddr, port: u16, now: Date
     if rule.is_expired(now) {
         return false;
     }
-    if let Some(ports) = rule.ports.as_ref() {
-        if !ports.contains(&port) {
-            return false;
-        }
+    if let Some(ports) = rule.ports.as_ref()
+        && !ports.contains(&port)
+    {
+        return false;
     }
     let target = rule.cidr_or_host.trim();
     if let Ok(net) = target.parse::<IpNet>() {

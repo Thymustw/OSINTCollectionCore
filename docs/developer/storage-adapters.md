@@ -27,7 +27,7 @@ crates/storage-core          capability traits、StorageError、health、conform
 crates/storage-postgres      CanonicalStore + RelationalStore（sqlx 0.9、rustls-ring）
 crates/storage-sqlite        EmbeddedStore + RelationalStore（sqlx 0.9 sqlite）
 crates/storage-opensearch    SearchStore + EmbeddingProvider（opensearch 2.4.0、rustls-tls；ml-commons `_predict`）
-crates/storage-redis         KeyValueStore（redis =1.2.2；workspace rust-version 1.87）
+crates/storage-redis         KeyValueStore（redis 1.8.x）
 crates/storage-s3            ObjectStore（object_store 0.14.1 aws + reqwest/rustls）
 crates/storage-neo4j         GraphStore + ProjectionStore（neo4rs 0.8.0）
 ```
@@ -88,7 +88,8 @@ V0.2 Phase 3 Step 2 起有兩個寫入者，indexer 改走 `bulk_upsert_fields`�
 adapter 必須通過 `storage_core::conformance::assert_bulk_upsert_preserves_unknown_fields`。
 
 新增 SearchStore adapter 必須通過 `storage_core::conformance::assert_structured_search`
-（驗過濾真的過濾、`Not` 真的排除、hit 帶得回 `sort`、`search_after` 真的接續）。
+（驗過濾真的過濾、`Not` 真的排除、hit 帶得回 `sort`、`search_after` 真的接續、
+`StructuredSearch.normalized` 逐詞配對——原文與正規化文字任一命中即可，不是兩棵樹各自整棵比對）。
 呼叫端要先自己建好帶明確 mapping 的 index——建 index 的語法是後端專屬的，
 放進 conformance 就等於把 OpenSearch 的 mapping DSL 塞進中立介面。
 
@@ -347,7 +348,7 @@ cargo test --workspace --all-targets -- --nocapture
 - sqlx：`runtime-tokio` + `tls-rustls-ring`，不開 native-tls。
 - OpenSearch client：`rustls-tls`。
 - object_store：`default-features = false` + `aws`。`aws` 會開 `reqwest/rustls` 與 `aws-lc-rs`，不開 native-tls。crate 預設的 `fs` feature 關掉，因為我們只接 S3 相容後端。
-- redis：精確 `=1.2.2`。`1.3+` 的 rust-version 是 1.88，超過 workspace `1.87.0`。
+- redis：`1.8.2`（caret，允許 1.x 小版更新，實際版本由 Cargo.lock 固定）。2026-11-16 從精確 `=1.2.2` 解除：當初釘版是因 `1.3+` 要 Rust 1.88、超過當時 MSRV 1.87；MSRV 升到 1.100 後理由不再成立。1.2.2 → 1.8.2 不需改程式（`clippy -D warnings` 通過、`redis_kv_conformance` 對本機 Redis 通過、`osint-cli health` 回 PING PONG）。**不再精確釘版**：Cargo.lock 已固定實際版本，精確釘版只會擋住小版的安全修正。2.0 目前只有 rc，主版號升級另外評估。
 - rdkafka：`cmake-build` + `libz`，不開 `ssl-vendored`（見 `docs/developer/events.md`）。
 
 ## `storage-postgres` 也實作 core-security 的兩個能力介面（Phase 6a）

@@ -111,6 +111,8 @@ pub async fn similar_objects(
                 ascending: true,
             }],
             highlight_fields: vec![],
+            highlight_expression: None,
+            normalized: None,
         })
         .await?;
 

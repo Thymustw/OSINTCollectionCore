@@ -48,7 +48,9 @@ core-api 與 osint-cli 都引用那裡的常數。
 |---|---|---|
 | `document_id` | keyword | `_id` 的副本；`search_after` 的收尾排序鍵 |
 | `object_type` | keyword（lowercase normalizer） | object type 過濾 |
-| `title` / `summary` / `body` | text（standard）+ `.cjk` sub-field | 全文檢索 |
+| `title` / `summary` / `body` | text（standard）+ `.cjk` sub-field | 全文檢索（保留原文） |
+| `title_s` / `summary_s` / `body_s` | text，analyzer `cjk`（頂層欄位，不是 sub-field） | 同一段文字的簡體副本。只被**轉簡後的查詢**打，所以繁簡互通。見 ADR-017 |
+| `text_norm_version` | keyword | 這份文件是用哪一套轉換寫的。缺欄位 = 還沒重建 |
 | `author` | text + `.keyword` | 顯示 |
 | `language` | keyword（lowercase） | language 過濾 |
 | `labels` | keyword | 保留 |
@@ -82,10 +84,41 @@ compose 的 image 是原版 `opensearchproject/opensearch:2.19.6`，**不裝任�
 |---|---|
 | 只用 `standard` | ❌ 中文退化成**單字**切分。查「勒索軟體」等同查「勒 OR 索 OR 軟 OR 體」，幾乎任何中文文件都命中 |
 | `standard` + `cjk` sub-field | ✅ **採用**。`cjk` 是 Lucene 內建、OpenSearch core 自帶（2.19.6 已實測：`勒索軟體攻擊` → `勒索`／`索軟`／`軟體`／`體攻`／`攻擊`） |
-| `analysis-icu` / `analysis-smartcn` | ❌ 都要 `opensearch-plugin install` → 自建 image ＋ 每次升級重裝。V0.1 不接受這個維運成本 |
+| `analysis-icu` / `analysis-smartcn` / `analysis-stconvert` | ❌ 都要 `opensearch-plugin install` → 自建 image ＋ 每次升級重裝。簡繁對齊改在應用端做（下面） |
 
-查詢時 `multi_match` 同時掃 `title`／`title.cjk`／`summary`／`summary.cjk`／`body`／`body.cjk`，
-權重 title 3、summary 2、body 1，`.cjk` 與母欄位同權重。
+查詢的每個詞是 `dis_max`：原文打 `title`／`title.cjk`／`summary`／`summary.cjk`／`body`／`body.cjk`
+（`schema::full_text_fields`），轉簡打 `title_s`／`summary_s`／`body_s`（`schema::simplified_text_fields`）。
+兩邊文字相同（英文、數字）時只送一個 `multi_match` 打全部欄位。權重 title 3、summary 2、body 1，
+`.cjk` 與 `*_s` 跟對應的母欄位同權重。
+
+### 簡繁：應用端轉簡，不裝 plugin
+
+`standard` 與 `cjk` 都不做簡繁正規化。查「秦剛」對不到只寫「秦刚」的文件。
+2026-11-16 的對照（同一批 1,290 份、OSINT 29 題可回答題，見 `docs/KNOWN_GAPS.md` §23
+與 ADR-017）裡，analysis-stconvert 外掛的 R@5 是 17/29，應用端 OpenCC `t2s`
+寫進 `*_s` 的 R@5 是 18/29（同結構查詢逐題相同）。這是**不改 Core 的臨時 index 實驗**，不是這份程式的實測。
+選應用端是為了不推翻「映像不裝外部 plugin」。
+
+做法：
+
+* indexer 把截斷後的 `title`／`summary`／`body` 用 `ferrous-opencc` 的 `BuiltinConfig::T2s`
+  轉成簡體，寫進 `title_s`／`summary_s`／`body_s`，再依同一個 byte 上限截一次
+  （轉換可能讓字串變長）。缺值寫 `null`，不寫空字串。
+* 同一筆寫 `text_norm_version`（目前 `opencc-t2s/ferrous-opencc-0.4.0`）。
+* 查詢端（`search::build`，core-api 與 osint-cli 都走這裡）保留原文樹（`expression`），另把
+  Term／Phrase 葉子轉簡放進 `normalized`；adapter 逐詞配對。**不可**把轉簡的詞拿去打原文欄位：
+  standard analyzer 一字一 token，繁體文件的「罰」用「罚」查不到（2026-11-16 第一版的迴歸，§23）。
+  `highlight_expression` 是「原文查詢 OR 轉簡查詢」，adapter 把它翻成
+  `highlight.highlight_query`，欄位含母欄位與 `.cjk`，**不含** `*_s`。
+* **沒有**轉 `author`、`entities.name`、`entities.normalized_name`（KNOWN_GAPS §25）。
+
+`*_s` 必須是頂層欄位。sub-field 的內容被規定成跟母欄位同一段字，寫不進另一份簡體。
+
+轉換表載入失敗時 indexer 與 core-api **拒絕啟動**。靜默退回原文會讓繁體查詢漏掉簡體文件，
+而且不會有錯誤訊息。
+
+即時消費一筆文件的轉換留在 async 路徑上（最壞約 30 ms，前後是資料庫往返）。
+`--rebuild` 一頁最多 100 筆，改在 `spawn_blocking` 裡組文件，避免卡住 Tokio worker。
 
 **`operator: "and"`** 是關鍵：一個 term 被 analyzer 拆成多個 token 時全部都要命中。
 中文靠的就是這個——預設的 `or` 會讓只含「軟體」的文件也命中「勒索軟體」。
@@ -352,6 +385,28 @@ indexer 的 `build_body()` 完全不知道這四個欄位。若 `--rebuild`（�
 mapping 有**破壞性**變更（欄位改型別、analyzer 換掉）時**必須**用 `--drop`：
 OpenSearch 的 `_mapping` 只能新增欄位。不加的話重建會成功，但舊欄位仍用舊型別，
 查詢行為與新叢集不同**且不會報錯**。
+
+### 簡繁欄位的上線順序（不要先重啟 core-api）
+
+`title_s` 這組欄位是**新增**，不是改型別，所以不要 `--drop`——`--drop` 會把
+embedding-worker 疊上去的向量一起清掉。順序反了（core-api 先重啟、文件還沒重建）不會報錯：沒重建的簡體文件沒有 `*_s`，繁體查詢還是找不到它們。
+（第一版只送轉簡查詢時，順序反了會讓繁體文件用繁體查不到；2026-11-16 改成逐詞配對後原文查詢仍打原文欄位，這個後果已不存在。）步驟：
+
+1. 先換上新的 indexer 並讓它起來（`ensure_index` 會把新欄位補進既有 mapping）。
+2. `osint-indexer --rebuild`，**不要**加 `--drop`。
+3. 確認缺 `text_norm_version` 的文件數是 0（見下面的查詢）。不是 0 就不要進下一步。
+4. 才重啟 core-api。
+
+數還沒重建的文件（`_count` 只算 root document，不會把 nested entity 算進去）：
+
+```bash
+curl -s -H 'Content-Type: application/json' \
+  "$OPENSEARCH_URL/osint-documents/_count" \
+  -d '{"query":{"bool":{"must_not":[{"exists":{"field":"text_norm_version"}}]}}}'
+```
+
+`"count": 0` 才算補完。這個數沒有做成 `/metrics` gauge：每次 scrape 都打一次
+`_count` 要在 adapter 加一條新查詢，而 rollout 期間用上面這次查詢就夠。
 
 `--drop` 不能單獨使用（沒有 `--rebuild`）：單獨刪掉 index 會讓搜尋直接空掉，
 而且沒有任何東西會把它補回來。argument parser 會擋。

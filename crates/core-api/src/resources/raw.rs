@@ -99,10 +99,9 @@ async fn fetch_body(state: &AppState, evidence: &RawEvidence) -> Result<RawBody,
     if let Some(declared) = evidence
         .content_length
         .and_then(|n| usize::try_from(n).ok())
+        && declared > limit
     {
-        if declared > limit {
-            return Err(too_large(declared, limit, &key));
-        }
+        return Err(too_large(declared, limit, &key));
     }
 
     let bytes = objects

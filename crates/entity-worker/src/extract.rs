@@ -656,14 +656,10 @@ fn is_plausible_bare_domain(candidate: &str) -> bool {
     }
     // 全數字的標籤 + 兩碼 suffix 幾乎都是版本號或編號，不是網域。
     let labels: Vec<&str> = candidate.split('.').collect();
-    if labels
+    !labels
         .iter()
         .take(labels.len() - 1)
         .all(|l| l.chars().all(|c| c.is_ascii_digit()))
-    {
-        return false;
-    }
-    true
 }
 
 /// MD5／SHA1／SHA256。純 hex + 長度判斷。

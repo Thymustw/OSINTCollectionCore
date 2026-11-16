@@ -29,6 +29,13 @@ pub const F_OBJECT_TYPE: &str = "object_type";
 pub const F_TITLE: &str = "title";
 pub const F_SUMMARY: &str = "summary";
 pub const F_BODY: &str = "body";
+/// `title` 轉簡體後的副本。analyzer 是 `cjk`，不是 `title` 的 sub-field
+/// （理由見 [`index_mappings`] 上方的 analyzer 取捨）。
+pub const F_TITLE_S: &str = "title_s";
+pub const F_SUMMARY_S: &str = "summary_s";
+pub const F_BODY_S: &str = "body_s";
+/// 這份文件的正文是用哪一套簡繁轉換寫進去的。缺這個欄位代表還沒重建。
+pub const F_TEXT_NORM_VERSION: &str = "text_norm_version";
 pub const F_LANGUAGE: &str = "language";
 pub const F_SOURCE_ID: &str = "source_id";
 pub const F_CONNECTOR_ID: &str = "connector_id";
@@ -93,6 +100,10 @@ impl DateField {
 /// 每個文字欄位都出現兩次：`x`（standard analyzer）與 `x.cjk`（cjk bigram）。
 /// 兩者權重相同——同一段內容在兩個 analyzer 下各算一次分，
 /// 給 `.cjk` 較低權重只會讓中文查詢的排序比英文差，沒有道理。
+///
+/// 只含原文欄位。簡體副本在 [`simplified_text_fields`]，由**轉簡後的查詢**去打——
+/// 原文查詢打原文欄位、轉簡查詢打 `*_s`，逐詞取高分（ADR-017）。
+/// 轉簡查詢不能打原文欄位：standard analyzer 一字一 token，繁體文件的「罰」用「罚」查不到。
 #[must_use]
 pub fn full_text_fields() -> Vec<SearchField> {
     vec![
@@ -105,8 +116,20 @@ pub fn full_text_fields() -> Vec<SearchField> {
     ]
 }
 
-/// highlight 要產生片段的欄位。只取 title／summary／body 的 standard 版本；
-/// `.cjk` 的命中靠 `require_field_match: false` 折回母欄位（見 storage-opensearch）。
+/// 轉簡副本（本身就是 `cjk` analyzer），權重與母欄位相同。
+#[must_use]
+pub fn simplified_text_fields() -> Vec<SearchField> {
+    vec![
+        SearchField::new(F_TITLE_S, 3.0),
+        SearchField::new(F_SUMMARY_S, 2.0),
+        SearchField::new(F_BODY_S, 1.0),
+    ]
+}
+
+/// highlight 要產生片段的欄位。只取 title／summary／body 的原文欄位，
+/// **不含** `*_s`：簡體副本的片段會把畫面上的繁體標題換成簡體字。
+/// `.cjk` 的命中靠 `require_field_match: false`，並由 adapter 另送
+/// `highlight_query`（原文查詢 OR 轉簡查詢，欄位含 `.cjk`）讓整詞能被框起來。
 #[must_use]
 pub fn highlight_fields() -> Vec<String> {
     vec![F_TITLE.into(), F_SUMMARY.into(), F_BODY.into()]
@@ -141,21 +164,27 @@ pub fn index_settings() -> Value {
 /// * `cjk`（Lucene 內建，OpenSearch core 自帶，已在 2.19.6 實測可用）：
 ///   CJK 字元做 **bigram**，非 CJK 走 standard 的規則。「勒索軟體」→
 ///   `勒索`／`索軟`／`軟體`，精確度遠優於單字。
-/// * 沒有選 `analysis-icu` / `analysis-smartcn`：都需要 `opensearch-plugin install`，
-///   等於自建 image 並在每次升級時重裝。V0.1 不接受這個維運成本。
+/// * 沒有選 `analysis-icu` / `analysis-smartcn` / `analysis-stconvert`：都需要
+///   `opensearch-plugin install`，等於自建 image 並在每次升級時重裝。
+///   簡繁對齊改在應用端做（ADR-017）：`title_s`／`summary_s`／`body_s` 是
+///   **獨立的頂層欄位**（`analyzer: cjk`），不是 `.t2s` sub-field。
+///   2026-11-16 的對照實驗裡，外掛 sub-field（R@5 17/29）與應用端副本
+///   （R@5 18/29）效果相同，所以不為了簡繁去綁一個 plugin 版本。
 ///
 /// 已知代價：bigram 不是真正的斷詞，「軟體攻擊」會在「防毒軟體。攻擊者…」這種
 /// 跨句邊界的地方產生假命中（`體攻` bigram 不會，但 phrase 之外的 term 查詢會）。
 /// 精確比對請用引號做 phrase 查詢。
+/// `author` 與 `entities.name`／`normalized_name` **沒有**簡體副本——
+/// 那些欄位的簡繁仍對不到（見 KNOWN_GAPS §25）。
 fn text_field(extra: Option<Value>) -> Value {
     let mut fields = json!({
         "cjk": { "type": "text", "analyzer": "cjk" }
     });
-    if let (Some(extra), Some(map)) = (extra, fields.as_object_mut()) {
-        if let Some(extra) = extra.as_object() {
-            for (key, value) in extra {
-                map.insert(key.clone(), value.clone());
-            }
+    if let (Some(extra), Some(map)) = (extra, fields.as_object_mut())
+        && let Some(extra) = extra.as_object()
+    {
+        for (key, value) in extra {
+            map.insert(key.clone(), value.clone());
         }
     }
     json!({
@@ -174,6 +203,14 @@ fn lowercase_keyword() -> Value {
     json!({ "type": "keyword", "normalizer": "lowercase" })
 }
 
+/// 簡體副本。頂層 `text` + `cjk`，不是母欄位的 sub-field。
+///
+/// sub-field 的內容必須等於母欄位（OpenSearch 不會讓你對 sub-field 另寫一份字串）。
+/// 簡體副本的字和原文不同，所以只能是另一個欄位。
+fn simplified_text_field() -> Value {
+    json!({ "type": "text", "analyzer": "cjk" })
+}
+
 /// `osint-documents` 的完整欄位對映。
 #[must_use]
 pub fn index_mappings() -> Value {
@@ -190,6 +227,10 @@ pub fn index_mappings() -> Value {
             }))),
             F_SUMMARY: text_field(None),
             F_BODY: text_field(None),
+            F_TITLE_S: simplified_text_field(),
+            F_SUMMARY_S: simplified_text_field(),
+            F_BODY_S: simplified_text_field(),
+            F_TEXT_NORM_VERSION: { "type": "keyword" },
             "author": text_field(Some(json!({
                 "keyword": { "type": "keyword", "ignore_above": 256 }
             }))),
@@ -322,11 +363,69 @@ mod tests {
     }
 
     #[test]
+    fn simplified_fields_use_the_cjk_analyzer_at_the_top_level() {
+        let mappings = index_mappings();
+        for field in [F_TITLE_S, F_SUMMARY_S, F_BODY_S] {
+            assert_eq!(
+                mappings
+                    .pointer(&format!("/properties/{field}/analyzer"))
+                    .and_then(Value::as_str),
+                Some("cjk"),
+                "{field} 不是 cjk analyzer，簡體副本的 bigram 對不到查詢"
+            );
+            assert_eq!(
+                mappings
+                    .pointer(&format!("/properties/{field}/type"))
+                    .and_then(Value::as_str),
+                Some("text")
+            );
+            assert!(
+                mappings
+                    .pointer(&format!("/properties/{field}/fields"))
+                    .is_none(),
+                "{field} 不該是帶 sub-field 的母欄位；簡體字串和原文不同，sub-field 寫不進另一份內容"
+            );
+        }
+        assert_eq!(
+            mappings
+                .pointer(&format!("/properties/{F_TEXT_NORM_VERSION}/type"))
+                .and_then(Value::as_str),
+            Some("keyword"),
+            "text_norm_version 用來數「還沒重建」的文件，型別猜錯就數不準且不會報錯"
+        );
+    }
+
+    #[test]
     fn full_text_fields_cover_both_analyzers() {
         let names: Vec<String> = full_text_fields().into_iter().map(|f| f.name).collect();
         for field in [F_TITLE, F_SUMMARY, F_BODY] {
             assert!(names.contains(&field.to_string()), "缺 {field}");
             assert!(names.contains(&format!("{field}.cjk")), "缺 {field}.cjk");
+        }
+        let simplified: Vec<String> = simplified_text_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        for field in [F_TITLE_S, F_SUMMARY_S, F_BODY_S] {
+            assert!(
+                simplified.contains(&field.to_string()),
+                "缺 {field}，轉簡後的查詢打不到簡體副本"
+            );
+            assert!(
+                !names.contains(&field.to_string()),
+                "{field} 不可在原文欄位清單：原文查詢打簡體副本沒有意義，轉簡查詢打原文欄位會讓繁體單字落空"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_fields_exclude_simplified_copies() {
+        let fields = highlight_fields();
+        for field in [F_TITLE_S, F_SUMMARY_S, F_BODY_S] {
+            assert!(
+                !fields.iter().any(|name| name == field),
+                "{field} 不該產生 snippet，否則畫面上的繁體標題會被簡體副本蓋掉"
+            );
         }
     }
 
@@ -334,7 +433,10 @@ mod tests {
     fn every_full_text_field_exists_in_the_mapping() {
         // 查一個 mapping 裡沒有的欄位不會報錯，只會永遠查不到東西。
         let mappings = index_mappings();
-        for field in full_text_fields() {
+        for field in full_text_fields()
+            .into_iter()
+            .chain(simplified_text_fields())
+        {
             let (base, sub) = match field.name.split_once('.') {
                 Some((base, sub)) => (base.to_string(), Some(sub.to_string())),
                 None => (field.name.clone(), None),

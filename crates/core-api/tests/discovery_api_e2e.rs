@@ -26,7 +26,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use storage_core::conformance::{load_workspace_dotenv, required_env, verify_not_opencti_s3};
 use storage_core::{EventOutboxStore, EventOutboxTestSupport, RelationalStore};
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -35,22 +35,20 @@ const MAX_BODY_BYTES: u64 = 4_096;
 struct Stack {
     pg: PostgresCanonicalStore,
     dsn: String,
+    /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
+    _db: TestDatabase,
 }
 
 async fn connect_stack() -> Stack {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "e2e 只連本機 Postgres"
-    );
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    // dsn 給 E2eDiscoveryRowsOnDrop 用，指到同一個一次性 DB。
+    let db = TestDatabase::create().await;
+    let pg = db.store().clone();
+    let dsn = db.dsn().to_string();
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
-    Stack { pg, dsn }
+    Stack { pg, dsn, _db: db }
 }
 
 struct TestApi {

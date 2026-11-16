@@ -20,10 +20,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use storage_core::{SearchFilter, SearchHit, SortField, StructuredSearch};
+use storage_core::{
+    NormalizedSearch, QueryExpr, SearchFilter, SearchHit, SortField, StructuredSearch,
+};
 
 use crate::query::{self, QueryParseError};
 use crate::schema::{self, DateField};
+use crate::script;
 
 /// 單次搜尋最多回幾筆。防止一次請求拖垮 OpenSearch 與 API。
 pub const MAX_LIMIT: u32 = 100;
@@ -109,16 +112,29 @@ impl SearchRequest {
 
 /// 把請求翻成後端中立的結構化查詢。
 pub fn build(index: &str, request: &SearchRequest) -> Result<StructuredSearch, SearchRequestError> {
-    if let (Some(from), Some(to)) = (request.date_from, request.date_to) {
-        if from > to {
-            return Err(SearchRequestError::InvalidDateRange {
-                from: from.to_rfc3339(),
-                to: to.to_rfc3339(),
-            });
-        }
+    if let (Some(from), Some(to)) = (request.date_from, request.date_to)
+        && from > to
+    {
+        return Err(SearchRequestError::InvalidDateRange {
+            from: from.to_rfc3339(),
+            to: to.to_rfc3339(),
+        });
     }
 
     let expression = query::parse(&request.query)?;
+    // 原文樹打原文欄位，轉簡樹打 `*_s`，adapter 逐詞配對取高分（ADR-017）。
+    // 2026-11-16 第一版把整棵樹轉簡後打全部欄位：standard analyzer 一字一 token，
+    // `CRA 罰` 的「罚」在繁體文件的原文欄位對不上、在 `*_s` 又因 bigram 對不上，整題 0 筆。
+    let normalized = expression.clone().map(|orig| NormalizedSearch {
+        expression: simplify_expr(orig),
+        fields: schema::simplified_text_fields(),
+    });
+    // highlight 要同時框住兩種字形（NOT 底下的詞不會被 highlight，
+    // 因為它仍在 Not 節點裡，不是被拿出來的 Term）。
+    let highlight_expression = expression.clone().map(|orig| {
+        let converted = simplify_expr(orig.clone());
+        QueryExpr::Or(vec![orig, converted])
+    });
     let mut filters = Vec::new();
 
     if let Some(source_id) = request.source_id {
@@ -214,7 +230,21 @@ pub fn build(index: &str, request: &SearchRequest) -> Result<StructuredSearch, S
         search_after: decode_cursor(request.cursor.as_deref())?,
         sort,
         highlight_fields: schema::highlight_fields(),
+        highlight_expression,
+        normalized,
     })
+}
+
+/// 只轉 Term／Phrase 的文字。And／Or／Not 的形狀不動，否則 `NOT 外長` 會變成
+/// 一個要命中的詞。
+fn simplify_expr(expr: QueryExpr) -> QueryExpr {
+    match expr {
+        QueryExpr::Term(text) => QueryExpr::Term(script::to_simplified(&text)),
+        QueryExpr::Phrase(text) => QueryExpr::Phrase(script::to_simplified(&text)),
+        QueryExpr::And(parts) => QueryExpr::And(parts.into_iter().map(simplify_expr).collect()),
+        QueryExpr::Or(parts) => QueryExpr::Or(parts.into_iter().map(simplify_expr).collect()),
+        QueryExpr::Not(inner) => QueryExpr::Not(Box::new(simplify_expr(*inner))),
+    }
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -460,6 +490,112 @@ mod tests {
             build("idx", &req).unwrap().sort[0].field,
             schema::F_EFFECTIVE_DATE
         );
+    }
+
+    fn leaf_texts(expr: &QueryExpr, out: &mut Vec<String>) {
+        match expr {
+            QueryExpr::Term(text) | QueryExpr::Phrase(text) => out.push(text.clone()),
+            QueryExpr::And(parts) | QueryExpr::Or(parts) => {
+                for part in parts {
+                    leaf_texts(part, out);
+                }
+            }
+            QueryExpr::Not(inner) => leaf_texts(inner, out),
+        }
+    }
+
+    #[test]
+    fn nested_chinese_leaves_are_simplified_and_highlight_keeps_the_original() {
+        let mut req = request();
+        req.query = "(秦剛 OR \"外長\") NOT 華春瑩".into();
+        let built = build("idx", &req).unwrap();
+        let mut original = Vec::new();
+        leaf_texts(
+            built.expression.as_ref().expect("expression"),
+            &mut original,
+        );
+        assert_eq!(
+            original,
+            vec!["秦剛".to_string(), "外長".to_string(), "華春瑩".to_string(),],
+            "原文樹要留原文：它打的是原文欄位，轉簡後繁體單字會對不上"
+        );
+        let normalized = built.normalized.as_ref().expect("normalized");
+        let mut searched = Vec::new();
+        leaf_texts(&normalized.expression, &mut searched);
+        assert_eq!(
+            searched,
+            vec!["秦刚".to_string(), "外长".to_string(), "华春莹".to_string(),]
+        );
+        assert_eq!(normalized.fields, schema::simplified_text_fields());
+        let QueryExpr::Or(parts) = built.highlight_expression.expect("highlight") else {
+            panic!("highlight 應是原文 OR 轉簡");
+        };
+        assert_eq!(parts.len(), 2);
+        let mut original_leaves = Vec::new();
+        leaf_texts(&parts[0], &mut original_leaves);
+        assert_eq!(
+            original_leaves,
+            vec!["秦剛".to_string(), "外長".to_string(), "華春瑩".to_string(),],
+            "highlight 丟掉原文的話，繁體文件只會被標成單字"
+        );
+        let mut converted_leaves = Vec::new();
+        leaf_texts(&parts[1], &mut converted_leaves);
+        assert_eq!(converted_leaves, searched);
+        // NOT 仍包著華春瑩，沒有被抬成一個要命中的 Term。
+        assert!(matches!(
+            parts[0],
+            QueryExpr::And(ref and_parts)
+                if matches!(and_parts.last(), Some(QueryExpr::Not(_)))
+        ));
+    }
+
+    #[test]
+    fn ascii_leaves_survive_simplification() {
+        let mut req = request();
+        req.query = "CVE-2026-0001".into();
+        let built = build("idx", &req).unwrap();
+        assert_eq!(
+            built.expression,
+            Some(QueryExpr::Term("CVE-2026-0001".into()))
+        );
+    }
+
+    #[test]
+    fn filter_only_request_has_no_highlight_expression() {
+        let built = build("idx", &request()).unwrap();
+        assert!(built.expression.is_none());
+        assert!(built.highlight_expression.is_none());
+        assert!(built.normalized.is_none());
+    }
+
+    /// 迴歸（2026-11-16 v0 評估 zh-n-27）：`CRA 罰` 第一版把整棵樹轉簡打全部欄位，
+    /// 「罚」對不上繁體文件的原文欄位（standard 一字一 token），整題 0 筆。
+    #[test]
+    fn original_tree_targets_original_fields_and_simplified_tree_targets_copies() {
+        let mut req = request();
+        req.query = "CRA 罰".into();
+        let built = build("idx", &req).unwrap();
+        assert_eq!(
+            built.expression,
+            Some(QueryExpr::And(vec![
+                QueryExpr::Term("CRA".into()),
+                QueryExpr::Term("罰".into()),
+            ]))
+        );
+        assert!(
+            built.fields.iter().all(|f| !f.name.ends_with("_s")),
+            "原文樹不可打簡體副本：{:?}",
+            built.fields
+        );
+        let normalized = built.normalized.expect("normalized");
+        assert_eq!(
+            normalized.expression,
+            QueryExpr::And(vec![
+                QueryExpr::Term("CRA".into()),
+                QueryExpr::Term("罚".into()),
+            ])
+        );
+        assert!(normalized.fields.iter().all(|f| f.name.ends_with("_s")));
     }
 
     #[test]

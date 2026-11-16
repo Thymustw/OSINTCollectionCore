@@ -24,7 +24,7 @@ use normalizer::Normalizer;
 use serde_json::json;
 use storage_core::RelationalStore;
 use storage_core::conformance::{load_workspace_dotenv, required_env, verify_not_opencti_s3};
-use storage_postgres::PostgresCanonicalStore;
+use storage_postgres::{PostgresCanonicalStore, TestDatabase};
 use storage_s3::S3ObjectStore;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -34,15 +34,15 @@ pub struct Stack {
     pub s3: S3ObjectStore,
     pub bucket: String,
     pub brokers: String,
+    /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
+    _db: TestDatabase,
 }
 
 pub async fn connect_stack() -> Stack {
     load_workspace_dotenv();
-    let dsn = required_env("DATABASE_URL").expect("DATABASE_URL");
-    assert!(
-        dsn.contains("127.0.0.1") || dsn.contains("localhost"),
-        "驗收測試只連本機 Postgres"
-    );
+    // 一次性 DB：TestDatabase 只對本機 Postgres 建立，並已跑完 migration。
+    let db = TestDatabase::create().await;
+    let pg = db.store().clone();
     let endpoint = required_env("S3_ENDPOINT").expect("S3_ENDPOINT");
     let _ = verify_not_opencti_s3(&endpoint).expect("S3 埠隔離");
     let bucket = required_env("S3_BUCKET").unwrap_or_else(|_| "raw-evidence".into());
@@ -56,10 +56,6 @@ pub async fn connect_stack() -> Stack {
         "驗收測試只連本機 Redpanda，實際 brokers={brokers}"
     );
 
-    let pg = PostgresCanonicalStore::connect(&dsn, 5)
-        .await
-        .expect("postgres");
-    pg.migrate().await.expect("migrate");
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
     Stack {
@@ -67,6 +63,7 @@ pub async fn connect_stack() -> Stack {
         s3,
         bucket,
         brokers,
+        _db: db,
     }
 }
 

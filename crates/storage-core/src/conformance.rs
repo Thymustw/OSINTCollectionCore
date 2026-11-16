@@ -5275,13 +5275,14 @@ pub async fn assert_bulk_upsert_preserves_unknown_fields<S: SearchStore>(
 
 /// `SearchStore::search`（[`StructuredSearch`]）的後端契約。
 ///
-/// **未來新增任何 SearchStore adapter 都必須通過這一支。** 這裡驗的四件事全部都是
+/// **未來新增任何 SearchStore adapter 都必須通過這一支。** 這裡驗的五件事全部都是
 /// 「做錯了不會報錯，只會讓搜尋悄悄變得不對」的那一類：
 ///
 /// 1. 過濾條件真的過濾（不是被忽略）；
 /// 2. `Not` 真的排除（只有 `must_not` 的 bool 在某些後端等於不篩選）；
 /// 3. hit 帶得回 `sort`（沒有它就翻不了頁）；
 /// 4. `search_after` 真的接續（不是每次都從頭回同一頁）。
+/// 5. `normalized` 逐葉子配對（整棵樹分開比對，繁體單字＋其他詞會整題落空）。
 ///
 /// # 呼叫端要先準備好 index
 ///
@@ -5335,6 +5336,8 @@ pub async fn assert_structured_search<S: SearchStore>(
             ascending: true,
         }],
         highlight_fields: vec!["title".into()],
+        highlight_expression: None,
+        normalized: None,
     };
 
     // 1) 全文條件命中三筆。
@@ -5387,6 +5390,35 @@ pub async fn assert_structured_search<S: SearchStore>(
             message: format!(
                 "NOT 之後預期 2 筆，實際 {}——排除條件沒有生效",
                 negated.total
+            ),
+        });
+    }
+
+    // 3b) normalized 要逐葉子配對。原文樹第二個詞、正規化樹第一個詞都不存在：
+    //     逐葉子「任一命中」→ 3 筆；整棵樹 OR、或只用正規化樹 → 0 筆（ADR-017，
+    //     2026-11-16 第一版就是只用轉簡樹，繁體單字整題落空）。
+    let missing = format!("{token}absent");
+    let mut paired = base(
+        Some(QueryExpr::And(vec![
+            QueryExpr::Term(token.clone()),
+            QueryExpr::Term(missing.clone()),
+        ])),
+        Vec::new(),
+    );
+    paired.normalized = Some(crate::traits::NormalizedSearch {
+        expression: QueryExpr::And(vec![
+            QueryExpr::Term(missing),
+            QueryExpr::Term(token.clone()),
+        ]),
+        fields: vec![SearchField::new("title", 1.0)],
+    });
+    let paired_hits = store.search(paired).await?;
+    if paired_hits.total != 3 {
+        return Err(StorageError::Unknown {
+            backend: "search",
+            message: format!(
+                "normalized 逐葉子配對預期 3 筆，實際 {}——後端把兩棵樹整棵分開比對了",
+                paired_hits.total
             ),
         });
     }

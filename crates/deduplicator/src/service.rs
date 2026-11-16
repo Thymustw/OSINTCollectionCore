@@ -401,14 +401,15 @@ impl Deduplicator {
                 .as_deref()
                 .and_then(url_norm::canonicalize)
         };
-        if canonical_url.is_none() && !synthetic {
-            if let Some(raw) = document.source_url.as_deref() {
-                tracing::debug!(
-                    document_id = %document.id,
-                    source_url = %url_norm::short(raw),
-                    "source_url 不是合法絕對 URL，Stage 2 對這份不適用"
-                );
-            }
+        if canonical_url.is_none()
+            && !synthetic
+            && let Some(raw) = document.source_url.as_deref()
+        {
+            tracing::debug!(
+                document_id = %document.id,
+                source_url = %url_norm::short(raw),
+                "source_url 不是合法絕對 URL，Stage 2 對這份不適用"
+            );
         }
 
         // Stage 3 的 hash 由 normalizer 寫；這裡只在它缺席時補算（例如舊資料），

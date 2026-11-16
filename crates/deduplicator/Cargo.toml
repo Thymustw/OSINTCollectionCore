@@ -39,3 +39,5 @@ collector = { path = "../collector" }
 core-jobs = { workspace = true }
 normalizer = { path = "../normalizer" }
 storage-s3 = { path = "../storage-s3" }
+# 一次性測試 DB（TestDatabase，KNOWN_GAPS §26）。
+storage-postgres = { path = "../storage-postgres", features = ["test-support"] }

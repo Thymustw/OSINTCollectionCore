@@ -212,10 +212,10 @@ where
             );
         }
 
-        if let Some(depth) = filter.depth {
-            if depth > 0 {
-                self.bfs_expand(filter, depth, &mut seeds).await?;
-            }
+        if let Some(depth) = filter.depth
+            && depth > 0
+        {
+            self.bfs_expand(filter, depth, &mut seeds).await?;
         }
 
         Ok(seeds.into_values().collect())
@@ -245,10 +245,10 @@ where
                 for rel in rels {
                     // time_range 同時限制「能不能繼續往外走」與「這條邊最終算不算數」：
                     // 不然會沿著一條理應被時間窗排除的邊走到不該匯出的鄰居。
-                    if let Some(range) = &filter.time_range {
-                        if !range.overlaps(rel.first_seen, rel.last_seen) {
-                            continue;
-                        }
+                    if let Some(range) = &filter.time_range
+                        && !range.overlaps(rel.first_seen, rel.last_seen)
+                    {
+                        continue;
                     }
                     let other = if rel.source_object_id == id {
                         rel.target_object_id
@@ -388,10 +388,10 @@ where
                 if !(ids.contains(&rel.source_object_id) && ids.contains(&rel.target_object_id)) {
                     continue;
                 }
-                if let Some(range) = &filter.time_range {
-                    if !range.overlaps(rel.first_seen, rel.last_seen) {
-                        continue;
-                    }
+                if let Some(range) = &filter.time_range
+                    && !range.overlaps(rel.first_seen, rel.last_seen)
+                {
+                    continue;
                 }
                 collected.insert(rel.id, rel);
             }

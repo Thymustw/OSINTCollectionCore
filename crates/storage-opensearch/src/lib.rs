@@ -1080,10 +1080,24 @@ fn build_search_body(query: &StructuredSearch) -> Result<Value, StorageError> {
                     .into(),
             });
         }
-        bool_query.insert(
-            "must".into(),
-            Value::Array(vec![translate_expr(expr, &query.fields, 0)?]),
-        );
+        let translated = match &query.normalized {
+            Some(normalized) => {
+                if normalized.fields.is_empty() {
+                    return Err(StorageError::Configuration {
+                        message: "StructuredSearch.normalized 沒有 fields。\
+                                  正規化查詢不知道要打哪個欄位"
+                            .into(),
+                    });
+                }
+                let leaf_fields = LeafFields {
+                    original: &query.fields,
+                    normalized: &normalized.fields,
+                };
+                translate_paired(expr, &normalized.expression, leaf_fields, 0)?
+            }
+            None => translate_expr(expr, &query.fields, 0)?,
+        };
+        bool_query.insert("must".into(), Value::Array(vec![translated]));
     }
 
     let filters: Vec<Value> = query.filters.iter().map(translate_filter).collect();
@@ -1117,36 +1131,75 @@ fn build_search_body(query: &StructuredSearch) -> Result<Value, StorageError> {
             ),
         );
     }
-    if let Some(after) = &query.search_after {
-        if !after.is_empty() {
-            map.insert("search_after".into(), Value::Array(after.clone()));
-        }
+    if let Some(after) = &query.search_after
+        && !after.is_empty()
+    {
+        map.insert("search_after".into(), Value::Array(after.clone()));
     }
     if !query.highlight_fields.is_empty() {
-        let fields: serde_json::Map<String, Value> = query
-            .highlight_fields
-            .iter()
-            .map(|field| {
-                (
-                    field.clone(),
+        let mut fields: serde_json::Map<String, Value> = serde_json::Map::new();
+        for field in &query.highlight_fields {
+            fields.insert(
+                field.clone(),
+                json!({ "fragment_size": 160, "number_of_fragments": 1 }),
+            );
+            // `.cjk` 才有完整 bigram。只標 standard 欄位時，繁體文件的「秦剛」
+            // 會被拆成「秦」「剛」兩個單字。`*_s` 不加：那是簡體副本，片段不該拿它。
+            if !field.contains('.') {
+                fields.insert(
+                    format!("{field}.cjk"),
                     json!({ "fragment_size": 160, "number_of_fragments": 1 }),
-                )
-            })
-            .collect();
-        map.insert(
-            "highlight".into(),
-            json!({
-                // require_field_match=false 是必要的：命中可能發生在 `title.cjk`
-                // 這個 sub-field 上，但我們要 highlight 的是 `title`。
-                // 設成 true 的話中文查詢會回一個沒有 snippet 的結果。
-                "require_field_match": false,
-                "pre_tags": ["<em>"],
-                "post_tags": ["</em>"],
-                "fields": Value::Object(fields),
-            }),
-        );
+                );
+            }
+        }
+        let mut highlight = json!({
+            // require_field_match=false 是必要的：命中可能發生在 `title.cjk`
+            // 這個 sub-field 上，但我們要 highlight 的是 `title`。
+            // 設成 true 的話中文查詢會回一個沒有 snippet 的結果。
+            "require_field_match": false,
+            "pre_tags": ["<em>"],
+            "post_tags": ["</em>"],
+            "fields": Value::Object(fields),
+        });
+        if let Some(expr) = &query.highlight_expression {
+            let hl_fields = highlight_match_fields(&query.highlight_fields);
+            // 頂層 Or 是呼叫端（indexer::search::build）為了「原文＋轉簡」包的外殼，不是使用者
+            // 寫的括號。照一般方式翻會讓每個分支多吃一層深度：使用者寫滿 MAX_EXPR_DEPTH 層的查詢，
+            // 主查詢過、highlight 卻超限，整次搜尋回 Configuration 錯誤（2026-11-16 審查發現）。
+            // 所以各分支從 depth 0 翻，深度預算與主查詢相同。
+            let translated = match expr {
+                QueryExpr::Or(branches) => {
+                    let clauses = branches
+                        .iter()
+                        .map(|b| translate_expr(b, &hl_fields, 0))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    json!({ "bool": { "should": clauses, "minimum_should_match": 1 } })
+                }
+                other => translate_expr(other, &hl_fields, 0)?,
+            };
+            highlight
+                .as_object_mut()
+                .expect("json! 建的是 object")
+                .insert("highlight_query".into(), translated);
+        }
+        map.insert("highlight".into(), highlight);
     }
     Ok(body)
+}
+
+/// highlight_query 要打的欄位：呼叫端點名的欄位，加上它的 `.cjk` sub-field。
+///
+/// 不含 `*_s`。簡體副本的 token 不在原文欄位的倒排索引裡，拿去標 snippet 不會
+/// 框住畫面上的字；原文查詢打 `.cjk` 才會把「秦剛」當成一個 bigram。
+fn highlight_match_fields(fields: &[String]) -> Vec<SearchField> {
+    let mut out = Vec::with_capacity(fields.len() * 2);
+    for field in fields {
+        out.push(SearchField::new(field.clone(), 1.0));
+        if !field.contains('.') {
+            out.push(SearchField::new(format!("{field}.cjk"), 1.0));
+        }
+    }
+    out
 }
 
 fn field_list(fields: &[SearchField]) -> Vec<String> {
@@ -1175,24 +1228,8 @@ fn translate_expr(
         });
     }
     Ok(match expr {
-        // `operator: and` 讓「一個 term 被 analyzer 拆成多個 token」時全部都要命中。
-        // 中文靠的就是這個：`勒索軟體` 經 cjk analyzer 是 3 個 bigram，
-        // 預設的 or 會讓只含「軟體」的文件也命中。
-        QueryExpr::Term(text) => json!({
-            "multi_match": {
-                "query": text,
-                "fields": field_list(fields),
-                "type": "best_fields",
-                "operator": "and",
-            }
-        }),
-        QueryExpr::Phrase(text) => json!({
-            "multi_match": {
-                "query": text,
-                "fields": field_list(fields),
-                "type": "phrase",
-            }
-        }),
+        QueryExpr::Term(text) => term_clause(text, fields),
+        QueryExpr::Phrase(text) => phrase_clause(text, fields),
         QueryExpr::And(parts) => {
             let clauses = translate_all(parts, fields, depth)?;
             json!({ "bool": { "must": clauses } })
@@ -1219,6 +1256,104 @@ fn translate_all(
         .iter()
         .map(|part| translate_expr(part, fields, depth + 1))
         .collect()
+}
+
+// `operator: and` 讓「一個 term 被 analyzer 拆成多個 token」時全部都要命中。
+// 中文靠的就是這個：`勒索軟體` 經 cjk analyzer 是 3 個 bigram，
+// 預設的 or 會讓只含「軟體」的文件也命中。
+fn term_clause(text: &str, fields: &[SearchField]) -> Value {
+    json!({
+        "multi_match": {
+            "query": text,
+            "fields": field_list(fields),
+            "type": "best_fields",
+            "operator": "and",
+        }
+    })
+}
+
+fn phrase_clause(text: &str, fields: &[SearchField]) -> Value {
+    json!({
+        "multi_match": {
+            "query": text,
+            "fields": field_list(fields),
+            "type": "phrase",
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+struct LeafFields<'a> {
+    original: &'a [SearchField],
+    normalized: &'a [SearchField],
+}
+
+/// 原文樹與正規化樹一起走，葉子變成 `dis_max[原文→原文欄位, 正規化→正規化欄位]`。
+///
+/// 為什麼是逐葉子而不是整棵樹 OR：`A B` 要求兩個詞都命中，但一個詞可能只在原文欄位
+/// 中（繁體單字「罰」）、另一個只在簡體副本中（「秦剛」對簡體文件）。整棵 OR 會要求
+/// 同一邊同時命中兩個詞，兩種情況都漏。
+/// `dis_max` 是葉子的一部分，不算一層深度——深度上限與沒有正規化時相同。
+/// 兩邊文字相同（英文、數字）時只送一個 multi_match 打全部欄位，少一個子查詢。
+fn translate_paired(
+    expr: &QueryExpr,
+    normalized: &QueryExpr,
+    fields: LeafFields<'_>,
+    depth: u32,
+) -> Result<Value, StorageError> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(StorageError::Configuration {
+            message: format!(
+                "查詢條件巢狀超過 {MAX_EXPR_DEPTH} 層。請把括號拆成多次查詢，或簡化條件"
+            ),
+        });
+    }
+    let leaf = |orig: &str, norm: &str, clause: fn(&str, &[SearchField]) -> Value| {
+        if orig == norm {
+            let all: Vec<SearchField> = fields
+                .original
+                .iter()
+                .chain(fields.normalized)
+                .cloned()
+                .collect();
+            clause(orig, &all)
+        } else {
+            json!({ "dis_max": { "queries": [
+                clause(orig, fields.original),
+                clause(norm, fields.normalized),
+            ] } })
+        }
+    };
+    let pair_all = |a: &[QueryExpr], b: &[QueryExpr]| -> Result<Vec<Value>, StorageError> {
+        if a.len() != b.len() {
+            return Err(shape_mismatch());
+        }
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| translate_paired(x, y, fields, depth + 1))
+            .collect()
+    };
+    Ok(match (expr, normalized) {
+        (QueryExpr::Term(orig), QueryExpr::Term(norm)) => leaf(orig, norm, term_clause),
+        (QueryExpr::Phrase(orig), QueryExpr::Phrase(norm)) => leaf(orig, norm, phrase_clause),
+        (QueryExpr::And(a), QueryExpr::And(b)) => json!({ "bool": { "must": pair_all(a, b)? } }),
+        (QueryExpr::Or(a), QueryExpr::Or(b)) => {
+            json!({ "bool": { "should": pair_all(a, b)?, "minimum_should_match": 1 } })
+        }
+        (QueryExpr::Not(a), QueryExpr::Not(b)) => {
+            let clause = translate_paired(a, b, fields, depth + 1)?;
+            json!({ "bool": { "must": [{ "match_all": {} }], "must_not": [clause] } })
+        }
+        _ => return Err(shape_mismatch()),
+    })
+}
+
+fn shape_mismatch() -> StorageError {
+    StorageError::Configuration {
+        message: "StructuredSearch.normalized.expression 與 expression 形狀不同。\
+                  正規化只能改葉子文字，不能改 And／Or／Not 結構"
+            .into(),
+    }
 }
 
 /// 組 k-NN 查詢 body。
@@ -1326,6 +1461,8 @@ mod tests {
                 ascending: false,
             }],
             highlight_fields: vec!["title".into()],
+            highlight_expression: None,
+            normalized: None,
         }
     }
 
@@ -1535,6 +1672,178 @@ mod tests {
             Some(false),
             "命中在 title.cjk 時要能 highlight title，設 true 中文查詢會沒有 snippet"
         );
+    }
+
+    #[test]
+    fn highlight_query_is_absent_when_expression_is_none() {
+        let body = build_search_body(&base(Some(QueryExpr::Term("秦剛".into())))).unwrap();
+        assert!(
+            body.pointer("/highlight/highlight_query").is_none(),
+            "沒有另外指定時不該送 highlight_query，否則會蓋掉主查詢的標示"
+        );
+    }
+
+    #[test]
+    fn highlight_query_uses_original_and_simplified_against_cjk_fields() {
+        let mut query = base(Some(QueryExpr::Term("秦刚".into())));
+        query.highlight_expression = Some(QueryExpr::Or(vec![
+            QueryExpr::Term("秦剛".into()),
+            QueryExpr::Term("秦刚".into()),
+        ]));
+        let body = build_search_body(&query).unwrap();
+        let hq = body
+            .pointer("/highlight/highlight_query")
+            .expect("有 highlight_expression 就必須翻成 highlight_query");
+        let rendered = hq.to_string();
+        assert!(rendered.contains("秦剛"), "{rendered}");
+        assert!(rendered.contains("秦刚"), "{rendered}");
+        assert!(
+            rendered.contains("title.cjk"),
+            "沒有 title.cjk 時繁體文件只會被標成單字：{rendered}"
+        );
+        assert!(
+            body.pointer("/highlight/fields/title.cjk").is_some(),
+            "片段欄位也要含 title.cjk，整詞標示才回得來"
+        );
+        assert!(
+            !rendered.contains("title_s"),
+            "簡體副本不該出現在 highlight_query：{rendered}"
+        );
+    }
+
+    /// 迴歸：主查詢剛好 MAX_EXPR_DEPTH 層時，highlight 外面那層「原文＋轉簡」的 Or
+    /// 不能讓深度超限。改前這裡回 Configuration 錯誤，整次搜尋失敗。
+    #[test]
+    fn highlight_wrapper_or_does_not_consume_depth_budget() {
+        let mut deep = QueryExpr::Term("秦剛".into());
+        for _ in 0..MAX_EXPR_DEPTH {
+            deep = QueryExpr::Not(Box::new(deep));
+        }
+        let mut query = base(Some(deep.clone()));
+        assert!(
+            build_search_body(&query).is_ok(),
+            "前提：主查詢本身在上限內"
+        );
+        query.highlight_expression = Some(QueryExpr::Or(vec![deep.clone(), deep]));
+        assert!(
+            build_search_body(&query).is_ok(),
+            "highlight 的外殼 Or 不該多吃一層深度"
+        );
+    }
+
+    fn with_normalized(expr: QueryExpr, normalized: QueryExpr) -> StructuredSearch {
+        let mut query = base(Some(expr));
+        query.normalized = Some(storage_core::NormalizedSearch {
+            expression: normalized,
+            fields: vec![SearchField::new("title_s", 3.0)],
+        });
+        query
+    }
+
+    /// 迴歸（2026-11-16）：`CRA 罰` 的每個詞各自 dis_max——「罰」走原文欄位、
+    /// 「罚」走簡體副本。整棵轉簡打全部欄位時，繁體文件上「罰」對不上，整題 0 筆。
+    #[test]
+    fn normalized_leaves_pair_original_fields_with_copies() {
+        let query = with_normalized(
+            QueryExpr::And(vec![
+                QueryExpr::Term("CRA".into()),
+                QueryExpr::Term("罰".into()),
+            ]),
+            QueryExpr::And(vec![
+                QueryExpr::Term("CRA".into()),
+                QueryExpr::Term("罚".into()),
+            ]),
+        );
+        let body = build_search_body(&query).unwrap();
+        let must = body
+            .pointer("/query/bool/must/0/bool/must")
+            .and_then(Value::as_array)
+            .expect("And → bool.must");
+        // 英文兩邊相同：一個 multi_match 打全部欄位。
+        assert_eq!(
+            must[0].pointer("/multi_match/fields"),
+            Some(&json!(["title^3", "body", "title_s^3"]))
+        );
+        let queries = must[1]
+            .pointer("/dis_max/queries")
+            .and_then(Value::as_array)
+            .expect("中文葉子要是 dis_max");
+        assert_eq!(queries[0].pointer("/multi_match/query"), Some(&json!("罰")));
+        assert_eq!(
+            queries[0].pointer("/multi_match/fields"),
+            Some(&json!(["title^3", "body"])),
+            "原文只打原文欄位"
+        );
+        assert_eq!(queries[1].pointer("/multi_match/query"), Some(&json!("罚")));
+        assert_eq!(
+            queries[1].pointer("/multi_match/fields"),
+            Some(&json!(["title_s^3"])),
+            "轉簡只打簡體副本"
+        );
+    }
+
+    #[test]
+    fn normalized_phrase_and_not_keep_their_shape() {
+        let query = with_normalized(
+            QueryExpr::Not(Box::new(QueryExpr::Phrase("外長 秦剛".into()))),
+            QueryExpr::Not(Box::new(QueryExpr::Phrase("外长 秦刚".into()))),
+        );
+        let body = build_search_body(&query).unwrap();
+        let inner = body
+            .pointer("/query/bool/must/0/bool/must_not/0/dis_max/queries")
+            .and_then(Value::as_array)
+            .expect("Not 底下仍是 dis_max");
+        for q in inner {
+            assert_eq!(q.pointer("/multi_match/type"), Some(&json!("phrase")));
+        }
+    }
+
+    #[test]
+    fn normalized_tree_with_different_shape_is_rejected() {
+        let query = with_normalized(
+            QueryExpr::And(vec![
+                QueryExpr::Term("a".into()),
+                QueryExpr::Term("b".into()),
+            ]),
+            QueryExpr::Term("a".into()),
+        );
+        assert!(matches!(
+            build_search_body(&query),
+            Err(StorageError::Configuration { .. })
+        ));
+    }
+
+    #[test]
+    fn normalized_pairing_keeps_the_same_depth_budget() {
+        let mut deep = QueryExpr::Term("秦剛".into());
+        let mut deep_s = QueryExpr::Term("秦刚".into());
+        for _ in 0..MAX_EXPR_DEPTH {
+            deep = QueryExpr::Not(Box::new(deep));
+            deep_s = QueryExpr::Not(Box::new(deep_s));
+        }
+        assert!(build_search_body(&with_normalized(deep.clone(), deep_s.clone())).is_ok());
+        let too_deep = with_normalized(
+            QueryExpr::Not(Box::new(deep)),
+            QueryExpr::Not(Box::new(deep_s)),
+        );
+        assert!(build_search_body(&too_deep).is_err());
+    }
+
+    #[test]
+    fn highlight_expression_defaults_when_the_field_is_absent() {
+        let raw = r#"{
+            "index": "documents",
+            "expression": null,
+            "fields": [],
+            "filters": [],
+            "size": 1,
+            "search_after": null,
+            "sort": [],
+            "highlight_fields": []
+        }"#;
+        let parsed: StructuredSearch = serde_json::from_str(raw).expect("舊 payload 仍要能解");
+        assert!(parsed.highlight_expression.is_none());
+        assert!(parsed.normalized.is_none());
     }
 
     #[test]
