@@ -109,7 +109,7 @@ rdkafka = { version = "0.39.0", default-features = false, features = [
     "libz",
 ] }
 # default-features 關掉 `main`（getopts CLI）。只當 HTML 解析庫用。
-scraper = { version = "0.27.0", default-features = false, features = ["errors"] }
+scraper = { version = "0.29.0", default-features = false, features = ["errors"] }
 # 2026-11-16 解除 =1.2.2 精確釘版（原為 MSRV 1.87；1.3+ 要 1.88，MSRV 已升 1.100）。
 # 用一般 caret 範圍（>=1.8.2,<2）：2.0 目前只有 rc，主版號升級要另外評估。
 redis = { version = "1.8.2", default-features = false, features = ["tokio-comp"] }
