@@ -21,7 +21,7 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use core_api::{AppState, AuthState, RateLimiter, ReadyProbe, ready_always, router};
 use core_config::ImportSection;
-use core_events::EventProducer;
+use core_events::{EventProducer, TestTopics};
 use core_jobs::JobService;
 use core_model::{
     Collection, Connector, Document, DocumentType, DuplicateGroup, Entity, EntityAlias,
@@ -46,7 +46,9 @@ struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
     bucket: String,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    topics: TestTopics,
     dsn: String,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
@@ -74,11 +76,12 @@ async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
         bucket,
-        brokers,
+        topics,
         dsn,
         _db: db,
     }
@@ -192,7 +195,11 @@ fn build_api_with_backends(
         backends: ReadyProbe::new(checks),
         // 真的接本機 Redpanda：`/ops/queues` 要驗的正是「查得到 group lag」，
         // 給 None 只會驗到 503 那條路徑。
-        queues: core_events::GroupLagProbe::new(&stack.brokers, std::time::Duration::from_secs(3))
+        // 探針走這個測試的 namespace：查的是 `<ns>.raw.collected`（不存在 → absent），
+        // 不碰執行中服務的正式 topic。
+        queues: stack
+            .topics
+            .lag_probe(std::time::Duration::from_secs(3))
             .ok()
             .map(|probe| {
                 Arc::new(core_api::QueueInspector {
@@ -2031,7 +2038,10 @@ async fn raw_metadata_and_body() {
 async fn job_retry_only_from_failed_and_is_audited() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-e2e").expect("Redpanda producer"),
+        stack
+            .topics
+            .producer("core-api-e2e")
+            .expect("Redpanda producer"),
     );
     let api = build_api(&stack, Some(producer));
 
@@ -2309,7 +2319,9 @@ async fn connector_reset_backoff_clears_error_count_and_is_audited() {
 async fn graph_rebuild_writes_success_audit() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-e2e-graph-rebuild")
+        stack
+            .topics
+            .producer("core-api-e2e-graph-rebuild")
             .expect("Redpanda producer"),
     );
     let api = build_api(&stack, Some(producer));

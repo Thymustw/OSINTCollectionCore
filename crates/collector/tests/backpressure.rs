@@ -10,7 +10,7 @@ use axum::routing::get;
 use chrono::Utc;
 use collector::{BackpressureGate, CollectOutcome, CollectorRunner, LagSource, RunBounds};
 use core_config::CollectorBackpressureConfig;
-use core_events::EventProducer;
+use core_events::{EventProducer, TestTopics};
 use core_jobs::JobService;
 use core_model::{Connector, JobStatus, NetworkRule, Source, SourceType};
 use core_observability::MetricsRegistry;
@@ -42,7 +42,9 @@ const RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic。
+    topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -76,10 +78,11 @@ async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -204,8 +207,12 @@ async fn pause_does_not_touch_last_run_error_count_or_status() {
     let error_count_before = 4;
     let (source, rule, connector) =
         seed_connector(&stack.pg, &feed_url, error_count_before, "error").await;
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "collector-bp-pause").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("collector-bp-pause")
+            .expect("producer"),
+    );
     let collector = runner_with_lag(&stack, producer, 50_000, 4);
     let results = collector
         .tick_connectors(
@@ -270,7 +277,10 @@ async fn throttle_caps_actual_concurrency_at_one() {
     let (source_a, rule_a, connector_a) = seed_connector(&stack.pg, &feed_a, 0, "idle").await;
     let (source_b, rule_b, connector_b) = seed_connector(&stack.pg, &feed_b, 0, "idle").await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "collector-bp-throttle").expect("producer"),
+        stack
+            .topics
+            .producer("collector-bp-throttle")
+            .expect("producer"),
     );
     let collector = runner_with_lag(&stack, producer, 5_000, 4);
     let ids = [connector_a.id, connector_b.id];

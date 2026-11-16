@@ -14,7 +14,7 @@ use axum::Router;
 use axum::routing::get;
 use chrono::Utc;
 use collector::{CollectOutcome, CollectorRunner, RunBounds};
-use core_events::{EventConsumer, EventEnvelope, EventProducer, EventTopic};
+use core_events::{EventConsumer, EventEnvelope, EventProducer, EventTopic, TestTopics};
 use core_jobs::JobService;
 use core_model::{Connector, NetworkRule, Source, SourceType};
 use core_observability::MetricsRegistry;
@@ -34,6 +34,9 @@ pub struct Stack {
     pub s3: S3ObjectStore,
     pub bucket: String,
     pub brokers: String,
+    /// 這個測試專屬的一次性 topic namespace。producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    pub topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -58,11 +61,13 @@ pub async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
         bucket,
         brokers,
+        topics,
         _db: db,
     }
 }
@@ -285,10 +290,16 @@ pub async fn collect_once(collector: &CollectorRunner, connector: &Connector) ->
 
 // ------------------------------------------------------------------ 事件往返
 
-/// 訂閱一個 topic 的一次性 consumer（run-specific group，不會干擾真正的服務）。
-pub fn probe_consumer(brokers: &str, topic: EventTopic) -> EventConsumer {
-    let group = format!("osint-acceptance-{}", Uuid::now_v7());
-    EventConsumer::connect(brokers, &group, &[topic.as_str()]).expect("consumer")
+/// 訂閱這個測試 namespace 底下一個 topic 的 consumer（group 也在 namespace 內，drop 時刪）。
+pub fn probe_consumer(topics: &TestTopics, topic: EventTopic) -> EventConsumer {
+    topics
+        .consumer(&format!("probe-{}", topic.as_str()), &[topic.as_str()])
+        .expect("consumer")
+}
+
+/// 這個測試 namespace 的 producer。
+pub fn test_producer(stack: &Stack, source_service: &str) -> Arc<EventProducer> {
+    Arc::new(stack.topics.producer(source_service).expect("producer"))
 }
 
 /// 等到 payload 的 `field == value` 的那一則 envelope。

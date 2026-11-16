@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use core_events::{EventConsumer, EventProducer, EventTopic};
+use core_events::{EventConsumer, EventProducer, EventTopic, TestTopics};
 use core_model::{Entity, EntityId, EntityType, Relationship, RelationshipType};
 use merge::MergeService;
 use serde_json::json;
@@ -135,18 +135,14 @@ async fn wait_for(
 
 #[tokio::test]
 async fn execute_merge_publishes_upserted_for_safe_repoint() {
-    let brokers = brokers();
-    let run = Uuid::now_v7();
-    let group = format!("osint-e2e-merge-rel-{run}");
-    let consumer = EventConsumer::connect(
-        &brokers,
-        &group,
-        &[EventTopic::RelationshipChanged.as_str()],
-    )
-    .expect("consumer");
+    // 一次性 topic namespace：執行中的 graph-worker 訂不到這個測試的事件。
+    let topics = TestTopics::create(&brokers());
+    let consumer = topics
+        .consumer("merge-rel", &[EventTopic::RelationshipChanged.as_str()])
+        .expect("consumer");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer = Arc::new(EventProducer::connect(&brokers, "merge-e2e").expect("producer"));
+    let producer = Arc::new(topics.producer("merge-e2e").expect("producer"));
     let h = open_harness(producer).await;
 
     let survivor = entity("s-evt", EntityType::Organization);
@@ -179,18 +175,14 @@ async fn execute_merge_publishes_upserted_for_safe_repoint() {
 
 #[tokio::test]
 async fn execute_and_undo_publish_deleted_then_upserted_for_self_loop() {
-    let brokers = brokers();
-    let run = Uuid::now_v7();
-    let group = format!("osint-e2e-merge-loop-{run}");
-    let consumer = EventConsumer::connect(
-        &brokers,
-        &group,
-        &[EventTopic::RelationshipChanged.as_str()],
-    )
-    .expect("consumer");
+    // 一次性 topic namespace：執行中的 graph-worker 訂不到這個測試的事件。
+    let topics = TestTopics::create(&brokers());
+    let consumer = topics
+        .consumer("merge-loop", &[EventTopic::RelationshipChanged.as_str()])
+        .expect("consumer");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer = Arc::new(EventProducer::connect(&brokers, "merge-e2e-loop").expect("producer"));
+    let producer = Arc::new(topics.producer("merge-e2e-loop").expect("producer"));
     let h = open_harness(producer).await;
 
     let survivor = entity("s-loop-evt", EntityType::Organization);

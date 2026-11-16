@@ -17,6 +17,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 
+[features]
+# 一次性 topic namespace（TestTopics）。只由各 crate 的 dev-dependencies 開啟。
+test-support = []
+
 [dev-dependencies]
+core-events = { path = ".", features = ["test-support"] }
 dotenvy = { workspace = true }
 storage-core = { workspace = true }

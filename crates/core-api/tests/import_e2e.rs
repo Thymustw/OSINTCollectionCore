@@ -14,7 +14,7 @@ use chrono::Utc;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{AppState, AuthState, ImportState, RateLimiter, ready_always, router};
 use core_config::ImportSection;
-use core_events::{EventConsumer, EventProducer, EventTopic};
+use core_events::{EventConsumer, EventProducer, EventTopic, TestTopics};
 use core_model::{Collection, EntityType, RelationshipType, Source, SourceType};
 use core_observability::MetricsRegistry;
 use core_security::{JwtService, MemoryApiTokenStore, MemoryAuditLog, Role};
@@ -34,7 +34,9 @@ const BOUNDARY: &str = "X-OSINT-IMPORT-E2E";
 struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -59,10 +61,11 @@ async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -261,14 +264,18 @@ CSV-0002,第二列,http://127.0.0.1/c2,2026-09-12,csv-2\n";
 async fn json_import_round_trip_produces_documents() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::JsonImport).await;
-    let group = format!("osint-e2e-import-json-{}", Uuid::now_v7());
-    let consumer =
-        EventConsumer::connect(&stack.brokers, &group, &[EventTopic::RawCollected.as_str()])
-            .expect("raw.collected consumer");
+    let consumer = stack
+        .topics
+        .consumer("import-json", &[EventTopic::RawCollected.as_str()])
+        .expect("raw.collected consumer");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "core-api-import-e2e").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("core-api-import-e2e")
+            .expect("producer"),
+    );
     let api = build_api(&stack, producer, ImportSection::default());
 
     let request = format!(
@@ -373,7 +380,10 @@ async fn csv_import_with_explicit_mapping_produces_documents() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::CsvImport).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-csv").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-import-e2e-csv")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer, ImportSection::default());
 
@@ -417,7 +427,10 @@ async fn manual_upload_is_stored_but_not_normalized() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::ManualUpload).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-manual").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-import-e2e-manual")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer, ImportSection::default());
 
@@ -477,7 +490,10 @@ async fn record_limit_rejects_before_anything_is_stored() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::JsonImport).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-limit").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-import-e2e-limit")
+            .expect("producer"),
     );
     let api = build_api(
         &stack,
@@ -510,7 +526,10 @@ async fn field_size_limit_is_enforced_on_upload() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::CsvImport).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-field").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-import-e2e-field")
+            .expect("producer"),
     );
     let api = build_api(
         &stack,
@@ -540,7 +559,10 @@ async fn source_type_must_match_kind() {
     // RSS 的 Source 不可以拿來塞 CSV。
     let source = seed_source(&stack.pg, SourceType::Rss).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-mismatch").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-import-e2e-mismatch")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer, ImportSection::default());
     let request = format!(r#"{{"source_id":"{}","kind":"csv"}}"#, source.id);
@@ -557,7 +579,10 @@ async fn repeated_uploads_reuse_the_same_import_connector() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::JsonImport).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-reuse").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-import-e2e-reuse")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer, ImportSection::default());
     let request = format!(r#"{{"source_id":"{}","kind":"json"}}"#, source.id);
@@ -603,7 +628,9 @@ async fn two_collections_and_publisher_flow_through_import() {
     );
 
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-collections")
+        stack
+            .topics
+            .producer("core-api-import-e2e-collections")
             .expect("producer"),
     );
     let api = build_api(&stack, producer, ImportSection::default());
@@ -706,7 +733,10 @@ async fn import_unknown_collection_ids_is_422_and_stores_nothing() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::JsonImport).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-import-e2e-bad-col").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-import-e2e-bad-col")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer, ImportSection::default());
     let missing = Uuid::now_v7();

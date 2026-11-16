@@ -34,6 +34,7 @@ use rdkafka::types::RDKafkaErrorCode;
 use serde::Serialize;
 
 use crate::error::EventError;
+use crate::namespace::TopicNamespace;
 
 /// 單一 partition 的落後量。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -69,10 +70,21 @@ pub struct GroupLag {
 pub struct GroupLagProbe {
     brokers: String,
     timeout: Duration,
+    namespace: TopicNamespace,
 }
 
 impl GroupLagProbe {
+    /// 不加 namespace（正式與開發服務）。
     pub fn new(brokers: impl Into<String>, timeout: Duration) -> Result<Self, EventError> {
+        Self::new_namespaced(brokers, timeout, TopicNamespace::NONE)
+    }
+
+    /// 查 `<namespace>.<邏輯名稱>` 的 lag；回傳的 [`GroupLag::topic`] 仍是邏輯名稱。
+    pub fn new_namespaced(
+        brokers: impl Into<String>,
+        timeout: Duration,
+        namespace: TopicNamespace,
+    ) -> Result<Self, EventError> {
         let brokers = brokers.into();
         if brokers.trim().is_empty() {
             return Err(EventError::Configuration {
@@ -80,7 +92,11 @@ impl GroupLagProbe {
                     .into(),
             });
         }
-        Ok(Self { brokers, timeout })
+        Ok(Self {
+            brokers,
+            timeout,
+            namespace,
+        })
     }
 
     #[must_use]
@@ -104,12 +120,14 @@ impl GroupLagProbe {
         }
     }
 
-    fn group_lag_blocking(&self, group: &str, topic: &str) -> Result<GroupLag, EventError> {
+    fn group_lag_blocking(&self, group: &str, logical: &str) -> Result<GroupLag, EventError> {
         if group.trim().is_empty() {
             return Err(EventError::Configuration {
                 message: "consumer group 不可為空".into(),
             });
         }
+        let broker_topic = self.namespace.broker_name(logical);
+        let topic: &str = &broker_topic;
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", &self.brokers)
             .set("group.id", group)
@@ -127,7 +145,7 @@ impl GroupLagProbe {
                 message: format!("查詢 {topic} 的 metadata 失敗：{err}"),
             })?;
         let Some(meta_topic) = metadata.topics().iter().find(|t| t.name() == topic) else {
-            return Ok(GroupLag::absent(group, topic));
+            return Ok(GroupLag::absent(group, logical));
         };
         if let Some(code) = meta_topic.error() {
             // 尚未建立的 topic 會回這兩個碼。那是「還沒有人發過事件」，不是故障。
@@ -135,14 +153,14 @@ impl GroupLagProbe {
                 RDKafkaErrorCode::from(code),
                 RDKafkaErrorCode::UnknownTopic | RDKafkaErrorCode::UnknownTopicOrPartition
             ) {
-                return Ok(GroupLag::absent(group, topic));
+                return Ok(GroupLag::absent(group, logical));
             }
             return Err(EventError::Commit {
                 message: format!("{topic} 的 metadata 回報錯誤碼 {code:?}"),
             });
         }
         if meta_topic.partitions().is_empty() {
-            return Ok(GroupLag::absent(group, topic));
+            return Ok(GroupLag::absent(group, logical));
         }
 
         let mut wanted = TopicPartitionList::new();
@@ -194,7 +212,7 @@ impl GroupLagProbe {
 
         Ok(GroupLag {
             group: group.to_string(),
-            topic: topic.to_string(),
+            topic: logical.to_string(),
             topic_exists: true,
             total_lag,
             partitions,

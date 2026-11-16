@@ -219,9 +219,21 @@ Redpanda 在 `127.0.0.1:9092`（容器 `osint-core-redpanda-1`）。
 cargo test -p core-events --test redpanda_roundtrip -- --nocapture
 ```
 
-會 produce 一則、consume 回來比對 id／payload。測試用一次性 topic `osint.conformance.<uuid>`，不寫進共用的 `job.dispatched`（unique group + `auto.offset.reset=earliest` 會先吃到歷史訊息）。
+會 produce 一則、consume 回來比對 id／payload，並驗證 namespace 隔離（共用 `job.dispatched` 的 high watermark 不變）與 drop 後 topic／group 都被刪。
 
-**一次性 topic 測完一定要刪。** 測試開頭會先刪掉所有殘留的 `osint.conformance.*`，結尾再刪自己這次的 topic（刪除函式只接受這個前綴）。原因：本機 Redpanda 以 `--memory 256M --smp 1` 啟動，partition 總數受記憶體限制（`topic_memory_per_partition`）。2026-10-15 實測累積 119 個未刪的測試 topic（144 個 partition）後，**任何新 topic 都建不出來**——`rpk topic create` 回 `INVALID_PARTITIONS: Can not increase partition count due to memory limit`，但 producer 端只看得到 `MessageTimedOut`，完全看不出原因。正式服務的 topic 受同一個上限。producer 一直 `MessageTimedOut` 而 Redpanda 又是 healthy 時，先用 `docker exec osint-core-redpanda-1 rpk topic create <名稱>` 看是不是這個錯誤。
+## Topic namespace（2026-11-17）
+
+`TopicNamespace`：broker 名稱 = `<namespace>.<邏輯名稱>`；空 namespace（預設，所有服務）= 邏輯名稱本身。
+`EventProducer::connect_namespaced`／`EventConsumer::connect_namespaced`／`GroupLagProbe::new_namespaced`
+只在碰 broker 時換名；envelope `event_type`、outbox 表的 `topic`、`last_coordinates()`（寫進
+`failed_events.topic`）、`GroupLag::topic` 都是**邏輯名稱**，所以 DLQ 查詢與 replay 不受 namespace 影響。
+namespace 只能用 `[a-z0-9-]`，**不可含 `.`**（邏輯名稱本身有 `.`）。
+
+測試一律用 `TestTopics`（`test-support` feature）：每個測試一個 `osinttest-<uuidv7>` namespace，用法見
+`docs/developer/local-dev.md`「Storage conformance」。服務設定沒有 namespace 欄位（刻意，見 KNOWN_GAPS §26）。
+
+**一次性 topic 測完一定要刪。** `TestTopics` drop 時刪自己 namespace 的 topic 與 group，建立時清掃逾時 30 分鐘的
+`osinttest-*`（只動這個前綴）。舊的 `osint.conformance.*` 前綴已不再產生。原因：本機 Redpanda 以 `--memory 256M --smp 1` 啟動，partition 總數受記憶體限制（`topic_memory_per_partition`）。2026-10-15 實測累積 119 個未刪的測試 topic（144 個 partition）後，**任何新 topic 都建不出來**——`rpk topic create` 回 `INVALID_PARTITIONS: Can not increase partition count due to memory limit`，但 producer 端只看得到 `MessageTimedOut`，完全看不出原因。正式服務的 topic 受同一個上限。producer 一直 `MessageTimedOut` 而 Redpanda 又是 healthy 時，先用 `docker exec osint-core-redpanda-1 rpk topic create <名稱>` 看是不是這個錯誤。
 
 `EventConsumer::next_envelope` 會在逾時內重試 `UnknownTopicOrPartition`：consumer 先 subscribe、topic 由第一次 produce 自動建立時，librdkafka 可能先回這個暫時性錯誤。
 

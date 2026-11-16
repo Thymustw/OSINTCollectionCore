@@ -13,16 +13,28 @@ use serde_json::Value;
 
 use crate::envelope::EventEnvelope;
 use crate::error::EventError;
+use crate::namespace::TopicNamespace;
 use crate::topics::EventTopic;
 
 /// 有界 produce。`queue.buffering.max.messages` 避免無界堆積。
 pub struct EventProducer {
     inner: FutureProducer,
     source_service: String,
+    namespace: TopicNamespace,
 }
 
 impl EventProducer {
+    /// 不加 namespace（正式與開發服務）。
     pub fn connect(brokers: &str, source_service: impl Into<String>) -> Result<Self, EventError> {
+        Self::connect_namespaced(brokers, source_service, TopicNamespace::NONE)
+    }
+
+    /// 送出時把邏輯 topic 換成 `<namespace>.<邏輯名稱>`（見 [`TopicNamespace`]）。
+    pub fn connect_namespaced(
+        brokers: &str,
+        source_service: impl Into<String>,
+        namespace: TopicNamespace,
+    ) -> Result<Self, EventError> {
         if brokers.trim().is_empty() {
             return Err(EventError::Configuration {
                 message: "broker 位址是空的。請設 REDPANDA_BROKERS 或 config [broker].brokers"
@@ -42,7 +54,13 @@ impl EventProducer {
         Ok(Self {
             inner,
             source_service: source_service.into(),
+            namespace,
         })
+    }
+
+    #[must_use]
+    pub fn namespace(&self) -> &TopicNamespace {
+        &self.namespace
     }
 
     /// 抓一次 cluster metadata，回 `(broker 數, topic 數)`。連不上時回 [`EventError::Produce`]。
@@ -92,7 +110,8 @@ impl EventProducer {
             .await
     }
 
-    /// 送到任意 topic 名。conformance 用一次性 topic，避免吃到歷史 `job.dispatched`。
+    /// 送到任意**邏輯** topic 名（一樣會套 namespace）。outbox 用它送表裡存的 topic；
+    /// conformance 用一次性 topic，避免吃到歷史 `job.dispatched`。
     pub async fn publish_to_topic(
         &self,
         topic_name: &str,
@@ -104,6 +123,8 @@ impl EventProducer {
                 message: "topic 名稱不可為空".into(),
             });
         }
+        let broker_topic = self.namespace.broker_name(topic_name);
+        let topic_name: &str = &broker_topic;
         let body = serde_json::to_vec(envelope)?;
         let mut record = FutureRecord::to(topic_name).payload(&body);
         let key_owned: Option<String> = partition_key.map(str::to_string);
@@ -127,10 +148,23 @@ impl EventProducer {
 pub struct EventConsumer {
     inner: StreamConsumer,
     last: Mutex<Option<TopicPartitionList>>,
+    namespace: TopicNamespace,
 }
 
 impl EventConsumer {
+    /// 不加 namespace（正式與開發服務）。`topics` 是邏輯名稱。
     pub fn connect(brokers: &str, group_id: &str, topics: &[&str]) -> Result<Self, EventError> {
+        Self::connect_namespaced(brokers, group_id, topics, TopicNamespace::NONE)
+    }
+
+    /// 訂閱 `<namespace>.<邏輯名稱>`。`topics` 仍傳邏輯名稱；
+    /// [`Self::last_coordinates`] 回的也是邏輯名稱（給 `failed_events.topic`）。
+    pub fn connect_namespaced(
+        brokers: &str,
+        group_id: &str,
+        topics: &[&str],
+        namespace: TopicNamespace,
+    ) -> Result<Self, EventError> {
         if brokers.trim().is_empty() {
             return Err(EventError::Configuration {
                 message: "broker 位址是空的。請設 REDPANDA_BROKERS".into(),
@@ -154,14 +188,20 @@ impl EventConsumer {
             .map_err(|err| EventError::ConsumerCreate {
                 message: err.to_string(),
             })?;
+        let broker_topics: Vec<String> = topics
+            .iter()
+            .map(|t| namespace.broker_name(t).into_owned())
+            .collect();
+        let refs: Vec<&str> = broker_topics.iter().map(String::as_str).collect();
         inner
-            .subscribe(topics)
+            .subscribe(&refs)
             .map_err(|err| EventError::ConsumerCreate {
-                message: format!("subscribe {topics:?} 失敗：{err}"),
+                message: format!("subscribe {refs:?} 失敗：{err}"),
             })?;
         Ok(Self {
             inner,
             last: Mutex::new(None),
+            namespace,
         })
     }
 
@@ -306,8 +346,17 @@ impl EventConsumer {
     pub fn last_coordinates(&self) -> Option<(String, i32, i64)> {
         // `remember_offset` 每次寫入的都是「只有一筆」的 list，所以空 list 等於
         // 「沒有上一則」。lock 被毒化也回 None，不要把失敗當成 panic。
+        // 存的是 broker 名稱（commit 要用）；對外回邏輯名稱，failed_events 與 DLQ replay
+        // 才會照原本的 topic 運作，不會把 namespace 寫進表裡。
         match self.last.lock() {
-            Ok(guard) => first_coordinates(&guard.clone().unwrap_or(TopicPartitionList::new())),
+            Ok(guard) => first_coordinates(&guard.clone().unwrap_or(TopicPartitionList::new()))
+                .map(|(topic, partition, offset)| {
+                    (
+                        self.namespace.logical_name(&topic).to_string(),
+                        partition,
+                        offset,
+                    )
+                }),
             Err(_) => None,
         }
     }

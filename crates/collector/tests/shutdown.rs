@@ -11,7 +11,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use chrono::Utc;
 use collector::{ABORT_JOB_ERROR, CollectorRunner, RunBounds, health_router};
-use core_events::EventProducer;
+use core_events::{EventProducer, TestTopics};
 use core_jobs::JobService;
 use core_model::{Connector, JobStatus, NetworkRule, Source, SourceType};
 use core_observability::MetricsRegistry;
@@ -44,7 +44,9 @@ const RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic。
+    topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -69,10 +71,11 @@ async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -205,7 +208,10 @@ async fn cleanup_abort(
 async fn cancelled_tick_dispatches_nothing() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "collector-shutdown-none").expect("producer"),
+        stack
+            .topics
+            .producer("collector-shutdown-none")
+            .expect("producer"),
     );
     let collector = runner(&stack, producer, 20);
     let token = CancellationToken::new();
@@ -232,7 +238,10 @@ async fn drain_timeout_aborts_inflight_without_bumping_error_count() {
     let error_count_before = 2;
     let (source, rule, connector) = seed_connector(&stack.pg, &feed_url, error_count_before).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "collector-shutdown-abort").expect("producer"),
+        stack
+            .topics
+            .producer("collector-shutdown-abort")
+            .expect("producer"),
     );
     let collector = runner(&stack, producer, 1);
     let token = CancellationToken::new();
@@ -307,7 +316,10 @@ async fn drain_waits_for_inflight_to_complete() {
     let feed_url = serve_rss_delayed(Duration::from_millis(300)).await;
     let (source, rule, connector) = seed_connector(&stack.pg, &feed_url, 0).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "collector-shutdown-complete").expect("producer"),
+        stack
+            .topics
+            .producer("collector-shutdown-complete")
+            .expect("producer"),
     );
     let collector = runner(&stack, producer, 5);
     let token = CancellationToken::new();

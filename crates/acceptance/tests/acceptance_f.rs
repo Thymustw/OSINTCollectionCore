@@ -23,11 +23,10 @@
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use core_events::{EventProducer, EventTopic};
+use core_events::EventTopic;
 use core_model::{
     Document, DocumentType, DuplicateGroup, EntityExtraction, Provenance, Relationship,
 };
@@ -86,9 +85,8 @@ async fn acceptance_f_normalizer_uncommitted_replay_leaves_exactly_one_document(
     let source = seed_source(&stack.pg, Some(&platform), Some(&feed_url)).await;
     let connector = seed_connector(&stack.pg, &source, &feed_url).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "acceptance-f").expect("producer"));
-    let raw_probe = probe_consumer(&stack.brokers, EventTopic::RawCollected);
+    let producer = test_producer(&stack, "acceptance-f");
+    let raw_probe = probe_consumer(&stack.topics, EventTopic::RawCollected);
     tokio::time::sleep(ASSIGN_WAIT).await;
 
     let collector = collector_runner(&stack, producer.clone());
@@ -284,9 +282,8 @@ async fn acceptance_f_deduplicator_crash_replay_does_not_duplicate_the_group() {
     let source = seed_source(&stack.pg, Some(&platform), Some(&feed_url)).await;
     let connector = seed_connector(&stack.pg, &source, &feed_url).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "acceptance-f-dd").expect("producer"));
-    let normalized_probe = probe_consumer(&stack.brokers, EventTopic::ObjectNormalized);
+    let producer = test_producer(&stack, "acceptance-f-dd");
+    let normalized_probe = probe_consumer(&stack.topics, EventTopic::ObjectNormalized);
     tokio::time::sleep(ASSIGN_WAIT).await;
 
     let metrics = MetricsRegistry::new();
@@ -412,10 +409,9 @@ async fn acceptance_f_entity_worker_crash_replay_keeps_entity_counts() {
     let source = seed_source(&stack.pg, Some(&platform), Some(&feed_url)).await;
     let connector = seed_connector(&stack.pg, &source, &feed_url).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "acceptance-f-ew").expect("producer"));
-    let normalized_probe = probe_consumer(&stack.brokers, EventTopic::ObjectNormalized);
-    let dedup_probe = probe_consumer(&stack.brokers, EventTopic::DedupCompleted);
+    let producer = test_producer(&stack, "acceptance-f-ew");
+    let normalized_probe = probe_consumer(&stack.topics, EventTopic::ObjectNormalized);
+    let dedup_probe = probe_consumer(&stack.topics, EventTopic::DedupCompleted);
     tokio::time::sleep(ASSIGN_WAIT).await;
 
     let metrics = MetricsRegistry::new();

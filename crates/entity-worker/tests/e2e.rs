@@ -21,7 +21,7 @@ use axum::Router;
 use axum::routing::get;
 use chrono::Utc;
 use collector::{CollectOutcome, CollectorRunner, RunBounds};
-use core_events::{EventConsumer, EventProducer, EventTopic};
+use core_events::{EventTopic, TestTopics};
 use core_jobs::JobService;
 use core_model::{
     Connector, Document, DocumentType, Entity, EntityIdentifier, EntityType, NetworkRule,
@@ -113,7 +113,9 @@ impl Fixture {
 struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -138,10 +140,11 @@ async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -483,8 +486,7 @@ async fn acceptance_e_entity_traces_back_to_raw_evidence_source_and_connector() 
     let source = seed_source(&stack.pg, Some(&feed_url)).await;
     let connector = seed_connector(&stack.pg, &source, &feed_url).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "entity-e2e-e").expect("producer"));
+    let producer = Arc::new(stack.topics.producer("entity-e2e-e").expect("producer"));
     let jobs = Arc::new(JobService::new(stack.pg.clone(), Some(producer.clone())));
     let collector = CollectorRunner::new(
         stack.pg.clone(),
@@ -1600,17 +1602,13 @@ async fn relationship_changed_is_published_for_each_upserted_edge() {
     )
     .await;
 
-    let group_id = format!("osint-e2e-entity-rel-{run}", run = fixture.run);
-    let consumer = EventConsumer::connect(
-        &stack.brokers,
-        &group_id,
-        &[EventTopic::RelationshipChanged.as_str()],
-    )
-    .expect("relationship.changed consumer");
+    let consumer = stack
+        .topics
+        .consumer("entity-rel", &[EventTopic::RelationshipChanged.as_str()])
+        .expect("relationship.changed consumer");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "entity-e2e-rel").expect("producer"));
+    let producer = Arc::new(stack.topics.producer("entity-e2e-rel").expect("producer"));
     let service = EntityWorker::new(
         stack.pg.clone(),
         Some(producer),

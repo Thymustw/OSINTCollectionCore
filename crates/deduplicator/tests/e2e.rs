@@ -14,7 +14,7 @@ use axum::Router;
 use axum::routing::get;
 use chrono::Utc;
 use collector::{CollectOutcome, CollectorRunner, RunBounds};
-use core_events::{EventConsumer, EventProducer, EventTopic};
+use core_events::{EventConsumer, EventProducer, EventTopic, TestTopics};
 use core_jobs::JobService;
 use core_model::{Connector, Document, DocumentType, NetworkRule, RawEvidence, Source, SourceType};
 use core_observability::MetricsRegistry;
@@ -92,7 +92,9 @@ fn short_body(run: Uuid, tag: &str) -> String {
 struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    topics: TestTopics,
     /// 一次性 PostgreSQL DB（KNOWN_GAPS §26）。以前開發 DB 裡 90 個 `dedup-e2e-*` source 都是這支留的。
     _db: TestDatabase,
 }
@@ -116,10 +118,11 @@ async fn connect_stack() -> Stack {
     let pg = db.store().clone();
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -370,8 +373,7 @@ async fn acceptance_b_same_article_ten_times_keeps_one_canonical_and_all_evidenc
     let source = seed_source(&stack.pg, Some("dedup-e2e-platform"), Some(&feed_url)).await;
     let connector = seed_connector(&stack.pg, &source, &feed_url).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "dedup-e2e-b").expect("producer"));
+    let producer = Arc::new(stack.topics.producer("dedup-e2e-b").expect("producer"));
     let collector = runner(&stack, producer.clone());
     let normalizer = Normalizer::new(
         stack.pg.clone(),
@@ -523,8 +525,7 @@ async fn acceptance_c_reprint_from_two_sources_shares_one_duplicate_group() {
     let source_b = seed_source(&stack.pg, Some("site-b"), Some(&url_b)).await;
     let connector_b = seed_connector(&stack.pg, &source_b, &url_b).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "dedup-e2e-c").expect("producer"));
+    let producer = Arc::new(stack.topics.producer("dedup-e2e-c").expect("producer"));
     let collector = runner(&stack, producer);
     let normalizer = Normalizer::new(
         stack.pg.clone(),
@@ -1203,17 +1204,13 @@ async fn dedup_completed_event_is_published_with_stage_and_canonical() {
     let connector = seed_connector(&stack.pg, &source, "http://127.0.0.1/none").await;
     let external_id = format!("evt-guid-{run}");
 
-    let group_id = format!("osint-e2e-dedup-{run}");
-    let consumer = EventConsumer::connect(
-        &stack.brokers,
-        &group_id,
-        &[EventTopic::DedupCompleted.as_str()],
-    )
-    .expect("dedup.completed consumer");
+    let consumer = stack
+        .topics
+        .consumer("dedup", &[EventTopic::DedupCompleted.as_str()])
+        .expect("dedup.completed consumer");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "dedup-e2e-event").expect("producer"));
+    let producer = Arc::new(stack.topics.producer("dedup-e2e-event").expect("producer"));
     let service = dedup(&stack, Some(producer));
 
     let first = seed_document(

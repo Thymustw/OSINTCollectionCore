@@ -98,8 +98,7 @@ async fn acceptance_g_import_core_export_round_trip() {
     });
 
     // ---- 3. 起 operator／viewer token 的測試 API ----
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "acceptance-g").expect("producer"));
+    let producer = test_producer(&stack, "acceptance-g");
     let api = build_api(&stack, producer);
 
     // ---- 4. 走真正的 HTTP 匯入 ----

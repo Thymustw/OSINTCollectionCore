@@ -34,6 +34,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# 一次性 topic namespace（TestTopics），e2e 不跟執行中的服務共用 topic。
+core-events = { workspace = true, features = ["test-support"] }
 axum = { workspace = true }
 collector = { path = "../collector" }
 core-jobs = { workspace = true }

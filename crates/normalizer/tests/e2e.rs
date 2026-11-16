@@ -8,7 +8,7 @@ use axum::Router;
 use axum::routing::get;
 use chrono::Utc;
 use collector::{CollectOutcome, CollectorRunner, RunBounds};
-use core_events::{EventConsumer, EventProducer, EventTopic};
+use core_events::{EventConsumer, EventProducer, EventTopic, TestTopics};
 use core_jobs::JobService;
 use core_model::{Connector, NetworkRule, Source, SourceType};
 use core_observability::MetricsRegistry;
@@ -40,7 +40,9 @@ const RSS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -65,10 +67,11 @@ async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -195,25 +198,17 @@ async fn rss_collect_publish_normalize_round_trip() {
     let feed_url = serve_rss().await;
     let connector = seed_rss_connector(&stack.pg, &feed_url, "rss").await;
 
-    let probe = Uuid::now_v7();
-    let raw_group = format!("osint-e2e-raw-{probe}");
-    let obj_group = format!("osint-e2e-obj-{probe}");
-    let raw_consumer = EventConsumer::connect(
-        &stack.brokers,
-        &raw_group,
-        &[EventTopic::RawCollected.as_str()],
-    )
-    .expect("raw.collected consumer");
-    let obj_consumer = EventConsumer::connect(
-        &stack.brokers,
-        &obj_group,
-        &[EventTopic::ObjectNormalized.as_str()],
-    )
-    .expect("object.normalized consumer");
+    let raw_consumer = stack
+        .topics
+        .consumer("raw", &[EventTopic::RawCollected.as_str()])
+        .expect("raw.collected consumer");
+    let obj_consumer = stack
+        .topics
+        .consumer("obj", &[EventTopic::ObjectNormalized.as_str()])
+        .expect("object.normalized consumer");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "collector-e2e").expect("producer"));
+    let producer = Arc::new(stack.topics.producer("collector-e2e").expect("producer"));
     let collector = runner(&stack, producer.clone());
     let outcome = collector
         .run_connector(connector.clone())
@@ -299,8 +294,12 @@ async fn normalize_same_raw_evidence_twice_is_idempotent() {
     let stack = connect_stack().await;
     let feed_url = serve_rss().await;
     let connector = seed_rss_connector(&stack.pg, &feed_url, "rss").await;
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "collector-e2e-idem").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("collector-e2e-idem")
+            .expect("producer"),
+    );
     let collector = runner(&stack, producer);
     let outcome = collector.run_connector(connector).await.expect("collect");
     let CollectOutcome::Collected { raw_evidence_id } = outcome else {
@@ -356,8 +355,12 @@ async fn concurrent_normalize_hits_conflict_and_keeps_one_document() {
     let stack = connect_stack().await;
     let feed_url = serve_rss().await;
     let connector = seed_rss_connector(&stack.pg, &feed_url, "rss").await;
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "collector-e2e-race").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("collector-e2e-race")
+            .expect("producer"),
+    );
     let collector = runner(&stack, producer);
     let outcome = collector.run_connector(connector).await.expect("collect");
     let CollectOutcome::Collected { raw_evidence_id } = outcome else {
@@ -422,7 +425,10 @@ async fn concurrent_normalize_hits_conflict_and_keeps_one_document() {
 async fn unknown_connector_type_is_skipped() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "collector-e2e-unknown").expect("producer"),
+        stack
+            .topics
+            .producer("collector-e2e-unknown")
+            .expect("producer"),
     );
     let collector = runner(&stack, producer);
     let now = Utc::now();
@@ -699,8 +705,12 @@ async fn static_web_collect_normalize_webpage() {
         json!({ "url": page_url }),
     )
     .await;
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "collector-e2e-web").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("collector-e2e-web")
+            .expect("producer"),
+    );
     let collector = runner(&stack, producer);
     let outcome = collector.run_connector(connector).await.expect("collect");
     let CollectOutcome::Collected { raw_evidence_id } = outcome else {
@@ -751,8 +761,12 @@ async fn rest_api_collect_normalize_skips_json() {
         json!({ "url": api_url, "method": "GET" }),
     )
     .await;
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "collector-e2e-rest").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("collector-e2e-rest")
+            .expect("producer"),
+    );
     let collector = runner(&stack, producer);
     let outcome = collector.run_connector(connector).await.expect("collect");
     let CollectOutcome::Collected { raw_evidence_id } = outcome else {

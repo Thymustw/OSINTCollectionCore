@@ -842,6 +842,7 @@ name = "core-events"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "core-events",
  "core-model",
  "dotenvy",
  "rdkafka",

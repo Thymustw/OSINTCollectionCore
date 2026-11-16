@@ -23,7 +23,7 @@ use axum::{Router, http};
 use chrono::Utc;
 use collector::{CollectOutcome, CollectorRunner, RunBounds};
 use core_api::{AppState, AuthState, RateLimiter, SearchState, ready_always, router};
-use core_events::EventProducer;
+use core_events::TestTopics;
 use core_jobs::JobService;
 use core_model::{Connector, NetworkRule, Source, SourceType};
 use core_observability::MetricsRegistry;
@@ -50,7 +50,9 @@ struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
     os: OpenSearchStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -84,11 +86,12 @@ async fn connect_stack() -> Stack {
     assert_opensearch_identity(&os.cluster_info().await.expect("GET /"))
         .expect("必須是 OpenSearch");
 
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
         os,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -287,8 +290,7 @@ async fn acceptance_a_and_e_rss_to_search_and_back_to_connector() {
     let connector = seed_connector(&stack.pg, &source, &feed_url).await;
 
     // ---- 1) collector ----
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "search-e2e").expect("producer"));
+    let producer = Arc::new(stack.topics.producer("search-e2e").expect("producer"));
     let jobs = Arc::new(JobService::new(stack.pg.clone(), Some(producer.clone())));
     let collector = CollectorRunner::new(
         stack.pg.clone(),

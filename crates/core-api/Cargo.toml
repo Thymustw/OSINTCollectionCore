@@ -59,6 +59,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# 一次性 topic namespace（TestTopics），e2e 不跟執行中的服務共用 topic。
+core-events = { workspace = true, features = ["test-support"] }
 storage-sqlite = { path = "../storage-sqlite" }
 # 整合測試用的 DisableConnectorsOnDrop／測試鎖（見 storage-postgres 的 test-support feature）。
 storage-postgres = { path = "../storage-postgres", features = ["test-support"] }

@@ -352,8 +352,18 @@ let pg = db.store().clone();             // 需要 DSN 的 guard 用 db.dsn()
   （模板 `osint_test_tpl_*` 留著是正常的，migration 改了會自動建新的；舊模板可手動 `DROP DATABASE`）。
 - 新 crate 要用：`[dev-dependencies]` 加 `storage-postgres = { path = "../storage-postgres", features = ["test-support"] }`。
 - 唯二刻意連開發 DB 的測試：`no_stale_enabled_test_connectors.rs`（守門）與 `acceptance/tests/failure_recovery.rs`（`#[ignore]`）。
-- Redpanda 沒有隔離：測試事件仍會被執行中的服務吃到，normalizer 在開發 DB 找不到那筆 raw_evidence 而寫進
-  `failed_events`（跑一輪全部測試實測 +44 列）；測試的 `osint-e2e-*` consumer group 也不會刪。兩者都是已知缺口。
+- Redpanda 用 `core_events::TestTopics` 隔離（2026-11-17 起）：每個測試一個 `osinttest-<uuidv7>` topic namespace，
+  執行中的服務訂不到測試事件；drop 時刪掉該 namespace 的 topic 與 group。
+
+  ```rust
+  let topics = TestTopics::create(&brokers);            // 綁進 Stack（`_topics`），活到測試結束
+  let producer = topics.producer("normalizer-e2e")?;     // 送 `<ns>.raw.collected`
+  let consumer = topics.consumer("raw", &[EventTopic::RawCollected.as_str()])?;  // 傳邏輯名稱
+  ```
+
+  producer 與 consumer **必須來自同一個 `TestTopics`**，否則 consumer 永遠收不到（表現是 consume 逾時）。
+  `OSINT_TEST_KEEP_TOPICS=1` 保留 topic 方便用 `rpk` 除錯。手動檢查殘留：
+  `docker exec osint-core-redpanda-1 rpk topic list | grep osinttest`（group 同理用 `rpk group list`）。
 
 ### ⚠️ 跑測試前先停掉應用服務容器
 

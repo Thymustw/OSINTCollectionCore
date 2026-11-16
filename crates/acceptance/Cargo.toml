@@ -19,7 +19,7 @@ chrono = { workspace = true }
 collector = { path = "../collector" }
 core-api = { path = "../core-api" }
 core-config = { workspace = true }
-core-events = { workspace = true }
+core-events = { workspace = true, features = ["test-support"] }
 core-jobs = { workspace = true }
 core-model = { workspace = true }
 core-observability = { workspace = true }

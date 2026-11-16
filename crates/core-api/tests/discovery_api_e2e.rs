@@ -17,7 +17,7 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use core_api::{AppState, AuthState, RateLimiter, envelope_from_outbox, ready_always, router};
 use core_config::ImportSection;
-use core_events::{EventConsumer, EventProducer};
+use core_events::{EventProducer, TestTopics};
 use core_jobs::JobService;
 use core_model::{AiRun, Candidate, CandidateEvidence, CandidateStatus, CandidateType, Collection};
 use core_observability::MetricsRegistry;
@@ -421,8 +421,8 @@ async fn approve_candidate_twice_does_not_reemit_outbox() {
     assert_eq!(after_second, 1, "重複核准不可再寫 candidate.approved");
 }
 
-/// 真實 Redpanda：建立 seed、核准 candidate，郵差送出後從正式 topic 消費。
-/// 測完刪自己的 outbox 列；正式 V0.3 topic 留下。
+/// 真實 Redpanda：建立 seed、核准 candidate，郵差送出後從這個測試的一次性 namespace 消費。
+/// 測完刪自己的 outbox 列；namespace 的 topic／group 由 `TestTopics` drop 時刪。
 #[tokio::test]
 async fn outbox_relay_publishes_seed_created_and_candidate_approved() {
     let stack = connect_stack().await;
@@ -434,6 +434,9 @@ async fn outbox_relay_publishes_seed_created_and_candidate_approved() {
         brokers.contains("127.0.0.1") || brokers.contains("localhost"),
         "e2e 只連本機 Redpanda，實際 brokers={brokers}"
     );
+    // 一次性 topic namespace：郵差送到 `<ns>.seed.created`，執行中的 discovery-worker 訂不到。
+    // 要活過 consumer／producer，drop 時刪 topic 與 group。
+    let topics = TestTopics::create(&brokers);
 
     let seed_value = format!("outbox-e2e-{}", Uuid::now_v7().simple());
     let (seed_status, seed_resp) = send(
@@ -466,13 +469,13 @@ async fn outbox_relay_publishes_seed_created_and_candidate_approved() {
     .await;
     assert_eq!(approve_status, StatusCode::OK, "{approve_resp}");
 
-    let group = format!("osint-outbox-e2e-{}", Uuid::now_v7());
-    let consumer =
-        EventConsumer::connect(&brokers, &group, &["seed.created", "candidate.approved"])
-            .expect("建立 consumer。請確認 osint-core-redpanda-1 在跑（埠 9092）");
+    let consumer = topics
+        .consumer("outbox", &["seed.created", "candidate.approved"])
+        .expect("建立 consumer。請確認 osint-core-redpanda-1 在跑（埠 9092）");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer = EventProducer::connect(&brokers, "core-api-outbox-e2e")
+    let producer = topics
+        .producer("core-api-outbox-e2e")
         .expect("建立 producer。請確認 Redpanda healthy");
     relay_own_outbox_rows(&stack, &producer, &[seed_id, candidate.id]).await;
 

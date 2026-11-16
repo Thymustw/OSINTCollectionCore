@@ -14,7 +14,7 @@ use axum::http::{Request, StatusCode};
 use chrono::Utc;
 use connector_sdk::StoreEvidenceSink;
 use core_api::{AppState, AuthState, ImportState, RateLimiter, ready_always, router};
-use core_events::{EventConsumer, EventError, EventProducer, EventTopic};
+use core_events::{EventError, EventProducer, EventTopic, TestTopics};
 use core_jobs::JobService;
 use core_model::{Source, SourceType};
 use core_observability::MetricsRegistry;
@@ -34,7 +34,9 @@ const UUID: &str = "2152fbe0-4471-4d43-8b64-0b907d186c23";
 struct Stack {
     pg: PostgresCanonicalStore,
     s3: S3ObjectStore,
-    brokers: String,
+    /// 這個測試專屬的一次性 topic namespace：producer／consumer 一律從它拿，
+    /// 執行中的開發服務才不會吃到測試事件；drop 時刪掉 topic 與 group。
+    topics: TestTopics,
     /// 這個測試專屬的一次性 PostgreSQL DB（KNOWN_GAPS §26）。drop 時刪掉。
     _db: TestDatabase,
 }
@@ -59,10 +61,11 @@ async fn connect_stack() -> Stack {
 
     let s3 = S3ObjectStore::connect(&endpoint, &bucket, &access, &secret).expect("s3");
     s3.ensure_bucket().await.expect("bucket");
+    let topics = TestTopics::create(&brokers);
     Stack {
         pg,
         s3,
-        brokers,
+        topics,
         _db: db,
     }
 }
@@ -204,14 +207,18 @@ fn ok_bundle() -> Value {
 async fn import_stix_creates_job_without_publishing_raw_collected() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::StixImport).await;
-    let group = format!("osint-e2e-stix-{}", Uuid::now_v7());
-    let consumer =
-        EventConsumer::connect(&stack.brokers, &group, &[EventTopic::RawCollected.as_str()])
-            .expect("raw.collected consumer");
+    let consumer = stack
+        .topics
+        .consumer("stix", &[EventTopic::RawCollected.as_str()])
+        .expect("raw.collected consumer");
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "core-api-stix-e2e").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("core-api-stix-e2e")
+            .expect("producer"),
+    );
     let api = build_api(&stack, producer);
 
     let (status, body) = send(
@@ -285,7 +292,10 @@ async fn import_stix_creates_job_without_publishing_raw_collected() {
 async fn import_stix_missing_source_is_404() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-stix-e2e-404").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-stix-e2e-404")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer);
     let (status, body) = send(
@@ -306,7 +316,10 @@ async fn import_stix_wrong_source_type_is_400() {
     let stack = connect_stack().await;
     let source = seed_source(&stack.pg, SourceType::Rss).await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-stix-e2e-400").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-stix-e2e-400")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer);
     let (status, body) = send(
@@ -327,8 +340,12 @@ async fn import_stix_wrong_source_type_is_400() {
 #[tokio::test]
 async fn export_stix_creates_queued_job() {
     let stack = connect_stack().await;
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "core-api-stix-export").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("core-api-stix-export")
+            .expect("producer"),
+    );
     let api = build_api(&stack, producer);
     let (status, body) = send(
         &api.app,
@@ -362,8 +379,12 @@ async fn export_stix_creates_queued_job() {
 #[tokio::test]
 async fn job_result_unknown_id_is_404() {
     let stack = connect_stack().await;
-    let producer =
-        Arc::new(EventProducer::connect(&stack.brokers, "core-api-stix-result").expect("producer"));
+    let producer = Arc::new(
+        stack
+            .topics
+            .producer("core-api-stix-result")
+            .expect("producer"),
+    );
     let api = build_api(&stack, producer);
     let (status, body) = send(
         &api.app,
@@ -380,7 +401,10 @@ async fn job_result_unknown_id_is_404() {
 async fn job_result_wrong_type_is_404() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-stix-wrong-type").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-stix-wrong-type")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer);
     let (status, job) = send(
@@ -407,7 +431,10 @@ async fn job_result_wrong_type_is_404() {
 async fn job_result_completed_without_key_is_500() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-stix-completed").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-stix-completed")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer);
     let (status, job) = send(
@@ -465,7 +492,10 @@ async fn job_result_completed_without_key_is_500() {
 async fn job_result_completed_with_object_returns_bundle() {
     let stack = connect_stack().await;
     let producer = Arc::new(
-        EventProducer::connect(&stack.brokers, "core-api-stix-result-ok").expect("producer"),
+        stack
+            .topics
+            .producer("core-api-stix-result-ok")
+            .expect("producer"),
     );
     let api = build_api(&stack, producer);
     let (status, job) = send(
