@@ -21,9 +21,9 @@ use storage_core::codec::encode_enum;
 use storage_core::{
     BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor,
     CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage, EventOutboxStore, HealthProvider,
-    JobPurgeFilter, OutboxEvent, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RelationalStore,
-    SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
-    clamp_outbox_limit,
+    JobPurgeFilter, OutboxEvent, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR,
+    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
+    TransactionalStore, clamp_outbox_limit,
 };
 
 use crate::error::map_sqlx;
@@ -1928,6 +1928,35 @@ impl RelationalStore for PostgresCanonicalStore {
         .map_err(map_sqlx)?;
 
         Ok((jobs.rows_affected(), connectors.rows_affected()))
+    }
+
+    async fn reclaim_orphan_jobs(
+        &self,
+        job_types: &[&str],
+        now: DateTime<Utc>,
+    ) -> Result<u64, StorageError> {
+        if job_types.is_empty() {
+            return Ok(0);
+        }
+        let failed = encode_enum(&JobStatus::Failed)?;
+        let running = encode_enum(&JobStatus::Running)?;
+        let types: Vec<String> = job_types.iter().map(|t| (*t).to_string()).collect();
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = $1, completed_at = $2, error = $3
+            WHERE "type" = ANY($4::text[]) AND status = $5
+            "#,
+        )
+        .bind(&failed)
+        .bind(now)
+        .bind(RECLAIM_ORPHAN_JOB_ERROR)
+        .bind(&types)
+        .bind(&running)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected())
     }
 
     async fn find_document_ids_by_external_key(

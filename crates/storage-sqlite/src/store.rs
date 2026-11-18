@@ -25,9 +25,9 @@ use storage_core::conformance::assert_sqlite_path_safe;
 use storage_core::{
     BudgetConsumption, CandidateDiscoveryOutcome, CapabilityDescriptor, CollectionDailyUsage,
     ConnectorRunStateUpdate, DailyUsage, EmbeddedStore, EventOutboxStore, HealthProvider,
-    JobPurgeFilter, OutboxEvent, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RelationalStore,
-    SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
-    clamp_outbox_limit,
+    JobPurgeFilter, OutboxEvent, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR,
+    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
+    TransactionalStore, clamp_outbox_limit,
 };
 use uuid::Uuid;
 
@@ -1912,6 +1912,38 @@ impl RelationalStore for SqliteEmbeddedStore {
         .map_err(map_sqlx)?;
 
         Ok((jobs.rows_affected(), connectors.rows_affected()))
+    }
+
+    async fn reclaim_orphan_jobs(
+        &self,
+        job_types: &[&str],
+        now: DateTime<Utc>,
+    ) -> Result<u64, StorageError> {
+        if job_types.is_empty() {
+            return Ok(0);
+        }
+        let failed = encode_enum(&JobStatus::Failed)?;
+        let running = encode_enum(&JobStatus::Running)?;
+        let types =
+            serde_json::to_string(job_types).map_err(|err| StorageError::Configuration {
+                message: format!("job_types 無法序列化：{err}"),
+            })?;
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = ?1, completed_at = ?2, error = ?3
+            WHERE type IN (SELECT value FROM json_each(?4)) AND status = ?5
+            "#,
+        )
+        .bind(&failed)
+        .bind(rfc3339(now))
+        .bind(RECLAIM_ORPHAN_JOB_ERROR)
+        .bind(&types)
+        .bind(&running)
+        .execute(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(result.rows_affected())
     }
 
     async fn find_document_ids_by_external_key(

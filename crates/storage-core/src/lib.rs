@@ -25,8 +25,8 @@ pub use traits::{
     EmbeddingProvider, EmbeddingRequest, EmbeddingVector, GraphEdge, GraphNode, GraphPath,
     GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions, JobPurgeFilter, KeyValueStore,
     NormalizedSearch, ObjectStore, ProjectionCheckpoint, ProjectionLag, ProjectionStore, QueryExpr,
-    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RebuildState, RebuildStatus, RelationalStore, SearchDocument,
-    SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery, SearchStore, SimhashCandidate,
-    SortField, StructuredSearch, Transaction, TransactionalStore, VectorSearch,
-    embedding_cache_key, embedding_content_hash, merge_json_objects,
+    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR, RebuildState, RebuildStatus,
+    RelationalStore, SearchDocument, SearchField, SearchFilter, SearchHit, SearchHits, SearchQuery,
+    SearchStore, SimhashCandidate, SortField, StructuredSearch, Transaction, TransactionalStore,
+    VectorSearch, embedding_cache_key, embedding_content_hash, merge_json_objects,
 };

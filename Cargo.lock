@@ -896,6 +896,7 @@ dependencies = [
  "storage-sqlite",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

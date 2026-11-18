@@ -261,13 +261,15 @@ async fn consume_loop(
     let mut ids: Vec<Uuid> = Vec::with_capacity(bounds.batch_size as usize);
     let mut flushes: u32 = 0;
 
+    // 只註冊一次：處理事件期間到的 SIGTERM 也不會漏（見 core_observability::shutdown_watch）。
+    let mut stop = core_observability::shutdown_watch();
     loop {
         let timeout = controller.poll_timeout(batch.len(), IDLE_POLL, Instant::now());
         let mut reason = None;
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!(pending = batch.len(), "收到 SIGINT，把手上的批次送完再結束");
+            _ = stop.changed() => {
+                tracing::info!(pending = batch.len(), "收到停止訊號（SIGTERM／SIGINT），把手上的批次送完再結束");
                 reason = Some(FlushReason::Shutdown);
             }
             result = consumer.next_envelope(timeout) => {

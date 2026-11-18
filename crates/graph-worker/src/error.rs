@@ -22,4 +22,10 @@ pub enum GraphWorkerError {
     InvalidChangeKind { got: String },
     #[error("{message}")]
     Configuration { message: String },
+    /// 收到停止訊號，在兩頁之間中斷。已寫進圖的邊保留（重建是冪等 upsert），重新觸發即可補完。
+    #[error(
+        "收到停止訊號（SIGTERM／SIGINT），rebuild 在掃過 {scanned} 筆後中斷。\
+         已寫入的邊保留；重新 POST /api/v1/graph/rebuild 即可補完"
+    )]
+    Interrupted { scanned: u64 },
 }

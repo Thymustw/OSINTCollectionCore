@@ -9,5 +9,5 @@ mod tracing_setup;
 
 pub use health::{CheckResult, HealthStatus, ReadyStatus};
 pub use metrics::MetricsRegistry;
-pub use shutdown::{ShutdownCause, shutdown_signal};
+pub use shutdown::{ShutdownCause, shutdown_signal, shutdown_watch};
 pub use tracing_setup::{TracingInitError, init_tracing};

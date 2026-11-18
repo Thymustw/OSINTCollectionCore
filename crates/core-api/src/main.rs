@@ -766,6 +766,7 @@ async fn fallback() -> (axum::http::StatusCode, axum::Json<ErrorBody>) {
     )
 }
 
+/// SIGTERM（`docker stop`）或 SIGINT。只等一次（不在迴圈裡），所以直接用 `shutdown_signal`。
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let _cause = core_observability::shutdown_signal().await;
 }

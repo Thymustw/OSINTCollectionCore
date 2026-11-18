@@ -164,6 +164,13 @@ async fn run() -> Result<(), String> {
     });
 
     let jobs = JobService::new(store.clone(), None);
+    // 開始消費前收回上次被 SIGKILL／OOM 留下、卡在 running 的 job（單一副本前提，見
+    // RelationalStore::reclaim_orphan_jobs）。之後才收到的 job 不會被誤收。
+    let reclaimed = jobs
+        .reclaim_orphans(&[graph_worker::GRAPH_REBUILD_JOB_TYPE])
+        .await
+        .map_err(|err| err.to_string())?;
+    metrics.inc("osint_graph_worker_orphan_jobs_reclaimed_total", reclaimed);
 
     let consumer = EventConsumer::connect(
         &cfg.broker.brokers,
@@ -234,12 +241,14 @@ async fn consume_loop(
     page_size: u32,
 ) {
     let mut processed = 0_u64;
+    // 只註冊一次：處理事件期間到的 SIGTERM 也不會漏（見 core_observability::shutdown_watch）。
+    let mut stop = core_observability::shutdown_watch();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = stop.changed() => {
                 // 不在這裡 commit：上一則成功時已經 commit 過；上一則失敗時
                 // 必須留給 broker 重送。關機時再 commit 一次會把失敗那則吃掉。
-                tracing::info!("收到 SIGINT，graph-worker 結束");
+                tracing::info!("收到停止訊號（SIGTERM／SIGINT），graph-worker 結束");
                 break;
             }
             result = consumer.next_envelope(IDLE_POLL) => {
@@ -250,7 +259,7 @@ async fn consume_loop(
                                 handle_relationship_changed(service, consumer, metrics, &envelope).await;
                             }
                             "job.dispatched" => {
-                                handle_job_dispatched(service, jobs, consumer, page_size, &envelope).await;
+                                handle_job_dispatched(service, jobs, consumer, page_size, &envelope, &stop).await;
                             }
                             other => {
                                 tracing::warn!(
@@ -319,9 +328,10 @@ async fn handle_job_dispatched(
     consumer: &EventConsumer,
     page_size: u32,
     envelope: &core_events::EventEnvelope,
+    stop: &tokio::sync::watch::Receiver<bool>,
 ) {
     let outcome = service
-        .process_dispatched_job(jobs, &envelope.payload, page_size)
+        .process_dispatched_job(jobs, &envelope.payload, page_size, Some(stop))
         .await;
     log_job_outcome(&envelope.id.to_string(), &outcome);
     // 執行完（不管成敗）就 commit。理由見 consume_loop 的文件註解。

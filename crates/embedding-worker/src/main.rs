@@ -317,10 +317,12 @@ async fn consume_loop(
     metrics: &MetricsRegistry,
 ) {
     let mut processed = 0_u64;
+    // 只註冊一次：處理事件期間到的 SIGTERM 也不會漏（見 core_observability::shutdown_watch）。
+    let mut stop = core_observability::shutdown_watch();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("收到 SIGINT，embedding-worker 結束");
+            _ = stop.changed() => {
+                tracing::info!("收到停止訊號（SIGTERM／SIGINT），embedding-worker 結束");
                 break;
             }
             result = consumer.next_envelope(IDLE_POLL) => {

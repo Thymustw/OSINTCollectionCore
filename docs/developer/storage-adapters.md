@@ -478,6 +478,19 @@ adapter 測試：
 - `postgres_jobs_purge`
 - `sqlite_jobs_purge`
 
+## `reclaim_orphan_jobs`（job worker 啟動回收，2026-11-18）
+
+```text
+reclaim_orphan_jobs(job_types: &[&str], now) -> Result<u64>
+```
+
+- `jobs.type IN job_types AND status='running'` → `failed`，設 `completed_at=now`、`error`＝`RECLAIM_ORPHAN_JOB_ERROR`。
+  其他類型的 running、指定類型的 queued／completed 都不動；`job_types` 為空回 0、不動任何列。
+- 給 graph-worker（`graph_rebuild`）／stix-worker（`stix_import`、`stix_export`）／discovery-worker（`discovery_run`）
+  **開始消費前**呼叫（經 `JobService::reclaim_orphans`）。**單一副本前提**同下節。不需要 migration。
+- postgres 用 `= ANY($4::text[])`，sqlite 用 `IN (SELECT value FROM json_each(?4))`，都不拼 SQL 字串。
+- conformance：`storage_core::conformance::assert_reclaim_orphan_jobs`（postgres 跑在 `TestDatabase` 裡，全表 UPDATE 不會碰開發 DB）。
+
 ## `reclaim_orphan_collect_runs`（collector 啟動回收，2026-10-28 步驟 4）
 
 把上次非正常結束留下的 collect 工作收回來。**不需要 migration**。

@@ -33,8 +33,9 @@ use crate::traits::{
     CanonicalStore, CanonicalWriteStore, CheckpointUpdate, ConnectorRunStateUpdate, EmbeddedStore,
     GraphEdge, GraphNode, GraphPattern, GraphQuery, GraphStore, GraphTraversalOptions,
     JobPurgeFilter, KeyValueStore, ObjectStore, ProjectionCheckpoint, ProjectionStore,
-    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RebuildState, RebuildStatus, RelationalStore, SearchDocument,
-    SearchQuery, SearchStore, StructuredSearch, TransactionalStore,
+    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR, RebuildState, RebuildStatus,
+    RelationalStore, SearchDocument, SearchQuery, SearchStore, StructuredSearch,
+    TransactionalStore,
 };
 
 /// 從 workspace 根目錄載入 `.env`（若存在）。已設定的環境變數不被覆蓋。
@@ -1734,6 +1735,95 @@ pub async fn assert_reclaim_orphan_collect_runs<S: RelationalStore>(
 
     let result = run.await;
     cleanup.await;
+    result
+}
+
+/// [`RelationalStore::reclaim_orphan_jobs`]：只收「指定類型 ∧ running」，設 Failed＋completed_at＋固定 error；
+/// 其他類型的 running、指定類型的 queued／completed 都不動；空清單不動任何列。
+///
+/// 用一次性 DB（`TestDatabase`）跑時表裡只有這裡建的 job；共用 DB 跑時只斷言自己建的列。
+pub async fn assert_reclaim_orphan_jobs<S: RelationalStore>(store: &S) -> Result<(), StorageError> {
+    let now = Utc::now();
+    let job = |job_type: &str, status: JobStatus| Job {
+        id: Uuid::now_v7(),
+        job_type: job_type.into(),
+        status,
+        correlation_id: None,
+        created_at: now,
+        started_at: (status != JobStatus::Queued).then_some(now),
+        completed_at: (status == JobStatus::Completed).then_some(now),
+        retry_count: 0,
+        error: None,
+        parameters: None,
+    };
+    let rebuild_running = job("graph_rebuild", JobStatus::Running);
+    let import_running = job("stix_import", JobStatus::Running);
+    let rebuild_queued = job("graph_rebuild", JobStatus::Queued);
+    let rebuild_completed = job("graph_rebuild", JobStatus::Completed);
+    let collect_running = job("collect", JobStatus::Running);
+    let all = [
+        &rebuild_running,
+        &import_running,
+        &rebuild_queued,
+        &rebuild_completed,
+        &collect_running,
+    ];
+    let ids: Vec<Uuid> = all.iter().map(|j| j.id).collect();
+
+    let fail = |message: String| StorageError::Unknown {
+        backend: "conformance",
+        message,
+    };
+    let run = async {
+        for j in all {
+            store.put_job(j).await?;
+        }
+        if store.reclaim_orphan_jobs(&[], now).await? != 0 {
+            return Err(fail("job_types 為空時不得回收任何列".into()));
+        }
+        let n = store
+            .reclaim_orphan_jobs(&["graph_rebuild", "stix_import"], now)
+            .await?;
+        if n < 2 {
+            return Err(fail(format!(
+                "應至少收回本次建立的 2 筆 running job，實際 {n}"
+            )));
+        }
+        for (j, want) in [
+            (&rebuild_running, JobStatus::Failed),
+            (&import_running, JobStatus::Failed),
+            (&rebuild_queued, JobStatus::Queued),
+            (&rebuild_completed, JobStatus::Completed),
+            (&collect_running, JobStatus::Running),
+        ] {
+            let got = store
+                .get_job(j.id)
+                .await?
+                .ok_or_else(|| fail(format!("job {}（{}）消失了", j.id, j.job_type)))?;
+            if got.status != want {
+                return Err(fail(format!(
+                    "{} {:?} 回收後應為 {want:?}，實際 {:?}",
+                    j.job_type, j.status, got.status
+                )));
+            }
+            if want == JobStatus::Failed {
+                if got.completed_at.is_none() {
+                    return Err(fail("回收後必須設 completed_at（保留期限靠它）".into()));
+                }
+                if got.error.as_deref() != Some(RECLAIM_ORPHAN_JOB_ERROR) {
+                    return Err(fail(format!(
+                        "回收後 error 應為「{RECLAIM_ORPHAN_JOB_ERROR}」，實際 {:?}",
+                        got.error
+                    )));
+                }
+            }
+        }
+        Ok(())
+    };
+    let result = run.await;
+    for id in ids {
+        let _ = store.delete_job(id).await;
+    }
     result
 }
 

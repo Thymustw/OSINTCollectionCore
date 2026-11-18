@@ -142,6 +142,10 @@ pub fn merge_json_objects(base: &Value, patch: &Value) -> Value {
 /// 讓 `/ops/dlq` 看得到。步驟 3 的保留期限靠 `completed_at`。
 pub const RECLAIM_ORPHAN_COLLECT_JOB_ERROR: &str = "collector 非正常結束（啟動回收）";
 
+/// [`RelationalStore::reclaim_orphan_jobs`] 寫進 `jobs.error` 的訊息。
+pub const RECLAIM_ORPHAN_JOB_ERROR: &str =
+    "worker 非正常結束（SIGKILL／OOM），啟動時回收；可重新觸發這個 job";
+
 /// `purge_jobs`／`count_purgeable_jobs` 的過濾條件。
 ///
 /// 單次 `purge_jobs` 只刪一批（`<= limit`）。迴圈與批次間 sleep 由呼叫端
@@ -705,6 +709,34 @@ pub trait RelationalStore: HealthProvider {
         Err(StorageError::UnsupportedCapability {
             backend: "relational",
             capability: "reclaim_orphan_collect_runs",
+        })
+    }
+
+    /// 把上次非正常結束（SIGKILL／OOM）留下、卡在 `running` 的 job 收回成 Failed。
+    /// 給 graph-worker／stix-worker／discovery-worker 啟動時呼叫，只收自己負責的 `job_types`。
+    ///
+    /// **為什麼需要**：被 SIGKILL 的 job 停在 `running`；worker 重啟後收到同一則
+    /// `job.dispatched`，`can_transition(Running, Running)` 擋下、commit offset——
+    /// 這個 job 從此沒有人處理，也沒有人標失敗（2026-11-18 實測重現）。
+    ///
+    /// **單一副本前提**同 [`Self::reclaim_orphan_collect_runs`]：每種 job_type 只有一個
+    /// worker 副本在跑，所以它啟動時這些類型的 running 一定是孤兒。多副本時會誤收
+    /// 別的副本正在跑的 job，屆時要改成 lease。
+    ///
+    /// Failed（不是 Cancelled）、設 `completed_at`、`error` 用
+    /// [`RECLAIM_ORPHAN_JOB_ERROR`]——理由同 collect。`job_types` 為空時不動任何列、回 0。
+    ///
+    /// # 預設實作
+    ///
+    /// 回 [`StorageError::UnsupportedCapability`]。測試替身不必覆寫。
+    async fn reclaim_orphan_jobs(
+        &self,
+        _job_types: &[&str],
+        _now: DateTime<Utc>,
+    ) -> Result<u64, StorageError> {
+        Err(StorageError::UnsupportedCapability {
+            backend: "relational",
+            capability: "reclaim_orphan_jobs",
         })
     }
 

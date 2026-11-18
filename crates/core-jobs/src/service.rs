@@ -112,6 +112,25 @@ impl<S: RelationalStore> JobService<S> {
         self.dispatch(id).await
     }
 
+    /// worker 啟動時呼叫：把自己負責的 `job_types` 裡卡在 `running` 的 job 收回成 Failed
+    /// （上次被 SIGKILL／OOM 留下的；詳見 `RelationalStore::reclaim_orphan_jobs` 的單一副本前提）。
+    /// **必須在開始消費之前呼叫**——開始消費後收到的 job 會進 running，再回收就是誤收。
+    /// 有收回時打 warn，回傳收回筆數給呼叫端記 metric。
+    pub async fn reclaim_orphans(&self, job_types: &[&str]) -> Result<u64, JobError> {
+        let n = self
+            .store
+            .reclaim_orphan_jobs(job_types, Utc::now())
+            .await?;
+        if n > 0 {
+            tracing::warn!(
+                reclaimed = n,
+                ?job_types,
+                "啟動回收：上次非正常結束留下的 running job 已標 Failed，可在 /ops/dlq 看到並重新觸發"
+            );
+        }
+        Ok(n)
+    }
+
     /// 只改記憶體裡的 [`Job`]，不寫 store。給需要「put_job + 其他寫入同一個交易」
     /// 的呼叫端（例如 discovery-worker 把 `discovery.completed` 寫進 outbox）。
     pub fn apply_transition(

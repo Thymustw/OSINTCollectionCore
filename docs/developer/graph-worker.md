@@ -91,7 +91,13 @@ consumer lag 仍寫進 `osint_queue_depth` gauge（給人／Prometheus 看）。
 | `relationship.changed`：`StorageError`／Neo4j 連不上 | **否** | 這則邊還沒進圖；先提交會讓它永遠消失且沒有跡象 |
 | `job.dispatched`：任何結果（含 rebuild 失敗、不認識的 job_type、transition 失敗） | **是** | job 已經跑完（或確定不該跑）；重送不會讓 already-failed 的 job 重跑 |
 
-關機（SIGINT）時**不再**多 commit 一次：上一則成功時已經 commit 過；上一則失敗時必須留給 broker 重送。
+關機（SIGTERM／SIGINT）時**不再**多 commit 一次：上一則成功時已經 commit 過；上一則失敗時必須留給 broker 重送。
+
+**job 路徑的 rebuild 可中斷**（2026-11-18）：`process_dispatched_job(…, stop)` 走 `rebuild_interruptible`，
+每頁之間檢查 `core_observability::shutdown_watch` 的值，收到停止訊號回 `GraphWorkerError::Interrupted`，
+job 標 `failed`（錯誤訊息含掃過幾筆、「重新 POST /api/v1/graph/rebuild 即可補完」），offset 照常 commit。
+CLI `--rebuild` 用不可中斷的 `rebuild()`。啟動時 `JobService::reclaim_orphans(["graph_rebuild"])` 收回上次被
+SIGKILL 留下的 running job。實測與理由見 `docs/operations/OPERATIONS.md`「其他 9 個服務」。
 
 ## Rebuild（`--rebuild`）
 

@@ -4,7 +4,7 @@ use storage_core::conformance::{
     assert_candidate_natural_key, assert_collection_member_links_atomic,
     assert_connector_run_state_partial_update, assert_embedded_health,
     assert_event_outbox_contract, assert_evidence_collections, assert_jobs_purge,
-    assert_list_sources_by_entity, assert_reclaim_orphan_collect_runs,
+    assert_list_sources_by_entity, assert_reclaim_orphan_collect_runs, assert_reclaim_orphan_jobs,
     assert_relational_round_trip, assert_transactional_contract, find_workspace_root,
 };
 use storage_sqlite::SqliteEmbeddedStore;
@@ -162,6 +162,17 @@ async fn sqlite_reclaim_orphan_collect_runs_marks_failed_and_idle() {
         assert_reclaim_orphan_collect_runs(&store)
             .await
             .expect("reclaim：running collect job → failed（completed_at／固定 error）、running connector → idle（error_count 不動）");
+        store
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_reclaim_orphan_jobs_only_touches_given_running_types() {
+    with_temp_store("reclaim-orphan-jobs", |store| async move {
+        assert_reclaim_orphan_jobs(&store)
+            .await
+            .expect("reclaim_orphan_jobs：指定類型的 running → failed，其他不動");
         store
     })
     .await;

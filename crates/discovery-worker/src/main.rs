@@ -68,6 +68,16 @@ async fn run() -> Result<(), String> {
     });
 
     let jobs = JobService::new(store.clone(), None);
+    // 開始消費前收回上次被 SIGKILL／OOM 留下、卡在 running 的 job（單一副本前提，見
+    // RelationalStore::reclaim_orphan_jobs）。之後才收到的 job 不會被誤收。
+    let reclaimed = jobs
+        .reclaim_orphans(&[discovery_worker::JOB_TYPE_DISCOVERY_RUN])
+        .await
+        .map_err(|err| err.to_string())?;
+    metrics.inc(
+        "osint_discovery_worker_orphan_jobs_reclaimed_total",
+        reclaimed,
+    );
 
     let consumer = EventConsumer::connect(
         &cfg.broker.brokers,
@@ -114,10 +124,12 @@ async fn consume_loop(
     metrics: &MetricsRegistry,
 ) {
     let mut processed = 0_u64;
+    // 只註冊一次：處理事件期間到的 SIGTERM 也不會漏（見 core_observability::shutdown_watch）。
+    let mut stop = core_observability::shutdown_watch();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("收到 SIGINT，discovery-worker 結束");
+            _ = stop.changed() => {
+                tracing::info!("收到停止訊號（SIGTERM／SIGINT），discovery-worker 結束");
                 break;
             }
             result = consumer.next_envelope(IDLE_POLL) => match result {

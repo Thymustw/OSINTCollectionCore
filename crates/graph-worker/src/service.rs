@@ -247,6 +247,17 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
         &self,
         options: RebuildOptions,
     ) -> Result<RebuildReport, GraphWorkerError> {
+        self.rebuild_interruptible(options, None).await
+    }
+
+    /// 同 [`Self::rebuild`]，但每頁之間檢查 `stop`（`core_observability::shutdown_watch`）。
+    /// 收到停止訊號回 [`GraphWorkerError::Interrupted`]——呼叫端（job 路徑）會把 job 標 Failed，
+    /// 而不是讓行程被 SIGKILL、job 卡在 running。CLI `--rebuild` 用不可中斷的版本。
+    pub async fn rebuild_interruptible(
+        &self,
+        options: RebuildOptions,
+        stop: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<RebuildReport, GraphWorkerError> {
         let started_at = Utc::now();
         if options.drop_graph {
             // 狀態要在 wipe **之前**清掉，順序不能反：先寫 Running 再 reset，
@@ -280,7 +291,7 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
         };
         self.record_rebuild_status(&status).await;
 
-        let result = self.rebuild_pages(options, &mut status).await;
+        let result = self.rebuild_pages(options, &mut status, stop).await;
 
         status.finished_at = Some(Utc::now());
         match &result {
@@ -305,6 +316,7 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
         &self,
         options: RebuildOptions,
         status: &mut RebuildStatus,
+        stop: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<RebuildReport, GraphWorkerError> {
         let page_size = options.page_size.clamp(1, 100);
         let mut report = RebuildReport::default();
@@ -365,6 +377,16 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
             if got < page_size {
                 break;
             }
+            // 一頁最多 100 筆，實測 12k 筆約要數分鐘；只在頁與頁之間停，避免半頁狀態。
+            if stop.is_some_and(|s| *s.borrow()) {
+                tracing::warn!(
+                    scanned = report.scanned,
+                    "收到停止訊號，rebuild 在頁與頁之間中斷"
+                );
+                return Err(GraphWorkerError::Interrupted {
+                    scanned: report.scanned,
+                });
+            }
         }
 
         tracing::info!(
@@ -397,9 +419,10 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
         jobs: &JobService<R>,
         payload: &Value,
         page_size: u32,
+        stop: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> JobDispatchOutcome {
         let outcome = self
-            .process_dispatched_job_inner(jobs, payload, page_size)
+            .process_dispatched_job_inner(jobs, payload, page_size, stop)
             .await;
         self.metrics.inc(outcome.metric_name(), 1);
         outcome
@@ -410,6 +433,7 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
         jobs: &JobService<R>,
         payload: &Value,
         page_size: u32,
+        stop: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> JobDispatchOutcome {
         let job_type = payload
             .get("job_type")
@@ -447,10 +471,13 @@ impl<R: RelationalStore, G: GraphStore + ProjectionStore> GraphWorker<R, G> {
         }
 
         let rebuild = self
-            .rebuild(RebuildOptions {
-                drop_graph: false,
-                page_size: page_size.max(1),
-            })
+            .rebuild_interruptible(
+                RebuildOptions {
+                    drop_graph: false,
+                    page_size: page_size.max(1),
+                },
+                stop,
+            )
             .await;
 
         match rebuild {
@@ -979,7 +1006,7 @@ mod tests {
         let jobs = JobService::new(h.db.clone(), None);
         let outcome = h
             .worker
-            .process_dispatched_job(&jobs, &job_payload(Uuid::now_v7(), "collect"), 100)
+            .process_dispatched_job(&jobs, &job_payload(Uuid::now_v7(), "collect"), 100, None)
             .await;
         assert_eq!(
             outcome,
@@ -1008,7 +1035,12 @@ mod tests {
 
         let outcome = h
             .worker
-            .process_dispatched_job(&jobs, &job_payload(job.id, GRAPH_REBUILD_JOB_TYPE), 100)
+            .process_dispatched_job(
+                &jobs,
+                &job_payload(job.id, GRAPH_REBUILD_JOB_TYPE),
+                100,
+                None,
+            )
             .await;
         assert_eq!(outcome, JobDispatchOutcome::Completed { job_id: job.id });
 
@@ -1056,7 +1088,12 @@ mod tests {
         );
 
         let outcome = worker
-            .process_dispatched_job(&jobs, &job_payload(job.id, GRAPH_REBUILD_JOB_TYPE), 100)
+            .process_dispatched_job(
+                &jobs,
+                &job_payload(job.id, GRAPH_REBUILD_JOB_TYPE),
+                100,
+                None,
+            )
             .await;
         assert_eq!(outcome, JobDispatchOutcome::Failed { job_id: job.id });
 
@@ -1071,5 +1108,77 @@ mod tests {
         let _ = std::fs::remove_file(&broken_path);
         let _ = std::fs::remove_file(format!("{}-wal", broken_path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", broken_path.display()));
+    }
+
+    /// 停止訊號已設時，rebuild 在第一頁後中斷，job 標 Failed（不是卡在 Running）。
+    /// 2026-11-18 實測：沒有這個檢查時 docker stop 遇到 12k 筆 rebuild 要等到 SIGKILL，
+    /// job 永遠停在 running。
+    #[tokio::test]
+    async fn graph_rebuild_job_is_interrupted_by_stop_signal_and_marked_failed() {
+        let h = open_harness().await;
+        // 兩頁（page_size=1、兩條邊），才有「頁與頁之間」可以停。
+        for (x, y) in [("alice", "acme"), ("bob", "globex")] {
+            let a = entity(x, EntityType::Person);
+            let b = entity(y, EntityType::Organization);
+            h.db.put_entity(&a).await.unwrap();
+            h.db.put_entity(&b).await.unwrap();
+            h.db.put_relationship(&relationship(a.id, RelationshipType::AssociatedWith, b.id))
+                .await
+                .unwrap();
+        }
+        let jobs = JobService::new(h.db.clone(), None);
+        let job = jobs
+            .create(GRAPH_REBUILD_JOB_TYPE, None, None)
+            .await
+            .unwrap();
+        let (_tx, stop) = tokio::sync::watch::channel(true);
+
+        let outcome = h
+            .worker
+            .process_dispatched_job(
+                &jobs,
+                &job_payload(job.id, GRAPH_REBUILD_JOB_TYPE),
+                1,
+                Some(&stop),
+            )
+            .await;
+        assert_eq!(outcome, JobDispatchOutcome::Failed { job_id: job.id });
+
+        let finished = jobs.get(job.id).await.unwrap();
+        assert_eq!(finished.status, JobStatus::Failed);
+        assert!(
+            finished.completed_at.is_some(),
+            "Failed 要有 completed_at，保留期限靠它"
+        );
+        let error = finished.error.unwrap_or_default();
+        assert!(
+            error.contains("停止訊號"),
+            "錯誤訊息要說明是被停止訊號中斷：{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_without_stop_signal_is_unaffected() {
+        let h = open_harness().await;
+        let a = entity("carol", EntityType::Person);
+        let b = entity("initech", EntityType::Organization);
+        h.db.put_entity(&a).await.unwrap();
+        h.db.put_entity(&b).await.unwrap();
+        h.db.put_relationship(&relationship(a.id, RelationshipType::AssociatedWith, b.id))
+            .await
+            .unwrap();
+        let (_tx, stop) = tokio::sync::watch::channel(false);
+        let report = h
+            .worker
+            .rebuild_interruptible(
+                RebuildOptions {
+                    drop_graph: false,
+                    page_size: 1,
+                },
+                Some(&stop),
+            )
+            .await
+            .expect("沒有停止訊號時應該跑完");
+        assert_eq!(report.applied, 1);
     }
 }

@@ -3,8 +3,9 @@ use storage_core::conformance::{
     assert_canonical_health, assert_collection_member_links_atomic,
     assert_connector_run_state_partial_update, assert_event_outbox_contract_tracked,
     assert_evidence_collections, assert_jobs_purge, assert_list_sources_by_entity,
-    assert_reclaim_orphan_collect_runs, assert_relational_round_trip_with_enabled_hook,
-    assert_transactional_contract, load_workspace_dotenv,
+    assert_reclaim_orphan_collect_runs, assert_reclaim_orphan_jobs,
+    assert_relational_round_trip_with_enabled_hook, assert_transactional_contract,
+    load_workspace_dotenv,
 };
 use storage_postgres::{
     CleanupOutboxConformanceOnDrop, DisableConnectorsOnDrop, PostgresCanonicalStore, TestDatabase,
@@ -254,4 +255,13 @@ async fn postgres_concurrent_candidate_approve_writes_single_outbox_row() {
         .await
         .expect("cleanup candidate");
     drop(guard);
+}
+
+#[tokio::test]
+async fn postgres_reclaim_orphan_jobs_only_touches_given_running_types() {
+    // 一次性 DB：全表 UPDATE 不會碰到開發 DB 或其他測試。
+    let (store, _dsn, _db) = connect().await;
+    assert_reclaim_orphan_jobs(&store)
+        .await
+        .expect("reclaim_orphan_jobs：指定類型的 running → failed，其他不動");
 }

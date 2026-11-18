@@ -102,10 +102,12 @@ async fn run() -> Result<(), String> {
     // CPU-bound 的 regex 掃描已經在 service 內走 spawn_blocking，不會卡住這個迴圈的 I/O。
     // 已處理事件數，只用來決定何時量一次 lag。
     let mut processed = 0_u64;
+    // 只註冊一次：處理事件期間到的 SIGTERM 也不會漏（見 core_observability::shutdown_watch）。
+    let mut stop = core_observability::shutdown_watch();
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("收到 SIGINT，entity-worker 結束");
+            _ = stop.changed() => {
+                tracing::info!("收到停止訊號（SIGTERM／SIGINT），entity-worker 結束");
                 break;
             }
             result = consumer.next_envelope(Duration::from_secs(30)) => {
