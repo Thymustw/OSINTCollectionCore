@@ -12,7 +12,7 @@ flowchart TB
         App[應用程式 / API 客戶端]
     end
 
-    subgraph CORE["Rust Core（10 個服務）"]
+    subgraph CORE["Rust Core（11 個服務）"]
         API[osint-api<br/>REST API 閘道]
         COL[osint-collector<br/>資料收集]
         NOR[osint-normalizer<br/>正規化]
@@ -23,6 +23,7 @@ flowchart TB
         EMB[osint-embedding-worker<br/>向量投影]
         STX[osint-stix-worker<br/>STIX 匯入匯出]
         DIS[osint-discovery-worker<br/>關聯發現]
+        CHK[osint-chunk-worker<br/>段落切分]
     end
 
     subgraph INFRA["基礎設施"]
@@ -71,6 +72,9 @@ flowchart TB
     DIS --> PG
     DIS --> N4J
 
+    CHK --> PG
+    CHK --> RP
+
     RP -.訂閱.-> NOR
     RP -.訂閱.-> DED
     RP -.訂閱.-> ENT
@@ -78,6 +82,7 @@ flowchart TB
     RP -.訂閱.-> GRA
     RP -.訂閱.-> EMB
     RP -.訂閱.-> STX
+    RP -.訂閱.-> CHK
     RP -.訂閱.-> DIS
 
     API --> AIE
@@ -189,6 +194,17 @@ STIX 匯入後用 AI Gateway 評估實體解析的自動核准。
 - 讀：PostgreSQL（Entity、Collection、Budget）、Neo4j（1-hop 圖鄰居）
 - 寫：PostgreSQL（Candidate、CandidateEvidence）
 
+### osint-chunk-worker
+
+**把文件切成段落，為之後的段落檢索打地基。**
+長度用向量模型自己的斷詞器計算，每段都在模型上限內，超過的部分不會被模型靜默截斷。
+匯入資料一筆一段，RSS 條目整篇一段，其他文件依句子打包成約 300 token、前後重疊約 100 token 的段落。
+同一份文件重切會得到同樣的段落，重送事件不會重複寫入。
+
+- 訂閱：`dedup.completed`（只處理非重複文件）
+- 讀寫：PostgreSQL（Document、段落）
+- 發布：`document.chunked`
+
 ---
 
 ## 基礎設施
@@ -232,7 +248,7 @@ OpenSearch 和 Neo4j 都是可重建的投影，不是真相來源。
 
 ### 為什麼用 Redpanda？
 
-服務解耦。10 個服務透過事件主題通訊，不直接呼叫彼此。
+服務解耦。11 個服務透過事件主題通訊，不直接呼叫彼此。
 一個服務暫停不會讓上游服務失敗——事件留在 Redpanda 等待。
 Redpanda 是 Kafka 相容的，但不需要 ZooKeeper，更容易在工作站上部署。
 

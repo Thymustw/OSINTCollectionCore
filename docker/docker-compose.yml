@@ -391,7 +391,7 @@ services:
   # 每個服務都必須把 bind 覆寫成 0.0.0.0：config/default.toml 的預設
   # 127.0.0.1 在容器內等於「只有容器自己連得到」，宿主與其他容器都打不到。
   #
-  # 宿主埠沿用本機開發同一組 18080–18089，方便在容器版與 `cargo run` 版之間
+  # 宿主埠沿用本機開發同一組 18080–18090，方便在容器版與 `cargo run` 版之間
   # 直接切換（兩者不能同時跑，會搶埠）。
 
   osint-api:
@@ -576,6 +576,26 @@ services:
       OSINT__DISCOVERY_WORKER__BIND: 0.0.0.0:18089
     ports:
       - "18089:18089"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+    logging: *osint-logging
+
+  # ADR-016 階段 5 M1：訂閱 dedup.completed，把非重複文件切成段落寫進 document_chunks，
+  # 發 document.chunked。tokenizer 在 image 裡（建置時驗 sha256）。
+  osint-chunk-worker:
+    build:
+      <<: *osint-build
+      target: osint-chunk-worker
+    image: osint-core/osint-chunk-worker:0.1.0
+    hostname: osint-chunk-worker
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__CHUNK_WORKER__BIND: 0.0.0.0:18090
+    ports:
+      - "18090:18090"
     networks:
       - osint-core
     depends_on: *osint-depends

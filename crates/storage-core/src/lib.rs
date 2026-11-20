@@ -4,20 +4,27 @@
 //! 後端只實作它真正支援的 capability，不要做成萬能 `UniversalDatabase`。
 
 pub mod capability;
+pub mod chunks;
 pub mod codec;
 pub mod conformance;
 pub mod error;
 pub mod health;
 pub mod mock;
 pub mod outbox;
+pub mod source_text;
 pub mod traits;
 
 pub use capability::{CapabilityDescriptor, StorageAdapter};
+pub use chunks::{
+    CHUNK_LIST_LIMIT_MAX, CHUNK_NAMESPACE, ChunkStats, ChunkStore, DocumentChunk, chunk_id,
+    clamp_chunk_list_limit, validate_chunks,
+};
 pub use error::StorageError;
 pub use health::{HealthProvider, StorageHealth};
 #[cfg(feature = "test-support")]
 pub use outbox::EventOutboxTestSupport;
 pub use outbox::{EventOutboxStore, OUTBOX_CLAIM_LIMIT_MAX, OutboxEvent, clamp_outbox_limit};
+pub use source_text::{chunk_source_text, truncate_on_char_boundary};
 pub use traits::{
     BudgetConsumption, BulkFailure, BulkIndexResult, CandidateDiscoveryOutcome, CanonicalStore,
     CanonicalWriteStore, CheckpointUpdate, CollectionDailyUsage, ConnectorRunStateUpdate,

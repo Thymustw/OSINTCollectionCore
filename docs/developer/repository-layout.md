@@ -1,4 +1,4 @@
-# Repository layout（V0.3：35 個 crate；resolver／merge／ai-gateway／stix-adapter 目前是函式庫；十個服務 binary 都在 compose 的 `app` profile）
+# Repository layout（37 個 crate；resolver／merge／ai-gateway／stix-adapter／chunker 目前是函式庫；十一個服務 binary 都在 compose 的 `app` profile）
 
 Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.100.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 `channel = "1.100.0"`（2026-11-16 起釘版，與 `docker/Dockerfile` 的 `RUST_IMAGE` 同步升）。
 

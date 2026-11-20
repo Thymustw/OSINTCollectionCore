@@ -605,3 +605,28 @@ pub fn entity_extraction(row: &SqliteRow) -> Result<EntityExtraction, StorageErr
         excerpt: get_opt_str(row, "excerpt")?,
     })
 }
+
+pub fn document_chunk(row: &SqliteRow) -> Result<storage_core::DocumentChunk, StorageError> {
+    let u32_col = |col: &str| -> Result<u32, StorageError> {
+        let v: i64 = row.try_get(col).map_err(map_sqlx)?;
+        u32::try_from(v).map_err(|_| StorageError::Unknown {
+            backend: "sqlite",
+            message: format!("document_chunks.{col}={v} 超出 u32，違反 CHECK"),
+        })
+    };
+    Ok(storage_core::DocumentChunk {
+        id: uuid_from(row, "id")?,
+        document_id: uuid_from(row, "document_id")?,
+        seq: u32_col("seq")?,
+        start_char: u32_col("start_char")?,
+        end_char: u32_col("end_char")?,
+        text: get_str(row, "text")?,
+        header: get_opt_str(row, "header")?,
+        token_count: u32_col("token_count")?,
+        strategy: get_str(row, "strategy")?,
+        strategy_version: u32_col("strategy_version")?,
+        simhash: row.try_get("simhash").map_err(map_sqlx)?,
+        group_id: opt_uuid(row, "group_id")?,
+        created_at: ts(row, "created_at")?,
+    })
+}

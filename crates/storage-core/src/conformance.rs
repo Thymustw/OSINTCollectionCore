@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use url::Url;
 use uuid::Uuid;
 
+use crate::chunks::{ChunkStore, DocumentChunk, chunk_id};
 use crate::error::StorageError;
 #[cfg(feature = "test-support")]
 use crate::outbox::{EventOutboxTestSupport, OutboxEvent};
@@ -5145,6 +5146,148 @@ fn assert_eq_debug<T: PartialEq + std::fmt::Debug>(label: &str, expected: &T, ac
         expected, actual,
         "{label} round-trip 不符\nexpected: {expected:?}\nactual: {actual:?}"
     );
+}
+
+/// 段落 capability（ADR-016 D5）：整批取代、重切縮短、冪等、輸入檢查、刪文件連帶刪段落。
+pub async fn assert_chunk_store<S>(store: &S) -> Result<(), StorageError>
+where
+    S: RelationalStore + ChunkStore,
+{
+    fn fail(message: impl Into<String>) -> StorageError {
+        StorageError::Unknown {
+            backend: "conformance",
+            message: message.into(),
+        }
+    }
+    fn chunks_for(document_id: Uuid, texts: &[&str]) -> Vec<DocumentChunk> {
+        let mut start = 0_u32;
+        texts
+            .iter()
+            .enumerate()
+            .map(|(seq, text)| {
+                let seq = u32::try_from(seq).expect("測試段落數很小");
+                let len = u32::try_from(text.chars().count()).expect("測試段落很短");
+                let chunk = DocumentChunk {
+                    id: chunk_id(document_id, "fixed", 1, seq),
+                    document_id,
+                    seq,
+                    start_char: start,
+                    end_char: start + len,
+                    text: (*text).to_string(),
+                    header: (seq == 0).then(|| "標題".to_string()),
+                    token_count: len + 1,
+                    strategy: "fixed".into(),
+                    strategy_version: 1,
+                    simhash: (seq == 1).then_some(-42),
+                    group_id: None,
+                    created_at: fixture_ts(),
+                };
+                start += len;
+                chunk
+            })
+            .collect()
+    }
+
+    let document = Document {
+        id: Uuid::now_v7(),
+        object_type: DocumentType::Article,
+        schema_version: "1.0".into(),
+        title: Some("chunk-conformance".into()),
+        body: Some("第一段。第二段。第三段。".into()),
+        summary: None,
+        language: Some("zh".into()),
+        author: None,
+        published_at: None,
+        modified_at: None,
+        observed_at: fixture_ts(),
+        collected_at: fixture_ts(),
+        source_url: None,
+        canonical_url: None,
+        normalized_content_hash: None,
+        confidence: 0.9,
+        labels: vec![],
+        attributes: json!({}),
+        external_key: None,
+        simhash: None,
+        duplicate_of: None,
+    };
+    store.put_document(&document).await?;
+    let before = store.chunk_stats().await?;
+
+    let three = chunks_for(document.id, &["第一段。", "第二段。", "第三段。"]);
+    store.replace_document_chunks(document.id, &three).await?;
+    if store.list_document_chunks(document.id).await? != three {
+        return Err(fail("寫入的三個段落讀回來不一致（欄位或 seq 順序）"));
+    }
+    // 冪等：同一批再寫一次，結果不變、不撞 UNIQUE。
+    store.replace_document_chunks(document.id, &three).await?;
+    if store.list_document_chunks(document.id).await? != three {
+        return Err(fail("同一批段落重寫一次後內容變了"));
+    }
+    let stats = store.chunk_stats().await?;
+    if stats.chunks != before.chunks + 3 || stats.documents != before.documents + 1 {
+        return Err(fail(format!("chunk_stats 不對：{before:?} → {stats:?}")));
+    }
+    if stats.max_token_count < 5 {
+        return Err(fail(format!(
+            "max_token_count 應 ≥ 5，實際 {}",
+            stats.max_token_count
+        )));
+    }
+    let ids = store.list_chunked_document_ids(None, 1000).await?;
+    if !ids.contains(&document.id) {
+        return Err(fail("list_chunked_document_ids 沒列出剛切段的文件"));
+    }
+    if ids.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(fail(
+            "list_chunked_document_ids 不是嚴格升序（DISTINCT／ORDER BY 失效）",
+        ));
+    }
+    let after_self = store
+        .list_chunked_document_ids(Some(document.id), 1000)
+        .await?;
+    if after_self.iter().any(|id| *id <= document.id) {
+        return Err(fail(
+            "list_chunked_document_ids 的 after 游標沒有排除 ≤ after 的 id",
+        ));
+    }
+
+    // 重切變短：舊的第三段必須消失，不能殘留。
+    let two = chunks_for(document.id, &["第一段。第二段。", "第三段。"]);
+    store.replace_document_chunks(document.id, &two).await?;
+    if store.list_document_chunks(document.id).await? != two {
+        return Err(fail("重切成兩段後讀回不是那兩段（舊段落殘留？）"));
+    }
+
+    // 輸入檢查：seq 跳號、別的文件的段落 → Configuration，且原段落不受影響。
+    let mut gap = chunks_for(document.id, &["a", "b"]);
+    gap[1].seq = 2;
+    let other = chunks_for(Uuid::now_v7(), &["x"]);
+    for (label, bad) in [("seq 跳號", gap), ("別的文件", other)] {
+        match store.replace_document_chunks(document.id, &bad).await {
+            Err(StorageError::Configuration { .. }) => {}
+            other => return Err(fail(format!("{label} 應回 Configuration，實際 {other:?}"))),
+        }
+    }
+    if store.list_document_chunks(document.id).await? != two {
+        return Err(fail("被拒絕的寫入動到了既有段落"));
+    }
+
+    // 空批次＝刪光。
+    store.replace_document_chunks(document.id, &[]).await?;
+    if !store.list_document_chunks(document.id).await?.is_empty() {
+        return Err(fail("空批次應刪光該文件段落"));
+    }
+
+    // FK CASCADE：刪文件連帶刪段落。
+    store.replace_document_chunks(document.id, &three).await?;
+    if !store.delete_document(document.id).await? {
+        return Err(fail("刪剛寫入的 document 應回 true"));
+    }
+    if !store.list_document_chunks(document.id).await?.is_empty() {
+        return Err(fail("刪文件後段落應被 FK CASCADE 清掉"));
+    }
+    Ok(())
 }
 
 /// Canonical adapter 必須宣告 backend id，且 health 為 healthy。

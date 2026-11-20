@@ -48,6 +48,7 @@ Domain 只依賴 `storage-core`。具體 adapter 由 bootstrap／composition 注
 | `EmbeddedStore` | `storage-sqlite` | SQLite（本機／App／投影，不是高併發 canonical） |
 | `TransactionalStore` | postgres + sqlite | 跨表交易（V0.2 Phase 0e）。見下方「`TransactionalStore`」 |
 | `EventOutboxStore` | postgres + sqlite | V0.3 transactional outbox（migration `0020`）。見下方「`EventOutboxStore`」 |
+| `ChunkStore` | postgres + sqlite | 段落（ADR-016 D5，migration `0021`）。見下方「`ChunkStore`」 |
 | `CanonicalWriteStore` | postgres + sqlite | `TransactionalStore + EventOutboxStore` 的 blanket。給「業務寫入與事件列同一交易」的呼叫端 |
 | `RelationalStore` | postgres + sqlite | V0.1 18 張表的 CRUD；`put_*` = upsert；含 `source_network_rules`。V0.2 Phase 0c 另加 migration `0007` 的五張表；Phase 1e 再加 `0008`（`entities.merged_into`、`merge_history.merged_relationships`）；Phase 3 Step 1 再加 `0010`（`embeddings` metadata，`put_embedding` **不是** upsert）與 `0011`（`duplicate_groups.model`）；ADR-012 Step 0 再加 `0012`（`merge_history.auto_approval_audit`）。見 `schema-v0.2.md` |
 | `SearchStore` | `storage-opensearch`；mock：`storage_core::mock::MockSearchStore` | OpenSearch 文件索引／查詢（`index`／`bulk_index`／`bulk_upsert_fields`／`query`／`search`／`delete`／`update_fields`／`vector_search`） |
@@ -242,7 +243,7 @@ migrations/postgres/   Core canonical（sqlx migrate；adapter 也可 `PostgresC
 migrations/sqlite/     Embedded / App / projection（`SqliteEmbeddedStore::migrate`）
 ```
 
-SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / TIMESTAMPTZ）。見 `docs/developer/schema-v0.1.md`；V0.2 的 `0007`（Entity Resolution + `failed_events`）、`0008`（Entity Merge 欄位）與 `0009`（`entity_identifiers.normalized_value` 單欄索引）見 `docs/developer/schema-v0.2.md`。
+SQLite schema 語意對齊 PostgreSQL，但不共用同一份 SQL（無 JSONB / TIMESTAMPTZ）。見 `docs/developer/schema-v0.1.md`；V0.2 的 `0007`（Entity Resolution + `failed_events`）、`0008`（Entity Merge 欄位）與 `0009`（`entity_identifiers.normalized_value` 單欄索引）見 `docs/developer/schema-v0.2.md`。`0021`（`document_chunks`）見下方「`ChunkStore`」。
 
 ## `RelationalStore` 的 V0.2 方法（Phase 0c）
 
@@ -618,6 +619,28 @@ adapter 測試：
 
 郵差本體在 `crates/core-api/src/outbox.rs`，設定 `[event_outbox]`，見
 `docs/developer/events.md` 的 V0.3 一節。
+
+## `ChunkStore`（ADR-016 D5 段落，migration `0021`，2026-11-18）
+
+段落是 PostgreSQL 裡的**衍生資料**：從 `storage_core::chunk_source_text` 的串接文字切出來，可整批刪掉重切；
+向量是 OpenSearch 投影（M2），不在這張表。獨立 capability，沒有塞進 `RelationalStore`。
+
+| 方法 | 契約 |
+|---|---|
+| `replace_document_chunks(document_id, chunks)` | **同一交易**先刪該文件全部段落再寫入。重切段落數變少時舊段落不會殘留。`chunks` 要全屬於 `document_id`、`seq` 從 0 連續、`end_char ≥ start_char`，否則回 `Configuration` 且不動既有資料。空陣列＝刪光。有綁定交易（`TransactionalStore`）就用那條，否則自開一條 |
+| `list_document_chunks(document_id)` | 依 `seq` 升序 |
+| `list_chunked_document_ids(after, limit)` | 有段落的文件 id，升序分頁，`limit` 夾在 1..=1000 |
+| `chunk_stats()` | 文件數、段落數、最大 token 數 |
+
+固定的幾件事（改了要升策略版本或換 namespace，會讓 M2 以後的向量／群組／共現邊出處對不上）：
+
+- 段落 id ＝ UUID v5(`CHUNK_NAMESPACE`, `"{document_id}|{strategy}@{strategy_version}|{seq}"`)，`chunk_id()`。namespace 凍結，有單元測試釘住。
+- `start_char`／`end_char` 是**字元**（Unicode scalar）偏移，對的是 `chunk_source_text(doc, None)` 的輸出，不是 byte。
+- `chunk_source_text`：`title`、`summary`、`body` 依序、只取有值的、每個後面接 `\n`。entity-worker 抽取改用同一支函式（ADR-016 決定 #11），抽取路徑帶 `max_scan_bytes` 上限、切段不截斷。
+- 表沒有時間欄位：段落時間繼承文件（M2 投影時冗餘一份）。`simhash`／`group_id` 給 M4，M1 一律 NULL。刪文件時 FK `ON DELETE CASCADE` 帶走段落。
+
+conformance：`storage_core::conformance::assert_chunk_store`（寫入讀回、冪等重寫、重切縮短、兩種錯誤輸入被拒且不動資料、空批次、FK CASCADE、分頁升序與游標）。
+postgres 在 `TestDatabase` 裡跑（`postgres_chunk_store_contract`），sqlite 用一次性檔（`sqlite_chunk_store_contract`）。
 
 ## `ProjectionStore`（V0.2 Phase 0f）
 

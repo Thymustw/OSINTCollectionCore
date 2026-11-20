@@ -42,6 +42,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub discovery_worker: DiscoveryWorkerSection,
     #[serde(default)]
+    pub chunk_worker: ChunkWorkerSection,
+    #[serde(default)]
     pub import: ImportSection,
     #[serde(default)]
     pub embedding: EmbeddingSection,
@@ -617,6 +619,44 @@ impl Default for DiscoveryWorkerSection {
             // 18080-18088 已分別是既有服務的 health 埠，18089 是下一個。
             bind: "127.0.0.1:18089".into(),
             consumer_group: "osint-discovery-worker".into(),
+        }
+    }
+}
+
+/// chunk-worker（`osint-chunk-worker`，ADR-016 階段 5 M1）的 health、consumer 與切段設定。
+///
+/// 切段參數的意義與檢查見 `chunker::ChunkerConfig`；改任何一個切段參數都等於換策略，
+/// 要升 `chunker::Strategy::version` 並 `--rebuild`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkWorkerSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// e5 `tokenizer.json` 路徑。容器內由 image 帶（建置時驗 sha256），本機用
+    /// `scripts/fetch-e5-tokenizer.sh` 下載。
+    pub tokenizer_path: String,
+    pub target_tokens: u32,
+    pub overlap_tokens: u32,
+    pub max_model_tokens: u32,
+    pub max_header_tokens: u32,
+    /// 串接文字的 byte 上限，超過截斷（外部輸入不可信）。
+    pub max_source_bytes: usize,
+    /// `--rebuild` 每頁讀幾份文件。
+    pub rebuild_page_size: u32,
+}
+
+impl Default for ChunkWorkerSection {
+    fn default() -> Self {
+        Self {
+            // 18080-18089 已分別是既有服務的 health 埠，18090 是下一個。
+            bind: "127.0.0.1:18090".into(),
+            consumer_group: "osint-chunk-worker".into(),
+            tokenizer_path: "models/e5-small/tokenizer.json".into(),
+            target_tokens: 300,
+            overlap_tokens: 100,
+            max_model_tokens: 512,
+            max_header_tokens: 64,
+            max_source_bytes: 2 * 1024 * 1024,
+            rebuild_page_size: 200,
         }
     }
 }
@@ -1581,6 +1621,10 @@ mod tests {
         assert_eq!(cfg.embedding_worker.entities_index, "osint-entities");
         assert_eq!(cfg.embedding_worker.page_size, 100);
         assert_eq!(cfg.stix_worker.bind, "127.0.0.1:18088");
+        assert_eq!(cfg.chunk_worker.bind, "127.0.0.1:18090");
+        assert_eq!(cfg.chunk_worker.consumer_group, "osint-chunk-worker");
+        assert_eq!(cfg.chunk_worker.target_tokens, 300);
+        assert_eq!(cfg.chunk_worker.overlap_tokens, 100);
         assert_eq!(cfg.stix_worker.consumer_group, "osint-stix-worker");
         assert_eq!(cfg.stix_worker.max_objects_per_tx, 10_000);
         assert_eq!(cfg.import.max_upload_bytes, 10 * 1024 * 1024);

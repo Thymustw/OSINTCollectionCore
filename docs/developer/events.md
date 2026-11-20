@@ -202,6 +202,17 @@ Postgres claim 用 `FOR UPDATE SKIP LOCKED`：租約內兩個郵差不會拿到�
 
 表結構：migration `0020_v0_3_event_outbox.sql`（postgres + sqlite）。capability 是獨立的 `EventOutboxStore`，**沒有**塞進 `RelationalStore`。見 `docs/developer/storage-adapters.md`。
 
+### V0.4 前置新增（ADR-016 段落化，階段 5 M1）
+
+```text
+document.chunked
+```
+
+`EventTopic::DocumentChunked`。生產者是 `osint-chunk-worker`：訂 `dedup.completed`、只處理非重複文件，
+段落**有變更**才寫進 `document_chunks` 並發一則（重送同一份、段落沒變不發），partition key = `document_id`。
+`--rebuild` 不發。payload（`document_id`／`chunk_count`／`chunk_ids`／`strategy`／`strategy_version`／
+`max_token_count`／`truncated`）見 `docs/developer/chunk-worker.md`。**目前沒有消費者**，M2 的段落向量化會訂它。
+
 ## Broker health check
 
 `EventProducer::cluster_metadata(timeout) -> Result<(broker 數, topic 數), EventError>`

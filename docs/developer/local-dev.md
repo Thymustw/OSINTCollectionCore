@@ -53,8 +53,8 @@ storage conformance 在本機開了 `OSINT_STRICT_PORT_ISOLATION=1` 時會拒絕
 
 ## 全容器化：`make compose-up-full`
 
-上面那套是「基礎建設在容器裡、十個服務在本機 `cargo run`」。Phase 7a 之後也可以
-把十個服務一起放進容器：
+上面那套是「基礎建設在容器裡、十一個服務在本機 `cargo run`」。Phase 7a 之後也可以
+把十一個服務一起放進容器：
 
 ```bash
 make compose-up-full      # 含 --build --wait，全部 healthy 才返回
@@ -332,6 +332,7 @@ SQLite 不是 Core canonical store（詳見內部架構文件 STORAGE_ARCHITECTU
 需要已啟動的 compose 服務與正確的 `.env`：
 
 ```bash
+scripts/fetch-e5-tokenizer.sh     # 或 make fetch-tokenizer；crates/chunker、chunk-worker 測試與 make run-chunk-worker 需要（17 MB，驗 sha256，不進 repo）
 cargo test --workspace --all-targets -- --nocapture
 ```
 
@@ -352,6 +353,12 @@ let pg = db.store().clone();             // 需要 DSN 的 guard 用 db.dsn()
   （模板 `osint_test_tpl_*` 留著是正常的，migration 改了會自動建新的；舊模板可手動 `DROP DATABASE`）。
 - 新 crate 要用：`[dev-dependencies]` 加 `storage-postgres = { path = "../storage-postgres", features = ["test-support"] }`。
 - 唯二刻意連開發 DB 的測試：`no_stale_enabled_test_connectors.rs`（守門）與 `acceptance/tests/failure_recovery.rs`（`#[ignore]`）。
+- ⚠️ **跑測試會讓開發 DB 的 migration 跑在容器 image 前面。** 守門測試會對開發 DB 呼叫 `migrate()`，
+  所以新 migration 一加進來、測試一跑，開發 DB 就已經套用了；但執行中的容器還是舊 image。
+  舊 binary 重啟時，sqlx 看到它不認得的版本會回 `VersionMissing`，**服務起不來**
+  （`ignore_missing` 預設關，見 sqlx-core `validate_applied_migrations`）。
+  2026-11-18 實際發生過：0021 在 07:41 UTC 已套用到開發 DB，比 image 重建早了好幾個小時；
+  那段時間任何一個容器重啟都會失敗。所以有 migration 的改動，測完要盡快 `make image-build` 再 force-recreate。
 - Redpanda 用 `core_events::TestTopics` 隔離（2026-11-17 起）：每個測試一個 `osinttest-<uuidv7>` topic namespace，
   執行中的服務訂不到測試事件；drop 時刪掉該 namespace 的 topic 與 group。
 

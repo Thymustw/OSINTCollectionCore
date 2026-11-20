@@ -1,0 +1,24 @@
+[package]
+name = "chunker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "段落切分核心（ADR-016 D6／D7）：e5 tokenizer 計數、中英斷句、whole／record／fixed 策略、512 token 保護。純計算，不碰 I/O 以外的外部服務"
+
+[dependencies]
+chrono = { workspace = true }
+core-model = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+storage-core = { workspace = true }
+thiserror = { workspace = true }
+# ADR-016 實驗 5-2c：0.23.2 + fancy-regex 與 Python tokenizers 30／30 句 id 完全相同。
+# default-features 會帶 onig（C 函式庫）與 esaxx cpp；fancy-regex 是純 Rust，`cargo tree -i cc` 為空。
+# 單獨 default-features = false 編不過（compile_error!），fancy-regex 必須明確開。
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

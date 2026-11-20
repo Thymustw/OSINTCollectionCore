@@ -8,7 +8,7 @@
 	run-indexer rebuild-index rebuild-index-drop run-cli \
 	run-graph-worker rebuild-graph rebuild-graph-drop \
 	run-embedding-worker rebuild-embeddings rebuild-embeddings-drop \
-	run-stix-worker run-discovery-worker \
+	run-stix-worker run-discovery-worker run-chunk-worker rebuild-chunks fetch-tokenizer \
 	image-build image-scan image-prune image-ls \
 	compose-up-full compose-down-full compose-ps-full \
 	docs-serve docs-build \
@@ -53,9 +53,12 @@ help:
 	@echo "  make rebuild-embeddings-drop 先刪 osint-entities 再從零重建（永不刪 osint-documents）"
 	@echo "  make run-stix-worker   啟動 osint-stix-worker（需 compose 與 .env；沒有 --rebuild）"
 	@echo "  make run-discovery-worker 啟動 osint-discovery-worker（需 compose 與 .env）"
+	@echo "  make fetch-tokenizer   下載 e5 tokenizer.json 到 models/e5-small/（驗 sha256）"
+	@echo "  make run-chunk-worker  啟動 osint-chunk-worker（需 compose、.env、tokenizer）"
+	@echo "  make rebuild-chunks    從 PostgreSQL 重切全部非重複文件後結束（不發事件）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
-	@echo "  make image-build       建十個服務的容器 image（不 push）"
-	@echo "  make image-scan        trivy image 掃十個 image（需已安裝 trivy）"
+	@echo "  make image-build       建十一個服務的容器 image（不 push）"
+	@echo "  make image-scan        trivy image 掃十一個 image（需已安裝 trivy）"
 	@echo "  make image-ls          列出本專案的 image 與大小"
 	@echo "  make image-prune       清掉 dangling layer 與 builder 快取"
 	@echo "  make compose-up-full   基礎建設 + 十個應用服務（會先 build）"
@@ -148,7 +151,7 @@ IMAGE_PREFIX ?= osint-core
 SERVICES := osint-api osint-collector osint-normalizer \
 	osint-deduplicator osint-entity-worker osint-indexer \
 	osint-graph-worker osint-embedding-worker osint-stix-worker \
-	osint-discovery-worker
+	osint-discovery-worker osint-chunk-worker
 
 # 只 build，不啟動。image 名稱固定成 $(IMAGE_PREFIX)/<服務>:$(IMAGE_TAG)，
 # 所以重 build 會覆蓋同一個 tag（舊的變成 dangling，用 image-prune 清）。
@@ -293,6 +296,18 @@ run-stix-worker:
 # 沒有 --rebuild：Candidate 不是可重建的投影。細節見 docs/developer/discovery-worker.md。
 run-discovery-worker:
 	$(CARGO) run -p discovery-worker --bin osint-discovery-worker
+
+# ADR-016 階段 5 M1 段落切分。訂閱 dedup.completed，寫 document_chunks，發 document.chunked。
+# 需要 e5 tokenizer（make fetch-tokenizer）。細節見 docs/developer/chunk-worker.md。
+fetch-tokenizer:
+	bash scripts/fetch-e5-tokenizer.sh
+
+run-chunk-worker:
+	$(CARGO) run -p chunk-worker --bin osint-chunk-worker
+
+# 重切全部非重複文件（策略版本升級後用）。不發 document.chunked；未變更的文件不寫。
+rebuild-chunks:
+	$(CARGO) run -p chunk-worker --bin osint-chunk-worker -- --rebuild
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。

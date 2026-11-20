@@ -14,10 +14,10 @@
 | `GET /ready` | **就緒探針**：這個行程能收流量嗎（依賴的後端就緒了嗎） | `{"ready":true,"checks":[...]}` |
 | `GET /metrics` | **Prometheus 格式指標**：計數器、佇列深度、延遲等 | Prometheus text 格式 |
 
-一次確認 10 個服務是否存活：
+一次確認 11 個服務是否存活：
 
 ```bash
-for p in 18080 18081 18082 18083 18084 18085 18086 18087 18088 18089; do
+for p in 18080 18081 18082 18083 18084 18085 18086 18087 18088 18089 18090; do
   printf ":%s  " $p; curl -s localhost:$p/health
   echo
 done

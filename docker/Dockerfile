@@ -7,7 +7,7 @@
 # 十個 target：osint-api / osint-collector / osint-normalizer /
 #              osint-deduplicator / osint-entity-worker / osint-indexer /
 #              osint-graph-worker / osint-embedding-worker / osint-stix-worker /
-#              osint-discovery-worker
+#              osint-discovery-worker / osint-chunk-worker
 #
 # ---------------------------------------------------------------------------
 # 為什麼用 BuildKit cache mount 而不是 cargo-chef
@@ -73,7 +73,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && for bin in osint-api osint-collector osint-normalizer \
                osint-deduplicator osint-entity-worker osint-indexer \
                osint-graph-worker osint-embedding-worker osint-stix-worker \
-               osint-discovery-worker; do \
+               osint-discovery-worker osint-chunk-worker; do \
         cp "target/release/$bin" "/out/$bin"; \
     done \
  && ls -l /out
@@ -211,3 +211,31 @@ EXPOSE 18089
 HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
     CMD curl -fsS http://127.0.0.1:18089/health || exit 1
 ENTRYPOINT ["/usr/local/bin/osint-discovery-worker"]
+
+# ADR-016 階段 5 M1 段落切分。e5 tokenizer.json（17 MB、上游公開）不進 repo，
+# 在這個 stage 下載並以 sha256 驗證；hash 與 scripts/fetch-e5-tokenizer.sh、
+# crates/chunker 的 E5_TOKENIZER_SHA256 是同一顆，三處一起改。
+# 用獨立 stage 下載（runtime-base 已有 curl），不讓下載失敗污染其他服務的 build。
+FROM runtime-base AS e5-tokenizer
+USER root
+ARG E5_TOKENIZER_URL=https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/tokenizer.json
+# gitleaks generic-api-key 會把變數名裡的「TOKENizer」當成 token 關鍵字（同
+# scripts/opensearch-ml-setup-e5.sh 的註解）。這是公開檔案的 sha256，不是憑證。
+ARG E5_TOKENIZER_SHA256=0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39 # gitleaks:allow
+RUN curl -sSL --fail -o /tmp/tokenizer.json "$E5_TOKENIZER_URL" \
+ && echo "${E5_TOKENIZER_SHA256}  /tmp/tokenizer.json" | sha256sum -c -
+
+FROM runtime-base AS osint-chunk-worker
+COPY --from=builder --chown=root:root --chmod=555 /out/osint-chunk-worker /usr/local/bin/osint-chunk-worker
+# 目錄先自己建，理由同上方 /app/config：COPY --chmod=444 會把 444 套到它自動建的
+# 父目錄，/opt/e5 變成 dr--r--r--，uid 10001 進不去（2026-11-18 實測：啟動即
+# Permission denied、crashloop）。runtime-base 結尾是 USER 10001，建目錄要切回 root。
+USER root
+RUN mkdir -m 0555 -p /opt/e5
+USER 10001:10001
+COPY --from=e5-tokenizer --chown=root:root --chmod=444 /tmp/tokenizer.json /opt/e5/tokenizer.json
+ENV OSINT__CHUNK_WORKER__TOKENIZER_PATH=/opt/e5/tokenizer.json
+EXPOSE 18090
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
+    CMD curl -fsS http://127.0.0.1:18090/health || exit 1
+ENTRYPOINT ["/usr/local/bin/osint-chunk-worker"]

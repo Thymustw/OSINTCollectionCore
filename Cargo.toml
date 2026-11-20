@@ -32,6 +32,8 @@ members = [
     "crates/discovery-worker",
     "crates/graph-worker",
     "crates/embedding-worker",
+    "crates/chunker",
+    "crates/chunk-worker",
     "crates/stix-worker",
     "crates/osint-cli",
     "crates/worker-skeleton",
@@ -136,6 +138,9 @@ neo4rs = "0.8.0"
 resolver = { path = "crates/resolver" }
 merge = { path = "crates/merge" }
 thiserror = "2.0.20"
+# 段落 token 計數（ADR-016 D7，實驗 5-2c）。只開 fancy-regex：default 的 onig／esaxx cpp
+# 會帶 C／C++ 編譯；單獨 default-features = false 編不過，fancy-regex 必須明確開。
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time", "net", "sync", "signal"] }
 # CancellationToken 在 `sync` 模組；0.7 沒有 feature gate，關掉 default 以免
 # 把 codec／io-util 一併拉進來。collector 優雅停止用，之後其他服務也可共用。

@@ -265,3 +265,11 @@ async fn postgres_reclaim_orphan_jobs_only_touches_given_running_types() {
         .await
         .expect("reclaim_orphan_jobs：指定類型的 running → failed，其他不動");
 }
+
+#[tokio::test]
+async fn postgres_chunk_store_contract() {
+    let (store, _dsn, _db) = connect().await;
+    storage_core::conformance::assert_chunk_store(&store)
+        .await
+        .expect("chunk store：整批取代／重切縮短／冪等／輸入檢查／FK CASCADE");
+}

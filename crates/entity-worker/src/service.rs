@@ -45,7 +45,6 @@ use uuid::Uuid;
 use crate::error::EntityWorkerError;
 use crate::extract::{
     self, DerivedLink, EXTRACTOR_VERSION, Extracted, ExtractionBounds, ExtractionInput,
-    truncate_on_char_boundary,
 };
 
 pub const PROCESSOR: &str = "entity-worker";
@@ -1107,27 +1106,9 @@ fn raw_evidence_id_of(document: &Document) -> Option<Uuid> {
 
 /// 組出抽取器的輸入：`title` + `summary` + `body` + 結構化欄位。
 fn extraction_input(document: &Document, bounds: ExtractionBounds) -> ExtractionInput {
-    // 上限在**串接時**就套用，不是串完再截。`documents.body` 沒有長度限制，
-    // 先把一份 50 MB 的正文複製進記憶體再丟掉 99% 是白花的配置——而且那是外部輸入
-    // 控制的大小（CLAUDE.md §5：external content is untrusted）。
-    let mut text = String::new();
-    for part in [
-        document.title.as_deref(),
-        document.summary.as_deref(),
-        document.body.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let remaining = bounds.max_scan_bytes.saturating_sub(text.len());
-        if remaining == 0 {
-            break;
-        }
-        text.push_str(truncate_on_char_boundary(part, remaining));
-        // 用換行而不是空白分隔：`標題` 與 `body 第一個字` 之間若只有空白，
-        // 兩個相鄰的 token 有機會被 regex 當成一個（例如標題結尾是網域、正文開頭是 TLD）。
-        text.push('\n');
-    }
+    // 串接格式與 chunk-worker 共用（storage_core::chunk_source_text，ADR-016 決定 #11）：
+    // 兩邊各寫一份會讓實體 offset 與段落 offset 靜默錯位。上限在串接時就套用（外部輸入不可信）。
+    let text = storage_core::chunk_source_text(document, Some(bounds.max_scan_bytes));
 
     let organizations = ORGANIZATION_FIELDS
         .iter()

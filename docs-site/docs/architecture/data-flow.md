@@ -99,7 +99,7 @@ Redpanda 上共有 29 個主題（topic）。以下按功能分類，並標明�
 | `object.normalized` | osint-normalizer | osint-deduplicator |
 | `object.created` | — | — |
 | `object.updated` | — | — |
-| `dedup.completed` | osint-deduplicator | osint-entity-worker |
+| `dedup.completed` | osint-deduplicator | osint-entity-worker、osint-chunk-worker |
 | `entity.extracted` | osint-entity-worker | osint-indexer、osint-embedding-worker |
 | `search.index.requested` | — | — |
 | `search.index.completed` | osint-indexer | — |
@@ -147,6 +147,12 @@ Redpanda 上共有 29 個主題（topic）。以下按功能分類，並標明�
 
 郵差設定見 `[event_outbox]`。`GET /api/v1/ops/discovery` 的 `event_outbox_pending`
 是待送列數。
+
+### 段落化（V0.4 前置）
+
+| 主題 | 生產者 | 消費者 |
+|---|---|---|
+| `document.chunked` | osint-chunk-worker（段落有變更才發；重送同一份文件、段落沒變不發） | —（段落向量化會訂閱，下一階段） |
 
 ---
 

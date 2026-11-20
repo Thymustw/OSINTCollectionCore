@@ -19,12 +19,14 @@ use sqlx::Row;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use storage_core::codec::encode_enum;
 use storage_core::{
-    BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor,
-    CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage, EventOutboxStore, HealthProvider,
-    JobPurgeFilter, OutboxEvent, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR,
-    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
-    TransactionalStore, clamp_outbox_limit,
+    BudgetConsumption, CandidateDiscoveryOutcome, CanonicalStore, CapabilityDescriptor, ChunkStats,
+    ChunkStore, CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage, DocumentChunk,
+    EventOutboxStore, HealthProvider, JobPurgeFilter, OutboxEvent,
+    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR, RelationalStore, SimhashCandidate,
+    StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
+    clamp_chunk_list_limit, clamp_outbox_limit, validate_chunks,
 };
+use uuid::Uuid;
 
 use crate::error::map_sqlx;
 use crate::mapping;
@@ -3623,4 +3625,130 @@ impl storage_core::EventOutboxTestSupport for PostgresCanonicalStore {
             .map_err(map_sqlx)?;
         rows.iter().map(mapping::outbox_event).collect()
     }
+}
+
+/// 段落 capability（ADR-016 D5，階段 5 M1）。SQL 只在這個 adapter 裡。
+#[async_trait]
+impl ChunkStore for PostgresCanonicalStore {
+    async fn replace_document_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[DocumentChunk],
+    ) -> Result<(), StorageError> {
+        validate_chunks(document_id, chunks)?;
+        // 已綁交易就沿用（原子性由呼叫端負責）；否則自己開一條，刪＋寫要嘛全成、要嘛全不成——
+        // 只寫一半會留下「新段落接著舊段落尾巴」的混合狀態。
+        let mut own_tx = match &self.tx {
+            Some(_) => None,
+            None => Some(self.pool.begin().await.map_err(map_sqlx)?),
+        };
+        let mut bound = match &self.tx {
+            Some(tx) => Some(tx.lock().await),
+            None => None,
+        };
+        let conn: &mut sqlx::PgConnection = match (&mut own_tx, &mut bound) {
+            (Some(tx), _) => tx,
+            (None, Some(guard)) => guard,
+            (None, None) => unreachable!("tx 與 own_tx 恰有一個"),
+        };
+        sqlx::query("DELETE FROM document_chunks WHERE document_id = $1")
+            .bind(document_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+        for chunk in chunks {
+            sqlx::query(
+                r#"
+                INSERT INTO document_chunks (
+                    id, document_id, seq, start_char, end_char, text, header, token_count,
+                    strategy, strategy_version, simhash, group_id, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                "#,
+            )
+            .bind(chunk.id)
+            .bind(chunk.document_id)
+            .bind(i32_of(chunk.seq, "seq")?)
+            .bind(i32_of(chunk.start_char, "start_char")?)
+            .bind(i32_of(chunk.end_char, "end_char")?)
+            .bind(&chunk.text)
+            .bind(&chunk.header)
+            .bind(i32_of(chunk.token_count, "token_count")?)
+            .bind(&chunk.strategy)
+            .bind(i32_of(chunk.strategy_version, "strategy_version")?)
+            .bind(chunk.simhash)
+            .bind(chunk.group_id)
+            .bind(chunk.created_at)
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        drop(bound);
+        if let Some(tx) = own_tx {
+            tx.commit().await.map_err(map_sqlx)?;
+        }
+        Ok(())
+    }
+
+    async fn list_document_chunks(
+        &self,
+        document_id: Uuid,
+    ) -> Result<Vec<DocumentChunk>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, document_id, seq, start_char, end_char, text, header, token_count,
+                   strategy, strategy_version, simhash, group_id, created_at
+            FROM document_chunks
+            WHERE document_id = $1
+            ORDER BY seq ASC
+            "#,
+        )
+        .bind(document_id)
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::document_chunk).collect()
+    }
+
+    async fn list_chunked_document_ids(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, StorageError> {
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT document_id
+            FROM document_chunks
+            WHERE ($1::uuid IS NULL OR document_id > $1)
+            ORDER BY document_id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(after)
+        .bind(i64::from(clamp_chunk_list_limit(limit)))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn chunk_stats(&self) -> Result<ChunkStats, StorageError> {
+        let (documents, chunks, max_tokens): (i64, i64, Option<i32>) = sqlx::query_as(
+            "SELECT count(DISTINCT document_id), count(*), max(token_count) FROM document_chunks",
+        )
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(ChunkStats {
+            documents: u64::try_from(documents).unwrap_or(0),
+            chunks: u64::try_from(chunks).unwrap_or(0),
+            max_token_count: max_tokens.and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        })
+    }
+}
+
+/// u32 → INTEGER。超過 i32 上限回 Configuration（段落 offset 超過 21 億字元＝輸入異常）。
+fn i32_of(value: u32, field: &str) -> Result<i32, StorageError> {
+    i32::try_from(value).map_err(|_| StorageError::Configuration {
+        message: format!("段落欄位 {field}={value} 超過 INTEGER 上限"),
+    })
 }

@@ -186,6 +186,22 @@ max_objects_per_tx = 10000
 bind = "127.0.0.1:18089"
 consumer_group = "osint-discovery-worker"
 
+[chunk_worker]
+# 段落切分（ADR-016 階段 5 M1）。18080-18089 已分別是既有服務的 health 埠。
+bind = "127.0.0.1:18090"
+consumer_group = "osint-chunk-worker"
+# e5 tokenizer。本機：scripts/fetch-e5-tokenizer.sh；容器內 image 已帶（建置時驗 sha256）。
+tokenizer_path = "models/e5-small/tokenizer.json"
+# D6 參考值 300／100；e5 上限 512（含 passage: 前綴與特殊 token）。
+# 改任何一個切段參數都等於換策略：要升 chunker::Strategy::version 並 --rebuild。
+target_tokens = 300
+overlap_tokens = 100
+max_model_tokens = 512
+max_header_tokens = 64
+# 串接文字（title＋summary＋body）的 byte 上限 2 MiB，超過截斷並計數。
+max_source_bytes = 2097152
+rebuild_page_size = 200
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

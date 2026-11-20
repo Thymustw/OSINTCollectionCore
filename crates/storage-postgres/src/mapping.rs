@@ -531,3 +531,28 @@ pub fn outbox_event(row: &PgRow) -> Result<OutboxEvent, StorageError> {
         published_at: get(row, "published_at")?,
     })
 }
+
+pub fn document_chunk(row: &PgRow) -> Result<storage_core::DocumentChunk, StorageError> {
+    let u32_col = |col: &str| -> Result<u32, StorageError> {
+        let v: i32 = get(row, col)?;
+        u32::try_from(v).map_err(|_| StorageError::Unknown {
+            backend: "postgres",
+            message: format!("document_chunks.{col}={v} 是負數，違反 CHECK"),
+        })
+    };
+    Ok(storage_core::DocumentChunk {
+        id: get(row, "id")?,
+        document_id: get(row, "document_id")?,
+        seq: u32_col("seq")?,
+        start_char: u32_col("start_char")?,
+        end_char: u32_col("end_char")?,
+        text: get(row, "text")?,
+        header: get(row, "header")?,
+        token_count: u32_col("token_count")?,
+        strategy: get(row, "strategy")?,
+        strategy_version: u32_col("strategy_version")?,
+        simhash: get(row, "simhash")?,
+        group_id: get(row, "group_id")?,
+        created_at: get(row, "created_at")?,
+    })
+}

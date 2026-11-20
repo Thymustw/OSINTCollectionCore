@@ -28,8 +28,8 @@
 | 類別 | 加總 |
 |---|---|
 | 基礎設施（6 個服務） | PostgreSQL 1 GB + OpenSearch 8 GB + Redpanda 512 MB + Redis 256 MB + SeaweedFS 512 MB + Neo4j 2 GB = **約 12.25 GB** |
-| 應用服務（10 個服務） | osint-api 512 MB + osint-indexer 384 MB + 其餘 8 個各 256 MB = **約 2.9 GB** |
-| **合計** | **約 15.15 GB** |
+| 應用服務（11 個服務） | osint-api 512 MB + osint-indexer 384 MB + osint-chunk-worker 384 MB + 其餘 8 個各 256 MB = **約 3.3 GB** |
+| **合計** | **約 15.55 GB** |
 
 !!! note "OpenSearch 的記憶體不能縮減"
     OpenSearch 設為 8 GB（JVM heap 3 GB）是段落向量檢索需要的配置，不是餘裕。

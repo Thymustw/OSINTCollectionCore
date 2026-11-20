@@ -87,6 +87,12 @@ pub enum EventTopic {
     AiCompleted,
     #[serde(rename = "ai.failed")]
     AiFailed,
+
+    // ===== V0.4 前置（ADR-016 段落化，階段 5 M1）=====
+    /// chunk-worker 把一份 Document 切完段、寫進 `document_chunks` 之後發。
+    /// partition key = `document_id`。M2 的段落向量化訂這個。
+    #[serde(rename = "document.chunked")]
+    DocumentChunked,
 }
 
 impl EventTopic {
@@ -122,6 +128,7 @@ impl EventTopic {
             Self::AiRequested => "ai.requested",
             Self::AiCompleted => "ai.completed",
             Self::AiFailed => "ai.failed",
+            Self::DocumentChunked => "document.chunked",
         }
     }
 
@@ -129,7 +136,7 @@ impl EventTopic {
     ///
     /// 沒有這個清單，漏掉一個 topic 的 `as_str` 分支只會在執行期才發現，
     /// 而且是以「送到錯誤 topic」的形式發現——那時訊息已經在別的 partition 上了。
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::RawCollected,
         Self::RawFailed,
         Self::ObjectNormalized,
@@ -159,6 +166,7 @@ impl EventTopic {
         Self::AiRequested,
         Self::AiCompleted,
         Self::AiFailed,
+        Self::DocumentChunked,
     ];
 }
 
@@ -255,6 +263,6 @@ mod tests {
         assert_eq!(names.len(), total, "EventTopic::ALL 有重複的 topic 名稱");
         // V0.1 的 10 個 + V0.2 §20 的 9 個 + V0.3 §18 的 10 個。新增 variant
         // 時這個數字要一起改，否則 ALL 漏掉的那個不會被上面兩個測試檢查到。
-        assert_eq!(total, 29);
+        assert_eq!(total, 30);
     }
 }

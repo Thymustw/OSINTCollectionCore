@@ -172,3 +172,9 @@ services:
   osint-discovery-worker:
     mem_limit: 256m
     cpus: "0.25"
+
+  # tokenizer（17 MB）常駐記憶體；切段是 CPU-bound，但循序處理一次一份。
+  # 語料實測單執行緒 RSS 約 300 MB（含測試行程），給 384m 留餘裕。
+  osint-chunk-worker:
+    mem_limit: 384m
+    cpus: "0.50"

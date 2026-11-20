@@ -177,3 +177,25 @@ async fn sqlite_reclaim_orphan_jobs_only_touches_given_running_types() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn sqlite_chunk_store_contract() {
+    let root = find_workspace_root().expect("workspace root");
+    let path: PathBuf = root.join(format!(
+        "var/osint-chunks-{}.sqlite",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let store = SqliteEmbeddedStore::connect(&path)
+        .await
+        .expect("開 SQLite");
+    store.migrate().await.expect("migrate");
+    let result = storage_core::conformance::assert_chunk_store(&store).await;
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    result.expect("chunk store：整批取代／重切縮短／冪等／輸入檢查／FK CASCADE");
+}

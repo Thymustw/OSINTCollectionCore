@@ -14,7 +14,7 @@
 | `crates/` | 全部 35 個 Rust crate，這一頁的主角 |
 | `migrations/postgres/`、`migrations/sqlite/` | 資料庫結構變更檔（migration），兩種後端各一份、編號一一對應 |
 | `config/default.toml` | 所有服務的預設設定；可用 `OSINT_CONFIG_FILE` 指向另一份 TOML，或用 `OSINT__` 開頭的環境變數覆蓋 |
-| `docker/` | `Dockerfile`（10 個服務共用一份多階段建置）、`docker-compose.yml`（基礎設施＋應用服務）、`docker-compose.dev.yml`（本機開發覆寫） |
+| `docker/` | `Dockerfile`（11 個服務共用一份多階段建置）、`docker-compose.yml`（基礎設施＋應用服務）、`docker-compose.dev.yml`（本機開發覆寫） |
 | `scripts/` | 開發輔助腳本：產生測試用 API 憑證（`dev-token.py`）、部署 OpenSearch 向量模型、公開 repo 匯出、密鑰掃描自我檢查 |
 | `docs-site/` | 你正在讀的文件網站（MkDocs） |
 | `docs/` | 內部文件：版本規格（`docs/specs/`）、架構決策紀錄、開發者筆記（`docs/developer/`）、已知缺口實錄 |

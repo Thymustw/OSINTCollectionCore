@@ -23,11 +23,12 @@ use sqlx::sqlite::{
 use storage_core::codec::encode_enum;
 use storage_core::conformance::assert_sqlite_path_safe;
 use storage_core::{
-    BudgetConsumption, CandidateDiscoveryOutcome, CapabilityDescriptor, CollectionDailyUsage,
-    ConnectorRunStateUpdate, DailyUsage, EmbeddedStore, EventOutboxStore, HealthProvider,
-    JobPurgeFilter, OutboxEvent, RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR,
-    RelationalStore, SimhashCandidate, StorageAdapter, StorageError, StorageHealth, Transaction,
-    TransactionalStore, clamp_outbox_limit,
+    BudgetConsumption, CandidateDiscoveryOutcome, CapabilityDescriptor, ChunkStats, ChunkStore,
+    CollectionDailyUsage, ConnectorRunStateUpdate, DailyUsage, DocumentChunk, EmbeddedStore,
+    EventOutboxStore, HealthProvider, JobPurgeFilter, OutboxEvent,
+    RECLAIM_ORPHAN_COLLECT_JOB_ERROR, RECLAIM_ORPHAN_JOB_ERROR, RelationalStore, SimhashCandidate,
+    StorageAdapter, StorageError, StorageHealth, Transaction, TransactionalStore,
+    clamp_chunk_list_limit, clamp_outbox_limit, validate_chunks,
 };
 use uuid::Uuid;
 
@@ -3605,5 +3606,129 @@ impl storage_core::EventOutboxTestSupport for SqliteEmbeddedStore {
             .await
             .map_err(map_sqlx)?;
         rows.iter().map(mapping::outbox_event).collect()
+    }
+}
+
+/// 段落 capability（ADR-016 D5，階段 5 M1）。語意同 postgres 版。
+#[async_trait]
+impl ChunkStore for SqliteEmbeddedStore {
+    async fn replace_document_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[DocumentChunk],
+    ) -> Result<(), StorageError> {
+        validate_chunks(document_id, chunks)?;
+        let mut own_tx = match &self.tx {
+            Some(_) => None,
+            None => Some(self.pool.begin().await.map_err(map_sqlx)?),
+        };
+        let mut bound = match &self.tx {
+            Some(tx) => Some(tx.lock().await),
+            None => None,
+        };
+        let conn: &mut sqlx::SqliteConnection = match (&mut own_tx, &mut bound) {
+            (Some(tx), _) => tx,
+            (None, Some(guard)) => guard,
+            (None, None) => unreachable!("tx 與 own_tx 恰有一個"),
+        };
+        sqlx::query("DELETE FROM document_chunks WHERE document_id = ?1")
+            .bind(uuid_text(document_id))
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+        for chunk in chunks {
+            sqlx::query(
+                r#"
+                INSERT INTO document_chunks (
+                    id, document_id, seq, start_char, end_char, text, header, token_count,
+                    strategy, strategy_version, simhash, group_id, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                "#,
+            )
+            .bind(uuid_text(chunk.id))
+            .bind(uuid_text(chunk.document_id))
+            .bind(i64::from(chunk.seq))
+            .bind(i64::from(chunk.start_char))
+            .bind(i64::from(chunk.end_char))
+            .bind(&chunk.text)
+            .bind(&chunk.header)
+            .bind(i64::from(chunk.token_count))
+            .bind(&chunk.strategy)
+            .bind(i64::from(chunk.strategy_version))
+            .bind(chunk.simhash)
+            .bind(opt_uuid_text(chunk.group_id))
+            .bind(rfc3339(chunk.created_at))
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        drop(bound);
+        if let Some(tx) = own_tx {
+            tx.commit().await.map_err(map_sqlx)?;
+        }
+        Ok(())
+    }
+
+    async fn list_document_chunks(
+        &self,
+        document_id: Uuid,
+    ) -> Result<Vec<DocumentChunk>, StorageError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, document_id, seq, start_char, end_char, text, header, token_count,
+                   strategy, strategy_version, simhash, group_id, created_at
+            FROM document_chunks
+            WHERE document_id = ?1
+            ORDER BY seq ASC
+            "#,
+        )
+        .bind(uuid_text(document_id))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(mapping::document_chunk).collect()
+    }
+
+    async fn list_chunked_document_ids(
+        &self,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<Uuid>, StorageError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT document_id
+            FROM document_chunks
+            WHERE (?1 IS NULL OR document_id > ?1)
+            ORDER BY document_id ASC
+            LIMIT ?2
+            "#,
+        )
+        .bind(opt_uuid_text(after))
+        .bind(i64::from(clamp_chunk_list_limit(limit)))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter()
+            .map(|(raw,)| {
+                Uuid::parse_str(&raw).map_err(|err| StorageError::Unknown {
+                    backend: "sqlite",
+                    message: format!("document_chunks.document_id `{raw}` 不是 UUID：{err}"),
+                })
+            })
+            .collect()
+    }
+
+    async fn chunk_stats(&self) -> Result<ChunkStats, StorageError> {
+        let (documents, chunks, max_tokens): (i64, i64, Option<i64>) = sqlx::query_as(
+            "SELECT count(DISTINCT document_id), count(*), max(token_count) FROM document_chunks",
+        )
+        .fetch_one(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        Ok(ChunkStats {
+            documents: u64::try_from(documents).unwrap_or(0),
+            chunks: u64::try_from(chunks).unwrap_or(0),
+            max_token_count: max_tokens.and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        })
     }
 }
