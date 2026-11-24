@@ -9,6 +9,7 @@ mod health;
 pub mod inference;
 pub mod schema;
 mod service;
+mod slow;
 
 pub use error::ChunkEmbedderError;
 pub use health::serve as serve_health;

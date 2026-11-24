@@ -15,7 +15,6 @@
 //! 推論暫時性失敗（503／連線）退避後重試同一批、不放棄；永久性失敗（400）回錯誤。
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -33,6 +32,7 @@ use uuid::Uuid;
 use crate::error::ChunkEmbedderError;
 use crate::inference::{InferenceClient, InferenceError};
 use crate::schema;
+use crate::slow::SlowDetector;
 
 /// 一份文件最多查回幾個既有向量 id 來比對刪除。M1 實測單份最多 91 段。
 const MAX_EXISTING_PER_DOCUMENT: u32 = 1000;
@@ -44,7 +44,7 @@ pub struct EmbedderConfig {
     pub batch_size: usize,
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
-    /// 單批耗時超過「移動基準 × 這個倍數」就暫停 `slow_pause`（owner 裁決 2026-11-05：
+    /// 單批「每 token 耗時」超過「移動基準 × 這個倍數」就暫停 `slow_pause`（owner 裁決 2026-11-05：
     /// 同批工作每批延遲明顯變慢就暫停背景工作）。倍數待 M2-4 實測後定。
     pub slow_factor: f64,
     pub slow_pause: Duration,
@@ -97,8 +97,7 @@ pub struct ChunkEmbedder<S, O> {
     inference: InferenceClient,
     metrics: MetricsRegistry,
     config: EmbedderConfig,
-    /// 每批耗時的指數移動平均（毫秒）。0 代表還沒有樣本。
-    baseline_ms: AtomicU64,
+    slow_detector: SlowDetector,
 }
 
 impl<S, O> ChunkEmbedder<S, O>
@@ -118,8 +117,8 @@ where
             search,
             inference,
             metrics,
+            slow_detector: SlowDetector::new(config.slow_factor),
             config,
-            baseline_ms: AtomicU64::new(0),
         }
     }
 
@@ -181,7 +180,8 @@ where
                     )
                 })
                 .collect();
-            let (model, vectors) = self.infer_with_backoff(&inputs, stop).await?;
+            let tokens: u64 = batch.iter().map(|c| u64::from(c.token_count)).sum();
+            let (model, vectors) = self.infer_with_backoff(&inputs, tokens, stop).await?;
             let docs: Vec<SearchDocument> = batch
                 .iter()
                 .zip(vectors)
@@ -226,6 +226,7 @@ where
     async fn infer_with_backoff(
         &self,
         inputs: &[String],
+        tokens: u64,
         stop: &watch::Receiver<bool>,
     ) -> Result<(String, Vec<Vec<f32>>), ChunkEmbedderError> {
         let mut delay = self.config.backoff_initial;
@@ -240,7 +241,7 @@ where
                 .await
             {
                 Ok(out) => {
-                    self.observe_batch(started.elapsed()).await;
+                    self.observe_batch(started.elapsed(), tokens).await;
                     return Ok(out);
                 }
                 Err(InferenceError::Retryable {
@@ -262,29 +263,19 @@ where
         }
     }
 
-    /// 單批明顯變慢（> 基準 × slow_factor）就暫停一下，讓出 CPU 給前景工作。
-    /// 基準是指數移動平均（α＝0.1），慢批不併入基準——否則持續變慢時基準跟著升、永遠不觸發。
-    async fn observe_batch(&self, elapsed: Duration) {
-        let ms = u64::try_from(elapsed.as_millis())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let base = self.baseline_ms.load(Ordering::Relaxed);
-        if base == 0 {
-            self.baseline_ms.store(ms, Ordering::Relaxed);
-            return;
-        }
-        if (ms as f64) > (base as f64) * self.config.slow_factor {
+    /// 單批「每 token 耗時」明顯變慢（> 基準 × slow_factor）就暫停一下，讓出 CPU 給前景工作。
+    async fn observe_batch(&self, elapsed: Duration, tokens: u64) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        if self.slow_detector.observe(us, tokens) {
             self.metrics.inc("osint_chunk_embed_slow_pauses_total", 1);
             tracing::info!(
-                batch_ms = ms,
-                baseline_ms = base,
-                "推論批次明顯變慢，暫停讓出 CPU"
+                batch_ms = us / 1000,
+                tokens,
+                baseline_us_per_token = self.slow_detector.baseline(),
+                "推論批次每 token 耗時明顯變慢，暫停讓出 CPU"
             );
             tokio::time::sleep(self.config.slow_pause).await;
-            return;
         }
-        let next = ((base as f64) * 0.9 + (ms as f64) * 0.1).round() as u64;
-        self.baseline_ms.store(next.max(1), Ordering::Relaxed);
     }
 
     /// 刪掉 index 裡屬於 `document_id`、但不在 `keep` 裡的向量。回刪掉幾筆。

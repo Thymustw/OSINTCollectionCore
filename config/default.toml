@@ -214,7 +214,7 @@ batch_size = 8
 # 推論 503／連線失敗：指數退避 1 s → 30 s，不放棄。
 backoff_initial_ms = 1000
 backoff_max_ms = 30000
-# 單批耗時 > 移動基準 × slow_factor 就暫停 slow_pause_ms，讓出 CPU（owner 裁決 2026-11-05）。
+# 單批「每 token 耗時」> 移動基準 × slow_factor 就暫停 slow_pause_ms，讓出 CPU（owner 裁決 2026-11-05）。
 slow_factor = 3.0
 slow_pause_ms = 2000
 rebuild_page_size = 100

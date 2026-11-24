@@ -676,7 +676,7 @@ pub struct ChunkEmbedderSection {
     pub batch_size: usize,
     pub backoff_initial_ms: u64,
     pub backoff_max_ms: u64,
-    /// 單批耗時超過移動基準 × 這個倍數就暫停 `slow_pause_ms`。待 M2-4 實測後調整。
+    /// 單批「每 token 耗時」超過移動基準 × 這個倍數就暫停 `slow_pause_ms`。待 M2-4 實測後調整。
     pub slow_factor: f64,
     pub slow_pause_ms: u64,
     pub rebuild_page_size: u32,

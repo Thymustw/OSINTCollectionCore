@@ -53,12 +53,19 @@ payload 只用 `document_id`。段落文字、id、段數一律從 PostgreSQL �
 
 owner 裁決（ADR-016，2026-11-05）：同批工作每批延遲明顯變慢就暫停背景工作。實作：
 
-- 每批推論耗時取指數移動平均（α ＝ 0.1）當基準，第一批直接當基準。
-- 單批耗時 > 基準 × `slow_factor`（預設 3.0）→ 睡 `slow_pause_ms`（預設 2000 ms），`osint_chunk_embed_slow_pauses_total` +1。
+- 量的是**每 token 耗時**（批次耗時 ÷ 這批段落 `token_count` 總和），取指數移動平均（α ＝ 0.1）當基準；前 5 個樣本只建基準不判定。
+- 每 token 耗時 > 基準 × `slow_factor`（預設 3.0）→ 睡 `slow_pause_ms`（預設 2000 ms），`osint_chunk_embed_slow_pauses_total` +1。
+- token 總數 < 64 的批次不判定、不進基準：HTTP 來回等固定成本占比太高。
 - **慢批不併入基準**，否則持續變慢時基準跟著升，永遠不會觸發。
 - `slow_factor` 必須 > 1（NaN 也擋），否則啟動失敗。
+- 實作在 `src/slow.rs`（純邏輯，有單元測試）。
 
-倍數 3.0 是暫定值，要等 M2-4 回填實測後再定。
+**為什麼不用每批耗時**（2026-11-24 回填實測推翻了原本的設計）：原本以「每批耗時」當基準。
+語料多是短文件，一批常只有 1～2 段（約 17 ms），基準被拉到 18 ms；碰到一份 8 段長文
+（123～246 ms）就超過 3 倍、觸發暫停。主機 load 0.5、完全沒有壓力，30 秒內卻誤暫停 13 次，
+回填吞吐被壓到約每秒 15 段。批次耗時主要由 token 數決定，所以要以 token 正規化。
+
+倍數 3.0 仍是暫定值（M2-4 回填時記錄是否觸發）。
 
 ## `osint-chunks` index
 
@@ -102,7 +109,7 @@ make rebuild-chunk-vectors   # = cargo run -p chunk-embedder --bin osint-chunk-e
 - 換模型、或 mapping 有破壞性變更 → `--rebuild --drop`。
 - `GET /api/v1/ops/chunks` 穩定後 `extra_vectors > 0` → `--rebuild --drop`。
 
-全量回填的吞吐量與耗時還沒量（M2-4 待量）。
+全量回填實測（2026-11-24，開發 DB）：6,098 份文件／16,833 段，`--rebuild --drop` 476 秒（約 35 段／秒），失敗 0；推論服務是瓶頸（CPU 中位數 395%／4 核上限，記憶體峰值 542 MiB），embedder 本身 CPU 中位數 2%、記憶體 < 8 MiB。
 
 ## 對帳：`GET /api/v1/ops/chunks`
 
@@ -191,11 +198,28 @@ cargo test -p chunk-embedder
 | `consumes_document_chunked_from_broker_and_rebuilds` | 從 broker 收 `document.chunked` 寫入；`rebuild`（page_size 2）補齊其餘文件；停止訊號先到時 `interrupted` |
 | `unreachable_inference_is_retried_until_stopped` | 連不上推論服務時持續退避不放棄，停止訊號到了才回 |
 
-單元測試：mapping 是 strict 且向量 384 維 cosinesimil；`--drop` 單獨使用被拒；`batch_size` 0／33、`slow_factor` 1.0／NaN 被拒。
+單元測試：mapping 是 strict 且向量 384 維 cosinesimil；`--drop` 單獨使用被拒；`batch_size` 0／33、`slow_factor` 1.0／NaN 被拒；
+慢批偵測（`slow.rs`）：同速率的長批不暫停（回填誤觸發的回歸）、每 token 耗時 4 倍時暫停且不抬高基準、極短批不判定、暖機期不判定。
 
-## 還沒做（M2-4 待量）
+## M2-4 實測（2026-11-24，開發 DB）
 
-- 全量回填吞吐量、耗時、記憶體峰值。
-- kNN 查詢延遲（實際語料，不是實驗 5-2e 的臨時索引）。
-- 段落向量對評估集的效果比較。
+| 項目 | 結果 |
+|---|---|
+| 回填 | 6,098 份文件／16,833 段，476 秒（約 35 段／秒），失敗 0，`/ops/chunks` `in_sync: true` |
+| 瓶頸 | osint-inference：CPU 中位數 395%（4 核上限），記憶體峰值 542 MiB（上限 1 GB） |
+| embedder | CPU 中位數 2%、峰值 13%；容器記憶體 < 8 MiB |
+| OpenSearch | 回填期間 CPU 中位數 8%、峰值 79%；容器記憶體 4.6 GiB（8 GB 上限內） |
+| 主機 load1 | 中位數 4.4（24 核） |
+| index 大小 | 209.5 MB（M2 計畫估 100 MB，實際約兩倍） |
+| kNN 延遲（k＝200、`document_id` terms filter） | v0 90 題 p50 34 ms／p95 104 ms；OSINT 52 題 p50 30 ms／p95 93 ms |
+| 查詢向量（推論服務） | p50 9 ms／p95 11 ms |
+| 慢批暫停 | 修正後整輪 1 次（71 token 的小批，剛過 64 門檻，代價 2 秒） |
+
+吞吐 35 段／秒低於 M2-1 在主機直接量的 59 段／秒。推測原因（**未拆開量**）：容器 cgroup 限制與 HTTP
+開銷，以及回填時每段都帶 `passage:` 前綴與 header、token 數比 M2-1 的取樣多。
+
+評估比較（只記錄、不是 gate）見 ADR-016 的 M2-4 註記與 `eval/README.md`。
+
+## 還沒做
+
 - 檢索 API 查 `osint-chunks`（M3）。
