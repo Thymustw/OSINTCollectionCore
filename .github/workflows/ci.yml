@@ -80,6 +80,64 @@ jobs:
       - run: cargo audit
       - run: cargo deny check
 
+  # services/inference（Python，ADR-016 D2）。與 Rust 服務分開一個 job：build context 不同
+  # （services/inference），也不共用 builder cache。四關都在這裡：pytest（含 golden 向量）、
+  # pip-audit、image build、trivy（Critical 擋、HIGH 列出，同 image-scan 的規矩）＋ SBOM。
+  inference:
+    name: Inference service (pytest + pip-audit + image)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/inference
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v6
+      - name: pip-audit（requirements.lock，帶 hash）
+        run: uvx --from pip-audit==2.10.0 pip-audit -r requirements.lock --require-hashes --disable-pip
+      - uses: docker/setup-buildx-action@v3
+      # 模型檔從 Dockerfile 的 model stage 取（該 stage 下載並驗 sha256），pytest 與 image 用同一份。
+      - name: 取出模型檔（model stage）
+        run: docker buildx build --target model --output type=local,dest=/tmp/model-stage .
+      - name: pytest
+        env:
+          INFERENCE_ONNX_PATH: /tmp/model-stage/model/model.onnx
+          INFERENCE_TOKENIZER_PATH: /tmp/model-stage/model/tokenizer.json
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip sync --python .venv/bin/python requirements.lock requirements-dev.lock
+          .venv/bin/python -m pytest -q tests
+      - name: image build
+        run: docker buildx build --load -t osint-core/osint-inference:ci .
+      - name: Trivy（Critical 擋）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: osint-core/osint-inference:ci
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Trivy（HIGH 列出、不擋）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: osint-core/osint-inference:ci
+          severity: HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+      - name: SBOM（CycloneDX）
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: osint-core/osint-inference:ci
+          format: cyclonedx
+          output: sbom-osint-inference.cdx.json
+          exit-code: "0"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-osint-inference
+          path: sbom-osint-inference.cdx.json
+          retention-days: 30
+
   iac-scan:
     name: Docker/IaC scan (trivy)
     runs-on: ubuntu-latest
@@ -217,6 +275,7 @@ jobs:
           - osint-stix-worker
           - osint-discovery-worker
           - osint-chunk-worker
+          - osint-chunk-embedder
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
@@ -262,6 +321,7 @@ jobs:
           - osint-stix-worker
           - osint-discovery-worker
           - osint-chunk-worker
+          - osint-chunk-embedder
     steps:
       # V0.1 只要求「有產生路徑」（DEVSECOPS.md §25：正式 SBOM 是 V1.0 的
       # release gate）。這裡用 trivy 而不是 syft，理由是 SECURITY_CI.md 的
@@ -358,6 +418,7 @@ jobs:
           - osint-stix-worker
           - osint-discovery-worker
           - osint-chunk-worker
+          - osint-chunk-embedder
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4

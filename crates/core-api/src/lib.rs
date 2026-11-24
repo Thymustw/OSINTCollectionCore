@@ -72,9 +72,9 @@ pub use search_hybrid::{
 };
 pub use semantic_search::{SemanticSearchHit, SemanticSearchRequest, SemanticSearchResponse};
 pub use state::{
-    AppState, AuthState, AutoApprovalState, GraphProjectionState, ImportState, SearchState,
-    SemanticSearchState, SharedAutoApprovalState, SharedGraphProjection, SharedGraphStore,
-    SharedObjects, SharedStore, SharedTokenStore,
+    AppState, AuthState, AutoApprovalState, ChunkOpsState, GraphProjectionState, ImportState,
+    SearchState, SemanticSearchState, SharedAutoApprovalState, SharedGraphProjection,
+    SharedGraphStore, SharedObjects, SharedStore, SharedTokenStore,
 };
 pub use tokens::{
     AUDIT_TOKEN_ISSUE, AUDIT_TOKEN_LIST, AUDIT_TOKEN_REVOKE, IssueTokenBody, TokenSummary,

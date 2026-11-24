@@ -32,9 +32,9 @@
 
 ---
 
-## 應用服務（11 個）
+## 應用服務（13 個）
 
-這 11 個服務是用 Rust 寫的核心業務邏輯，放在 Docker profile `app` 底下，用 `make compose-up-full` 啟動。
+其中 12 個是用 Rust 寫的核心業務邏輯，另外 1 個（`osint-inference`）是 Python 的向量推論服務。全部放在 Docker profile `app` 底下，用 `make compose-up-full` 啟動。
 
 ### 服務一覽
 
@@ -51,6 +51,8 @@
 | `osint-stix-worker` | 18088 | 處理 STIX 2.1 匯入作業 | 訂閱 `job.dispatched`（job_type=stix_import）→ 對映寫 PostgreSQL |
 | `osint-discovery-worker` | 18089 | 執行 Discovery（從已知實體擴展發現新關聯） | 訂閱 `job.dispatched`（job_type=discovery_run）→ 查圖 → 寫 Candidate |
 | `osint-chunk-worker` | 18090 | 把文件切成段落，供之後的段落檢索使用 | 訂閱 `dedup.completed`（只處理非重複文件）→ 切段寫 PostgreSQL → 發布 `document.chunked` |
+| `osint-inference` | 18091（只綁 `127.0.0.1`） | 本機向量模型的推論服務（Python，沒有認證、只對內） | 被 `osint-chunk-embedder` 以 HTTP 呼叫；不連資料庫、不訂閱事件 |
+| `osint-chunk-embedder` | 18092 | 替段落算向量（目前搜尋還沒使用） | 訂閱 `document.chunked` → 從 PostgreSQL 重讀段落 → 呼叫 `osint-inference` → 寫 OpenSearch `osint-chunks` |
 
 ### 所有應用服務共有的端點
 

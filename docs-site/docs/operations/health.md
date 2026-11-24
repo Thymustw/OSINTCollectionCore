@@ -14,10 +14,10 @@
 | `GET /ready` | **就緒探針**：這個行程能收流量嗎（依賴的後端就緒了嗎） | `{"ready":true,"checks":[...]}` |
 | `GET /metrics` | **Prometheus 格式指標**：計數器、佇列深度、延遲等 | Prometheus text 格式 |
 
-一次確認 11 個服務是否存活：
+一次確認 13 個服務是否存活（18091 是 `osint-inference`，只綁 `127.0.0.1`）：
 
 ```bash
-for p in 18080 18081 18082 18083 18084 18085 18086 18087 18088 18089 18090; do
+for p in 18080 18081 18082 18083 18084 18085 18086 18087 18088 18089 18090 18091 18092; do
   printf ":%s  " $p; curl -s localhost:$p/health
   echo
 done
@@ -87,6 +87,7 @@ curl -s http://127.0.0.1:18080/api/v1/ops/health \
 | `GET /api/v1/ops/dlq` | 失敗 Job 列表（`?type=` 依種類過濾；目前不設獨立 DLQ topic，失敗 Job 可用 `POST /api/v1/jobs/{id}/retry` 重試） |
 | `GET /api/v1/ops/failed-events` | 處理失敗的事件記錄 |
 | `GET /api/v1/ops/graph` | 圖投影（Neo4j）的 lag 與最近一次 rebuild 狀態 |
+| `GET /api/v1/ops/chunks` | 段落數與段落向量數的對帳（`missing_vectors`／`extra_vectors`／`in_sync`）。兩個數字不是同一瞬間取的，寫入進行中會跳動，穩定後才有意義；消費落後看 `/api/v1/ops/queues` 的 `chunk-embedder` 列 |
 | `GET /api/v1/ops/discovery` | Discovery 的 AI 並發上限、Candidate 各狀態數量、最近 AI Run 歷史、今天有用量的 collection |
 
 重送失敗事件需要 operator 以上：

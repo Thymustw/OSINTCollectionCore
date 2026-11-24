@@ -62,7 +62,7 @@ make compose-ps-full      # 看狀態
 make compose-down-full    # 停掉
 ```
 
-十個應用服務在 compose 裡標了 `profiles: ["app"]`，**預設不啟動**。
+十三個應用服務在 compose 裡標了 `profiles: ["app"]`，**預設不啟動**。
 `make compose-up`／`make compose-down`／CI 的 integration-test 行為完全不變
 （它們不帶 `--profile app`，所以不會被迫先 build image）。
 
@@ -78,13 +78,16 @@ make compose-down-full    # 停掉
 | osint-embedding-worker | `osint-core/osint-embedding-worker:0.1.0` | 18087 | 同上 |
 | osint-stix-worker | `osint-core/osint-stix-worker:0.1.0` | 18088 | 同上 |
 | osint-discovery-worker | `osint-core/osint-discovery-worker:0.1.0` | 18089 | 同上 |
+| osint-chunk-worker | `osint-core/osint-chunk-worker:0.1.0` | 18090 | 同上 |
+| osint-inference | `osint-core/osint-inference:0.1.0` | `127.0.0.1:18091` | 同上（Python 服務，見 `services/inference/README.md`） |
+| osint-chunk-embedder | `osint-core/osint-chunk-embedder:0.1.0` | 18092 | 同上；`/ready` 含推論服務檢查 |
 
-⚠️ 容器版與 `cargo run` 版**不能同時跑**，兩者搶同一組 18080–18089。
+⚠️ 容器版與 `cargo run` 版**不能同時跑**，兩者搶同一組 18080–18092。
 
 ### Docker log 輪替（2026-10-13 collector 75 GB 事故）
 
-`docker/docker-compose.yml` 用 YAML anchor `x-osint-logging` 套到全部 16 個服務
-（基礎設施 6 + 應用 10）：
+`docker/docker-compose.yml` 用 YAML anchor `x-osint-logging` 套到全部 19 個服務
+（基礎設施 6 + 應用 13）：
 
 ```yaml
 x-osint-logging: &osint-logging
@@ -333,6 +336,8 @@ SQLite 不是 Core canonical store（詳見內部架構文件 STORAGE_ARCHITECTU
 
 ```bash
 scripts/fetch-e5-tokenizer.sh     # 或 make fetch-tokenizer；crates/chunker、chunk-worker 測試與 make run-chunk-worker 需要（17 MB，驗 sha256，不進 repo）
+# chunk-embedder 的 e2e 打真的 osint-inference（127.0.0.1:18091 或 INFERENCE_URL），要先起它：
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --profile app up -d osint-inference
 cargo test --workspace --all-targets -- --nocapture
 ```
 
@@ -393,6 +398,10 @@ cargo test --workspace
 
 make compose-up-full   # 測完再起回來
 ```
+
+這份清單是 2026-10-06 的十個服務。之後加入的 `osint-chunk-worker`／`osint-chunk-embedder` 的 e2e 用一次性 topic
+namespace（`TestTopics`），容器開著是否會干擾其他測試未重新驗證。**`osint-inference` 不要停**：
+chunk-embedder 的 e2e 打的是真的推論服務。
 
 `core-events::redpanda_roundtrip` 在本機會因 `MessageTimedOut` 失敗，與容器開關無關，是既有的
 環境問題（見 `docs/KNOWN_GAPS.md` §14）。
@@ -594,6 +603,27 @@ cargo test -p acceptance --test acceptance_g   # HTTP 匯入→Core→匯出 全
 ```
 
 細節：`docs/developer/stix-adapter.md`、`docs/user/stix.md`。
+
+## Chunk worker／Chunk embedder（ADR-016 階段 5）
+
+```bash
+make run-chunk-worker       # 訂閱 dedup.completed → document_chunks、發 document.chunked（health 18090）
+make run-chunk-embedder     # 訂閱 document.chunked → osint-chunks 段落向量（health 18092）
+make rebuild-chunks         # 從 PostgreSQL 重切全部段落（不發事件）
+make rebuild-chunk-vectors  # 從段落表重建全部段落向量（不發事件）
+```
+
+chunk-embedder 需要向量推論服務 `osint-inference`（只有容器版，宿主埠 `127.0.0.1:18091`）：
+
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --profile app up -d osint-inference
+curl -s http://127.0.0.1:18091/ready
+curl -s http://127.0.0.1:18092/ready   # postgres、opensearch、inference 三項
+```
+
+推論服務沒起來時 embedder 不會結束，而是退避重試（`osint_chunk_embed_retries_total` 上升）。
+設定在 `config/default.toml` 的 `[chunk_worker]`／`[chunk_embedder]`。
+細節：`docs/developer/chunk-worker.md`、`docs/developer/chunk-embedder.md`、`services/inference/README.md`。
 
 ## Failure／recovery 測試（會真的停掉 Docker 服務）
 

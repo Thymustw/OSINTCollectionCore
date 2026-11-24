@@ -1,0 +1,38 @@
+[package]
+name = "chunk-embedder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+publish.workspace = true
+description = "document.chunked → osint-inference 段落向量 → OpenSearch osint-chunks（ADR-016 階段 5 M2-2）"
+
+[[bin]]
+name = "osint-chunk-embedder"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+chrono = { workspace = true }
+# embedding_text（header＋段落）必須與切段時算 token 的組法一致。
+chunker = { path = "../chunker" }
+core-config = { workspace = true }
+core-events = { workspace = true }
+core-model = { workspace = true }
+core-observability = { workspace = true }
+# 簡體副本（ADR-017）與 cjk analyzer 慣例沿用 osint-documents，同 embedding-worker 的先例。
+indexer = { path = "../indexer" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+storage-core = { workspace = true }
+storage-opensearch = { path = "../storage-opensearch" }
+storage-postgres = { path = "../storage-postgres" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+core-events = { workspace = true, features = ["test-support"] }
+storage-postgres = { path = "../storage-postgres", features = ["test-support"] }

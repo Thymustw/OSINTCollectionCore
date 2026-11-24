@@ -87,6 +87,7 @@ fn build_api(stack: &Stack, index: &str) -> TestApi {
         graph_resolver: None,
         graph: None,
         graph_projection: None,
+        chunks: None,
         import: None,
         search: None,
         hybrid_weights: core_config::HybridSearchSection::default(),

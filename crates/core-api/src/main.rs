@@ -206,6 +206,15 @@ async fn run() -> Result<(), String> {
     // POST /api/v1/search/semantic 回 503，不要連帶讓 BM25 搜尋掛掉。
     // 連線失敗不推進 `missing`：`/ops/health` 的後端名單沒有獨立的
     // ml-commons 項目，OpenSearch 本身的健康已經由上面的 `opensearch` 檢查覆蓋。
+    // 段落對帳重用全文搜尋那條 OpenSearch 連線（同一叢集，已驗過身分），不再連一次。
+    let chunks = search.as_ref().map(|s| {
+        Arc::new(core_api::ChunkOpsState {
+            store: Arc::new(store.clone()) as Arc<dyn storage_core::ChunkStore + Send + Sync>,
+            search: s.store.clone(),
+            index: cfg.chunk_embedder.index.clone(),
+        })
+    });
+
     let semantic_search = match connect_semantic_search(&cfg).await {
         Ok(state) => Some(Arc::new(state)),
         Err(err) => {
@@ -294,6 +303,7 @@ async fn run() -> Result<(), String> {
         graph_resolver,
         graph,
         graph_projection,
+        chunks,
         import,
         search,
         semantic_search,
@@ -481,6 +491,16 @@ fn queue_bindings(cfg: &AppConfig) -> Vec<QueueBinding> {
             service: "indexer",
             group: cfg.indexer.consumer_group.clone(),
             topic: core_events::EventTopic::EntityExtracted.as_str(),
+        },
+        QueueBinding {
+            service: "chunk-worker",
+            group: cfg.chunk_worker.consumer_group.clone(),
+            topic: core_events::EventTopic::DedupCompleted.as_str(),
+        },
+        QueueBinding {
+            service: "chunk-embedder",
+            group: cfg.chunk_embedder.consumer_group.clone(),
+            topic: core_events::EventTopic::DocumentChunked.as_str(),
         },
     ]
 }

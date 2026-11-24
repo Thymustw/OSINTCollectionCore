@@ -54,6 +54,7 @@ fn read_paths() -> Vec<String> {
         "/api/v1/ops/metrics".into(),
         "/api/v1/ops/connectors".into(),
         "/api/v1/ops/graph".into(),
+        "/api/v1/ops/chunks".into(),
         "/api/v1/ops/discovery".into(),
         format!("/api/v1/graph/entities/{id}/neighbors"),
         format!("/api/v1/graph/entities/{id}/relationships"),
@@ -263,7 +264,12 @@ async fn viewer_may_read_and_gets_503_without_a_store() {
         );
         assert_eq!(body["error"], "unavailable");
         let message = body["message"].as_str().unwrap();
-        if path.starts_with("/api/v1/graph/") || path == "/api/v1/ops/graph" {
+        if path == "/api/v1/ops/chunks" {
+            assert!(
+                message.contains("PostgreSQL") && message.contains("OpenSearch"),
+                "段落對帳 503 訊息要講 PostgreSQL／OpenSearch：{body}"
+            );
+        } else if path.starts_with("/api/v1/graph/") || path == "/api/v1/ops/graph" {
             assert!(
                 message.contains("Neo4j") || message.contains("bolt_uri"),
                 "Graph 503 訊息要講 Neo4j／bolt_uri：{body}"
@@ -527,6 +533,7 @@ async fn ops_endpoints_are_not_public() {
         "/api/v1/ops/health",
         "/api/v1/ops/metrics",
         "/api/v1/ops/graph",
+        "/api/v1/ops/chunks",
         "/api/v1/ops/discovery",
     ] {
         let (status, _) = send(&app, get(path, None)).await;

@@ -103,6 +103,7 @@ fn build_api_with_store(
         graph_resolver: None,
         graph: None,
         graph_projection: None,
+        chunks: None,
         import: None,
         search: Some(Arc::new(SearchState {
             store: search_store,

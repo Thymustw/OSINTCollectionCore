@@ -3744,6 +3744,16 @@ impl ChunkStore for PostgresCanonicalStore {
             max_token_count: max_tokens.and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
         })
     }
+
+    async fn document_collection_ids(&self, document_id: Uuid) -> Result<Vec<Uuid>, StorageError> {
+        sqlx::query_scalar(
+            "SELECT collection_id FROM collection_objects WHERE object_id = $1 ORDER BY collection_id LIMIT 1000",
+        )
+        .bind(document_id)
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)
+    }
 }
 
 /// u32 → INTEGER。超過 i32 上限回 Configuration（段落 offset 超過 21 億字元＝輸入異常）。

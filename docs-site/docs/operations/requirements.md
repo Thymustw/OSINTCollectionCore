@@ -28,8 +28,8 @@
 | 類別 | 加總 |
 |---|---|
 | 基礎設施（6 個服務） | PostgreSQL 1 GB + OpenSearch 8 GB + Redpanda 512 MB + Redis 256 MB + SeaweedFS 512 MB + Neo4j 2 GB = **約 12.25 GB** |
-| 應用服務（11 個服務） | osint-api 512 MB + osint-indexer 384 MB + osint-chunk-worker 384 MB + 其餘 8 個各 256 MB = **約 3.3 GB** |
-| **合計** | **約 15.55 GB** |
+| 應用服務（13 個服務） | osint-api 512 MB + osint-indexer 384 MB + osint-chunk-worker 384 MB + osint-inference 1 GB + osint-chunk-embedder 128 MB + 其餘 8 個各 256 MB = **約 4.4 GB** |
+| **合計** | **約 16.6 GB** |
 
 !!! note "OpenSearch 的記憶體不能縮減"
     OpenSearch 設為 8 GB（JVM heap 3 GB）是段落向量檢索需要的配置，不是餘裕。
@@ -40,7 +40,7 @@
 
 ### CPU
 
-開發環境容器上限加總約 **8 CPU**（`cpus` 是 cgroup 上限，不是實際用量；這些消費者大部分時間閒置等訊息）。
+開發環境容器上限加總約 **14 CPU**（`cpus` 是 cgroup 上限，不是實際用量；這些消費者大部分時間閒置等訊息）。其中向量推論服務 `osint-inference` 佔 4 CPU，只有在替段落算向量時才會用滿。
 
 建議主機至少 **4 核心**，若主機同時跑其他工作負載（例如虛擬機）建議 8 核心以上。
 

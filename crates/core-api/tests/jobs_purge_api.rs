@@ -100,6 +100,7 @@ async fn pg_api() -> PgApi {
         graph_resolver: None,
         graph: None,
         graph_projection: None,
+        chunks: None,
         import: None,
         search: None,
         semantic_search: None,

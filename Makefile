@@ -8,7 +8,7 @@
 	run-indexer rebuild-index rebuild-index-drop run-cli \
 	run-graph-worker rebuild-graph rebuild-graph-drop \
 	run-embedding-worker rebuild-embeddings rebuild-embeddings-drop \
-	run-stix-worker run-discovery-worker run-chunk-worker rebuild-chunks fetch-tokenizer \
+	run-stix-worker run-discovery-worker run-chunk-worker rebuild-chunks fetch-tokenizer run-chunk-embedder rebuild-chunk-vectors \
 	image-build image-scan image-prune image-ls \
 	compose-up-full compose-down-full compose-ps-full \
 	docs-serve docs-build \
@@ -55,6 +55,7 @@ help:
 	@echo "  make run-discovery-worker 啟動 osint-discovery-worker（需 compose 與 .env）"
 	@echo "  make fetch-tokenizer   下載 e5 tokenizer.json 到 models/e5-small/（驗 sha256）"
 	@echo "  make run-chunk-worker  啟動 osint-chunk-worker（需 compose、.env、tokenizer）"
+	@echo "  make run-chunk-embedder 啟動 osint-chunk-embedder（需 compose、osint-inference）"
 	@echo "  make rebuild-chunks    從 PostgreSQL 重切全部非重複文件後結束（不發事件）"
 	@echo "  make run-cli ARGS=...  跑 osint-cli 唯讀查詢，例:make run-cli ARGS=\"documents list\""
 	@echo "  make image-build       建十一個服務的容器 image（不 push）"
@@ -151,7 +152,7 @@ IMAGE_PREFIX ?= osint-core
 SERVICES := osint-api osint-collector osint-normalizer \
 	osint-deduplicator osint-entity-worker osint-indexer \
 	osint-graph-worker osint-embedding-worker osint-stix-worker \
-	osint-discovery-worker osint-chunk-worker
+	osint-discovery-worker osint-chunk-worker osint-chunk-embedder
 
 # 只 build，不啟動。image 名稱固定成 $(IMAGE_PREFIX)/<服務>:$(IMAGE_TAG)，
 # 所以重 build 會覆蓋同一個 tag（舊的變成 dangling，用 image-prune 清）。
@@ -308,6 +309,15 @@ run-chunk-worker:
 # 重切全部非重複文件（策略版本升級後用）。不發 document.chunked；未變更的文件不寫。
 rebuild-chunks:
 	$(CARGO) run -p chunk-worker --bin osint-chunk-worker -- --rebuild
+
+# ADR-016 階段 5 M2 段落向量。訂閱 document.chunked，向量寫 osint-chunks。
+# 需要 osint-inference（compose app profile）。細節見 docs/developer/chunk-embedder.md。
+run-chunk-embedder:
+	$(CARGO) run -p chunk-embedder --bin osint-chunk-embedder
+
+# 依 document_chunks 重建全部段落向量（覆寫既有）。mapping 破壞性變更改用 `-- --rebuild --drop`。
+rebuild-chunk-vectors:
+	$(CARGO) run -p chunk-embedder --bin osint-chunk-embedder -- --rebuild
 
 # 本機唯讀查詢工具（直連 DB，不經 core-api）。用法見 docs/user/cli.md。
 # ARGS 未給時跑 --help，而不是靜默什麼都不做。

@@ -89,6 +89,18 @@ pub struct GraphProjectionState {
 
 pub type SharedGraphProjection = Arc<GraphProjectionState>;
 
+/// `GET /api/v1/ops/chunks` 的對帳來源：PostgreSQL 段落表（canonical）對
+/// OpenSearch 段落向量 index（投影）。`index` 讀 `[chunk_embedder].index`，
+/// 與 osint-chunk-embedder 同一個設定鍵——不一致會去數一個空 index 而回報「全缺」。
+#[derive(Clone)]
+pub struct ChunkOpsState {
+    pub store: Arc<dyn storage_core::ChunkStore + Send + Sync>,
+    pub search: OpenSearchStore,
+    pub index: String,
+}
+
+pub type SharedChunkOps = Arc<ChunkOpsState>;
+
 pub type SharedStore = Arc<dyn CanonicalWriteStore + Send + Sync>;
 
 /// 物件儲存（Raw Evidence blob）handle。理由同 [`SharedStore`]：
@@ -181,6 +193,9 @@ pub struct AppState {
     /// **只有** `GET /api/v1/ops/graph` 回 503。
     /// 與 [`AppState::graph`] 分開：讀圖與讀投影狀態是兩件不同的事。
     pub graph_projection: Option<SharedGraphProjection>,
+    /// 段落／段落向量對帳。`None` 代表 Postgres 或 OpenSearch 沒接上，
+    /// **只有** `GET /api/v1/ops/chunks` 回 503。
+    pub chunks: Option<SharedChunkOps>,
     pub import: Option<Arc<ImportState>>,
     pub search: Option<SharedSearchState>,
     /// 語意搜尋。`None` 代表沒接上 OpenSearch 或 ml-commons 模型未部署，

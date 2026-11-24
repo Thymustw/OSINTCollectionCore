@@ -74,6 +74,7 @@ token 管理是 admin only**。角色是嚴格超集（admin ⊃ operator ⊃ vi
 | GET | `/api/v1/ops/dlq` | viewer | 200／503 | 失敗 Job 清單。`?limit=`、`?type=`（job type，例如 `collect`）。沒接 Postgres 回 503 |
 | POST | `/api/v1/ops/jobs/purge` | admin | 200／422／503 | 清除終態 job。`{}` 套用 `[retention.jobs]`；自訂需同時給 `job_type`、`statuses`、`older_than_days`。`dry_run` 只計數。非終態 422。稽核 `jobs.purge` |
 | GET | `/api/v1/ops/graph` | viewer | 200／503 | 圖投影 lag／rebuild。沒接 Neo4j 回 503 |
+| GET | `/api/v1/ops/chunks` | viewer | 200／503 | 段落表對段落向量 index（`osint-chunks`）的計數對帳。沒接 Postgres 或 OpenSearch 回 503 |
 | GET | `/api/v1/ops/failed-events` | viewer | 200／503 | 永久失敗事件清單（ADR-008）。`?topic=`、`?unreplayed_only=`、`?cursor=`、`?limit=`。沒接 Postgres 回 503 |
 | POST | `/api/v1/ops/failed-events/{id}/replay` | operator | 200／404／500／503 | 把失敗事件的原始 envelope 重發回原 topic 並標記已重放。envelope 壞掉回 500，broker 不可用回 503 |
 | GET | `/api/v1/ops/discovery` | viewer | 200／503 | AI/Discovery 讀側子集（含今天有用量的 collection）。沒接 Postgres 回 503 |
@@ -563,6 +564,7 @@ curl -s "http://127.0.0.1:18080/api/v1/entities/$ENTITY_ID/timeline?limit=20" \
 | `/api/v1/ops/dlq` | viewer+ | 有哪些失敗的 Job（V0.1 沒有 DLQ topic） |
 | `/api/v1/ops/failed-events` | viewer+ | 有哪些**事件**永久失敗（ADR-008，跟上面的 Job 層級是兩回事） |
 | `/api/v1/ops/graph` | viewer+ | 圖投影 lag 與 rebuild 狀態 |
+| `/api/v1/ops/chunks` | viewer+ | 段落向量有沒有跟上段落表（缺幾筆、多幾筆） |
 | `/api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog 近似計數、最近 AI Run、今天有用量的 collection |
 
 Redis／Redpanda 刻意**不放進 `/ready`**：API 自己不需要它們，
@@ -678,6 +680,11 @@ SPEC §31 的 "queue summary"。viewer 以上。
 }
 ```
 
+列出的 group（`queue_bindings`，`crates/core-api/src/main.rs`）：normalizer（`raw.collected`）、
+deduplicator（`object.normalized`）、entity-worker（`dedup.completed`）、indexer（`entity.extracted`）、
+chunk-worker（`osint-chunk-worker`，`dedup.completed`）、chunk-embedder（`osint-chunk-embedder`，`document.chunked`）。
+group 名稱讀各服務的 `consumer_group` 設定，topic 寫死。
+
 - **單一 group 查不到不會讓整個端點失敗**：其他 group 照常回，失敗的那個帶
   `error` 且 `lag: null`。一個 group 的問題不該讓運維連別的 group 都看不到。
 - **`lag` 量不到時是 `null`，不是 `0`。** 「沒有落後」與「量不到」在面板上長得
@@ -737,6 +744,38 @@ curl -s http://127.0.0.1:18080/api/v1/ops/graph \
 - `rebuild.state` 是 `idle`／`running`／`completed`／`failed`。
   從來沒跑過 rebuild 時是 `idle`（`RebuildStatus::idle`），不是錯誤。
 - `rebuild.written` 是環境現況：這台機器跑過 Step 4／5 rebuild 之後通常不是 0。
+
+## `GET /ops/chunks`（段落向量對帳，ADR-016 階段 5 M2）
+
+viewer 以上。唯讀、不寫稽核（同 `/ops/graph`）。PostgreSQL 段落表（canonical）對
+OpenSearch 段落向量 index（投影）的計數比對。
+
+**沒接上 PostgreSQL 或 OpenSearch 時只有這條路由回 503**，其他路由照常。
+
+```json
+{
+  "index": "osint-chunks",
+  "chunked_documents": 6098,
+  "chunks": 16833,
+  "max_token_count": 508,
+  "vectors": 16833,
+  "missing_vectors": 0,
+  "extra_vectors": 0,
+  "in_sync": true
+}
+```
+
+（數字只是格式示意。）
+
+- `index` 讀 `[chunk_embedder].index`，與 `osint-chunk-embedder` 同一個設定鍵——兩邊不一致會去數一個空 index 而回報「全缺」。
+- `chunked_documents`／`chunks`／`max_token_count` 來自 `ChunkStore::chunk_stats`；`vectors` 是 index 的 `_count`。
+- `missing_vectors` ＝ `chunks − vectors`（下限 0）：回填中、或 embedder 落後時 > 0，穩定後應為 0。
+- `extra_vectors` ＝ `vectors − chunks`（下限 0）：> 0 代表 index 有 PostgreSQL 已不存在的段落，要 `osint-chunk-embedder --rebuild --drop`。
+- `in_sync` ＝ 兩者都是 0。
+- **兩個計數不是同一瞬間取的**：寫入進行中差值會跳動，穩定後才有對帳意義。
+- 消費落後（lag）不在這裡，看 `GET /ops/queues` 的 `chunk-embedder` 列。
+
+細節見 `docs/developer/chunk-embedder.md`。
 
 ## `GET /ops/dlq`（失敗紀錄）
 
@@ -836,6 +875,8 @@ V0.3 Phase 4 補上的**事件**層級失敗紀錄，跟上面 `/ops/dlq` 的**J
 目前只有三個 consumer（normalizer／deduplicator／entity-worker）的
 單則事件失敗分支會寫入 `failed_events`；indexer 的批次 flush 失敗語意
 不同（整批不進 index、不提交 offset），刻意不接這個機制。
+（這段寫於三個 consumer 時期；之後加入的 `osint-chunk-worker`、`osint-chunk-embedder` 也會在單則失敗時寫 `failed_events`，
+見 `chunk-worker.md`、`chunk-embedder.md`。其他 worker 未逐一重新核對。）
 
 > ⚠️ **重放靠 `envelope` 欄位，不是回頭去 broker 撈**——撈不撈得到取決於
 > retention，而 retention 正是這個機制要避開的坑。重放沒有保留原
@@ -922,6 +963,7 @@ Phase 6b 另外加了三個欄位：
 | `backends` | `ReadyProbe` | `GET /api/v1/ops/health` 要敲的後端檢查清單 |
 | `backends_missing` | `Vec<&'static str>` | **沒接上**（因此不在 `backends` 裡）的後端名稱 |
 | `object_bucket` | `String` | `GET /raw/{id}?body=true` 用來把 `s3://{bucket}/{key}` 形式的 `storage_path` 還原成物件 key；沒接物件儲存時是空字串 |
+| `chunks` | `Option<SharedChunkOps>`（`ChunkOpsState`：`ChunkStore` + `OpenSearchStore` + index 名稱） | `GET /api/v1/ops/chunks` 的對帳來源。`None` 回 503（只影響這條路由）。回應型別是 `ChunkOpsView` |
 | `graph_projection` | `Option<SharedGraphProjection>`（`GraphProjectionState`：`ProjectionStore` + 投影名稱） | `GET /api/v1/ops/graph` 的 lag／rebuild。`None` 回 503。回應型別是 `GraphProjectionView` |
 | `auto_approval_max_concurrent` | `usize` | `GET /ops/discovery` 回報的 AI 並發上限**設定值**。永遠有值，跟 `auto_approval` 是否為 `None` 無關 |
 

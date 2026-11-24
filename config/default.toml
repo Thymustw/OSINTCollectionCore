@@ -202,6 +202,23 @@ max_header_tokens = 64
 max_source_bytes = 2097152
 rebuild_page_size = 200
 
+[chunk_embedder]
+# 段落向量（ADR-016 階段 5 M2）。18090 是 chunk-worker、18091 是 osint-inference。
+bind = "127.0.0.1:18092"
+consumer_group = "osint-chunk-embedder"
+inference_url = "http://127.0.0.1:18091"
+inference_timeout_secs = 60
+index = "osint-chunks"
+# 推論服務內部逐筆跑（動態 int8 量化下批次會讓向量不可重現），這裡的批次只省 HTTP 來回。
+batch_size = 8
+# 推論 503／連線失敗：指數退避 1 s → 30 s，不放棄。
+backoff_initial_ms = 1000
+backoff_max_ms = 30000
+# 單批耗時 > 移動基準 × slow_factor 就暫停 slow_pause_ms，讓出 CPU（owner 裁決 2026-11-05）。
+slow_factor = 3.0
+slow_pause_ms = 2000
+rebuild_page_size = 100
+
 [import]
 # POST /api/v1/import 的上限。跟 [http].request_body_limit_bytes 是兩條獨立界線：
 # 一般 API body 維持 1 MiB，檔案上傳另外給 10 MiB，不放寬其他路由。

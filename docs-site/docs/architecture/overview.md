@@ -1,6 +1,6 @@
 # 系統架構
 
-這一頁描述 OSINT Intelligence Core 的元件組成：10 個 Rust 服務、6 個基礎設施，以及可選的本地 AI 服務。
+這一頁描述 OSINT Intelligence Core 的元件組成：12 個 Rust 服務、1 個向量推論服務、6 個基礎設施，以及可選的本地 AI 服務。
 
 ---
 
@@ -12,7 +12,7 @@ flowchart TB
         App[應用程式 / API 客戶端]
     end
 
-    subgraph CORE["Rust Core（11 個服務）"]
+    subgraph CORE["Rust Core（12 個服務）"]
         API[osint-api<br/>REST API 閘道]
         COL[osint-collector<br/>資料收集]
         NOR[osint-normalizer<br/>正規化]
@@ -24,7 +24,10 @@ flowchart TB
         STX[osint-stix-worker<br/>STIX 匯入匯出]
         DIS[osint-discovery-worker<br/>關聯發現]
         CHK[osint-chunk-worker<br/>段落切分]
+        CEM[osint-chunk-embedder<br/>段落向量]
     end
+
+    INF[osint-inference<br/>向量推論（Python，只對內）]
 
     subgraph INFRA["基礎設施"]
         PG[(PostgreSQL<br/>唯一真相來源)]
@@ -75,6 +78,10 @@ flowchart TB
     CHK --> PG
     CHK --> RP
 
+    CEM --> PG
+    CEM --> INF
+    CEM --> OS
+
     RP -.訂閱.-> NOR
     RP -.訂閱.-> DED
     RP -.訂閱.-> ENT
@@ -83,6 +90,7 @@ flowchart TB
     RP -.訂閱.-> EMB
     RP -.訂閱.-> STX
     RP -.訂閱.-> CHK
+    RP -.訂閱.-> CEM
     RP -.訂閱.-> DIS
 
     API --> AIE
@@ -205,6 +213,29 @@ STIX 匯入後用 AI Gateway 評估實體解析的自動核准。
 - 讀寫：PostgreSQL（Document、段落）
 - 發布：`document.chunked`
 
+### osint-chunk-embedder
+
+**替每個段落算向量，存進 OpenSearch 的段落向量索引（`osint-chunks`）。**
+事件裡只取文件 id，段落內容一律從 PostgreSQL 重讀，不信任事件內容。
+文件被刪除、被判成重複、或重切後段數變少時，會一併清掉過期的向量。
+向量推論服務暫時不可用時會退避重試、不放棄，資料不會因此遺失。
+
+目前**搜尋還沒有使用段落向量**，見[已知限制](limitations.md)。
+
+- 訂閱：`document.chunked`
+- 讀：PostgreSQL（Document、段落、所屬 Collection）
+- 呼叫：`osint-inference`
+- 寫：OpenSearch（`osint-chunks`）
+
+### osint-inference
+
+**本機向量模型的推論服務**，用 Python＋ONNX Runtime 在 CPU 上計算向量，提供 OpenAI 相容的 `/v1/embeddings`。
+這是專案裡唯一的 Python 服務：Python 只用在模型執行環境，核心服務一律是 Rust，透過 HTTP 呼叫它。
+
+- 沒有認證，**只對內**：宿主埠只綁 `127.0.0.1`
+- 同時處理的請求數有上限，滿了立刻回 503，不排隊
+- 不連資料庫、不訂閱事件
+
 ---
 
 ## 基礎設施
@@ -248,7 +279,7 @@ OpenSearch 和 Neo4j 都是可重建的投影，不是真相來源。
 
 ### 為什麼用 Redpanda？
 
-服務解耦。11 個服務透過事件主題通訊，不直接呼叫彼此。
+服務解耦。Rust 服務之間透過事件主題通訊，不直接呼叫彼此（唯一的直接呼叫是 `osint-chunk-embedder` 以 HTTP 呼叫 `osint-inference` 算向量）。
 一個服務暫停不會讓上游服務失敗——事件留在 Redpanda 等待。
 Redpanda 是 Kafka 相容的，但不需要 ZooKeeper，更容易在工作站上部署。
 

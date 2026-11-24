@@ -356,6 +356,10 @@ curl -s $API/ops/health -H "Authorization: Bearer $TOKEN"
 # 圖投影 lag／rebuild（沒接 Neo4j 回 503）
 curl -s $API/ops/graph -H "Authorization: Bearer $TOKEN"
 
+# 段落向量有沒有跟上段落表（沒接 Postgres 或 OpenSearch 回 503）。
+# missing_vectors／extra_vectors 在寫入進行中會跳動，穩定後才有意義；段落向量目前還沒被搜尋使用
+curl -s $API/ops/chunks -H "Authorization: Bearer $TOKEN"
+
 # AI / Discovery 讀側（沒接 Postgres 回 503）。這是設定值與近似 backlog，不是即時 GPU 負載
 curl -s $API/ops/discovery -H "Authorization: Bearer $TOKEN"
 

@@ -211,7 +211,11 @@ document.chunked
 `EventTopic::DocumentChunked`。生產者是 `osint-chunk-worker`：訂 `dedup.completed`、只處理非重複文件，
 段落**有變更**才寫進 `document_chunks` 並發一則（重送同一份、段落沒變不發），partition key = `document_id`。
 `--rebuild` 不發。payload（`document_id`／`chunk_count`／`chunk_ids`／`strategy`／`strategy_version`／
-`max_token_count`／`truncated`）見 `docs/developer/chunk-worker.md`。**目前沒有消費者**，M2 的段落向量化會訂它。
+`max_token_count`／`truncated`）見 `docs/developer/chunk-worker.md`。
+
+消費者（2026-11-24，M2）：`osint-chunk-embedder`（consumer group `osint-chunk-embedder`）。**只取 `document_id`**，
+段落一律從 PostgreSQL 重讀（事件內容不可信、也可能是舊的），向量寫 OpenSearch `osint-chunks`。
+重讀後文件不在、已標重複、或段落表裡沒有段落（例如 chunk-worker 發出 `chunk_count: 0` 的情況）時，刪掉該文件的全部向量。見 `docs/developer/chunk-embedder.md`。
 
 ## Broker health check
 

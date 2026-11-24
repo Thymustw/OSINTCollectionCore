@@ -1,4 +1,4 @@
-# Repository layout（37 個 crate；resolver／merge／ai-gateway／stix-adapter／chunker 目前是函式庫；十一個服務 binary 都在 compose 的 `app` profile）
+# Repository layout（38 個 crate；resolver／merge／ai-gateway／stix-adapter／chunker 目前是函式庫；十二個 Rust 服務 binary 與 Python 的 `osint-inference` 都在 compose 的 `app` profile）
 
 Cargo workspace：`edition = "2024"`、`resolver = "3"`、`rust-version = "1.100.0"`；工具鏈 pin 在 `rust-toolchain.toml` 的 `channel = "1.100.0"`（2026-11-16 起釘版，與 `docker/Dockerfile` 的 `RUST_IMAGE` 同步升）。
 
@@ -41,8 +41,13 @@ crates/
   indexer/               搜尋投影（osint-indexer）：entity.extracted → OpenSearch osint-documents（SPEC §18）＋搜尋語法解析
   graph-worker/          圖投影（osint-graph-worker）：relationship.changed → Neo4j（SPEC_V0.2 §8）；常駐模式也消費 job.dispatched 執行 graph_rebuild；只有 Entity→Entity 的邊才進圖
   embedding-worker/      向量投影（osint-embedding-worker）：entity.extracted → osint-documents overlay + osint-entities（SPEC_V0.2 §11–§14）；不訂 embedding.requested
+  chunker/               段落切分核心（ADR-016 階段 5 M1）：e5 tokenizer 計數、斷句、512 token 保護；無獨立 binary
+  chunk-worker/          段落切分服務（osint-chunk-worker）：dedup.completed → document_chunks、發 document.chunked
+  chunk-embedder/        段落向量服務（osint-chunk-embedder）：document.chunked → 從 PG 重讀段落 → osint-inference → OpenSearch osint-chunks
   osint-cli/             本機唯讀查詢 CLI（osint-cli）：直連 DB/物件儲存，不經 core-api
   acceptance/            跨服務驗收測試（SPEC §26 Acceptance F、failure/recovery）。無生產程式碼
+services/
+  inference/             Python＋ONNX Runtime 向量推論服務（osint-inference，ADR-016 D2）。CLAUDE.md §3 允許 Python 用於 AI／模型執行環境；Core 只透過 HTTP 呼叫
 docker/
   docker-compose.yml
   docker-compose.dev.yml

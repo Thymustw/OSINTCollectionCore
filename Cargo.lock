@@ -540,6 +540,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "chunk-embedder"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "chunker",
+ "core-config",
+ "core-events",
+ "core-model",
+ "core-observability",
+ "indexer",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "storage-core",
+ "storage-opensearch",
+ "storage-postgres",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "chunk-worker"
 version = "0.1.0"
 dependencies = [

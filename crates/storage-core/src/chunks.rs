@@ -92,6 +92,12 @@ pub trait ChunkStore: Send + Sync {
     ) -> Result<Vec<Uuid>, StorageError>;
 
     async fn chunk_stats(&self) -> Result<ChunkStats, StorageError>;
+
+    /// 這份文件屬於哪些 Collection（`collection_objects`），依 id 升序，最多 1000 個。
+    ///
+    /// 給段落投影帶 `collection_ids`（ADR-016 Q5）。放在這裡而不是 `RelationalStore`：
+    /// 只有段落投影要「依物件反查集合」，加進那個一百多個方法的 trait 要改 7 個實作。
+    async fn document_collection_ids(&self, document_id: Uuid) -> Result<Vec<Uuid>, StorageError>;
 }
 
 /// `list_chunked_document_ids` 的上限。

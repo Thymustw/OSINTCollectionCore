@@ -45,6 +45,7 @@ Phase 6a 起 `AuditLog` 落地到 Postgres 的 `audit_log` 表。哪些動作會
 | `GET /api/v1/ops/health` | viewer+ | **整套系統**哪一塊壞了 | 運維的人 |
 | `GET /api/v1/ops/metrics` | viewer+ | **這個行程**吃了多少記憶體／CPU | 運維的人 |
 | `GET /api/v1/ops/graph` | viewer+ | 圖投影 lag／rebuild | 運維的人 |
+| `GET /api/v1/ops/chunks` | viewer+ | 段落表對段落向量 index（`osint-chunks`）的計數對帳 | 運維的人 |
 | `GET /api/v1/ops/discovery` | viewer+ | AI 並發上限設定值、Candidate backlog、最近 AI Run、今天有用量的 collection、`event_outbox_pending` | 運維的人 |
 
 `/api/v1/ops/*` 另有七條（與上表不是「健康／指標」的分工關係，所以不列在表內）：

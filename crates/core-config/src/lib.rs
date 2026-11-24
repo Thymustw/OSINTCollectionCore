@@ -44,6 +44,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub chunk_worker: ChunkWorkerSection,
     #[serde(default)]
+    pub chunk_embedder: ChunkEmbedderSection,
+    #[serde(default)]
     pub import: ImportSection,
     #[serde(default)]
     pub embedding: EmbeddingSection,
@@ -657,6 +659,44 @@ impl Default for ChunkWorkerSection {
             max_header_tokens: 64,
             max_source_bytes: 2 * 1024 * 1024,
             rebuild_page_size: 200,
+        }
+    }
+}
+
+/// chunk-embedder（`osint-chunk-embedder`，ADR-016 階段 5 M2）的 health、consumer 與推論設定。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChunkEmbedderSection {
+    pub bind: String,
+    pub consumer_group: String,
+    /// osint-inference 的 base URL（不含 `/v1/embeddings`）。
+    pub inference_url: String,
+    pub inference_timeout_secs: u64,
+    pub index: String,
+    /// 每次送推論的段落數（服務內部逐筆跑；這只省 HTTP 來回）。
+    pub batch_size: usize,
+    pub backoff_initial_ms: u64,
+    pub backoff_max_ms: u64,
+    /// 單批耗時超過移動基準 × 這個倍數就暫停 `slow_pause_ms`。待 M2-4 實測後調整。
+    pub slow_factor: f64,
+    pub slow_pause_ms: u64,
+    pub rebuild_page_size: u32,
+}
+
+impl Default for ChunkEmbedderSection {
+    fn default() -> Self {
+        Self {
+            // 18090 是 chunk-worker，18091 是 osint-inference。
+            bind: "127.0.0.1:18092".into(),
+            consumer_group: "osint-chunk-embedder".into(),
+            inference_url: "http://127.0.0.1:18091".into(),
+            inference_timeout_secs: 60,
+            index: "osint-chunks".into(),
+            batch_size: 8,
+            backoff_initial_ms: 1000,
+            backoff_max_ms: 30_000,
+            slow_factor: 3.0,
+            slow_pause_ms: 2000,
+            rebuild_page_size: 100,
         }
     }
 }
@@ -1622,6 +1662,9 @@ mod tests {
         assert_eq!(cfg.embedding_worker.page_size, 100);
         assert_eq!(cfg.stix_worker.bind, "127.0.0.1:18088");
         assert_eq!(cfg.chunk_worker.bind, "127.0.0.1:18090");
+        assert_eq!(cfg.chunk_embedder.bind, "127.0.0.1:18092");
+        assert_eq!(cfg.chunk_embedder.index, "osint-chunks");
+        assert_eq!(cfg.chunk_embedder.batch_size, 8);
         assert_eq!(cfg.chunk_worker.consumer_group, "osint-chunk-worker");
         assert_eq!(cfg.chunk_worker.target_tokens, 300);
         assert_eq!(cfg.chunk_worker.overlap_tokens, 100);

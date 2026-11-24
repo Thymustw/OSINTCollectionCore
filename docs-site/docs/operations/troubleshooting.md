@@ -142,6 +142,31 @@ curl -s $API/ops/queues -H "Authorization: Bearer $TOKEN"
 
 ---
 
+### 段落向量沒有增加，`osint-chunk-embedder` 的 `/ready` 回 503
+
+**症狀**：`GET /api/v1/ops/chunks` 的 `missing_vectors` 不下降，`/ops/queues` 的 `chunk-embedder` 積壓上升；
+`http://127.0.0.1:18092/ready` 回 503，其中 `inference` 那一項是 down。
+
+**原因**：向量推論服務 `osint-inference` 沒起來、正在重啟、或忙到回 503。
+
+**這不會掉資料。** `osint-chunk-embedder` 把這類錯誤當成暫時性的，會退避重試同一批（最長間隔 30 秒），不放棄；
+停掉 embedder 時，手上那則事件不會被標記為已處理，重啟後會重送。可以從 metric 看到它在重試：
+
+```bash
+curl -s http://127.0.0.1:18092/metrics | grep osint_chunk_embed_retries_total
+```
+
+**解法**：把推論服務拉起來即可，embedder 會從卡住的地方繼續。
+
+```bash
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml --profile app up -d osint-inference
+curl -s http://127.0.0.1:18091/ready
+```
+
+`osint_chunk_embed_failed_total` 上升才是真的失敗（重試也不會成功的請求），要看失敗事件紀錄（`GET /api/v1/ops/failed-events`）。
+
+---
+
 ### 埠號衝突
 
 **症狀**：`make compose-up` 或 `make compose-up-full` 失敗，錯誤訊息包含 `address already in use`。
@@ -158,7 +183,7 @@ curl -s $API/ops/queues -H "Authorization: Bearer $TOKEN"
 | 9092 | Redpanda Kafka（宿主） |
 | **19200** | OpenSearch（開發環境改掛此埠） |
 | 6379 | Redis |
-| 18080–18089 | 10 個應用服務 |
+| 18080–18092 | 13 個應用服務（18091 是向量推論服務，只綁 `127.0.0.1`） |
 
 **解法**：找出佔用的行程後停掉，或修改 `docker-compose.dev.yml` 改掛其他埠（需要同步修改 `.env` 的對應設定）。
 

@@ -1,0 +1,10 @@
+# osint-inference 執行期相依。版本選擇理由見 README.md「相依版本」。
+# 改這個檔之後：uv pip compile requirements.in --generate-hashes -o requirements.lock --python-version 3.12
+fastapi==0.163.2
+starlette==1.9.0
+pydantic==2.14.2
+uvicorn==0.54.0
+onnxruntime==1.31.1
+tokenizers==0.23.3
+numpy==2.5.4
+prometheus-client==0.26.0

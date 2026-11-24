@@ -582,6 +582,27 @@ services:
     restart: unless-stopped
     logging: *osint-logging
 
+  # ADR-016 D2：e5-small int8 向量推論（Python＋ONNX Runtime，階段 5 M2）。只對內：
+  # 宿主埠綁 127.0.0.1，沒有認證。模型在 image 裡（建置時驗 sha256），不連外網。
+  # 不依賴 Postgres／Redpanda：只是 HTTP 推論，`depends_on` 刻意不寫。
+  osint-inference:
+    build:
+      context: ../services/inference
+      dockerfile: Dockerfile
+    image: osint-core/osint-inference:0.1.0
+    hostname: osint-inference
+    profiles: ["app"]
+    environment:
+      INFERENCE_THREADS: "4"
+      INFERENCE_MAX_PENDING: "4"
+    ports:
+      - "127.0.0.1:18091:18091"
+    networks:
+      - osint-core
+    restart: unless-stopped
+    stop_grace_period: 15s
+    logging: *osint-logging
+
   # ADR-016 階段 5 M1：訂閱 dedup.completed，把非重複文件切成段落寫進 document_chunks，
   # 發 document.chunked。tokenizer 在 image 裡（建置時驗 sha256）。
   osint-chunk-worker:
@@ -600,4 +621,27 @@ services:
       - osint-core
     depends_on: *osint-depends
     restart: unless-stopped
+    logging: *osint-logging
+
+  # ADR-016 階段 5 M2：訂閱 document.chunked，從 PostgreSQL 重讀段落、送 osint-inference，
+  # 向量寫 OpenSearch osint-chunks。推論不可用時退避重試（不 depends_on osint-inference，
+  # 讓它晚起或重啟時這邊只是等）。
+  osint-chunk-embedder:
+    build:
+      <<: *osint-build
+      target: osint-chunk-embedder
+    image: osint-core/osint-chunk-embedder:0.1.0
+    hostname: osint-chunk-embedder
+    profiles: ["app"]
+    environment:
+      <<: *osint-env
+      OSINT__CHUNK_EMBEDDER__BIND: 0.0.0.0:18092
+      OSINT__CHUNK_EMBEDDER__INFERENCE_URL: http://osint-inference:18091
+    ports:
+      - "18092:18092"
+    networks:
+      - osint-core
+    depends_on: *osint-depends
+    restart: unless-stopped
+    stop_grace_period: 15s
     logging: *osint-logging

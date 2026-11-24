@@ -5214,6 +5214,25 @@ where
     store.put_document(&document).await?;
     let before = store.chunk_stats().await?;
 
+    // document_collection_ids：沒有關聯回空；掛兩個集合依 id 升序回來。
+    if !store.document_collection_ids(document.id).await?.is_empty() {
+        return Err(fail("沒掛任何集合的文件 document_collection_ids 應回空"));
+    }
+    let col_b = conformance_collection(format!("chunk-col-b-{}", document.id));
+    let col_a = conformance_collection(format!("chunk-col-a-{}", document.id));
+    store.put_collection(&col_b).await?;
+    store.put_collection(&col_a).await?;
+    store.link_collection_object(col_b.id, document.id).await?;
+    store.link_collection_object(col_a.id, document.id).await?;
+    let mut want = vec![col_a.id, col_b.id];
+    want.sort();
+    let got = store.document_collection_ids(document.id).await?;
+    if got != want {
+        return Err(fail(format!(
+            "document_collection_ids 應為 {want:?}，實際 {got:?}"
+        )));
+    }
+
     let three = chunks_for(document.id, &["第一段。", "第二段。", "第三段。"]);
     store.replace_document_chunks(document.id, &three).await?;
     if store.list_document_chunks(document.id).await? != three {

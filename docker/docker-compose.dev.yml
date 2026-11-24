@@ -173,8 +173,19 @@ services:
     mem_limit: 256m
     cpus: "0.25"
 
+  # owner 裁決（2026-11-05）：推論常駐 4 核、記憶體 1 GB；大量回填時暫時放寬到 8 核
+  # （改 cpus 與 INFERENCE_THREADS 兩處）。實驗 5-2a RSS 峰值約 665 MB。
+  osint-inference:
+    mem_limit: 1g
+    cpus: "4.0"
+
   # tokenizer（17 MB）常駐記憶體；切段是 CPU-bound，但循序處理一次一份。
   # 語料實測單執行緒 RSS 約 300 MB（含測試行程），給 384m 留餘裕。
   osint-chunk-worker:
     mem_limit: 384m
+    cpus: "0.50"
+
+  # 只做 HTTP＋JSON＋bulk，CPU 在 osint-inference。一批 8 段 × 384 維，記憶體很小。
+  osint-chunk-embedder:
+    mem_limit: 128m
     cpus: "0.50"

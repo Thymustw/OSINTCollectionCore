@@ -3731,4 +3731,22 @@ impl ChunkStore for SqliteEmbeddedStore {
             max_token_count: max_tokens.and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
         })
     }
+
+    async fn document_collection_ids(&self, document_id: Uuid) -> Result<Vec<Uuid>, StorageError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT collection_id FROM collection_objects WHERE object_id = ?1 ORDER BY collection_id LIMIT 1000",
+        )
+        .bind(uuid_text(document_id))
+        .fetch_all(self.conn().await?.as_mut())
+        .await
+        .map_err(map_sqlx)?;
+        rows.into_iter()
+            .map(|(raw,)| {
+                Uuid::parse_str(&raw).map_err(|err| StorageError::Unknown {
+                    backend: "sqlite",
+                    message: format!("collection_objects.collection_id `{raw}` 不是 UUID：{err}"),
+                })
+            })
+            .collect()
+    }
 }

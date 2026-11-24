@@ -24,7 +24,7 @@
 | 順序 | 讀什麼 | 為什麼 |
 |---|---|---|
 | 1 | [快速上手](../getting-started/quickstart.md) | 先親眼看過資料從匯入到上圖的完整過程，後面的東西會好讀很多 |
-| 2 | [系統架構](../architecture/overview.md)、[資料流](../architecture/data-flow.md) | 知道 11 個服務怎麼透過事件串起來 |
+| 2 | [系統架構](../architecture/overview.md)、[資料流](../architecture/data-flow.md) | 知道 13 個服務怎麼透過事件串起來 |
 | 3 | [設計原則](../architecture/principles.md) | 這個專案的限制大多是刻意的；不懂原則會把設計當成 bug 去修 |
 | 4 | [原始碼地圖](codebase.md) | 把服務對應到實際的 crate 與目錄 |
 | 5 | [版本路線與未修清單](roadmap.md) | 動手之前先知道哪些坑已經被記錄過 |

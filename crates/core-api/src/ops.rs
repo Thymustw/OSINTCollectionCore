@@ -1216,6 +1216,66 @@ pub async fn graph_projection(
     }))
 }
 
+// --------------------------------------------------------------- chunk ops
+
+/// `GET /ops/chunks` 的回應（ADR-016 階段 5）。
+///
+/// `missing_vectors` = PG 段落數 − index 向量數（下限 0）。回填中、或 embedder 落後時 > 0；
+/// 穩定後應為 0。`extra_vectors` > 0 代表 index 有 PG 已不存在的段落（重切後沒清掉，
+/// 或 index 指向別的資料），要 `--rebuild --drop`。
+///
+/// 消費落後（lag）不在這裡：看 `GET /ops/queues` 的 `chunk-embedder` 列。
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkOpsView {
+    pub index: String,
+    pub chunked_documents: u64,
+    pub chunks: u64,
+    pub max_token_count: u32,
+    pub vectors: u64,
+    pub missing_vectors: u64,
+    pub extra_vectors: u64,
+    /// `missing_vectors == 0 && extra_vectors == 0`。
+    pub in_sync: bool,
+}
+
+impl ChunkOpsView {
+    #[must_use]
+    pub fn new(index: String, stats: &storage_core::ChunkStats, vectors: u64) -> Self {
+        let missing = stats.chunks.saturating_sub(vectors);
+        let extra = vectors.saturating_sub(stats.chunks);
+        Self {
+            index,
+            chunked_documents: stats.documents,
+            chunks: stats.chunks,
+            max_token_count: stats.max_token_count,
+            vectors,
+            missing_vectors: missing,
+            extra_vectors: extra,
+            in_sync: missing == 0 && extra == 0,
+        }
+    }
+}
+
+/// `GET /api/v1/ops/chunks`。viewer 以上。唯讀、不寫稽核（同 `/ops/graph`）。
+///
+/// 兩個計數不是同一瞬間取的：寫入進行中時差值會跳動，穩定後才有對帳意義。
+pub async fn chunks(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<Json<ChunkOpsView>, ApiError> {
+    principal.role.require(Permission::Read)?;
+    let c = state.chunks.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "段落對帳未接上 PostgreSQL 或 OpenSearch。請確認兩者設定並重啟 osint-api",
+        )
+    })?;
+    let stats = c.store.chunk_stats().await.map_err(storage_error)?;
+    let vectors = c.search.count(&c.index).await.map_err(storage_error)?;
+    Ok(Json(ChunkOpsView::new(c.index.clone(), &stats, vectors)))
+}
+
 // --------------------------------------------------------------- discovery ops
 
 /// `GET /ops/discovery` 一次最多數幾筆來近似 backlog 計數。

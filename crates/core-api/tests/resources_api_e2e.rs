@@ -95,11 +95,11 @@ struct TestApi {
 }
 
 fn build_api(stack: &Stack, producer: Option<Arc<EventProducer>>) -> TestApi {
-    build_api_with_backends(stack, producer, Vec::new(), Vec::new(), None, false)
+    build_api_with_backends(stack, producer, Vec::new(), Vec::new(), None, false, None)
 }
 
 fn build_api_with_auto_approval(stack: &Stack) -> TestApi {
-    build_api_with_backends(stack, None, Vec::new(), Vec::new(), None, true)
+    build_api_with_backends(stack, None, Vec::new(), Vec::new(), None, true, None)
 }
 
 fn assemble_test_auto_approval(
@@ -154,6 +154,7 @@ fn build_api_with_backends(
     missing: Vec<&'static str>,
     graph_projection: Option<core_api::SharedGraphProjection>,
     auto_approval_enabled: bool,
+    chunks: Option<Arc<core_api::ChunkOpsState>>,
 ) -> TestApi {
     let jwt = JwtService::new(&[b't'; 32], "osint-core", chrono::Duration::hours(1)).expect("jwt");
     let viewer = jwt.issue("e2e-viewer", Role::Viewer).expect("issue");
@@ -187,6 +188,7 @@ fn build_api_with_backends(
         graph_resolver: None,
         graph: None,
         graph_projection,
+        chunks,
         import: None,
         search: None,
         semantic_search: None,
@@ -2386,6 +2388,7 @@ async fn ops_health_reports_a_broken_redis() {
         Vec::new(),
         None,
         false,
+        None,
     );
     let (status, body, _) = send(&api_ok.app, get("/api/v1/ops/health", &api_ok.viewer)).await;
     assert_eq!(status, StatusCode::OK, "全部活著時要 200：{body}");
@@ -2404,6 +2407,7 @@ async fn ops_health_reports_a_broken_redis() {
         Vec::new(),
         None,
         false,
+        None,
     );
     let (status, body, _) = send(&api_bad.app, get("/api/v1/ops/health", &api_bad.viewer)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -2470,6 +2474,7 @@ async fn ops_graph_reports_projection_status_from_neo4j() {
         Vec::new(),
         Some(graph_projection),
         false,
+        None,
     );
     let (status, body, _) = send(&api.app, get("/api/v1/ops/graph", &api.viewer)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2483,6 +2488,85 @@ async fn ops_graph_reports_projection_status_from_neo4j() {
     );
     assert!(body["rebuild"]["written"].is_number(), "{body}");
     assert!(body["lag"].is_object(), "{body}");
+}
+
+/// `/ops/chunks`：PG 段落數對 OpenSearch 段落向量數。用一次性 index，只寫一筆向量，
+/// 斷言差值算對；沒接上時回 503。
+#[tokio::test]
+async fn ops_chunks_reconciles_pg_chunks_against_vector_index() {
+    use storage_core::{ChunkStore, SearchStore};
+    let stack = connect_stack().await;
+    let api = build_api(&stack, None);
+    let (status, body, _) = send(&api.app, get("/api/v1/ops/chunks", &api.viewer)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body["message"].as_str().unwrap().contains("OpenSearch"),
+        "{body}"
+    );
+
+    let url = required_env("OPENSEARCH_URL").expect("OPENSEARCH_URL");
+    storage_core::conformance::verify_not_opencti_search(&url).expect("埠隔離");
+    let os = storage_opensearch::OpenSearchStore::connect(&url)
+        .expect("os")
+        .with_refresh_on_write(true);
+    let index = format!("osint-chunks-e2e-ops-{}", Uuid::now_v7().simple());
+
+    let doc = new_document(DocumentType::Article, None);
+    stack.pg.put_document(&doc).await.unwrap();
+    let chunks: Vec<storage_core::DocumentChunk> = (0..3)
+        .map(|seq| storage_core::DocumentChunk {
+            id: storage_core::chunk_id(doc.id, "fixed", 1, seq),
+            document_id: doc.id,
+            seq,
+            start_char: seq * 2,
+            end_char: seq * 2 + 2,
+            text: "段落".into(),
+            header: None,
+            token_count: 2,
+            strategy: "fixed".into(),
+            strategy_version: 1,
+            simhash: None,
+            group_id: None,
+            created_at: Utc::now(),
+        })
+        .collect();
+    stack
+        .pg
+        .replace_document_chunks(doc.id, &chunks)
+        .await
+        .unwrap();
+    os.bulk_index(vec![storage_core::SearchDocument {
+        index: index.clone(),
+        id: chunks[0].id.to_string(),
+        body: json!({"document_id": doc.id}),
+    }])
+    .await
+    .unwrap();
+
+    let api = build_api_with_backends(
+        &stack,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        Some(Arc::new(core_api::ChunkOpsState {
+            store: Arc::new(stack.pg.clone()),
+            search: os.clone(),
+            index: index.clone(),
+        })),
+    );
+    let (status, body, _) = send(&api.app, get("/api/v1/ops/chunks", &api.viewer)).await;
+    let _ = os.delete_index(&index).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["index"], index);
+    // 一次性 DB：只有這份文件的三段。
+    assert_eq!(body["chunks"], 3, "{body}");
+    assert_eq!(body["chunked_documents"], 1, "{body}");
+    assert_eq!(body["vectors"], 1, "{body}");
+    assert_eq!(body["missing_vectors"], 2, "{body}");
+    assert_eq!(body["extra_vectors"], 0, "{body}");
+    assert_eq!(body["in_sync"], false, "{body}");
 }
 
 // ---------------------------------------------------------------- resolve / merge

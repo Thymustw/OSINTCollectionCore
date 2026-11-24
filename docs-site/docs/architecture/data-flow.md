@@ -152,7 +152,7 @@ Redpanda 上共有 29 個主題（topic）。以下按功能分類，並標明�
 
 | 主題 | 生產者 | 消費者 |
 |---|---|---|
-| `document.chunked` | osint-chunk-worker（段落有變更才發；重送同一份文件、段落沒變不發） | —（段落向量化會訂閱，下一階段） |
+| `document.chunked` | osint-chunk-worker（段落有變更才發；重送同一份文件、段落沒變不發） | osint-chunk-embedder（只取文件 id，段落從 PostgreSQL 重讀，向量寫進 OpenSearch `osint-chunks`） |
 
 ---
 

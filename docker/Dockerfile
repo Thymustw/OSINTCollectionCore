@@ -7,7 +7,7 @@
 # 十個 target：osint-api / osint-collector / osint-normalizer /
 #              osint-deduplicator / osint-entity-worker / osint-indexer /
 #              osint-graph-worker / osint-embedding-worker / osint-stix-worker /
-#              osint-discovery-worker / osint-chunk-worker
+#              osint-discovery-worker / osint-chunk-worker / osint-chunk-embedder
 #
 # ---------------------------------------------------------------------------
 # 為什麼用 BuildKit cache mount 而不是 cargo-chef
@@ -73,7 +73,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && for bin in osint-api osint-collector osint-normalizer \
                osint-deduplicator osint-entity-worker osint-indexer \
                osint-graph-worker osint-embedding-worker osint-stix-worker \
-               osint-discovery-worker osint-chunk-worker; do \
+               osint-discovery-worker osint-chunk-worker osint-chunk-embedder; do \
         cp "target/release/$bin" "/out/$bin"; \
     done \
  && ls -l /out
@@ -239,3 +239,11 @@ EXPOSE 18090
 HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
     CMD curl -fsS http://127.0.0.1:18090/health || exit 1
 ENTRYPOINT ["/usr/local/bin/osint-chunk-worker"]
+
+# ADR-016 階段 5 M2：document.chunked → osint-inference → osint-chunks。不帶模型，推論走 HTTP。
+FROM runtime-base AS osint-chunk-embedder
+COPY --from=builder --chown=root:root --chmod=555 /out/osint-chunk-embedder /usr/local/bin/osint-chunk-embedder
+EXPOSE 18092
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=12 \
+    CMD curl -fsS http://127.0.0.1:18092/health || exit 1
+ENTRYPOINT ["/usr/local/bin/osint-chunk-embedder"]
